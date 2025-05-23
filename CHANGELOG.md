@@ -4,6 +4,8 @@
 
 - `application_name` parameter in pool #30.
 - link-time optimization #29.
+- add `DISCARD ALL`/`DEALLOCATE ALL` client query support.
+- fixes panics in admin console.
 
 ### Fixed
 
