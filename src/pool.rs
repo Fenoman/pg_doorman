@@ -530,6 +530,21 @@ impl managed::Manager for ServerPool {
         if conn.is_bad() {
             return Err(managed::RecycleError::StaticMessage("Bad connection"));
         }
+		
+		// ------------------------------------------------------------------
+		// Unconditional session cleanup before the connection is returned to the pool
+		// ------------------------------------------------------------------
+		// 1. Free pgv contexts (no-op if the pgv extension is not installed).
+		if let Err(e) = conn.small_simple_query("SELECT pgv_free();").await {
+			// Not a fatal error — the extension might be absent. Log and continue.
+			warn!("pgv_free() failed during recycle: {:?}", e);
+		}
+		// 2. Reset the role. If this fails, mark the connection as bad
+		//    because it is unsafe to reuse it.
+		if let Err(e) = conn.small_simple_query("RESET ROLE;").await {
+			warn!("RESET ROLE failed during recycle: {:?}", e);
+			return Err(managed::RecycleError::Message(e.to_string()));
+		}
         Ok(())
     }
 }

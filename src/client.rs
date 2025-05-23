@@ -128,6 +128,42 @@ pub struct Client<S, T> {
     virtual_pool_count: u16,
 }
 
+/// Fast check whether the simple-query body is a DISCARD ALL command.
+///  * ignores leading / trailing spaces
+///  * ignores a single trailing ';'
+///  * ignores trailing NUL
+///  * ignores any amount of interior spaces
+///  * ASCII case-insensitive
+#[inline]
+fn is_discard_all(mut q: &[u8]) -> bool {
+    // Trim leading spaces
+    while !q.is_empty() && q[0] == b' ' { q = &q[1..]; }
+
+    // Trim one trailing NUL if present
+    if q.last() == Some(&0) {
+        q = &q[..q.len() - 1];
+    }
+
+    // Trim trailing spaces and at most one ';'
+    let mut end = q.len();
+    while end > 0 && q[end - 1] == b' ' { end -= 1; }
+    if end > 0 && q[end - 1] == b';'   { end -= 1; }
+    while end > 0 && q[end - 1] == b' ' { end -= 1; }
+    q = &q[..end];
+
+    // Compare to "discardall" while skipping interior spaces
+    const PAT: &[u8] = b"discardall";
+    let mut i = 0;
+    for &c in q {
+        if c == b' ' { continue; }                      // skip blanks
+        if i >= PAT.len() || PAT[i] != c.to_ascii_lowercase() {
+            return false;
+        }
+        i += 1;
+    }
+    i == PAT.len() // must match exactly all 10 bytes
+}
+
 pub async fn client_entrypoint_too_many_clients_already(
     mut stream: TcpStream,
     client_server_map: ClientServerMap,
@@ -971,7 +1007,29 @@ where
                             continue;
                         }
                     }
-                }
+					// --- DISCARD ALL interceptor ---------------------------------
+					// Performance constraints:
+					//   • Inspect only very-small simple-query messages (≤ 20 bytes total; 5-byte header + body)  
+					//   • Case-insensitive comparison
+					//   • Accept and trim leading / trailing spaces
+					//   • Ignore one optional trailing ‘;’ (with spaces allowed before it)
+					//   • Ignore one optional trailing NUL byte
+                    if message.len() <= 20 {
+						// slice after the 5-byte header
+						let mut q = &message[5..];
+					
+						// cheap preliminary check: drop trailing NULL, no other trimming
+						if let Some(&0) = q.last() {
+							q = &q[..q.len() - 1];
+						}
+					
+						if is_discard_all(q) {
+							write_all_flush(&mut self.write, &discard_all_response()).await?;
+							continue;
+						}
+					}
+					// -----------------------------------------------------------------
+				}
                 // Buffer extended protocol messages even if we do not have
                 // a server connection yet. Hopefully, when we get the S message
                 // we'll be able to allocate a connection. Also, clients do not expect
