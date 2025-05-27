@@ -159,10 +159,6 @@ impl std::fmt::Display for CleanupState {
 
 static TRACKED_PARAMETERS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut set = HashSet::new();
-    set.insert("client_encoding".to_string());
-    set.insert("DateStyle".to_string());
-    set.insert("TimeZone".to_string());
-    set.insert("standard_conforming_strings".to_string());
     set.insert("application_name".to_string());
     set
 });
