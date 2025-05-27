@@ -159,10 +159,6 @@ impl std::fmt::Display for CleanupState {
 
 static TRACKED_PARAMETERS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut set = HashSet::new();
-    set.insert("client_encoding".to_string());
-    set.insert("DateStyle".to_string());
-    set.insert("TimeZone".to_string());
-    set.insert("standard_conforming_strings".to_string());
     set.insert("application_name".to_string());
     set
 });
@@ -848,6 +844,14 @@ impl Server {
             }
             self.cleanup_state.reset();
         }
+		
+		// Unconditional session cleanup before the connection is returned to the pool
+		if let Err(e) = self.small_simple_query("DO $$ BEGIN PERFORM public.pgv_free(); END $$;").await 
+		{
+			// Not a fatal error — the extension might be absent. Log and continue.
+			warn!("pgv_free() failed during checkin: {:?}", e);
+		}
+				
         Ok(())
     }
 
