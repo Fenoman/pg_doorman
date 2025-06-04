@@ -1,4 +1,4 @@
-FROM rust:1.86.0-slim-bookworm AS builder
+FROM rust:1.87.0-slim-bookworm AS builder
 
 RUN apt-get update && \
     apt-get install -y build-essential pkg-config libssl-dev
@@ -7,7 +7,7 @@ COPY . /app
 WORKDIR /app
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM ubuntu:noble
 RUN apt-get update && apt-get install  -o Dpkg::Options::=--force-confdef -yq --no-install-recommends postgresql-client openssl \
     # Clean up layer
     && apt-get clean \
