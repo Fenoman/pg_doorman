@@ -653,6 +653,32 @@ pub fn deallocate_response() -> BytesMut {
     bytes
 }
 
+/// Client-side stub that imitates a successful execution of
+/// `DISCARD ALL` on the server.
+///
+/// Generates two PostgreSQL protocol messages:
+///   1. `C` (CommandComplete) with the text "DISCARD"
+///   2. `Z` (ReadyForQuery) with status Idle
+///
+/// Resulting buffer = 19 bytes:
+///   C  | len = 16 | "DISCARD ALL\0"
+///   Z  | len =  5 | 'I'
+pub fn discard_all_response() -> BytesMut {
+    let mut bytes = BytesMut::with_capacity(23);
+
+    // CommandComplete
+    bytes.put_u8(b'C');      // message type
+    bytes.put_i32(16);       // length: 4 (self) + 12 ("DISCARD ALL\0")
+    bytes.put_slice(b"DISCARD ALL\0");
+
+    // ReadyForQuery
+    bytes.put_u8(b'Z');      // message type
+    bytes.put_i32(5);        // length: 4 + 1
+    bytes.put_u8(b'I');      // Idle
+
+    bytes
+}
+
 pub fn ready_for_query(in_transaction: bool) -> BytesMut {
     let mut bytes = BytesMut::with_capacity(
         mem::size_of::<u8>() + mem::size_of::<i32>() + mem::size_of::<u8>(),
