@@ -374,6 +374,85 @@ impl std::fmt::Display for Server {
 }
 
 impl Server {
+	pub async fn execute_pgv_free(&mut self) -> Result<(), Error> {
+		// Using Extended Protocol instead of Simple Query
+		let mut buffer = BytesMut::new();
+		
+		// Parse message for anonymous statement
+		let stmt_name = "";
+		let query = "SELECT public.pgv_free()";
+		buffer.put_u8(b'P');
+		let len_pos = buffer.len();
+		buffer.put_i32(0); // placeholder for length
+		buffer.put_slice(stmt_name.as_bytes());
+		buffer.put_u8(0);
+		buffer.put_slice(query.as_bytes());
+		buffer.put_u8(0);
+		buffer.put_i16(0); // no parameters
+		
+		// Update length
+		let len = buffer.len() - len_pos;
+		buffer[len_pos..len_pos + 4].copy_from_slice(&(len as i32).to_be_bytes());
+		
+		// Bind message
+		buffer.put_u8(b'B');
+		buffer.put_i32(4 + 1 + 1 + 2 + 2 + 2); // length
+		buffer.put_u8(0); // unnamed portal
+		buffer.put_u8(0); // unnamed statement
+		buffer.put_i16(0); // no format codes
+		buffer.put_i16(0); // no parameters
+		buffer.put_i16(0); // no result format codes
+		
+		// Execute message
+		buffer.put_u8(b'E');
+		buffer.put_i32(4 + 1 + 4); // length
+		buffer.put_u8(0); // unnamed portal
+		buffer.put_i32(0); // no row limit
+		
+		// Sync message
+		buffer.put_u8(b'S');
+		buffer.put_i32(4); // length
+		
+		// Send all messages
+		self.send_and_flush(&buffer).await?;
+		
+		// Read responses until ReadyForQuery
+		let mut noop = tokio::io::sink();
+		let mut function_not_found = false;
+		
+		loop {
+			match self.recv(&mut noop, None).await {
+				Ok(_) => {
+					// recv already processed the response
+				},
+				Err(err) => {
+					// Check if it's "function does not exist" error
+					let err_string = err.to_string();
+					if err_string.contains("function") && 
+					   (err_string.contains("does not exist") || 
+						err_string.contains("pgv_free")) {
+						// Expected error - extension not installed
+						if !function_not_found {
+							// Log only once
+							warn!("pgv extension not installed, pgv_free() function not found");
+							function_not_found = true;
+						}
+					} else {
+						// Unexpected error
+						error!("Unexpected error in pgv_free(): {:?}", err);
+						return Err(err);
+					}
+				}
+			}
+			
+			if !self.data_available {
+				break;
+			}
+		}
+		
+		Ok(())
+	}
+	
     /// Execute an arbitrary query against the server.
     /// It will use the simple query protocol.
     /// Result will not be returned, so this is useful for things like `SET` or `ROLLBACK`.
@@ -1054,11 +1133,19 @@ impl Server {
         }
 
         let mut query = String::from("");
-
-        for (key, value) in parameter_diff {
-            query.push_str(&format!("SET {key} TO '{value}';"));
-        }
-
+		
+		for (key, mut value) in parameter_diff {
+			// Remove quotes if they exist
+			if value.starts_with('\'') && value.ends_with('\'') && value.len() > 1 {
+				value = value[1..value.len()-1].to_string();
+			}
+			
+			// Escape single quotes in the value
+			let escaped_value = value.replace('\'', "''");
+			
+			query.push_str(&format!("SET {} TO '{}';", key, escaped_value));
+		}
+		
         let res = self.small_simple_query(&query).await;
 
         self.cleanup_state.reset();
