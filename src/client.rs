@@ -21,6 +21,7 @@ use crate::auth::talos::{extract_talos_token, talos_role_to_string};
 use crate::config::{addr_in_hba, get_config};
 use crate::constants::*;
 use crate::messages::*;
+use crate::messages::protocol::discard_all_response;
 use crate::pool::{get_pool, ClientServerMap, ConnectionPool, CANCELED_PIDS};
 use crate::rate_limit::RateLimiter;
 use crate::server::{Server, ServerParameters};
@@ -36,6 +37,8 @@ pub static PREPARED_STATEMENT_COUNTER: Lazy<Arc<AtomicUsize>> =
 pub static CLIENT_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
 // Ignore deallocate queries from pgx.
 static QUERY_DEALLOCATE: &[u8] = "deallocate ".as_bytes();
+// Ignore discard all queries
+static QUERY_DISCARD: &[u8] = "discard \"".as_bytes();
 
 /// Type of connection received from client.
 enum ClientConnectionType {
@@ -123,6 +126,41 @@ pub struct Client<S, T> {
 
     created_at: Instant,
     virtual_pool_count: u16,
+}
+
+/// Fast check whether the simple-query body is a DISCARD ALL command.
+///  * ignores leading / trailing spaces
+///  * ignores a single trailing ';'
+///  * ignores trailing NUL
+///  * ignores any amount of interior spaces
+///  * ASCII case-insensitive
+fn is_discard_all(mut q: &[u8]) -> bool {
+    // Trim leading spaces
+    while !q.is_empty() && q[0] == b' ' { q = &q[1..]; }
+
+    // Trim one trailing NUL if present
+    if q.last() == Some(&0) {
+        q = &q[..q.len() - 1];
+    }
+
+    // Trim trailing spaces and at most one ';'
+    let mut end = q.len();
+    while end > 0 && q[end - 1] == b' ' { end -= 1; }
+    if end > 0 && q[end - 1] == b';'   { end -= 1; }
+    while end > 0 && q[end - 1] == b' ' { end -= 1; }
+    q = &q[..end];
+
+    // Compare to "discardall" while skipping interior spaces
+    const PAT: &[u8] = b"discardall";
+    let mut i = 0;
+    for &c in q {
+        if c == b' ' { continue; }                      // skip blanks
+        if i >= PAT.len() || PAT[i] != c.to_ascii_lowercase() {
+            return false;
+        }
+        i += 1;
+    }
+    i == PAT.len() // must match exactly all 10 bytes
 }
 
 pub async fn client_entrypoint_too_many_clients_already(
@@ -864,7 +902,29 @@ where
                             continue;
                         }
                     }
-                }
+					// --- DISCARD ALL interceptor ---------------------------------
+					// Performance constraints:
+					//   • Inspect only very-small simple-query messages (≤ 20 bytes total; 5-byte header + body)
+					//   • Case-insensitive comparison
+					//   • Accept and trim leading / trailing spaces
+					//   • Ignore one optional trailing ‘;’ (with spaces allowed before it)
+					//   • Ignore one optional trailing NUL byte
+                    if message.len() <= 20 && message.len() > QUERY_DISCARD.len() + 5 {
+						let mut q = &message[5..];
+
+						// cheap preliminary check: drop trailing NULL, no other trimming
+						if let Some(&0) = q.last() {
+							q = &q[..q.len() - 1];
+						}
+
+						if is_discard_all(q) {
+							debug!("Intercepted DISCARD ALL from client {}", self.addr);
+							write_all_flush(&mut self.write, &discard_all_response()).await?;
+							continue;
+						}
+					}
+					// -----------------------------------------------------------------
+				}
                 // Buffer extended protocol messages even if we do not have
                 // a server connection yet. Hopefully, when we get the S message
                 // we'll be able to allocate a connection. Also, clients do not expect
@@ -926,7 +986,11 @@ where
                             }
                             // checkin_cleanup before give server to client.
                             match conn.checkin_cleanup().await {
-                                Ok(()) => break conn,
+                                Ok(()) => {
+        							// Execute pgv_free to ensure clean state for the new client
+        							conn.execute_pgv_free().await.ok();
+                                    break conn
+                                },
                                 Err(err) => {
                                     warn!(
                                         "Server {} cleanup error: {:?}",
@@ -1635,10 +1699,11 @@ where
                 .await?;
 
                 Err(Error::ClientError(format!(
-                    "Invalid pool name {{ username: {}, pool_name: {}, application_name: {} }}",
+                    "Invalid pool name {{ username: {}, pool_name: {}, application_name: {}, virtual pool id: {} }}",
                     self.pool_name,
                     self.username,
                     self.server_parameters.get_application_name(),
+                    virtual_pool_id
                 )))
             }
         }

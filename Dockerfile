@@ -7,7 +7,7 @@ COPY . /app
 WORKDIR /app
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM ubuntu:noble
 RUN apt-get update && apt-get install  -o Dpkg::Options::=--force-confdef -yq --no-install-recommends postgresql-client openssl \
     # Clean up layer
     && apt-get clean \
