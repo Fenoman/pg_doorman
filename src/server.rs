@@ -1565,6 +1565,18 @@ impl Server {
 
                 // Notice
                 'N' => {
+                    if len < 4 {
+                        return Err(Error::ServerStartupError(
+                            "Notice message length too small".into(),
+                            server_identifier,
+                        ));
+                    }
+                    if len > MAX_MESSAGE_SIZE {
+                        return Err(Error::ServerStartupError(
+                            "Notice message length too large".into(),
+                            server_identifier,
+                        ));
+                    }
                     let mut bytes = BytesMut::with_capacity(len as usize - 4);
                     bytes.resize(len as usize - mem::size_of::<i32>(), b'0');
                     match stream.read_exact(&mut bytes[..]).await {
@@ -1586,6 +1598,18 @@ impl Server {
 
                 // ParameterStatus
                 'S' => {
+                    if len < 4 {
+                        return Err(Error::ServerStartupError(
+                            "ParameterStatus message length too small".into(),
+                            server_identifier,
+                        ));
+                    }
+                    if len > MAX_MESSAGE_SIZE {
+                        return Err(Error::ServerStartupError(
+                            "ParameterStatus message length too large".into(),
+                            server_identifier,
+                        ));
+                    }
                     let mut bytes = BytesMut::with_capacity(len as usize - 4);
                     bytes.resize(len as usize - mem::size_of::<i32>(), b'0');
 
