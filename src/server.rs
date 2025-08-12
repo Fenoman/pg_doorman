@@ -756,7 +756,21 @@ impl Server {
 
                     self.server_parameters.set_param(key, value, false);
                 }
-
+				
+				// Extended protocol early-ack handling: if the client asked us to flush
+                // on a specific server message (ParseComplete '1', BindComplete '2',
+                // CloseComplete '3', ParameterDescription 't', RowDescription 'T'),
+                // break out only when we actually see that code.
+                '1' | '2' | '3' | 't' | 'T' => {
+                    if self.flush_wait_code == code {
+                        // Signal to the caller that we should flush now.
+                        self.data_available = false;
+                        break;
+                    }
+                    // Otherwise keep buffering until either the flush_wait_code shows up
+                    // or ReadyForQuery.
+                }
+				
                 // DataRow
                 'D' => {
                     // More data is available after this message, this is not the end of the reply.
