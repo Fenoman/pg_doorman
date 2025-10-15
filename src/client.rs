@@ -1075,6 +1075,9 @@ where
                                     server.emulate_discard_all().await?;
                                     write_all_flush(&mut self.write, &discard_all_response())
                                         .await?;
+                                    self.prepared_statements.clear();
+                                    self.extended_protocol_data_buffer.clear();
+                                    self.response_message_queue_buffer.clear();
                                     handled_discard_all = true;
                                 }
                             }
