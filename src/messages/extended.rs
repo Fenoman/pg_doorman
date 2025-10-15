@@ -226,9 +226,10 @@ impl TryFrom<&BytesMut> for Bind {
                 param_values.push((-1, BytesMut::new()));
             } else {
                 if param_len < 0 || param_len > MAX_MESSAGE_SIZE {
-                    return Err(Error::ProtocolSyncError(
-                        format!("Invalid parameter length: {}", param_len)
-                    ));
+                    return Err(Error::ProtocolSyncError(format!(
+                        "Invalid parameter length: {}",
+                        param_len
+                    )));
                 }
                 let mut param = BytesMut::with_capacity(param_len as usize);
                 for _ in 0..param_len {

@@ -887,7 +887,7 @@ where
                     // --- DISCARD ALL interceptor ---------------------------------
                     // Keep the check lightweight by inspecting only reasonably small
                     // messages and bailing out on invalid UTF-8.
-                    if message.len() <= DISCARD_INTERCEPT_MAX_LEN {
+                    if !self.connected_to_server && message.len() <= DISCARD_INTERCEPT_MAX_LEN {
                         let mut q = &message[5..];
 
                         if let Some(&0) = q.last() {
@@ -1065,7 +1065,23 @@ where
                     match code {
                         // Query
                         'Q' => {
-                            self.send_and_receive_loop(Some(&message), server).await?;
+                            let mut handled_discard_all = false;
+                            if message.len() <= DISCARD_INTERCEPT_MAX_LEN {
+                                let mut q = &message[5..];
+                                if let Some(&0) = q.last() {
+                                    q = &q[..q.len() - 1];
+                                }
+                                if is_discard_all(q) {
+                                    server.emulate_discard_all().await?;
+                                    write_all_flush(&mut self.write, &discard_all_response())
+                                        .await?;
+                                    handled_discard_all = true;
+                                }
+                            }
+
+                            if !handled_discard_all {
+                                self.send_and_receive_loop(Some(&message), server).await?;
+                            }
                             self.stats.query();
                             server.stats.query(
                                 query_start_at.elapsed().as_micros() as u64,
@@ -1085,6 +1101,10 @@ where
                                     self.stats.idle_read();
                                     break;
                                 }
+                            }
+
+                            if handled_discard_all {
+                                continue;
                             }
                         }
 

@@ -635,14 +635,14 @@ pub fn discard_all_response() -> BytesMut {
     let mut bytes = BytesMut::with_capacity(23);
 
     // CommandComplete
-    bytes.put_u8(b'C');      // message type
-    bytes.put_i32(16);       // length: 4 (self) + 12 ("DISCARD ALL\0")
+    bytes.put_u8(b'C'); // message type
+    bytes.put_i32(16); // length: 4 (self) + 12 ("DISCARD ALL\0")
     bytes.put_slice(b"DISCARD ALL\0");
 
     // ReadyForQuery
-    bytes.put_u8(b'Z');      // message type
-    bytes.put_i32(5);        // length: 4 + 1
-    bytes.put_u8(b'I');      // Idle
+    bytes.put_u8(b'Z'); // message type
+    bytes.put_i32(5); // length: 4 + 1
+    bytes.put_u8(b'I'); // Idle
 
     bytes
 }

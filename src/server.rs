@@ -39,6 +39,16 @@ const BASE_STATE_CLEANUP_SQL: &str = concat!(
     "SELECT pg_advisory_unlock_all();\n",
     "SELECT public.pgv_free();\n"
 );
+const DISCARD_ALL_EMULATION_SQL: &str = concat!(
+    "ROLLBACK;\n",
+    "RESET ROLE;\n",
+    "RESET ALL;\n",
+    "DEALLOCATE ALL;\n",
+    "CLOSE ALL;\n",
+    "UNLISTEN *;\n",
+    "SELECT pg_advisory_unlock_all();\n",
+    "SELECT public.pgv_free();\n"
+);
 
 pin_project! {
     #[project = SteamInnerProj]
@@ -682,8 +692,8 @@ impl Server {
 
                     self.server_parameters.set_param(key, value, false);
                 }
-				
-				// Extended protocol early-ack handling: if the client asked us to flush
+
+                // Extended protocol early-ack handling: if the client asked us to flush
                 // on a specific server message (ParseComplete '1', BindComplete '2',
                 // CloseComplete '3', ParameterDescription 't', RowDescription 'T'),
                 // break out only when we actually see that code.
@@ -696,7 +706,7 @@ impl Server {
                     // Otherwise keep buffering until either the flush_wait_code shows up
                     // or ReadyForQuery.
                 }
-				
+
                 // DataRow
                 'D' => {
                     // More data is available after this message, this is not the end of the reply.
@@ -948,6 +958,19 @@ impl Server {
         Ok(())
     }
 
+    /// Emulate DISCARD ALL on the server connection.
+    pub async fn emulate_discard_all(&mut self) -> Result<(), Error> {
+        self.small_simple_query(DISCARD_ALL_EMULATION_SQL).await?;
+        self.registering_prepared_statement.clear();
+        if let Some(cache) = self.prepared_statement_cache.as_mut() {
+            cache.clear();
+        }
+        self.cleanup_state.reset();
+        self.server_parameters = ServerParameters::new();
+        self.in_transaction = false;
+        Ok(())
+    }
+
     /// We don't buffer all of server responses, e.g. COPY OUT produces too much data.
     /// The client is responsible to call `self.recv()` while this method returns true.
     #[inline(always)]
@@ -1080,19 +1103,19 @@ impl Server {
         }
 
         let mut query = String::from("");
-		
-		for (key, mut value) in parameter_diff {
-			// Remove quotes if they exist
-			if value.starts_with('\'') && value.ends_with('\'') && value.len() > 1 {
-				value = value[1..value.len()-1].to_string();
-			}
-			
-			// Escape single quotes in the value
-			let escaped_value = value.replace('\'', "''");
-			
-			query.push_str(&format!("SET {} TO '{}';", key, escaped_value));
-		}
-		
+
+        for (key, mut value) in parameter_diff {
+            // Remove quotes if they exist
+            if value.starts_with('\'') && value.ends_with('\'') && value.len() > 1 {
+                value = value[1..value.len() - 1].to_string();
+            }
+
+            // Escape single quotes in the value
+            let escaped_value = value.replace('\'', "''");
+
+            query.push_str(&format!("SET {} TO '{}';", key, escaped_value));
+        }
+
         let res = self.small_simple_query(&query).await;
 
         self.cleanup_state.reset();
