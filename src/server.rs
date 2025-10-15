@@ -41,11 +41,14 @@ const BASE_STATE_CLEANUP_SQL: &str = concat!(
 );
 const DISCARD_ALL_EMULATION_SQL: &str = concat!(
     "ROLLBACK;\n",
+    "RESET SESSION AUTHORIZATION;\n",
     "RESET ROLE;\n",
     "RESET ALL;\n",
     "DEALLOCATE ALL;\n",
     "CLOSE ALL;\n",
     "UNLISTEN *;\n",
+    "DISCARD PLANS;\n",
+    "DISCARD SEQUENCES;\n",
     "SELECT pg_advisory_unlock_all();\n",
     "SELECT public.pgv_free();\n"
 );
