@@ -34,24 +34,6 @@ const COMMAND_COMPLETE_BY_SET: &[u8; 4] = b"SET\0";
 const COMMAND_COMPLETE_BY_DECLARE: &[u8; 15] = b"DECLARE CURSOR\0";
 const COMMAND_COMPLETE_BY_DEALLOCATE_ALL: &[u8; 15] = b"DEALLOCATE ALL\0";
 const COMMAND_COMPLETE_BY_DISCARD_ALL: &[u8; 12] = b"DISCARD ALL\0";
-/// Ensures we drop advisory locks and clear pg_variables session state
-const BASE_STATE_CLEANUP_SQL: &str = concat!(
-    "SELECT pg_advisory_unlock_all();\n",
-    "SELECT public.pgv_free();\n"
-);
-const DISCARD_ALL_EMULATION_SQL: &str = concat!(
-    "ROLLBACK;\n",
-    "RESET SESSION AUTHORIZATION;\n",
-    "RESET ROLE;\n",
-    "RESET ALL;\n",
-    "DEALLOCATE ALL;\n",
-    "CLOSE ALL;\n",
-    "UNLISTEN *;\n",
-    "DISCARD PLANS;\n",
-    "DISCARD SEQUENCES;\n",
-    "SELECT pg_advisory_unlock_all();\n",
-    "SELECT public.pgv_free();\n"
-);
 
 pin_project! {
     #[project = SteamInnerProj]
@@ -929,21 +911,20 @@ impl Server {
                     "Server {} returned with session state altered, discarding state ({}) for application {}",
                     self, self.cleanup_state, self.application_name
                 );
-                let mut reset_string = String::from("RESET ROLE;\n");
+                let mut reset_string = String::from("RESET ROLE;");
 
                 if self.cleanup_state.needs_cleanup_set {
-                    reset_string.push_str("RESET ALL;\n");
+                    reset_string.push_str("RESET ALL;");
                 };
 
                 if self.cleanup_state.needs_cleanup_prepare {
-                    reset_string.push_str("DEALLOCATE ALL;\n");
+                    reset_string.push_str("DEALLOCATE ALL;");
                 };
 
                 if self.cleanup_state.needs_cleanup_declare {
-                    reset_string.push_str("CLOSE ALL;\n");
+                    reset_string.push_str("CLOSE ALL;");
                 };
 
-                reset_string.push_str(BASE_STATE_CLEANUP_SQL);
                 self.small_simple_query(&reset_string).await?;
                 if self.cleanup_state.needs_cleanup_prepare {
                     // flush prepared.
@@ -954,28 +935,17 @@ impl Server {
                     }
                 }
                 self.cleanup_state.reset();
-            } else {
-                self.small_simple_query(BASE_STATE_CLEANUP_SQL).await?;
+            }
+
+            if let Err(err) = self
+                .small_simple_query("SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();")
+                .await
+            {
+                warn!("public.pgv_free() cleanup failed for server {self}: {err:?}");
             }
         }
         Ok(())
     }
-
-    /// Emulate DISCARD ALL on the server connection.
-    pub async fn emulate_discard_all(&mut self) -> Result<(), Error> {
-        self.small_simple_query(DISCARD_ALL_EMULATION_SQL).await?;
-        self.registering_prepared_statement.clear();
-        if let Some(cache) = self.prepared_statement_cache.as_mut() {
-            cache.clear();
-        }
-        self.cleanup_state.reset();
-        self.server_parameters = ServerParameters::new();
-        self.in_transaction = false;
-        Ok(())
-    }
-
-    /// We don't buffer all of server responses, e.g. COPY OUT produces too much data.
-    /// The client is responsible to call `self.recv()` while this method returns true.
     #[inline(always)]
     pub fn is_data_available(&self) -> bool {
         self.data_available
@@ -1538,18 +1508,6 @@ impl Server {
 
                 // Notice
                 'N' => {
-                    if len < 4 {
-                        return Err(Error::ServerStartupError(
-                            "Notice message length too small".into(),
-                            server_identifier,
-                        ));
-                    }
-                    if len > MAX_MESSAGE_SIZE {
-                        return Err(Error::ServerStartupError(
-                            "Notice message length too large".into(),
-                            server_identifier,
-                        ));
-                    }
                     let mut bytes = BytesMut::with_capacity(len as usize - 4);
                     bytes.resize(len as usize - mem::size_of::<i32>(), b'0');
                     match stream.read_exact(&mut bytes[..]).await {
@@ -1571,18 +1529,6 @@ impl Server {
 
                 // ParameterStatus
                 'S' => {
-                    if len < 4 {
-                        return Err(Error::ServerStartupError(
-                            "ParameterStatus message length too small".into(),
-                            server_identifier,
-                        ));
-                    }
-                    if len > MAX_MESSAGE_SIZE {
-                        return Err(Error::ServerStartupError(
-                            "ParameterStatus message length too large".into(),
-                            server_identifier,
-                        ));
-                    }
                     let mut bytes = BytesMut::with_capacity(len as usize - 4);
                     bytes.resize(len as usize - mem::size_of::<i32>(), b'0');
 
