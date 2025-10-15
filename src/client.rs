@@ -986,11 +986,7 @@ where
                             }
                             // checkin_cleanup before give server to client.
                             match conn.checkin_cleanup().await {
-                                Ok(()) => {
-        							// Execute pgv_free to ensure clean state for the new client
-        							conn.execute_pgv_free().await.ok();
-                                    break conn
-                                },
+                                Ok(()) => break conn,
                                 Err(err) => {
                                     warn!(
                                         "Server {} cleanup error: {:?}",

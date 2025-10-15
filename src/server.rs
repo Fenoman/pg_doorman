@@ -34,6 +34,11 @@ const COMMAND_COMPLETE_BY_SET: &[u8; 4] = b"SET\0";
 const COMMAND_COMPLETE_BY_DECLARE: &[u8; 15] = b"DECLARE CURSOR\0";
 const COMMAND_COMPLETE_BY_DEALLOCATE_ALL: &[u8; 15] = b"DEALLOCATE ALL\0";
 const COMMAND_COMPLETE_BY_DISCARD_ALL: &[u8; 12] = b"DISCARD ALL\0";
+/// Ensures we drop advisory locks and clear pg_variables session state
+const BASE_STATE_CLEANUP_SQL: &str = concat!(
+    "SELECT pg_advisory_unlock_all();\n",
+    "SELECT public.pgv_free();\n"
+);
 
 pin_project! {
     #[project = SteamInnerProj]
@@ -374,85 +379,6 @@ impl std::fmt::Display for Server {
 }
 
 impl Server {
-	pub async fn execute_pgv_free(&mut self) -> Result<(), Error> {
-		// Using Extended Protocol instead of Simple Query
-		let mut buffer = BytesMut::new();
-		
-		// Parse message for anonymous statement
-		let stmt_name = "";
-		let query = "SELECT public.pgv_free()";
-		buffer.put_u8(b'P');
-		let len_pos = buffer.len();
-		buffer.put_i32(0); // placeholder for length
-		buffer.put_slice(stmt_name.as_bytes());
-		buffer.put_u8(0);
-		buffer.put_slice(query.as_bytes());
-		buffer.put_u8(0);
-		buffer.put_i16(0); // no parameters
-		
-		// Update length
-		let len = buffer.len() - len_pos;
-		buffer[len_pos..len_pos + 4].copy_from_slice(&(len as i32).to_be_bytes());
-		
-		// Bind message
-		buffer.put_u8(b'B');
-		buffer.put_i32(4 + 1 + 1 + 2 + 2 + 2); // length
-		buffer.put_u8(0); // unnamed portal
-		buffer.put_u8(0); // unnamed statement
-		buffer.put_i16(0); // no format codes
-		buffer.put_i16(0); // no parameters
-		buffer.put_i16(0); // no result format codes
-		
-		// Execute message
-		buffer.put_u8(b'E');
-		buffer.put_i32(4 + 1 + 4); // length
-		buffer.put_u8(0); // unnamed portal
-		buffer.put_i32(0); // no row limit
-		
-		// Sync message
-		buffer.put_u8(b'S');
-		buffer.put_i32(4); // length
-		
-		// Send all messages
-		self.send_and_flush(&buffer).await?;
-		
-		// Read responses until ReadyForQuery
-		let mut noop = tokio::io::sink();
-		let mut function_not_found = false;
-		
-		loop {
-			match self.recv(&mut noop, None).await {
-				Ok(_) => {
-					// recv already processed the response
-				},
-				Err(err) => {
-					// Check if it's "function does not exist" error
-					let err_string = err.to_string();
-					if err_string.contains("function") && 
-					   (err_string.contains("does not exist") || 
-						err_string.contains("pgv_free")) {
-						// Expected error - extension not installed
-						if !function_not_found {
-							// Log only once
-							warn!("pgv extension not installed, pgv_free() function not found");
-							function_not_found = true;
-						}
-					} else {
-						// Unexpected error
-						error!("Unexpected error in pgv_free(): {:?}", err);
-						return Err(err);
-					}
-				}
-			}
-			
-			if !self.data_available {
-				break;
-			}
-		}
-		
-		Ok(())
-	}
-	
     /// Execute an arbitrary query against the server.
     /// It will use the simple query protocol.
     /// Result will not be returned, so this is useful for things like `SET` or `ROLLBACK`.
@@ -984,33 +910,40 @@ impl Server {
         // to avoid leaking state between clients. For performance reasons we only
         // send `RESET ALL` if we think the session is altered instead of just sending
         // it before each checkin.
-        if self.cleanup_state.needs_cleanup() && self.cleanup_connections {
-            info!("Server {} returned with session state altered, discarding state ({}) for application {}",
-                self, self.cleanup_state, self.application_name);
-            let mut reset_string = String::from("RESET ROLE;");
+        if self.cleanup_connections {
+            if self.cleanup_state.needs_cleanup() {
+                info!(
+                    "Server {} returned with session state altered, discarding state ({}) for application {}",
+                    self, self.cleanup_state, self.application_name
+                );
+                let mut reset_string = String::from("RESET ROLE;\n");
 
-            if self.cleanup_state.needs_cleanup_set {
-                reset_string.push_str("RESET ALL;");
-            };
+                if self.cleanup_state.needs_cleanup_set {
+                    reset_string.push_str("RESET ALL;\n");
+                };
 
-            if self.cleanup_state.needs_cleanup_prepare {
-                reset_string.push_str("DEALLOCATE ALL;");
-            };
+                if self.cleanup_state.needs_cleanup_prepare {
+                    reset_string.push_str("DEALLOCATE ALL;\n");
+                };
 
-            if self.cleanup_state.needs_cleanup_declare {
-                reset_string.push_str("CLOSE ALL;");
-            };
+                if self.cleanup_state.needs_cleanup_declare {
+                    reset_string.push_str("CLOSE ALL;\n");
+                };
 
-            self.small_simple_query(&reset_string).await?;
-            if self.cleanup_state.needs_cleanup_prepare {
-                // flush prepared.
-                self.registering_prepared_statement.clear();
-                if self.prepared_statement_cache.is_some() {
-                    warn!("Cleanup server {self} prepared statements cache");
-                    self.prepared_statement_cache.as_mut().unwrap().clear();
+                reset_string.push_str(BASE_STATE_CLEANUP_SQL);
+                self.small_simple_query(&reset_string).await?;
+                if self.cleanup_state.needs_cleanup_prepare {
+                    // flush prepared.
+                    self.registering_prepared_statement.clear();
+                    if self.prepared_statement_cache.is_some() {
+                        warn!("Cleanup server {self} prepared statements cache");
+                        self.prepared_statement_cache.as_mut().unwrap().clear();
+                    }
                 }
+                self.cleanup_state.reset();
+            } else {
+                self.small_simple_query(BASE_STATE_CLEANUP_SQL).await?;
             }
-            self.cleanup_state.reset();
         }
         Ok(())
     }
