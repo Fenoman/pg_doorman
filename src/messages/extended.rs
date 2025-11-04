@@ -149,6 +149,10 @@ impl Parse {
         self
     }
 
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
     /// Gets the name of the prepared statement from the buffer
     pub fn get_name(buf: &BytesMut) -> Result<String, Error> {
         let mut cursor = std::io::Cursor::new(buf);
@@ -308,6 +312,14 @@ impl Bind {
         // Skip the code and length
         cursor.advance(mem::size_of::<u8>() + mem::size_of::<i32>());
         cursor.read_string()?;
+        cursor.read_string()
+    }
+
+    /// Gets the portal name from the buffer
+    pub fn get_portal(buf: &BytesMut) -> Result<String, Error> {
+        let mut cursor = std::io::Cursor::new(buf);
+        // Skip the code and length
+        cursor.advance(mem::size_of::<u8>() + mem::size_of::<i32>());
         cursor.read_string()
     }
 

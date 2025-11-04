@@ -3,7 +3,7 @@ use crate::errors::{ClientIdentifier, Error};
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
 use std::ops::DerefMut;
 use std::str;
@@ -38,6 +38,113 @@ pub static PREPARED_STATEMENT_COUNTER: Lazy<Arc<AtomicUsize>> =
 pub static CLIENT_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
 // Ignore deallocate queries from pgx.
 static QUERY_DEALLOCATE: &[u8] = "deallocate ".as_bytes();
+
+const DISCARD_QUERY_MAX_LEN: usize = 64;
+
+#[inline(always)]
+fn contains_discard_all(bytes: &[u8]) -> bool {
+    let len = bytes.len().min(DISCARD_QUERY_MAX_LEN);
+    let mut idx = 0;
+    while idx < len {
+        while idx < len && (bytes[idx].is_ascii_whitespace() || bytes[idx] == b';') {
+            idx += 1;
+        }
+        if idx >= len {
+            break;
+        }
+
+        let start = idx;
+        while idx < len && bytes[idx] != b';' {
+            idx += 1;
+        }
+        let end = idx.min(len);
+
+        if is_discard_all_statement(&bytes[start..end]) {
+            return true;
+        }
+
+        if idx < len && bytes[idx] == b';' {
+            idx += 1;
+        }
+    }
+
+    false
+}
+
+#[inline(always)]
+fn is_discard_all_statement(stmt: &[u8]) -> bool {
+    let mut idx = 0;
+    skip_ascii_whitespace(stmt, &mut idx);
+    if !consume_keyword(stmt, &mut idx, b"DISCARD") {
+        return false;
+    }
+
+    skip_ascii_whitespace(stmt, &mut idx);
+    if !consume_keyword(stmt, &mut idx, b"ALL") {
+        return false;
+    }
+
+    skip_ascii_whitespace(stmt, &mut idx);
+    while idx < stmt.len() {
+        let ch = stmt[idx];
+        if ch.is_ascii_whitespace() {
+            idx += 1;
+            continue;
+        }
+        if ch == b'-' && idx + 1 < stmt.len() && stmt[idx + 1] == b'-' {
+            return true;
+        }
+        if ch == b'/' && idx + 1 < stmt.len() && stmt[idx + 1] == b'*' {
+            return true;
+        }
+        return false;
+    }
+
+    true
+}
+
+#[inline(always)]
+fn skip_ascii_whitespace(bytes: &[u8], idx: &mut usize) {
+    while *idx < bytes.len() && bytes[*idx].is_ascii_whitespace() {
+        *idx += 1;
+    }
+}
+
+#[inline(always)]
+fn consume_keyword(bytes: &[u8], idx: &mut usize, keyword: &[u8]) -> bool {
+    for expected in keyword {
+        if *idx >= bytes.len() {
+            return false;
+        }
+        if bytes[*idx].to_ascii_uppercase() != *expected {
+            return false;
+        }
+        *idx += 1;
+    }
+    true
+}
+
+#[inline(always)]
+fn simple_query_body(message: &BytesMut) -> &[u8] {
+    if message.len() <= 6 {
+        return &[];
+    }
+    let end = message.len().saturating_sub(1);
+    &message[5..end]
+}
+
+#[inline(always)]
+fn parse_execute_portal(message: &BytesMut) -> Option<String> {
+    if message.len() < 6 {
+        return None;
+    }
+    let mut cursor = std::io::Cursor::new(message);
+    if cursor.get_u8() as char != 'E' {
+        return None;
+    }
+    let _len = cursor.get_i32();
+    cursor.read_string().ok()
+}
 
 /// Type of connection received from client.
 enum ClientConnectionType {
@@ -113,6 +220,12 @@ pub struct Client<S, T> {
 
     /// Mapping of client named prepared statement to rewritten parse messages
     prepared_statements: HashMap<String, (Arc<Parse>, u64)>,
+    /// Names of prepared statements filtered out because they execute DISCARD ALL
+    filtered_prepared_statements: HashSet<String>,
+    /// Names of portals filtered out because they execute DISCARD ALL
+    filtered_portals: HashSet<String>,
+    /// Whether the unnamed prepared statement should be filtered
+    filter_unnamed_prepared_statement: bool,
 
     max_memory_usage: u64,
 
@@ -125,6 +238,8 @@ pub struct Client<S, T> {
 
     created_at: Instant,
     virtual_pool_count: u16,
+    discard_response_buffer: BytesMut,
+    discard_filtered_since_last_sync: bool,
 }
 
 pub async fn client_entrypoint_too_many_clients_already(
@@ -834,6 +949,9 @@ where
             shutdown,
             prepared_statements_enabled,
             prepared_statements: HashMap::new(),
+            filtered_prepared_statements: HashSet::new(),
+            filtered_portals: HashSet::new(),
+            filter_unnamed_prepared_statement: false,
             virtual_pool_count: config.general.virtual_pool_count,
             client_last_messages_in_tx: BytesMut::with_capacity(8196),
             extended_protocol_data_buffer: VecDeque::new(),
@@ -843,6 +961,8 @@ where
                 .general
                 .clone()
                 .poller_check_query_request_bytes_vec(),
+            discard_response_buffer: BytesMut::with_capacity(512),
+            discard_filtered_since_last_sync: false,
         })
     }
 
@@ -878,6 +998,9 @@ where
             shutdown,
             prepared_statements_enabled: false,
             prepared_statements: HashMap::new(),
+            filtered_prepared_statements: HashSet::new(),
+            filtered_portals: HashSet::new(),
+            filter_unnamed_prepared_statement: false,
             extended_protocol_data_buffer: VecDeque::new(),
             connected_to_server: false,
             client_last_messages_in_tx: BytesMut::with_capacity(8196),
@@ -885,6 +1008,8 @@ where
             created_at: Instant::now(),
             max_memory_usage: 128 * 1024 * 1024,
             pooler_check_query_request_vec: Vec::new(),
+            discard_response_buffer: BytesMut::with_capacity(512),
+            discard_filtered_since_last_sync: false,
         })
     }
 
@@ -978,6 +1103,10 @@ where
                         write_all_flush(&mut self.write, &check_query_response()).await?;
                         continue;
                     }
+                    if contains_discard_all(simple_query_body(&message)) {
+                        self.respond_to_simple_discard().await?;
+                        continue;
+                    }
                     if message.len() < 40 && message.len() > QUERY_DEALLOCATE.len() + 5 {
                         // Do not pass simple query with deallocate, as it will run on an unknown server.
                         let query = &message[5..QUERY_DEALLOCATE.len() + 5];
@@ -1013,6 +1142,25 @@ where
                 }
 
                 'E' => {
+                    let portal = parse_execute_portal(&message).unwrap_or_default();
+                    if self.is_filtered_portal(&portal) {
+                        debug!(
+                            "Filtering execute for DISCARD ALL portal `{}`",
+                            if portal.is_empty() {
+                                "<unnamed>"
+                            } else {
+                                portal.as_str()
+                            }
+                        );
+                        self.discard_response_buffer
+                            .put(command_complete("DISCARD ALL"));
+                        self.discard_filtered_since_last_sync = true;
+                        if portal.is_empty() {
+                            self.unmark_filtered_portal("");
+                            self.filter_unnamed_prepared_statement = false;
+                        }
+                        continue;
+                    }
                     self.extended_protocol_data_buffer
                         .push_back(ExtendedProtocolData::create_new_execute(message));
                     continue;
@@ -1021,6 +1169,40 @@ where
                 // Close (F)
                 'C' => {
                     let close: Close = (&message).try_into()?;
+                    let should_filter = if close.is_prepared_statement() {
+                        self.is_filtered_statement(&close.name)
+                    } else {
+                        self.is_filtered_portal(&close.name)
+                    };
+
+                    if should_filter {
+                        debug!(
+                            "Filtering close for DISCARD ALL {} `{}`",
+                            if close.is_prepared_statement() {
+                                "statement"
+                            } else {
+                                "portal"
+                            },
+                            if close.name.is_empty() {
+                                "<unnamed>"
+                            } else {
+                                close.name.as_str()
+                            }
+                        );
+                        self.discard_response_buffer.put(close_complete());
+                        self.discard_filtered_since_last_sync = true;
+                        if close.is_prepared_statement() {
+                            self.filtered_prepared_statements.remove(&close.name);
+                            self.prepared_statements.remove(&close.name);
+                        } else {
+                            if close.name.is_empty() {
+                                self.filter_unnamed_prepared_statement = false;
+                            }
+                            self.unmark_filtered_portal(&close.name);
+                        }
+                        continue;
+                    }
+
                     self.extended_protocol_data_buffer
                         .push_back(ExtendedProtocolData::create_new_close(message, close));
                     continue;
@@ -1127,7 +1309,7 @@ where
                                 Ok(message) => message,
                                 Err(err) => {
                                     self.stats.disconnect();
-                                    server.checkin_cleanup().await?;
+                                    server.finalize_checkin().await?;
                                     return self.process_error(err).await;
                                 }
                             }
@@ -1150,6 +1332,15 @@ where
                     match code {
                         // Query
                         'Q' => {
+                            if contains_discard_all(simple_query_body(&message)) {
+                                self.respond_to_simple_discard().await?;
+                                if self.transaction_mode && !server.in_copy_mode() {
+                                    self.stats.idle_read();
+                                    break;
+                                }
+                                continue;
+                            }
+
                             self.send_and_receive_loop(Some(&message), server).await?;
                             self.stats.query();
                             server.stats.query(
@@ -1179,8 +1370,8 @@ where
 
                         // Terminate
                         'X' => {
-                            // принудительно закрываем чтобы не допустить длинную транзакцию
-                            server.checkin_cleanup().await?;
+                            // Force close to prevent long-running transaction
+                            server.finalize_checkin().await?;
                             self.stats.disconnect();
                             self.release();
                             return Ok(());
@@ -1206,6 +1397,26 @@ where
                         // Execute
                         // Execute a prepared statement prepared in `P` and bound in `B`.
                         'E' => {
+                            let portal = parse_execute_portal(&message).unwrap_or_default();
+                            if self.is_filtered_portal(&portal) {
+                                debug!(
+                                    "Filtering execute for DISCARD ALL portal `{}`",
+                                    if portal.is_empty() {
+                                        "<unnamed>"
+                                    } else {
+                                        portal.as_str()
+                                    }
+                                );
+                                self.discard_response_buffer
+                                    .put(command_complete("DISCARD ALL"));
+                                self.discard_filtered_since_last_sync = true;
+                                if portal.is_empty() {
+                                    self.unmark_filtered_portal("");
+                                    self.filter_unnamed_prepared_statement = false;
+                                }
+                                continue;
+                            }
+
                             self.extended_protocol_data_buffer
                                 .push_back(ExtendedProtocolData::create_new_execute(message));
                         }
@@ -1214,6 +1425,39 @@ where
                         // Close the prepared statement.
                         'C' => {
                             let close: Close = (&message).try_into()?;
+                            let should_filter = if close.is_prepared_statement() {
+                                self.is_filtered_statement(&close.name)
+                            } else {
+                                self.is_filtered_portal(&close.name)
+                            };
+
+                            if should_filter {
+                                debug!(
+                                    "Filtering close for DISCARD ALL {} `{}`",
+                                    if close.is_prepared_statement() {
+                                        "statement"
+                                    } else {
+                                        "portal"
+                                    },
+                                    if close.name.is_empty() {
+                                        "<unnamed>"
+                                    } else {
+                                        close.name.as_str()
+                                    }
+                                );
+                                self.discard_response_buffer.put(close_complete());
+                                self.discard_filtered_since_last_sync = true;
+                                if close.is_prepared_statement() {
+                                    self.filtered_prepared_statements.remove(&close.name);
+                                    self.prepared_statements.remove(&close.name);
+                                } else {
+                                    if close.name.is_empty() {
+                                        self.filter_unnamed_prepared_statement = false;
+                                    }
+                                    self.unmark_filtered_portal(&close.name);
+                                }
+                                continue;
+                            }
 
                             self.extended_protocol_data_buffer
                                 .push_back(ExtendedProtocolData::create_new_close(message, close));
@@ -1344,30 +1588,50 @@ where
                                 }
                             }
 
-                            // Add the sync message
-                            self.buffer.put(&message[..]);
+                            let forward_to_server =
+                                !self.buffer.is_empty() || !self.discard_filtered_since_last_sync;
 
-                            if code == 'H' {
-                                server.set_flush_wait_code(async_wait_code);
-                                debug!("Client requested flush, going async");
-                            } else {
-                                server.set_flush_wait_code(' ')
-                            }
+                            if forward_to_server {
+                                self.buffer.put(&message[..]);
 
-                            self.send_and_receive_loop(None, server).await?;
-                            self.stats.query();
-                            server.stats.query(
-                                query_start_at.elapsed().as_micros() as u64,
-                                self.server_parameters.get_application_name(),
-                            );
+                                if code == 'H' {
+                                    server.set_flush_wait_code(async_wait_code);
+                                    debug!("Client requested flush, going async");
+                                } else {
+                                    server.set_flush_wait_code(' ');
+                                }
 
-                            self.buffer.clear();
+                                if !self.discard_response_buffer.is_empty() {
+                                    if let Err(err) = write_all_flush(
+                                        &mut self.write,
+                                        &self.discard_response_buffer,
+                                    )
+                                    .await
+                                    {
+                                        server.mark_bad(
+                                            format!("write to client {}: {:?}", self.addr, err)
+                                                .as_str(),
+                                        );
+                                        return Err(err);
+                                    }
+                                    self.discard_response_buffer.clear();
+                                }
 
-                            if !server.in_transaction() {
-                                self.stats.transaction();
-                                server
-                                    .stats
-                                    .transaction(self.server_parameters.get_application_name());
+                                self.send_and_receive_loop(None, server).await?;
+                                self.stats.query();
+                                server.stats.query(
+                                    query_start_at.elapsed().as_micros() as u64,
+                                    self.server_parameters.get_application_name(),
+                                );
+
+                                self.buffer.clear();
+                                self.discard_filtered_since_last_sync = false;
+
+                                if !server.in_transaction() {
+                                    self.stats.transaction();
+                                    server
+                                        .stats
+                                        .transaction(self.server_parameters.get_application_name());
 
                                 // Release server back to the pool if we are in transaction mode.
                                 // If we are in session mode, we keep the server until the client disconnects.
@@ -1388,25 +1652,74 @@ where
                                 }
                             }
 
-                            // Send all queued messages to the client
-                            // NOTE: it's possible we don't perfectly send things back in the same order as postgres would,
-                            //       however clients should be able to handle this
-                            if !self.response_message_queue_buffer.is_empty() {
-                                if let Err(err) = write_all_flush(
-                                    &mut self.write,
-                                    &self.response_message_queue_buffer,
-                                )
-                                .await
-                                {
-                                    // We might be in some kind of error/in between protocol state
-                                    server.mark_bad(
-                                        format!("write to client {}: {:?}", self.addr, err)
-                                            .as_str(),
-                                    );
-                                    return Err(err);
+                                if !self.response_message_queue_buffer.is_empty() {
+                                    if let Err(err) = write_all_flush(
+                                        &mut self.write,
+                                        &self.response_message_queue_buffer,
+                                    )
+                                    .await
+                                    {
+                                        server.mark_bad(
+                                            format!("write to client {}: {:?}", self.addr, err)
+                                                .as_str(),
+                                        );
+                                        return Err(err);
+                                    }
+
+                                    self.response_message_queue_buffer.clear();
+                                }
+                            } else {
+                                if code == 'S' {
+                                    self.discard_response_buffer.put(ready_for_query(false));
                                 }
 
-                                self.response_message_queue_buffer.clear();
+                                if !self.discard_response_buffer.is_empty() {
+                                    if let Err(err) = write_all_flush(
+                                        &mut self.write,
+                                        &self.discard_response_buffer,
+                                    )
+                                    .await
+                                    {
+                                        server.mark_bad(
+                                            format!("write to client {}: {:?}", self.addr, err)
+                                                .as_str(),
+                                        );
+                                        return Err(err);
+                                    }
+                                    self.discard_response_buffer.clear();
+                                    if code == 'S' {
+                                        self.discard_filtered_since_last_sync = false;
+                                    }
+                                }
+
+                                if !self.response_message_queue_buffer.is_empty() {
+                                    if let Err(err) = write_all_flush(
+                                        &mut self.write,
+                                        &self.response_message_queue_buffer,
+                                    )
+                                    .await
+                                    {
+                                        server.mark_bad(
+                                            format!("write to client {}: {:?}", self.addr, err)
+                                                .as_str(),
+                                        );
+                                        return Err(err);
+                                    }
+                                    self.response_message_queue_buffer.clear();
+                                }
+
+                                self.buffer.clear();
+                                self.stats.query();
+                                if !server.in_transaction() {
+                                    self.stats.transaction();
+
+                                    if self.transaction_mode && !server.in_copy_mode() {
+                                        self.stats.idle_read();
+                                        break;
+                                    }
+                                }
+
+                                continue;
                             }
                         }
 
@@ -1489,7 +1802,7 @@ where
                     }
                 }
                 if !server.is_async() {
-                    server.checkin_cleanup().await?;
+                    server.finalize_checkin().await?;
                 }
                 server
                     .stats
@@ -1588,7 +1901,26 @@ where
     /// Register and rewrite the parse statement to the clients statement cache
     /// and also the pool's statement cache. Add it to extended protocol data.
     fn buffer_parse(&mut self, message: BytesMut, pool: &ConnectionPool) -> Result<(), Error> {
-        // Avoid parsing if prepared statements not enabled
+        let parse: Parse = (&message).try_into()?;
+        let client_given_name = parse.name.clone();
+
+        if contains_discard_all(parse.query().as_bytes()) {
+            debug!(
+                "Filtering DISCARD ALL parse statement `{}`",
+                if client_given_name.is_empty() {
+                    "<unnamed>"
+                } else {
+                    client_given_name.as_str()
+                }
+            );
+            self.mark_filtered_statement(&client_given_name);
+            self.prepared_statements.remove(&client_given_name);
+            self.discard_response_buffer.put(parse_complete());
+            return Ok(());
+        }
+
+        self.unmark_filtered_statement(&client_given_name);
+
         if !self.prepared_statements_enabled {
             debug!("Anonymous parse message");
             self.extended_protocol_data_buffer
@@ -1596,13 +1928,8 @@ where
             return Ok(());
         }
 
-        let client_given_name = Parse::get_name(&message)?;
-        let parse: Parse = (&message).try_into()?;
-
-        // Compute the hash of the parse statement
         let hash = parse.get_hash();
 
-        // Add the statement to the cache or check if we already have it
         let new_parse = match pool.register_parse_to_cache(hash, &parse) {
             Some(parse) => parse,
             None => {
@@ -1632,15 +1959,34 @@ where
     /// Rewrite the Bind (F) message to use the prepared statement name
     /// saved in the client cache.
     async fn buffer_bind(&mut self, message: BytesMut) -> Result<(), Error> {
-        // Avoid parsing if prepared statements not enabled
+        let client_given_name = Bind::get_name(&message)?;
+
+        if self.is_filtered_statement(&client_given_name) {
+            let portal = Bind::get_portal(&message).unwrap_or_default();
+            self.mark_filtered_portal(&portal);
+            self.discard_response_buffer.put(bind_complete());
+            debug!(
+                "Filtering bind for DISCARD ALL statement `{}` portal `{}`",
+                if client_given_name.is_empty() {
+                    "<unnamed>"
+                } else {
+                    client_given_name.as_str()
+                },
+                if portal.is_empty() {
+                    "<unnamed>"
+                } else {
+                    portal.as_str()
+                }
+            );
+            return Ok(());
+        }
+
         if !self.prepared_statements_enabled {
             debug!("Anonymous bind message");
             self.extended_protocol_data_buffer
                 .push_back(ExtendedProtocolData::create_new_bind(message, None));
             return Ok(());
         }
-
-        let client_given_name = Bind::get_name(&message)?;
 
         match self.prepared_statements.get(&client_given_name) {
             Some((rewritten_parse, _)) => {
@@ -1677,7 +2023,43 @@ where
     /// Rewrite the Describe (F) message to use the prepared statement name
     /// saved in the client cache.
     async fn buffer_describe(&mut self, message: BytesMut) -> Result<(), Error> {
-        // Avoid parsing if prepared statements not enabled
+        let describe: Describe = (&message).try_into()?;
+
+        match describe.target {
+            'S' => {
+                if self.is_filtered_statement(&describe.statement_name) {
+                    debug!(
+                        "Filtering describe for DISCARD ALL prepared statement `{}`",
+                        if describe.statement_name.is_empty() {
+                            "<unnamed>"
+                        } else {
+                            describe.statement_name.as_str()
+                        }
+                    );
+                    self.discard_response_buffer.put(parameter_description(&[]));
+                    self.discard_response_buffer.put(no_data());
+                    self.discard_filtered_since_last_sync = true;
+                    return Ok(());
+                }
+            }
+            'P' => {
+                if self.is_filtered_portal(&describe.statement_name) {
+                    debug!(
+                        "Filtering describe for DISCARD ALL portal `{}`",
+                        if describe.statement_name.is_empty() {
+                            "<unnamed>"
+                        } else {
+                            describe.statement_name.as_str()
+                        }
+                    );
+                    self.discard_response_buffer.put(no_data());
+                    self.discard_filtered_since_last_sync = true;
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+
         if !self.prepared_statements_enabled {
             debug!("Anonymous describe message");
             self.extended_protocol_data_buffer
@@ -1686,7 +2068,6 @@ where
             return Ok(());
         }
 
-        let describe: Describe = (&message).try_into()?;
         if describe.target == 'P' {
             debug!("Portal describe message");
             self.extended_protocol_data_buffer
@@ -1737,6 +2118,59 @@ where
         self.buffer.clear();
         self.extended_protocol_data_buffer.clear();
         self.response_message_queue_buffer.clear();
+        self.discard_response_buffer.clear();
+        self.filtered_portals.clear();
+        self.filtered_prepared_statements.clear();
+        self.filter_unnamed_prepared_statement = false;
+        self.discard_filtered_since_last_sync = false;
+    }
+
+    #[inline(always)]
+    fn mark_filtered_statement(&mut self, name: &str) {
+        if name.is_empty() {
+            self.filter_unnamed_prepared_statement = true;
+        } else {
+            self.filtered_prepared_statements.insert(name.to_string());
+        }
+        self.discard_filtered_since_last_sync = true;
+    }
+
+    #[inline(always)]
+    fn unmark_filtered_statement(&mut self, name: &str) {
+        if name.is_empty() {
+            self.filter_unnamed_prepared_statement = false;
+        } else {
+            self.filtered_prepared_statements.remove(name);
+        }
+    }
+
+    #[inline(always)]
+    fn is_filtered_statement(&self, name: &str) -> bool {
+        if name.is_empty() {
+            self.filter_unnamed_prepared_statement
+        } else {
+            self.filtered_prepared_statements.contains(name)
+        }
+    }
+
+    #[inline(always)]
+    fn mark_filtered_portal(&mut self, name: &str) {
+        self.filtered_portals.insert(name.to_string());
+        self.discard_filtered_since_last_sync = true;
+    }
+
+    #[inline(always)]
+    fn unmark_filtered_portal(&mut self, name: &str) {
+        self.filtered_portals.remove(name);
+    }
+
+    #[inline(always)]
+    fn is_filtered_portal(&self, name: &str) -> bool {
+        if name.is_empty() {
+            self.filter_unnamed_prepared_statement || self.filtered_portals.contains(name)
+        } else {
+            self.filtered_portals.contains(name)
+        }
     }
 
     fn get_virtual_pool_id(&mut self, client_counter: usize) -> u16 {
@@ -1775,6 +2209,16 @@ where
     pub fn release(&self) {
         let mut guard = self.client_server_map.lock();
         guard.remove(&(self.process_id, self.secret_key));
+    }
+
+    async fn respond_to_simple_discard(&mut self) -> Result<(), Error> {
+        let mut response = BytesMut::new();
+        response.put(command_complete("DISCARD ALL"));
+        response.put(ready_for_query(false));
+        write_all_flush(&mut self.write, &response).await?;
+        self.stats.query();
+        self.stats.transaction();
+        Ok(())
     }
 
     async fn send_and_receive_loop(

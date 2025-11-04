@@ -152,7 +152,7 @@ pub struct PoolSettings {
     pub user: User,
     pub db: String,
 
-    /// Синхронизируем серверные параметры установленные клиентом через SET. (False).
+    /// Synchronize server parameters set by client via SET. (False).
     pub sync_server_parameters: bool,
 
     idle_timeout_ms: u64,
@@ -551,7 +551,7 @@ pub async fn retain_connections() {
     loop {
         interval.tick().await;
         for (_, pool) in get_all_pools() {
-            pool.retain_pool_connections(count.clone(), 1);
+            pool.retain_pool_connections(count.clone(), 20);
         }
         count.store(0, Ordering::Relaxed);
     }

@@ -34,6 +34,7 @@ const COMMAND_COMPLETE_BY_DECLARE: &[u8; 15] = b"DECLARE CURSOR\0";
 const COMMAND_SAVEPOINT: &[u8; 10] = b"SAVEPOINT\0";
 const COMMAND_COMPLETE_BY_DEALLOCATE_ALL: &[u8; 15] = b"DEALLOCATE ALL\0";
 const COMMAND_COMPLETE_BY_DISCARD_ALL: &[u8; 12] = b"DISCARD ALL\0";
+const RELEASE_SESSION_QUERY: &str = "SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();";
 
 pin_project! {
     #[project = SteamInnerProj]
@@ -945,6 +946,13 @@ impl Server {
         Ok(())
     }
 
+    /// Perform cleanup and release advisory locks/temp memory before returning to pool.
+    pub async fn finalize_checkin(&mut self) -> Result<(), Error> {
+        self.checkin_cleanup().await?;
+        self.small_simple_query(RELEASE_SESSION_QUERY).await?;
+        Ok(())
+    }
+
     /// We don't buffer all of server responses, e.g. COPY OUT produces too much data.
     /// The client is responsible to call `self.recv()` while this method returns true.
     #[inline(always)]
@@ -1077,8 +1085,16 @@ impl Server {
 
         let mut query = String::from("");
 
-        for (key, value) in parameter_diff {
-            query.push_str(&format!("SET {key} TO '{value}';"));
+        for (key, mut value) in parameter_diff {
+            // Remove quotes if they exist
+            if value.starts_with('\'') && value.ends_with('\'') && value.len() > 1 {
+                value = value[1..value.len() - 1].to_string();
+            }
+
+            // Escape single quotes in the value
+            let escaped_value = value.replace('\'', "''");
+
+            query.push_str(&format!("SET {} TO '{}';", key, escaped_value));
         }
 
         let res = self.small_simple_query(&query).await;
