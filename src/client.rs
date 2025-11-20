@@ -1601,22 +1601,6 @@ where
                                     server.set_flush_wait_code(' ');
                                 }
 
-                                if !self.discard_response_buffer.is_empty() {
-                                    if let Err(err) = write_all_flush(
-                                        &mut self.write,
-                                        &self.discard_response_buffer,
-                                    )
-                                    .await
-                                    {
-                                        server.mark_bad(
-                                            format!("write to client {}: {:?}", self.addr, err)
-                                                .as_str(),
-                                        );
-                                        return Err(err);
-                                    }
-                                    self.discard_response_buffer.clear();
-                                }
-
                                 self.send_and_receive_loop(None, server).await?;
                                 self.stats.query();
                                 server.stats.query(
@@ -1625,7 +1609,6 @@ where
                                 );
 
                                 self.buffer.clear();
-                                self.discard_filtered_since_last_sync = false;
 
                                 if !server.in_transaction() {
                                     self.stats.transaction();
@@ -2125,6 +2108,36 @@ where
         self.discard_filtered_since_last_sync = false;
     }
 
+    /// Inserts buffered DISCARD responses before a trailing ReadyForQuery (if present)
+    /// to keep client-visible ordering aligned with the original command sequence.
+    #[inline(always)]
+    fn inject_discard_responses(&mut self, response: &mut BytesMut) {
+        if self.discard_response_buffer.is_empty() {
+            return;
+        }
+
+        let ready_offset = response
+            .len()
+            .checked_sub(6)
+            .filter(|offset| response.get(*offset) == Some(&b'Z'));
+
+        let mut combined =
+            BytesMut::with_capacity(response.len() + self.discard_response_buffer.len());
+
+        if let Some(offset) = ready_offset {
+            combined.put(&response[..offset]);
+            combined.put(&self.discard_response_buffer[..]);
+            combined.put(&response[*offset..]);
+        } else {
+            combined.put(&response[..]);
+            combined.put(&self.discard_response_buffer[..]);
+        }
+
+        *response = combined;
+        self.discard_response_buffer.clear();
+        self.discard_filtered_since_last_sync = false;
+    }
+
     #[inline(always)]
     fn mark_filtered_statement(&mut self, name: &str) {
         if name.is_empty() {
@@ -2260,12 +2273,17 @@ where
 
             // Fast path: early release check before expensive operations
             // This is the most common case in transaction mode
+            let is_last_response = !server.is_data_available() || server.in_aborted();
+
             if can_fast_release
                 && !server.is_data_available()
                 && !server.in_transaction()
                 && !server.in_copy_mode()
                 && !server.is_async()
             {
+                if self.discard_filtered_since_last_sync {
+                    self.inject_discard_responses(&mut response);
+                }
                 self.client_last_messages_in_tx.put(&response[..]);
                 break;
             }
@@ -2288,6 +2306,12 @@ where
                     response = reorder_messages_in_place(response)?;
                     self.response_message_queue_buffer.clear();
                 }
+            }
+
+            // If this is the last server response for the batch, append any buffered
+            // DISCARD replies before forwarding to the client to maintain ordering.
+            if is_last_response && self.discard_filtered_since_last_sync {
+                self.inject_discard_responses(&mut response);
             }
 
             // Write response to client
