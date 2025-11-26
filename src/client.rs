@@ -226,6 +226,8 @@ pub struct Client<S, T> {
     filtered_portals: HashSet<String>,
     /// Whether the unnamed prepared statement should be filtered
     filter_unnamed_prepared_statement: bool,
+    /// Whether the unnamed portal should be filtered
+    filter_unnamed_portal: bool,
 
     max_memory_usage: u64,
 
@@ -952,6 +954,7 @@ where
             filtered_prepared_statements: HashSet::new(),
             filtered_portals: HashSet::new(),
             filter_unnamed_prepared_statement: false,
+            filter_unnamed_portal: false,
             virtual_pool_count: config.general.virtual_pool_count,
             client_last_messages_in_tx: BytesMut::with_capacity(8196),
             extended_protocol_data_buffer: VecDeque::new(),
@@ -1001,6 +1004,7 @@ where
             filtered_prepared_statements: HashSet::new(),
             filtered_portals: HashSet::new(),
             filter_unnamed_prepared_statement: false,
+            filter_unnamed_portal: false,
             extended_protocol_data_buffer: VecDeque::new(),
             connected_to_server: false,
             client_last_messages_in_tx: BytesMut::with_capacity(8196),
@@ -1142,23 +1146,7 @@ where
                 }
 
                 'E' => {
-                    let portal = parse_execute_portal(&message).unwrap_or_default();
-                    if self.is_filtered_portal(&portal) {
-                        debug!(
-                            "Filtering execute for DISCARD ALL portal `{}`",
-                            if portal.is_empty() {
-                                "<unnamed>"
-                            } else {
-                                portal.as_str()
-                            }
-                        );
-                        self.discard_response_buffer
-                            .put(command_complete("DISCARD ALL"));
-                        self.discard_filtered_since_last_sync = true;
-                        if portal.is_empty() {
-                            self.unmark_filtered_portal("");
-                            self.filter_unnamed_prepared_statement = false;
-                        }
+                    if self.try_filter_execute(&message) {
                         continue;
                     }
                     self.extended_protocol_data_buffer
@@ -1169,40 +1157,9 @@ where
                 // Close (F)
                 'C' => {
                     let close: Close = (&message).try_into()?;
-                    let should_filter = if close.is_prepared_statement() {
-                        self.is_filtered_statement(&close.name)
-                    } else {
-                        self.is_filtered_portal(&close.name)
-                    };
-
-                    if should_filter {
-                        debug!(
-                            "Filtering close for DISCARD ALL {} `{}`",
-                            if close.is_prepared_statement() {
-                                "statement"
-                            } else {
-                                "portal"
-                            },
-                            if close.name.is_empty() {
-                                "<unnamed>"
-                            } else {
-                                close.name.as_str()
-                            }
-                        );
-                        self.discard_response_buffer.put(close_complete());
-                        self.discard_filtered_since_last_sync = true;
-                        if close.is_prepared_statement() {
-                            self.filtered_prepared_statements.remove(&close.name);
-                            self.prepared_statements.remove(&close.name);
-                        } else {
-                            if close.name.is_empty() {
-                                self.filter_unnamed_prepared_statement = false;
-                            }
-                            self.unmark_filtered_portal(&close.name);
-                        }
+                    if self.try_filter_close(&close) {
                         continue;
                     }
-
                     self.extended_protocol_data_buffer
                         .push_back(ExtendedProtocolData::create_new_close(message, close));
                     continue;
@@ -1397,26 +1354,9 @@ where
                         // Execute
                         // Execute a prepared statement prepared in `P` and bound in `B`.
                         'E' => {
-                            let portal = parse_execute_portal(&message).unwrap_or_default();
-                            if self.is_filtered_portal(&portal) {
-                                debug!(
-                                    "Filtering execute for DISCARD ALL portal `{}`",
-                                    if portal.is_empty() {
-                                        "<unnamed>"
-                                    } else {
-                                        portal.as_str()
-                                    }
-                                );
-                                self.discard_response_buffer
-                                    .put(command_complete("DISCARD ALL"));
-                                self.discard_filtered_since_last_sync = true;
-                                if portal.is_empty() {
-                                    self.unmark_filtered_portal("");
-                                    self.filter_unnamed_prepared_statement = false;
-                                }
+                            if self.try_filter_execute(&message) {
                                 continue;
                             }
-
                             self.extended_protocol_data_buffer
                                 .push_back(ExtendedProtocolData::create_new_execute(message));
                         }
@@ -1425,40 +1365,9 @@ where
                         // Close the prepared statement.
                         'C' => {
                             let close: Close = (&message).try_into()?;
-                            let should_filter = if close.is_prepared_statement() {
-                                self.is_filtered_statement(&close.name)
-                            } else {
-                                self.is_filtered_portal(&close.name)
-                            };
-
-                            if should_filter {
-                                debug!(
-                                    "Filtering close for DISCARD ALL {} `{}`",
-                                    if close.is_prepared_statement() {
-                                        "statement"
-                                    } else {
-                                        "portal"
-                                    },
-                                    if close.name.is_empty() {
-                                        "<unnamed>"
-                                    } else {
-                                        close.name.as_str()
-                                    }
-                                );
-                                self.discard_response_buffer.put(close_complete());
-                                self.discard_filtered_since_last_sync = true;
-                                if close.is_prepared_statement() {
-                                    self.filtered_prepared_statements.remove(&close.name);
-                                    self.prepared_statements.remove(&close.name);
-                                } else {
-                                    if close.name.is_empty() {
-                                        self.filter_unnamed_prepared_statement = false;
-                                    }
-                                    self.unmark_filtered_portal(&close.name);
-                                }
+                            if self.try_filter_close(&close) {
                                 continue;
                             }
-
                             self.extended_protocol_data_buffer
                                 .push_back(ExtendedProtocolData::create_new_close(message, close));
                         }
@@ -1943,9 +1852,9 @@ where
     /// saved in the client cache.
     async fn buffer_bind(&mut self, message: BytesMut) -> Result<(), Error> {
         let client_given_name = Bind::get_name(&message)?;
+        let portal = Bind::get_portal(&message).unwrap_or_default();
 
         if self.is_filtered_statement(&client_given_name) {
-            let portal = Bind::get_portal(&message).unwrap_or_default();
             self.mark_filtered_portal(&portal);
             self.discard_response_buffer.put(bind_complete());
             debug!(
@@ -1963,6 +1872,10 @@ where
             );
             return Ok(());
         }
+
+        // PostgreSQL replaces existing portal on new Bind, so clear any previous
+        // filter state for this portal (it may have been bound to a filtered statement before).
+        self.unmark_filtered_portal(&portal);
 
         if !self.prepared_statements_enabled {
             debug!("Anonymous bind message");
@@ -2105,6 +2018,7 @@ where
         self.filtered_portals.clear();
         self.filtered_prepared_statements.clear();
         self.filter_unnamed_prepared_statement = false;
+        self.filter_unnamed_portal = false;
         self.discard_filtered_since_last_sync = false;
     }
 
@@ -2116,10 +2030,15 @@ where
             return;
         }
 
-        let ready_offset = response
-            .len()
-            .checked_sub(6)
-            .filter(|offset| response.get(*offset) == Some(&b'Z'));
+        // ReadyForQuery message format: 'Z' (1 byte) + length (4 bytes, value=5) + status (1 byte)
+        // Total size: 6 bytes
+        let ready_offset = response.len().checked_sub(6).filter(|offset| {
+            response.get(*offset) == Some(&b'Z')
+                && response
+                    .get(*offset + 1..*offset + 5)
+                    .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]) == 5)
+                    .unwrap_or(false)
+        });
 
         let mut combined =
             BytesMut::with_capacity(response.len() + self.discard_response_buffer.len());
@@ -2127,7 +2046,7 @@ where
         if let Some(offset) = ready_offset {
             combined.put(&response[..offset]);
             combined.put(&self.discard_response_buffer[..]);
-            combined.put(&response[*offset..]);
+            combined.put(&response[offset..]);
         } else {
             combined.put(&response[..]);
             combined.put(&self.discard_response_buffer[..]);
@@ -2152,6 +2071,9 @@ where
     fn unmark_filtered_statement(&mut self, name: &str) {
         if name.is_empty() {
             self.filter_unnamed_prepared_statement = false;
+            // PostgreSQL implicitly destroys the unnamed portal when a new unnamed
+            // statement is parsed, so we must clear the portal filter flag as well.
+            self.filter_unnamed_portal = false;
         } else {
             self.filtered_prepared_statements.remove(name);
         }
@@ -2168,22 +2090,96 @@ where
 
     #[inline(always)]
     fn mark_filtered_portal(&mut self, name: &str) {
-        self.filtered_portals.insert(name.to_string());
+        if name.is_empty() {
+            self.filter_unnamed_portal = true;
+        } else {
+            self.filtered_portals.insert(name.to_string());
+        }
         self.discard_filtered_since_last_sync = true;
     }
 
     #[inline(always)]
     fn unmark_filtered_portal(&mut self, name: &str) {
-        self.filtered_portals.remove(name);
+        if name.is_empty() {
+            self.filter_unnamed_portal = false;
+        } else {
+            self.filtered_portals.remove(name);
+        }
     }
 
     #[inline(always)]
     fn is_filtered_portal(&self, name: &str) -> bool {
         if name.is_empty() {
-            self.filter_unnamed_prepared_statement || self.filtered_portals.contains(name)
+            self.filter_unnamed_portal
         } else {
             self.filtered_portals.contains(name)
         }
+    }
+
+    /// Try to filter an Execute message for DISCARD ALL.
+    /// Returns true if the message was filtered, false otherwise.
+    fn try_filter_execute(&mut self, message: &BytesMut) -> bool {
+        let portal = parse_execute_portal(message).unwrap_or_default();
+        if !self.is_filtered_portal(&portal) {
+            return false;
+        }
+
+        debug!(
+            "Filtering execute for DISCARD ALL portal `{}`",
+            if portal.is_empty() {
+                "<unnamed>"
+            } else {
+                portal.as_str()
+            }
+        );
+        self.discard_response_buffer
+            .put(command_complete("DISCARD ALL"));
+        self.discard_filtered_since_last_sync = true;
+        if portal.is_empty() {
+            self.unmark_filtered_portal("");
+            self.filter_unnamed_prepared_statement = false;
+        }
+        true
+    }
+
+    /// Try to filter a Close message for DISCARD ALL.
+    /// Returns true if the message was filtered, false otherwise.
+    fn try_filter_close(&mut self, close: &Close) -> bool {
+        let should_filter = if close.is_prepared_statement() {
+            self.is_filtered_statement(&close.name)
+        } else {
+            self.is_filtered_portal(&close.name)
+        };
+
+        if !should_filter {
+            return false;
+        }
+
+        debug!(
+            "Filtering close for DISCARD ALL {} `{}`",
+            if close.is_prepared_statement() {
+                "statement"
+            } else {
+                "portal"
+            },
+            if close.name.is_empty() {
+                "<unnamed>"
+            } else {
+                close.name.as_str()
+            }
+        );
+        self.discard_response_buffer.put(close_complete());
+        self.discard_filtered_since_last_sync = true;
+        if close.is_prepared_statement() {
+            self.filtered_prepared_statements.remove(&close.name);
+            self.prepared_statements.remove(&close.name);
+        } else {
+            if close.name.is_empty() {
+                self.filter_unnamed_prepared_statement = false;
+            }
+            self.unmark_filtered_portal(&close.name);
+        }
+        true
     }
 
     fn get_virtual_pool_id(&mut self, client_counter: usize) -> u16 {
