@@ -56,7 +56,9 @@ use pg_doorman::daemon;
 use pg_doorman::format_duration;
 use pg_doorman::generate::generate_config;
 use pg_doorman::messages::configure_tcp_socket;
-use pg_doorman::pool::{retain_connections, ClientServerMap, ConnectionPool};
+use pg_doorman::pool::{
+    maintain_min_pool_size, retain_connections, warm_up_pools, ClientServerMap, ConnectionPool,
+};
 use pg_doorman::prometheus_exporter::start_prometheus_server;
 use pg_doorman::rate_limit::RateLimiter;
 use pg_doorman::stats::{Collector, Reporter, REPORTER, TOTAL_CONNECTION_COUNTER};
@@ -219,6 +221,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        // Pre-warm pools with min_pool_size configured
+        warm_up_pools().await;
+
         tokio::task::spawn(async move {
             let mut stats_collector = Collector::default();
             stats_collector.collect().await;
@@ -226,6 +231,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::task::spawn(async move {
             retain_connections().await;
+        });
+
+        tokio::task::spawn(async move {
+            maintain_min_pool_size().await;
         });
 
         // Prometheus metrics exporter

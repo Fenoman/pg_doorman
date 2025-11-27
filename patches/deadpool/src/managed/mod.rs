@@ -548,6 +548,86 @@ impl<M: Manager, W: From<Object<M>>> Pool<M, W> {
         guard.size -= len_before - guard.vec.len();
     }
 
+    /// Retains objects in the pool based on a predicate, with sorting control.
+    ///
+    /// This method first identifies candidates for removal using `should_remove`,
+    /// then sorts them using `sort_key` (ascending order - lower keys are removed first),
+    /// and finally removes up to `max_remove` objects while keeping at least `min_keep` objects.
+    ///
+    /// This is useful when you want to remove idle connections but prefer to keep
+    /// older connections (which may have accumulated state like temp tables).
+    ///
+    /// # Arguments
+    /// * `should_remove` - Predicate to identify candidates for removal
+    /// * `sort_key` - Function to extract sort key from metrics (lower = removed first)
+    /// * `min_keep` - Minimum number of objects to keep in the pool
+    /// * `max_remove` - Maximum number of objects to remove in this call
+    ///
+    /// # Returns
+    /// The number of objects actually removed
+    pub fn retain_sorted<K: Ord>(
+        &self,
+        should_remove: impl Fn(&M::Type, Metrics) -> bool,
+        sort_key: impl Fn(&Metrics) -> K,
+        min_keep: usize,
+        max_remove: usize,
+    ) -> usize {
+        let mut guard = self.inner.slots.lock().unwrap();
+
+        // Use total pool size (idle + in-use) for min_keep comparison,
+        // not just idle count (vec.len()). This allows cleanup to proceed
+        // when pool is above min_keep even if few connections are idle.
+        if guard.size <= min_keep {
+            return 0;
+        }
+
+        // Collect indices of candidates for removal along with their sort keys
+        let mut candidates: Vec<(usize, K)> = guard
+            .vec
+            .iter()
+            .enumerate()
+            .filter(|(_, obj)| should_remove(&obj.obj, obj.metrics))
+            .map(|(idx, obj)| (idx, sort_key(&obj.metrics)))
+            .collect();
+
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Sort by key ascending (youngest/lowest key first - these will be removed first)
+        candidates.sort_by(|a, b| a.1.cmp(&b.1));
+
+        // Calculate how many we can remove based on total pool size (not just idle)
+        let can_remove_to_min = guard.size.saturating_sub(min_keep);
+        let to_remove = candidates.len().min(max_remove).min(can_remove_to_min);
+
+        if to_remove == 0 {
+            return 0;
+        }
+
+        // Collect indices to remove into a HashSet for O(1) lookup
+        let indices_to_remove: std::collections::HashSet<usize> = candidates[..to_remove]
+            .iter()
+            .map(|(idx, _)| *idx)
+            .collect();
+
+        // Use retain_mut for O(n) removal instead of O(m*n) with individual removes
+        let mut current_idx = 0;
+        guard.vec.retain_mut(|obj| {
+            let dominated_idx = current_idx;
+            current_idx += 1;
+            if indices_to_remove.contains(&dominated_idx) {
+                self.manager().detach(&mut obj.obj);
+                false
+            } else {
+                true
+            }
+        });
+
+        guard.size -= to_remove;
+        to_remove
+    }
+
     /// Get current timeout configuration
     pub fn timeouts(&self) -> Timeouts {
         self.inner.config.timeouts

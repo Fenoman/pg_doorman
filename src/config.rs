@@ -21,7 +21,7 @@ use crate::auth::hba::{CheckResult, PgHba};
 use crate::auth::jwt::load_jwt_pub_key;
 use crate::auth::talos::load_talos_pub_key;
 use crate::errors::Error;
-use crate::pool::{ClientServerMap, ConnectionPool};
+use crate::pool::{warm_up_pools, ClientServerMap, ConnectionPool};
 use crate::stats::AddressStats;
 use crate::tls;
 use crate::tls::{load_identity, TLSMode};
@@ -1168,6 +1168,8 @@ pub async fn reload_config(client_server_map: ClientServerMap) -> Result<bool, E
     if old_config != new_config {
         info!("Config changed, reloading");
         ConnectionPool::from_config(client_server_map).await?;
+        // Pre-warm pools with min_pool_size configured
+        warm_up_pools().await;
         Ok(true)
     } else {
         Ok(false)
