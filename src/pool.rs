@@ -282,9 +282,12 @@ impl ConnectionPool {
                         application_name,
                     );
 
-                    let queue_strategy = match config.general.server_round_robin {
-                        true => managed::QueueMode::Fifo,
-                        false => managed::QueueMode::Lifo,
+                    let queue_strategy = if config.general.oldest_first {
+                        managed::QueueMode::OldestFirst
+                    } else if config.general.server_round_robin {
+                        managed::QueueMode::Fifo
+                    } else {
+                        managed::QueueMode::Lifo
                     };
 
                     info!(

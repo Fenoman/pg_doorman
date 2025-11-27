@@ -107,13 +107,16 @@ impl Default for Timeouts {
 ///
 /// [`Object`]: super::Object
 /// [`Pool`]: super::Pool
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum QueueMode {
     /// Dequeue the object that was least recently added (first in first out).
     Fifo,
     /// Dequeue the object that was most recently added (last in first out).
     Lifo,
+    /// Dequeue the oldest object by creation time.
+    /// Useful for preserving long-lived connections with accumulated state (e.g., temp tables).
+    OldestFirst,
 }
 
 impl Default for QueueMode {

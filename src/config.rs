@@ -261,6 +261,9 @@ pub struct General {
     #[serde(default = "General::default_server_round_robin")] // False
     pub server_round_robin: bool,
 
+    #[serde(default)] // False
+    pub oldest_first: bool,
+
     #[serde(default = "General::default_sync_server_parameters")] // False
     pub sync_server_parameters: bool,
 
@@ -559,6 +562,7 @@ impl Default for General {
             admin_password: String::from("admin"),
             server_lifetime: Self::default_server_lifetime(),
             server_round_robin: Self::default_server_round_robin(),
+            oldest_first: false,
             prepared_statements: Self::default_prepared_statements(),
             prepared_statements_cache_size: Self::default_prepared_statements_cache_size(),
             hba: Self::default_hba(),
@@ -856,7 +860,8 @@ impl Config {
         );
         info!("Backlog: {}", self.general.backlog);
         info!("Max connections: {}", self.general.max_connections);
-        info!("Sever round robin: {}", self.general.server_round_robin);
+        info!("Server round robin: {}", self.general.server_round_robin);
+        info!("Oldest first: {}", self.general.oldest_first);
         if self.general.hba.is_empty() {
             if let Some(pg_hba) = &self.general.pg_hba {
                 info!("HBA config:\n{pg_hba}\n");

@@ -369,6 +369,9 @@ impl<M: Manager, W: From<Object<M>>> Pool<M, W> {
             let inner_obj = match self.inner.config.queue_mode {
                 QueueMode::Fifo => self.inner.slots.lock().unwrap().vec.pop_front(),
                 QueueMode::Lifo => self.inner.slots.lock().unwrap().vec.pop_back(),
+                // OldestFirst: list is kept sorted (youngest at front, oldest at back)
+                // so pop_back() gives us the oldest connection in O(1)
+                QueueMode::OldestFirst => self.inner.slots.lock().unwrap().vec.pop_back(),
             };
             let inner_obj = if let Some(inner_obj) = inner_obj {
                 self.try_recycle(inner_obj).await?
@@ -714,16 +717,41 @@ where
 }
 
 impl<M: Manager> PoolInner<M> {
-    fn return_object(&self, mut inner: ObjectInner<M>) {
+    fn return_object(&self, inner: ObjectInner<M>) {
         let _ = self.users.fetch_sub(1, Ordering::Relaxed);
         let mut slots = self.slots.lock().unwrap();
         if slots.size <= slots.max_size {
-            slots.vec.push_back(inner);
+            // For OldestFirst mode, insert sorted by age (youngest at front, oldest at back)
+            // This allows O(1) retrieval of the oldest connection via pop_back()
+            if self.config.queue_mode == QueueMode::OldestFirst {
+                let age = inner.metrics.age();
+                // Fast path: if returning connection is oldest (common case when we just
+                // checked out the oldest), append to back in O(1)
+                let should_push_back = slots
+                    .vec
+                    .back()
+                    .map(|back| back.metrics.age() <= age)
+                    .unwrap_or(true);
+
+                if should_push_back {
+                    slots.vec.push_back(inner);
+                } else {
+                    // Slow path: binary search for correct position
+                    let pos = slots
+                        .vec
+                        .binary_search_by(|obj| obj.metrics.age().cmp(&age))
+                        .unwrap_or_else(|pos| pos);
+                    slots.vec.insert(pos, inner);
+                }
+            } else {
+                slots.vec.push_back(inner);
+            }
             drop(slots);
             self.semaphore.add_permits(1);
         } else {
             slots.size -= 1;
             drop(slots);
+            let mut inner = inner;
             self.manager.detach(&mut inner.obj);
         }
     }
