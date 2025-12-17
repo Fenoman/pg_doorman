@@ -469,7 +469,7 @@ impl ConnectionPool {
     }
 
     /// Pre-warm the pool by creating connections up to min_pool_size.
-    /// Connections are created concurrently for faster startup.
+    /// Avoids spawning many tasks while still forcing new connections to be created.
     /// Returns the number of connections successfully created.
     pub async fn warm_up(&self, log_on_startup: bool) -> usize {
         let min_pool_size = self.settings.min_pool_size;
@@ -491,40 +491,33 @@ impl ConnectionPool {
             );
         }
 
-        // Create connections concurrently using tokio::spawn
-        // Set APPLICATION_NAME_SUFFIX to identify warm_up connections in pg_stat_activity
-        let mut handles = Vec::with_capacity(connections_to_create);
-        for _ in 0..connections_to_create {
-            let pool = self.database.clone();
-            handles.push(tokio::spawn(
-                APPLICATION_NAME_SUFFIX.scope("warm_up".to_string(), async move {
-                    pool.get().await
-                }),
-            ));
-        }
-
-        let mut error_count = 0;
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(_conn)) => {
-                    // Connection is automatically returned to pool when dropped
+        // Set APPLICATION_NAME_SUFFIX to identify warm_up connections in pg_stat_activity.
+        //
+        // Note: server creation is already serialized inside `ServerPool::create()` by
+        // `open_new_server`, so spawning many tasks here only adds overhead and memory usage.
+        //
+        // We keep checked-out connections alive until the end so the pool can't just reuse a
+        // single idle connection repeatedly.
+        let (error_count, checked_out) = APPLICATION_NAME_SUFFIX
+            .scope("warm_up".to_string(), async {
+                let mut error_count = 0;
+                let mut checked_out = Vec::with_capacity(connections_to_create);
+                for _ in 0..connections_to_create {
+                    match self.database.get().await {
+                        Ok(conn) => checked_out.push(conn),
+                        Err(err) => {
+                            error_count += 1;
+                            warn!(
+                                "[pool: {}][user: {}] Failed to create connection for min_pool_size: {:?}",
+                                self.address.pool_name, self.address.username, err
+                            );
+                        }
+                    }
                 }
-                Ok(Err(err)) => {
-                    error_count += 1;
-                    warn!(
-                        "[pool: {}][user: {}] Failed to create connection for min_pool_size: {:?}",
-                        self.address.pool_name, self.address.username, err
-                    );
-                }
-                Err(err) => {
-                    error_count += 1;
-                    warn!(
-                        "[pool: {}][user: {}] Connection creation task panicked: {:?}",
-                        self.address.pool_name, self.address.username, err
-                    );
-                }
-            }
-        }
+                (error_count, checked_out)
+            })
+            .await;
+        drop(checked_out);
 
         // Calculate actual connections created by comparing pool size before and after
         let size_after = self.pool_state().size;

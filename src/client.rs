@@ -2119,6 +2119,11 @@ where
     /// Try to filter an Execute message for DISCARD ALL.
     /// Returns true if the message was filtered, false otherwise.
     fn try_filter_execute(&mut self, message: &BytesMut) -> bool {
+        // Fast path: if we have no filtered portals (named or unnamed), there's nothing to do.
+        if !self.filter_unnamed_portal && self.filtered_portals.is_empty() {
+            return false;
+        }
+
         let portal = parse_execute_portal(message).unwrap_or_default();
         if !self.is_filtered_portal(&portal) {
             return false;
