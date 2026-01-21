@@ -1,6 +1,7 @@
 use ahash::AHashMap;
 use bytes::{Buf, BufMut, BytesMut};
 use log::error;
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::str;
 use std::sync::atomic::Ordering;
@@ -380,6 +381,12 @@ where
             async_client: false,
             prepared_statements: AHashMap::new(),
             last_anonymous_prepared_hash: None,
+            filtered_prepared_statements: HashSet::new(),
+            filtered_portals: HashSet::new(),
+            filter_unnamed_prepared_statement: false,
+            filter_unnamed_portal: false,
+            discard_response_buffer: BytesMut::with_capacity(512),
+            discard_filtered_since_last_sync: false,
             client_last_messages_in_tx: PooledBuffer::new(),
             max_memory_usage: config.general.max_memory_usage.as_bytes(),
             pooler_check_query_request_vec: config.general.poller_check_query_request_bytes_vec(),
@@ -419,6 +426,12 @@ where
             async_client: false,
             prepared_statements: AHashMap::new(),
             last_anonymous_prepared_hash: None,
+            filtered_prepared_statements: HashSet::new(),
+            filtered_portals: HashSet::new(),
+            filter_unnamed_prepared_statement: false,
+            filter_unnamed_portal: false,
+            discard_response_buffer: BytesMut::with_capacity(512),
+            discard_filtered_since_last_sync: false,
             connected_to_server: false,
             client_last_messages_in_tx: PooledBuffer::new(),
             max_memory_usage: 128 * 1024 * 1024,

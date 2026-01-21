@@ -1,0 +1,155 @@
+[include]
+
+# You can include files in the configuration to merge settings seamlessly. This allows for modular and organized configuration files.
+# files = ["/etc/pg_doorman/hba.toml"]
+{{ if ne (env "INCLUDE_CONF_FILE") "" }}files = ['{{ env "INCLUDE_CONF_FILE" }}']{{ end }}
+
+[general]
+# Listen host for incoming with support for TCP v4 only.
+host = "0.0.0.0"
+
+# Listen port for incoming connections.
+port = 6432
+
+# Connection timeout to server.
+connect_timeout = "2s"
+
+# Analog of query_wait_timeout in PgBouncer (https://www.pgbouncer.org/config.html).
+query_wait_timeout = "5s"
+
+# Server idle timeout.
+idle_timeout = "10m"
+
+# Server lifetime.
+server_lifetime = "1h"
+
+# Time to retain idle connections before closing them.
+# Works together with min_pool_size - connections below minimum won't be closed.
+retain_connections_time = "60s"
+
+# Connect to the server using the TLS protocol.
+server_tls = false
+
+# Verify TLS server certificates.
+verify_server_certificate = false
+
+# Socket TCP keepalive settings (in seconds).
+tcp_keepalives_idle = 120
+tcp_keepalives_interval = 20
+tcp_keepalives_count = 5
+
+# By default, we send RST instead of keeping the connection open for a long time (TCP wait timeout).
+tcp_so_linger = 0
+
+# Enable TCP_NODELAY to disable Nagle's algorithm for lower latency.
+tcp_no_delay = true
+
+# TCP backlog (defaults to max_connections).
+backlog = 0
+
+# Buffer size for read and write operations when connecting to PostgreSQL via a unix socket.
+unix_socket_buffer_size = "1MB"
+
+# Log client connections and disconnections for monitoring.
+log_client_connections = true
+log_client_disconnections = true
+
+# With a graceful shutdown, we wait for queries to be completed within this time limit.
+shutdown_timeout = "10s"
+
+# Data responses from the server (message type 'D') greater than this value will be
+# transmitted through the proxy in small chunks.
+message_size_to_be_stream = "1MB"
+
+# We calculate the total amount of memory used by the internal buffers for all current queries.
+# If the limit is reached, the client will receive an error.
+max_memory_usage = "1GB"
+
+# The maximum number of clients that can connect to the pooler simultaneously.
+# When this limit is reached:
+# * A client connecting without SSL will receive the expected error.
+# * A client connecting via SSL will see a message indicating that the server does not support the SSL protocol.
+max_connections = 8192
+
+# Maximum number of server connections that can be created concurrently per pool.
+# Uses a semaphore to limit parallel connection creation, improving performance during cold start.
+max_concurrent_creates = 8
+
+# In transactional pool mode, we can choose whether the last free server backend will be used or the next one will be selected.
+# By default, the LRU (Least Recently Used) method is used, which has a positive impact on performance.
+server_round_robin = false
+
+# If enabled, the oldest server connections are returned to clients first.
+# This overrides server_round_robin and helps preserve long-lived connections
+# that may accumulate session state (e.g., temp tables).
+oldest_first = true
+
+# If enabled, we strive to restore the parameters that were set by the client (and application_name)
+# in transaction mode in other server backends. By default, this is disabled (false) due to performance.
+sync_server_parameters = true
+
+# The number of Tokio worker processes that serve clients, which affects the performance of pg_doorman.
+# The more workers there are, the faster the system works, but only up to a certain limit.
+worker_threads = 8
+
+# Automatically assign workers to different CPUs.
+worker_cpu_affinity_pinning = true
+
+# This query will not be sent to the server if it is run as a SimpleQuery.
+# It can be used to check the connection at the application level.
+pooler_check_query = ";"
+
+# TLS settings.
+# tls_private_key = "/etc/pg_doorman/ssl/server.key"
+# tls_certificate = "/etc/pg_doorman/server.crt"
+
+# Limit the number of simultaneous attempts to create a TLS session (0 means no limit).
+tls_rate_limit_per_second = 0
+
+# Access to the virtual admin database is carried out through the administrator's username and password,
+# which are specified in plaintext format.
+admin_username = "pgbouncer"
+admin_password = "admin"
+
+# Enable caching of prepared statements.
+prepared_statements = false
+prepared_statements_cache_size = 0
+
+# PID file for daemon mode.
+# Comment this out if you want to run pg_doorman in the foreground.
+daemon_pid_file = "/tmp/pg_doorman.pid"
+
+# When specified, pg_doorman starts sending messages to syslog (using /dev/log or /var/run/syslog).
+# Comment this out if you want to log to stdout.
+# syslog_prog_name = "pg_doorman"
+
+# Define the networks from which connections to pg_doorman are allowed.
+# For example, it can be the address mask 10.0.0.0/8. By default, access is allowed from any address.
+hba = []
+
+
+[pools]
+[pools.{{ env "DB_NAME" }}]
+server_host = "/cluster"  # or "127.0.0.1"
+server_port = 5432
+pool_mode = "transaction"
+# Log information about any SET command in the log.
+log_client_parameter_status_changes = false
+
+[pools.{{ env "DB_NAME" }}.users.1]
+username = "_client_connect"
+password = "{{ secret "db_client_connect.md5" }}"
+pool_size = 500
+min_pool_size = 100
+
+[pools.{{ env "DB_NAME" }}.users.2]
+username = "_login_provider"
+password = "{{ secret "db_login_provider.md5" }}"
+pool_size = 100
+min_pool_size = 3
+
+[pools.{{ env "DB_NAME" }}.users.3]
+username = "pgq_consumer_remote"
+password = "{{ secret "db_pgq_consumer_remote.md5" }}"
+pool_size = 100
+min_pool_size = 20

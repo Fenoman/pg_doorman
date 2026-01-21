@@ -308,6 +308,13 @@ By default, the LRU (Least Recently Used) method is used, which has a positive i
 
 Default: `false`.
 
+### oldest_first
+
+If enabled, the oldest server connections are returned to clients first. This overrides `server_round_robin`
+and helps preserve long-lived connections that may accumulate session state (e.g., temp tables).
+
+Default: `false`.
+
 ### sync_server_parameters
 
 If enabled, we strive to restore the parameters (via query `SET`) that were set by the client (and application_name)
