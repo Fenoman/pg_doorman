@@ -10,7 +10,7 @@ use crate::admin::handle_admin;
 use crate::app::server::{CLIENTS_IN_TRANSACTIONS, SHUTDOWN_IN_PROGRESS};
 use crate::client::batch_handling::PARSE_COMPLETE_MSG;
 use crate::client::core::{BatchOperation, Client};
-use crate::client::util::{is_standalone_begin, QUERY_DEALLOCATE};
+use crate::client::util::{contains_discard_all, is_standalone_begin, simple_query_body, QUERY_DEALLOCATE};
 use crate::errors::Error;
 use crate::messages::{
     check_query_response, command_complete, deallocate_response, error_message, error_response,
@@ -303,6 +303,11 @@ where
             return Ok(true);
         }
 
+        if contains_discard_all(simple_query_body(message)) {
+            self.respond_to_simple_discard().await?;
+            return Ok(true);
+        }
+
         // Check for DEALLOCATE ALL query
         if message.len() < 40 && message.len() > QUERY_DEALLOCATE.len() + 5 {
             let query = &message[5..QUERY_DEALLOCATE.len() + 5];
@@ -315,6 +320,16 @@ where
         Ok(false)
     }
 
+    async fn respond_to_simple_discard(&mut self) -> Result<(), Error> {
+        let mut response = BytesMut::new();
+        response.put(command_complete("DISCARD ALL"));
+        response.put(ready_for_query(false));
+        write_all_flush(&mut self.write, &response).await?;
+        self.stats.query();
+        self.stats.transaction();
+        Ok(())
+    }
+
     /// Handle simple query (Q message).
     /// Returns the action to take after processing.
     #[inline]
@@ -324,6 +339,15 @@ where
         server: &mut Server,
         query_start_at: quanta::Instant,
     ) -> Result<TransactionAction, Error> {
+        if contains_discard_all(simple_query_body(message)) {
+            self.respond_to_simple_discard().await?;
+            if self.transaction_mode && !server.in_copy_mode() {
+                self.stats.idle_read();
+                return Ok(TransactionAction::Break);
+            }
+            return Ok(TransactionAction::Continue);
+        }
+
         self.execute_server_roundtrip(Some(message), server).await?;
         self.stats.query();
         server.stats.query(
@@ -683,7 +707,7 @@ where
                                 Ok(message) => message,
                                 Err(err) => {
                                     self.stats.disconnect();
-                                    server.checkin_cleanup().await?;
+                                    server.finalize_checkin().await?;
                                     return self.process_error(err).await;
                                 }
                             }
@@ -719,7 +743,7 @@ where
                         // Terminate
                         'X' => {
                             // принудительно закрываем чтобы не допустить длинную транзакцию
-                            server.checkin_cleanup().await?;
+                            server.finalize_checkin().await?;
                             self.stats.disconnect();
                             self.release();
                             return Ok(());
@@ -751,9 +775,11 @@ where
                         // Execute
                         // Execute a prepared statement prepared in `P` and bound in `B`.
                         'E' => {
-                            self.buffer.put(&message[..]);
-                            // Track Execute for correct ParseComplete insertion position
-                            self.prepared.batch_operations.push(BatchOperation::Execute);
+                            if !self.try_filter_execute(&message) {
+                                self.buffer.put(&message[..]);
+                                // Track Execute for correct ParseComplete insertion position
+                                self.prepared.batch_operations.push(BatchOperation::Execute);
+                            }
                             TransactionAction::Continue
                         }
 
@@ -802,7 +828,7 @@ where
                 if shutdown_in_progress {
                     server.mark_bad("graceful shutdown - releasing server connection");
                 } else if !server.is_async() {
-                    server.checkin_cleanup().await?;
+                    server.finalize_checkin().await?;
                 }
                 server
                     .stats
@@ -899,6 +925,11 @@ where
                 );
                 response = new_response;
                 self.prepared.pending_close_complete -= inserted;
+            }
+
+            let is_last_response = !server.is_data_available() || server.in_aborted();
+            if is_last_response && self.discard_filtered_since_last_sync {
+                self.inject_discard_responses(&mut response);
             }
 
             // Debug log: server -> client (after all modifications to show what client actually receives)

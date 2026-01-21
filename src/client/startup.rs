@@ -1,5 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 use log::error;
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::str;
 use std::sync::atomic::Ordering;
@@ -373,6 +374,12 @@ where
             username: std::mem::take(&mut client_identifier.username),
             server_parameters,
             prepared: PreparedStatementState::new(prepared_statements_enabled),
+            filtered_prepared_statements: HashSet::new(),
+            filtered_portals: HashSet::new(),
+            filter_unnamed_prepared_statement: false,
+            filter_unnamed_portal: false,
+            discard_response_buffer: BytesMut::with_capacity(512),
+            discard_filtered_since_last_sync: false,
             client_last_messages_in_tx: PooledBuffer::new(),
             max_memory_usage: config.general.max_memory_usage.as_bytes(),
             pooler_check_query_request_vec: config.general.poller_check_query_request_bytes_vec(),
@@ -407,6 +414,12 @@ where
             username: String::from("undefined"),
             server_parameters: ServerParameters::new(),
             prepared: PreparedStatementState::default(),
+            filtered_prepared_statements: HashSet::new(),
+            filtered_portals: HashSet::new(),
+            filter_unnamed_prepared_statement: false,
+            filter_unnamed_portal: false,
+            discard_response_buffer: BytesMut::with_capacity(512),
+            discard_filtered_since_last_sync: false,
             connected_to_server: false,
             client_last_messages_in_tx: PooledBuffer::new(),
             max_memory_usage: 128 * 1024 * 1024,

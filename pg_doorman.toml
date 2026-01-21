@@ -170,6 +170,10 @@ worker_cpu_affinity_pinning = false
 # Default: false
 server_round_robin = false
 
+# Prefer oldest server connections first (overrides server_round_robin when true).
+# Default: false
+oldest_first = false
+
 # Sync server parameters (SET commands, application_name) across backends.
 # Disabled by default due to performance impact.
 # Consider using pool-level application_name instead.

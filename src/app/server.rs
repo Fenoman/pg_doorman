@@ -223,6 +223,9 @@ pub fn run_server(args: Args, config: Config) -> Result<(), Box<dyn std::error::
             }
         };
 
+        // Pre-warm pools with min_pool_size configured
+        retain::warm_up_pools().await;
+
         tokio::task::spawn(async move {
             let mut stats_collector = Collector::default();
             stats_collector.collect().await;
@@ -230,6 +233,10 @@ pub fn run_server(args: Args, config: Config) -> Result<(), Box<dyn std::error::
 
         tokio::task::spawn(async move {
             retain::retain_connections().await;
+        });
+
+        tokio::task::spawn(async move {
+            retain::maintain_min_pool_size().await;
         });
 
         // Clock upkeep thread for accurate timing statistics (updates Clock::recent())

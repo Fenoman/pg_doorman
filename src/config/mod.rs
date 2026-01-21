@@ -17,7 +17,7 @@ use tokio::io::AsyncReadExt;
 use self::tls::{load_identity, TLSMode};
 use crate::auth::hba::CheckResult;
 use crate::errors::Error;
-use crate::pool::{ClientServerMap, ConnectionPool};
+use crate::pool::{retain, ClientServerMap, ConnectionPool};
 
 // Sub-modules
 mod address;
@@ -239,6 +239,7 @@ impl Config {
         info!("Backlog: {}", self.general.backlog);
         info!("Max connections: {}", self.general.max_connections);
         info!("Sever round robin: {}", self.general.server_round_robin);
+        info!("Oldest first: {}", self.general.oldest_first);
         if self.general.hba.is_empty() {
             if let Some(pg_hba) = &self.general.pg_hba {
                 info!("HBA config:\n{pg_hba}\n");
@@ -487,6 +488,7 @@ pub async fn reload_config(client_server_map: ClientServerMap) -> Result<bool, E
     if old_config != new_config {
         info!("Config changed, reloading");
         ConnectionPool::from_config(client_server_map).await?;
+        retain::warm_up_pools().await;
         Ok(true)
     } else {
         Ok(false)
