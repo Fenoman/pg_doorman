@@ -1,7 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-
 use log::{info, warn};
+use std::cmp::Reverse;
 use std::time::Duration;
 
 use crate::config::get_config;
@@ -10,37 +8,70 @@ use super::{get_all_pools, ConnectionPool};
 use super::APPLICATION_NAME_SUFFIX;
 
 impl ConnectionPool {
-    pub fn retain_pool_connections(&self, count: Arc<AtomicUsize>, max: usize) {
+    pub fn retain_pool_connections(&self, max: usize) {
         let min_pool_size = self.settings.min_pool_size;
         let idle_timeout_ms = self.settings.idle_timeout_ms;
         let life_time_ms = self.settings.life_time_ms;
-        let remaining = max.saturating_sub(count.load(Ordering::Relaxed));
+        let mut remaining = max;
+        if remaining == 0 {
+            return;
+        }
 
+        // Hard rotation for server_lifetime: ignore min_pool_size for expired connections.
         // Use retain_sorted to remove youngest connections first, keeping oldest ones.
         // This preserves connections that have accumulated state (like temp tables).
         // Sort key is age: younger connections have smaller age and will be removed first.
-        let removed = self.database.retain_sorted(
-            |_, metrics| {
-                if remaining == 0 {
-                    return false;
-                }
-                // Check if connection should be removed (idle timeout or lifetime exceeded)
-                // A value of 0 disables the respective timeout
-                let idle_expired = idle_timeout_ms > 0
-                    && metrics
+        let lifetime_removed = if life_time_ms > 0 {
+            self.database.retain_sorted(
+                |_, metrics| (metrics.age().as_millis() as u64) > life_time_ms,
+                |metrics| Reverse(metrics.age()),
+                0,
+                remaining,
+            )
+        } else {
+            0
+        };
+
+        if lifetime_removed > 0 {
+            info!(
+                "[pool: {}][user: {}] rotated {} connection(s) due to server_lifetime (>{}ms)",
+                self.address.pool_name, self.address.username, lifetime_removed, life_time_ms
+            );
+        }
+
+        remaining = remaining.saturating_sub(lifetime_removed);
+        if remaining == 0 {
+            return;
+        }
+
+        // Idle timeout rotation keeps min_pool_size connections.
+        let idle_removed = if idle_timeout_ms > 0 {
+            self.database.retain_sorted(
+                |_, metrics| {
+                    metrics
                         .recycled
                         .map(|v| (v.elapsed().as_millis() as u64) > idle_timeout_ms)
-                        .unwrap_or(false);
-                let lifetime_expired =
-                    life_time_ms > 0 && (metrics.age().as_millis() as u64) > life_time_ms;
-                idle_expired || lifetime_expired
-            },
-            |metrics| metrics.age(),
-            min_pool_size,
-            remaining,
-        );
+                        .unwrap_or(false)
+                },
+                |metrics| metrics.age(),
+                min_pool_size,
+                remaining,
+            )
+        } else {
+            0
+        };
 
-        count.fetch_add(removed, Ordering::Relaxed);
+        if idle_removed > 0 {
+            info!(
+                "[pool: {}][user: {}] rotated {} connection(s) due to idle_timeout (>{}ms, min_pool_size={})",
+                self.address.pool_name,
+                self.address.username,
+                idle_removed,
+                idle_timeout_ms,
+                min_pool_size
+            );
+        }
+
     }
 
     /// Pre-warm the pool by creating connections up to min_pool_size.
@@ -144,13 +175,11 @@ impl ConnectionPool {
 pub async fn retain_connections() {
     let retain_time = get_config().general.retain_connections_time.as_std();
     let mut interval = tokio::time::interval(retain_time);
-    let count = Arc::new(AtomicUsize::new(0));
     loop {
         interval.tick().await;
         for (_, pool) in get_all_pools().iter() {
-            pool.retain_pool_connections(count.clone(), 20);
+            pool.retain_pool_connections(20);
         }
-        count.store(0, Ordering::Relaxed);
     }
 }
 
