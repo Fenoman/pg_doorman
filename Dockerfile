@@ -15,7 +15,8 @@ COPY . .
 
 RUN cargo build --release --locked
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:dc65e8ce812dac0f34ca456729ba0cb8a7c1b7c71078be099fb12390a33c4c31
+ARG DISTROLESS_CC_DEBIAN12_NONROOT_IMAGE=gcr.io/distroless/cc-debian12:nonroot
+FROM ${DISTROLESS_CC_DEBIAN12_NONROOT_IMAGE}
 
 COPY --from=builder /app/target/release/pg_doorman /usr/bin/pg_doorman
 COPY --from=builder /app/target/release/patroni_proxy /usr/bin/patroni_proxy
