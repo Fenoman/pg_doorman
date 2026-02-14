@@ -15,8 +15,7 @@ COPY . .
 
 RUN cargo build --release --locked
 
-ARG DISTROLESS_RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian12:nonroot
-FROM ${DISTROLESS_RUNTIME_IMAGE}
+FROM gcr.io/distroless/base-nossl-debian12:nonroot
 
 COPY --from=builder /app/target/release/pg_doorman /usr/bin/pg_doorman
 COPY --from=builder /app/target/release/patroni_proxy /usr/bin/patroni_proxy
