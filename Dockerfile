@@ -16,6 +16,7 @@ COPY . .
 RUN cargo build --release --locked
 
 FROM gcr.io/distroless/base-nossl-debian12:nonroot
+LABEL org.opencontainers.image.base.name="gcr.io/distroless/base-nossl-debian12:nonroot"
 
 COPY --from=builder /app/target/release/pg_doorman /usr/bin/pg_doorman
 COPY --from=builder /app/target/release/patroni_proxy /usr/bin/patroni_proxy
