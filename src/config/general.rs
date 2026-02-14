@@ -101,6 +101,9 @@ pub struct General {
     #[serde(default = "General::default_server_round_robin")] // False
     pub server_round_robin: bool,
 
+    #[serde(default = "General::default_oldest_first")] // False
+    pub oldest_first: bool,
+
     #[serde(default = "General::default_sync_server_parameters")] // False
     pub sync_server_parameters: bool,
 
@@ -292,6 +295,10 @@ impl General {
         false
     }
 
+    pub fn default_oldest_first() -> bool {
+        false
+    }
+
     pub fn default_prepared_statements_cache_size() -> usize {
         8 * 1024
     }
@@ -396,6 +403,7 @@ impl Default for General {
             retain_connections_max: Self::default_retain_connections_max(),
             server_idle_check_timeout: Self::default_server_idle_check_timeout(),
             server_round_robin: Self::default_server_round_robin(),
+            oldest_first: Self::default_oldest_first(),
             prepared_statements: Self::default_prepared_statements(),
             prepared_statements_cache_size: Self::default_prepared_statements_cache_size(),
             client_prepared_statements_cache_size:

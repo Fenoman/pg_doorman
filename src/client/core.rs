@@ -4,6 +4,7 @@ use ahash::AHashMap;
 use bytes::BytesMut;
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::BufReader;
 
@@ -354,6 +355,19 @@ pub struct Client<S, T> {
 
     /// Prepared statements state (caching, batch operations, etc.)
     pub(crate) prepared: PreparedStatementState,
+
+    /// Names of prepared statements filtered out because they execute DISCARD ALL
+    pub(crate) filtered_prepared_statements: HashSet<String>,
+    /// Names of portals filtered out because they execute DISCARD ALL
+    pub(crate) filtered_portals: HashSet<String>,
+    /// Whether the unnamed prepared statement should be filtered
+    pub(crate) filter_unnamed_prepared_statement: bool,
+    /// Whether the unnamed portal should be filtered
+    pub(crate) filter_unnamed_portal: bool,
+    /// Buffered responses for filtered DISCARD ALL messages
+    pub(crate) discard_response_buffer: BytesMut,
+    /// Whether DISCARD ALL responses were filtered since last sync/flush
+    pub(crate) discard_filtered_since_last_sync: bool,
 
     pub(crate) max_memory_usage: u64,
 
