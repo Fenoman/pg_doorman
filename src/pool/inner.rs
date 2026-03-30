@@ -61,12 +61,14 @@ impl Drop for Object {
 
 impl Deref for Object {
     type Target = Server;
+    #[inline(always)]
     fn deref(&self) -> &Self::Target {
         &self.inner.as_ref().unwrap().obj
     }
 }
 
 impl DerefMut for Object {
+    #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner.as_mut().unwrap().obj
     }

@@ -155,20 +155,43 @@ impl std::fmt::Display for Server {
     }
 }
 
+/// Timeout for housekeeping operations (RESET ALL, DEALLOCATE ALL, alive check, etc.).
+/// These are short queries that should never take more than a few seconds.
+/// If a backend doesn't respond within this time, it is considered dead.
+const HOUSEKEEPING_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Server {
     /// Execute an arbitrary query against the server.
     /// It will use the simple query protocol.
     /// Result will not be returned, so this is useful for things like `SET` or `ROLLBACK`.
+    ///
+    /// Uses a single HOUSEKEEPING_TIMEOUT deadline for the full send+recv cycle
+    /// to prevent indefinite hangs if the backend stops making progress.
     pub async fn small_simple_query(&mut self, query: &str) -> Result<(), Error> {
         let query = simple_query(query);
-
-        self.send_and_flush(&query).await?;
+        let deadline = tokio::time::Instant::now() + HOUSEKEEPING_TIMEOUT;
+        match tokio::time::timeout_at(deadline, self.send_and_flush(&query)).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                self.mark_bad("housekeeping send timeout in small_simple_query");
+                return Err(Error::SocketError(
+                    "Timeout sending housekeeping query".to_string(),
+                ));
+            }
+        }
 
         let mut noop = tokio::io::sink();
         loop {
-            match self.recv(&mut noop, None).await {
-                Ok(_) => (),
-                Err(err) => return Err(err),
+            match tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await {
+                Ok(Ok(_)) => (),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    self.mark_bad("housekeeping recv timeout in small_simple_query");
+                    return Err(Error::SocketError(
+                        "Timeout waiting for response to housekeeping query".to_string(),
+                    ));
+                }
             }
 
             if !self.data_available {
@@ -180,18 +203,34 @@ impl Server {
     }
 
     /// Check if the connection is alive by sending a minimal query (`;`).
-    /// Uses the provided timeout for the operation.
+    /// Uses the provided timeout for the entire operation (send + recv).
     /// Returns Ok(()) if connection is alive, Err if dead or timeout exceeded.
     pub async fn check_alive(&mut self, timeout: Duration) -> Result<(), Error> {
         let query = simple_query(";");
+        let deadline = tokio::time::Instant::now() + timeout;
 
-        self.send_and_flush_timeout(&query, timeout).await?;
+        match tokio::time::timeout_at(deadline, self.send_and_flush(&query)).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                self.mark_bad("alive check send timeout");
+                return Err(Error::SocketError(
+                    "Timeout sending alive check query".to_string(),
+                ));
+            }
+        }
 
         let mut noop = tokio::io::sink();
         loop {
-            match self.recv(&mut noop, None).await {
-                Ok(_) => (),
-                Err(err) => return Err(err),
+            match tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await {
+                Ok(Ok(_)) => (),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    self.mark_bad("alive check recv timeout");
+                    return Err(Error::SocketError(
+                        "Timeout waiting for alive check response".to_string(),
+                    ));
+                }
             }
 
             if !self.data_available {
@@ -257,11 +296,9 @@ impl Server {
 
     /// Server & client are out of sync, we must discard this connection.
     /// This happens with clients that misbehave.
+    #[inline(always)]
     pub fn is_bad(&self) -> bool {
-        if self.bad {
-            return self.bad;
-        };
-        false
+        self.bad
     }
 
     /// Drains any remaining data from the server that hasn't been read yet.
@@ -516,11 +553,53 @@ impl Server {
                     self.set_async_mode(false);
                 }
 
-                self.send_and_flush(&bytes).await?;
+                let deadline = tokio::time::Instant::now() + HOUSEKEEPING_TIMEOUT;
+                match tokio::time::timeout_at(deadline, self.send_and_flush(&bytes)).await {
+                    Ok(Ok(_)) => (),
+                    Ok(Err(err)) => {
+                        if was_async {
+                            self.set_async_mode(true);
+                            self.set_expected_responses(saved_expected);
+                        }
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        self.mark_bad("housekeeping send timeout in register_prepared_statement");
+                        if was_async {
+                            self.set_async_mode(true);
+                            self.set_expected_responses(saved_expected);
+                        }
+                        return Err(Error::SocketError(
+                            "Timeout sending prepared statement registration".to_string(),
+                        ));
+                    }
+                }
 
                 let mut noop = tokio::io::sink();
                 loop {
-                    self.recv(&mut noop, None).await?;
+                    match tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await {
+                        Ok(Ok(_)) => (),
+                        Ok(Err(err)) => {
+                            if was_async {
+                                self.set_async_mode(true);
+                                self.set_expected_responses(saved_expected);
+                            }
+                            return Err(err);
+                        }
+                        Err(_) => {
+                            self.mark_bad(
+                                "housekeeping recv timeout in register_prepared_statement",
+                            );
+                            if was_async {
+                                self.set_async_mode(true);
+                                self.set_expected_responses(saved_expected);
+                            }
+                            return Err(Error::SocketError(
+                                "Timeout waiting for prepared statement registration response"
+                                    .to_string(),
+                            ));
+                        }
+                    }
 
                     if !self.is_data_available() {
                         break;
@@ -850,6 +929,8 @@ impl Drop for Server {
             let mut guard = CANCELED_PIDS.lock();
             guard.remove(&self.process_id);
         }
+        // Clean up debug protocol state to prevent unbounded PROTOCOL_STATES growth
+        crate::utils::debug_messages::remove_protocol_state(self.process_id);
         if !self.is_bad() {
             let mut bytes = BytesMut::with_capacity(5);
             bytes.put_u8(b'X');

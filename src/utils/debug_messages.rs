@@ -466,10 +466,8 @@ pub fn log_server_to_client(client_addr: &str, server_pid: i32, buffer: &[u8]) {
     }
 }
 
-/// Clean up protocol state for a disconnected client
-/// Note: We don't remove the state because the server connection may be reused
-/// by another client. The state will be naturally cleaned up when the server
-/// connection is closed or when ReadyForQuery resets the state.
+/// Clean up protocol state for a disconnected client.
+/// Does not remove the entry because the server connection may be reused.
 pub fn cleanup_protocol_state(client_addr: &str, server_pid: i32) {
     let states = PROTOCOL_STATES.lock();
     if let Some(state) = states.get(&server_pid) {
@@ -481,6 +479,14 @@ pub fn cleanup_protocol_state(client_addr: &str, server_pid: i32) {
                 server_pid
             );
         }
+    }
+}
+
+/// Remove protocol state for a server connection that is being dropped.
+/// Prevents unbounded growth of PROTOCOL_STATES over time.
+pub fn remove_protocol_state(server_pid: i32) {
+    if log::log_enabled!(log::Level::Debug) {
+        PROTOCOL_STATES.lock().remove(&server_pid);
     }
 }
 

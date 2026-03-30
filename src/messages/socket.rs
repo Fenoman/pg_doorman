@@ -81,6 +81,9 @@ where
 }
 
 /// Read message data.
+///
+/// Reads directly into a single BytesMut buffer, avoiding the previous
+/// double-allocation pattern (BytesMut + temporary Vec + memcpy).
 pub async fn read_message_data<S>(stream: &mut S, code: u8, len: i32) -> Result<BytesMut, Error>
 where
     S: tokio::io::AsyncRead + std::marker::Unpin,
@@ -97,24 +100,27 @@ where
         )));
     }
 
-    let mut buf = BytesMut::with_capacity(len as usize + 1);
+    let total_size = len as usize + 1; // code(1) + len(4) + data(len-4)
+    let mut buf = BytesMut::with_capacity(total_size);
     buf.put_u8(code);
     buf.put_i32(len);
+    // Extend buffer to full size so read_exact can write into it directly
+    buf.resize(total_size, 0);
 
-    let data_len = len as usize - 4;
-    let mut data = vec![0; data_len];
-
-    match stream.read_exact(&mut data).await {
-        Ok(_) => {
-            buf.put_slice(&data);
-            Ok(buf)
-        }
+    match stream.read_exact(&mut buf[5..]).await {
+        Ok(_) => Ok(buf),
         Err(err) => Err(Error::SocketError(format!(
             "Error reading message data from socket - Code: {code:?}, Error: {err:?}"
         ))),
     }
 }
 
+/// Read a full PostgreSQL protocol message with memory admission control.
+///
+/// Note: CURRENT_MEMORY is a coarse admission gate, not a precise allocator tracker.
+/// It prevents accepting new messages when the system is overloaded but does NOT
+/// track the actual lifetime of returned BytesMut buffers. The counter is decremented
+/// immediately after the read, even though the buffer lives on in the processing pipeline.
 #[inline]
 pub async fn read_message<S>(stream: &mut S, max_memory_usage: u64) -> Result<BytesMut, Error>
 where

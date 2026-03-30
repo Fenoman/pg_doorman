@@ -186,32 +186,35 @@ impl PreparedStatementCache {
         }
     }
 
-    /// Evict the oldest entry from the cache (approximate LRU).
+    /// Evict an old entry from the cache using a bounded partial scan.
+    ///
+    /// Instead of scanning all entries O(n), we inspect only a small prefix of the
+    /// current DashMap iterator and evict the least-recently-used entry within that
+    /// bounded sample. This keeps eviction cost O(1) amortized without claiming
+    /// true randomness or full-LRU accuracy.
     fn evict_oldest(&self) {
-        // Find the entry with the smallest count_used timestamp
+        const SCAN_LIMIT: usize = 8;
+
         let mut oldest_key: Option<u64> = None;
         let mut oldest_time = u64::MAX;
-        let mut evicted_name: Option<String> = None;
 
-        // Sample entries to find the oldest one
-        // We iterate through all entries but this is still efficient because
-        // DashMap uses sharding and we only read, not write
+        // Inspect up to SCAN_LIMIT entries from the current iterator order.
+        let mut scanned = 0;
         for entry in self.cache.iter() {
             if entry.count_used < oldest_time {
                 oldest_time = entry.count_used;
                 oldest_key = Some(*entry.key());
             }
-        }
-
-        // Remove the oldest entry
-        if let Some(key) = oldest_key {
-            if let Some((_, entry)) = self.cache.remove(&key) {
-                evicted_name = Some(entry.parse.name.clone());
+            scanned += 1;
+            if scanned >= SCAN_LIMIT {
+                break;
             }
         }
 
-        if let Some(name) = evicted_name {
-            warn!("Evicted prepared statement {} from cache", name);
+        if let Some(key) = oldest_key {
+            if let Some((_, entry)) = self.cache.remove(&key) {
+                warn!("Evicted prepared statement {} from cache", entry.parse.name);
+            }
         }
     }
 }

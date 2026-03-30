@@ -291,8 +291,8 @@ general:
   # Maximum prepared statements cached per client connection.
   # Protection against malicious clients that don't call DEALLOCATE.
   # Set to 0 for unlimited (relies on client calling DEALLOCATE).
-  # Default: 0 (unlimited)
-  client_prepared_statements_cache_size: 0
+  # Default: 256
+  client_prepared_statements_cache_size: 256
 
   # --------------------------------------------------------------------------
   # Admin Console

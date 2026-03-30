@@ -770,11 +770,11 @@ fields:
         en: |
           Maximum prepared statements cached per client connection.
           Protection against malicious clients that don't call DEALLOCATE.
-          Set to 0 for unlimited (relies on client calling DEALLOCATE).
+          Default is 256. Set to 0 for unlimited (relies on client calling DEALLOCATE).
         ru: |
           Максимум подготовленных запросов в кеше для одного клиентского соединения.
           Защита от вредоносных клиентов, которые не вызывают DEALLOCATE.
-          0 — без ограничений (полагается на вызов DEALLOCATE клиентом).
+          По умолчанию 256. 0 — без ограничений (полагается на вызов DEALLOCATE клиентом).
       doc: |
         Maximum number of prepared statements cached per client connection. This is a protection mechanism against
         malicious or misbehaving clients that don't call `DEALLOCATE` and could cause memory exhaustion by creating
@@ -785,7 +785,7 @@ fields:
         query-to-server-name mapping.
 
         Set to `0` to disable the limit (unlimited cache size, relies on client calling `DEALLOCATE`).
-      default: "0 (unlimited)"
+      default: "256"
 
     admin_username:
       config:

@@ -175,7 +175,7 @@ pub struct General {
     /// This is a protection against malicious clients that don't call DEALLOCATE
     /// and could cause memory exhaustion by creating unlimited prepared statements.
     /// When the limit is reached, the oldest (least recently added) statement is evicted.
-    /// Default: 0 (unlimited - no protection, relies on client calling DEALLOCATE)
+    /// Default: 256 (bounded per-client cache; set to 0 for unlimited)
     #[serde(default = "General::default_client_prepared_statements_cache_size")]
     pub client_prepared_statements_cache_size: usize,
 
@@ -339,9 +339,10 @@ impl General {
     pub fn default_prepared_statements() -> bool {
         true
     }
-    /// Default: 0 (unlimited - no protection against malicious clients)
+    /// Default: 256 per client (prevents memory-DoS from a single connection).
+    /// Set to 0 for unlimited (not recommended in multi-tenant environments).
     pub fn default_client_prepared_statements_cache_size() -> usize {
-        0
+        256
     }
 
     pub fn default_daemon_pid_file() -> String {

@@ -7,7 +7,7 @@
 //!   TTL-based expiration, negative caching, and rate-limited re-fetch.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,6 +15,7 @@ use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Notify;
 use tokio_postgres::{Client, NoTls};
 
 use crate::config::{AuthQueryConfig, Duration};
@@ -65,6 +66,9 @@ pub struct AuthQueryExecutor {
     server_port: u16,
     tx: mpsc::Sender<Client>,
     rx: tokio::sync::Mutex<mpsc::Receiver<Client>>,
+    live_workers: AtomicUsize,
+    worker_state_changed: Notify,
+    reconnect_lock: TokioMutex<()>,
 }
 
 impl AuthQueryExecutor {
@@ -122,6 +126,9 @@ impl AuthQueryExecutor {
             server_port,
             tx,
             rx: tokio::sync::Mutex::new(rx),
+            live_workers: AtomicUsize::new(config.workers as usize),
+            worker_state_changed: Notify::new(),
+            reconnect_lock: TokioMutex::new(()),
         })
     }
 
@@ -181,28 +188,51 @@ impl AuthQueryExecutor {
         Ok(client)
     }
 
+    /// Poll interval for re-checking worker availability when the channel is empty.
+    /// This keeps busy healthy pools waiting normally, while still allowing dead pools
+    /// to fail fast once all workers are lost.
+    const WORKER_ACQUIRE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Timeout for executing the auth SQL query itself.
+    /// Prevents a hung backend from permanently consuming a worker.
+    const QUERY_EXECUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
     /// Fetch password hash for a username from PostgreSQL.
     /// Returns `Some(password_hash)` or `None` if user not found.
+    ///
+    /// SQL execution is bounded by timeout, and worker acquisition monitors
+    /// live worker count so dead pools fail fast without breaking healthy queued traffic.
     pub async fn fetch_password(&self, username: &str) -> Result<Option<String>, Error> {
         debug!(
             "[pool: {}] auth_query: fetching password for user '{username}'",
             self.pool_name
         );
 
-        let client = {
-            let mut rx = self.rx.lock().await;
-            rx.recv().await.ok_or_else(|| {
-                error!(
-                    "[pool: {}] auth_query: executor pool closed, \
-                     cannot fetch password for user '{username}'",
-                    self.pool_name
-                );
-                Error::AuthQueryPoolClosed
-            })?
-        };
+        let client = self.acquire_worker(username).await?;
 
+        // Execute query with timeout to prevent a hung backend from consuming a worker forever.
         let start = std::time::Instant::now();
-        let result = self.execute_query(&client, username).await;
+        let result = match tokio::time::timeout(
+            Self::QUERY_EXECUTE_TIMEOUT,
+            self.execute_query(&client, username),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                error!(
+                    "[pool: {}] auth_query: query timeout ({:.0?}) for user '{username}', \
+                     dropping dead worker",
+                    self.pool_name,
+                    Self::QUERY_EXECUTE_TIMEOUT
+                );
+                // Don't return the client — it's stuck. try_reconnect will replace it.
+                self.replace_dead_worker().await;
+                return Err(Error::AuthQueryQueryError(format!(
+                    "query timeout for user '{username}'"
+                )));
+            }
+        };
         let elapsed = start.elapsed();
 
         match &result {
@@ -236,13 +266,86 @@ impl AuthQueryExecutor {
                  attempting reconnect",
                 self.pool_name
             );
-            self.try_reconnect().await;
+            self.replace_dead_worker().await;
         }
 
         result
     }
 
-    async fn try_reconnect(&self) {
+    async fn acquire_worker(&self, username: &str) -> Result<Client, Error> {
+        loop {
+            if self.live_workers.load(Ordering::Acquire) == 0 && !self.try_revive_pool().await {
+                error!(
+                    "[pool: {}] auth_query: no live executor workers available \
+                     for user '{username}'",
+                    self.pool_name
+                );
+                return Err(Error::AuthQueryConnectionError(
+                    "auth_query executor has no live workers".into(),
+                ));
+            }
+
+            let mut rx = self.rx.lock().await;
+            enum AcquireResult {
+                Client(Option<Client>),
+                Retry,
+            }
+
+            match tokio::select! {
+                maybe = rx.recv() => AcquireResult::Client(maybe),
+                _ = self.worker_state_changed.notified() => AcquireResult::Retry,
+                _ = tokio::time::sleep(Self::WORKER_ACQUIRE_POLL_INTERVAL) => AcquireResult::Retry,
+            } {
+                AcquireResult::Client(Some(client)) => return Ok(client),
+                AcquireResult::Client(None) => return Err(Error::AuthQueryPoolClosed),
+                AcquireResult::Retry => continue,
+            }
+        }
+    }
+
+    async fn replace_dead_worker(&self) {
+        if self.try_reconnect().await {
+            return;
+        }
+
+        let remaining =
+            match self
+                .live_workers
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                }) {
+                Ok(previous) => previous.saturating_sub(1),
+                Err(current) => current,
+            };
+        self.worker_state_changed.notify_waiters();
+
+        error!(
+            "[pool: {}] auth_query: executor reconnection failed \
+             (live workers remaining: {remaining})",
+            self.pool_name
+        );
+    }
+
+    async fn try_revive_pool(&self) -> bool {
+        if self.live_workers.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+
+        let _guard = self.reconnect_lock.lock().await;
+        if self.live_workers.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+
+        if self.try_reconnect().await {
+            self.live_workers.fetch_add(1, Ordering::AcqRel);
+            self.worker_state_changed.notify_waiters();
+            return true;
+        }
+
+        false
+    }
+
+    async fn try_reconnect(&self) -> bool {
         let database = self
             .config
             .database
@@ -267,13 +370,15 @@ impl AuthQueryExecutor {
                     self.pool_name
                 );
                 let _ = self.tx.send(new_client).await;
+                self.worker_state_changed.notify_waiters();
+                true
             }
             Err(e) => {
                 error!(
-                    "[pool: {}] auth_query: executor reconnection failed: {e} \
-                     (pool shrinks by 1, will retry on next request)",
+                    "[pool: {}] auth_query: executor reconnection failed: {e}",
                     self.pool_name
                 );
+                false
             }
         }
     }
@@ -411,6 +516,11 @@ impl CacheEntry {
 ///
 /// Generic over the fetcher: defaults to `AuthQueryExecutor` in production,
 /// tests substitute a mock.
+/// Maximum number of cached usernames per pool.
+/// Expired entries are preferred for eviction, but the limit is enforced even
+/// when the workload continuously authenticates fresh unique usernames.
+const AUTH_CACHE_MAX_ENTRIES: usize = 10_000;
+
 pub struct AuthQueryCache<F = AuthQueryExecutor> {
     /// Cached credentials keyed by username.
     entries: DashMap<String, CacheEntry>,
@@ -503,17 +613,20 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
 
         // Cache miss — fetch from PG
         self.inc(|s| &s.executor_queries);
+
         match self.executor.fetch(username).await {
             Ok(Some(password_hash)) => {
                 self.inc(|s| &s.cache_misses);
                 let entry = CacheEntry::positive(password_hash);
                 self.entries.insert(username.to_string(), entry.clone());
+                self.enforce_capacity();
                 Ok(Some(entry))
             }
             Ok(None) => {
                 self.inc(|s| &s.cache_misses);
                 let entry = CacheEntry::negative();
                 self.entries.insert(username.to_string(), entry);
+                self.enforce_capacity();
                 Ok(None)
             }
             Err(err) => {
@@ -570,12 +683,14 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
                 let mut entry = CacheEntry::positive(password_hash);
                 entry.last_refetch_at = Some(Instant::now());
                 self.entries.insert(username.to_string(), entry.clone());
+                self.enforce_capacity();
                 Ok(Some(entry))
             }
             Ok(None) => {
                 let mut entry = CacheEntry::negative();
                 entry.last_refetch_at = Some(Instant::now());
                 self.entries.insert(username.to_string(), entry);
+                self.enforce_capacity();
                 Ok(None)
             }
             Err(err) => {
@@ -589,6 +704,51 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
     pub fn clear(&self) {
         self.entries.clear();
         self.locks.clear();
+    }
+
+    /// Keep the cache bounded even for workloads that continuously authenticate
+    /// new usernames before TTL expiration.
+    fn enforce_capacity(&self) {
+        if self.entries.len() <= AUTH_CACHE_MAX_ENTRIES {
+            return;
+        }
+
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| !entry.is_expired(&self.cache_ttl, &self.cache_failure_ttl));
+        let mut evicted = before.saturating_sub(self.entries.len());
+
+        if self.entries.len() > AUTH_CACHE_MAX_ENTRIES {
+            let overflow = self.entries.len() - AUTH_CACHE_MAX_ENTRIES;
+            let mut oldest: Vec<(String, Instant)> = self
+                .entries
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.fetched_at))
+                .collect();
+            oldest.sort_unstable_by_key(|(_, fetched_at)| *fetched_at);
+
+            for (username, _) in oldest.into_iter().take(overflow) {
+                if self.entries.remove(&username).is_some() {
+                    evicted += 1;
+                }
+            }
+        }
+
+        self.cleanup_orphaned_locks();
+
+        if evicted > 0 {
+            info!(
+                "auth_query cache: evicted {evicted} entries to enforce max size \
+                 (remaining: {})",
+                self.entries.len()
+            );
+        }
+    }
+
+    fn cleanup_orphaned_locks(&self) {
+        self.locks.retain(|username, lock| {
+            self.entries.contains_key(username) || Arc::strong_count(lock) > 1
+        });
     }
 
     /// Store ClientKey for a cached user (called after successful SCRAM auth).
@@ -885,6 +1045,20 @@ mod tests {
         cache.clear();
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cache_enforces_hard_max_entries() {
+        let fetcher = Arc::new(MockFetcher::new());
+        let cache = make_cache(fetcher, &test_config());
+
+        for i in 0..(AUTH_CACHE_MAX_ENTRIES + 32) {
+            let username = format!("u{i:05}");
+            assert!(cache.get_or_fetch(&username).await.unwrap().is_none());
+        }
+
+        assert_eq!(cache.len(), AUTH_CACHE_MAX_ENTRIES);
+        assert!(cache.locks.len() <= AUTH_CACHE_MAX_ENTRIES);
     }
 
     // -- test_set_client_key: stores SCRAM ClientKey on existing entry --
