@@ -161,9 +161,26 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="changelog"><a class="header" href="#changelog">Changelog</a></h1>
-<h3 id="332-mar-1-2026"><a class="header" href="#332-mar-1-2026">3.3.2 <small>Mar 1, 2026</small></a></h3>
+<h3 id="333-mar-26-2026"><a class="header" href="#333-mar-26-2026">3.3.3 <small>Mar 26, 2026</small></a></h3>
 <p><strong>Bug Fixes:</strong></p>
 <ul>
+<li>
+<p><strong>Log spam from missing <code>/proc/net/tcp6</code> when IPv6 disabled.</strong> <code>get_socket_states_count</code> failed entirely if any of the three /proc files was absent, logging errors every 15 seconds and losing tcp/unix metrics that were available. Missing files are now skipped — counters stay at zero. Other I/O errors (permission denied) still propagate.</p>
+</li>
+<li>
+<p><strong>Protocol violation when streaming large DataRow with cached prepared statements.</strong> <code>handle_large_data_row</code> wrote accumulated protocol messages (BindComplete, RowDescription) directly to the client socket, bypassing <code>reorder_parse_complete_responses</code>. When Parse was skipped (prepared statement cache hit), the client received BindComplete without the synthetic ParseComplete — causing <code>Received backend message BindComplete while expecting ParseCompleteMessage</code> in Npgsql and similar drivers. Triggered when <code>message_size_to_be_stream</code> ≤ 64KB. Fixed by returning accumulated messages from <code>recv()</code> before entering the streaming path, so response reordering runs first. Same fix applied to <code>handle_large_copy_data</code>.</p>
+</li>
+</ul>
+<h3 id="332-mar-1-2026"><a class="header" href="#332-mar-1-2026">3.3.2 <small>Mar 1, 2026</small></a></h3>
+<p><strong>Breaking Changes:</strong></p>
+<ul>
+<li><strong><code>auth_query</code> config field renames</strong>: Two fields in the <code>auth_query</code> section have been renamed for clarity. <code>auth_query.pool_size</code> (number of connections for running auth queries) is now <code>auth_query.workers</code>. <code>auth_query.default_pool_size</code> (data pool size for dynamic users) is now <code>auth_query.pool_size</code>, matching the same parameter name used in static pools. <strong>Migration</strong>: rename <code>pool_size</code> to <code>workers</code> and <code>default_pool_size</code> to <code>pool_size</code> in your <code>auth_query</code> config. If you don't update, the old <code>pool_size</code> value (typically 1-2) will be interpreted as the data pool size, drastically reducing connection capacity. The old <code>default_pool_size</code> key is silently ignored and defaults to 40.</li>
+</ul>
+<p><strong>Bug Fixes:</strong></p>
+<ul>
+<li>
+<p><strong>Session mode: keep server connections alive after SQL errors.</strong> A query like <code>SELECT 1/0</code> returns an <code>ErrorResponse</code> from PostgreSQL but leaves the connection fully usable. Previously, <code>handle_error_response</code> called <code>mark_bad()</code> unconditionally in async mode, so the connection was destroyed at session end. Now <code>mark_bad</code> is skipped when the pool runs in session mode. Transaction mode still calls <code>mark_bad</code> because the connection returns to a shared pool where protocol desync is dangerous.</p>
+</li>
 <li>
 <p><strong>Pool-level <code>server_lifetime</code> and <code>idle_timeout</code> overrides ignored</strong>: Pool-level overrides for <code>server_lifetime</code> and <code>idle_timeout</code> were silently ignored — the general (global) values were always used instead. Fixed in 6 places across 3 pool creation contexts (static pools, auth_query shared pools, dynamic pools). Now <code>pool.server_lifetime</code> and <code>pool.idle_timeout</code> correctly override the general settings when specified.</p>
 </li>
@@ -192,13 +209,20 @@
 <p><strong>Retain and replenish used separate pool snapshots</strong>: The retain and replenish phases each called <code>get_all_pools()</code> separately. If <code>POOLS</code> was atomically updated between them (config reload, dynamic pool GC), retain operated on one set of pools and replenish on another, potentially missing pools that need replenishment. Fixed by using a single snapshot for both phases.</p>
 </li>
 </ul>
+<p><strong>Testing:</strong></p>
+<ul>
+<li><strong>PHP PDO_PGSQL driver added to test infrastructure.</strong> PHP 8.4 with <code>pdo_pgsql</code> extension is now included in the Nix-based Docker test image. Two BDD scenarios verify basic connectivity (SELECT 1) and session mode behavior (SQL error does not change backend PID). Run with <code>make test-php</code> or <code>--tags @php</code>.</li>
+</ul>
 <p><strong>New Features:</strong></p>
 <ul>
+<li>
+<p><strong><code>pool_size</code> observability</strong>: New <code>pg_doorman_pool_size</code> Prometheus gauge exposes the configured maximum pool size per user/database. The <code>pool_size</code> column is also added to <code>SHOW POOLS</code> and <code>SHOW POOLS_EXTENDED</code> admin commands (after <code>sv_login</code>), allowing operators to compare current server connections against configured capacity directly from the admin console. Works for both static and dynamic (auth_query) pools.</p>
+</li>
 <li>
 <p><strong>PAUSE, RESUME, RECONNECT admin commands</strong>: New admin console commands for managing connection pools. <code>PAUSE [db]</code> blocks new backend connection acquisition (active transactions continue). <code>RESUME [db]</code> lifts the pause and unblocks waiting clients. <code>RECONNECT [db]</code> forces connection rotation by incrementing the pool epoch — idle connections are immediately closed and active connections are discarded when returned to the pool. Without arguments, all pools are affected; with a database name, only matching pools. Specifying a nonexistent database returns an error. Use <code>SHOW POOLS</code> to see the <code>paused</code> status column.</p>
 </li>
 <li>
-<p><strong><code>default_min_pool_size</code> for dynamic auth_query passthrough pools</strong>: New <code>auth_query.default_min_pool_size</code> setting controls the minimum number of backend connections maintained per dynamic user pool in passthrough mode. Connections are prewarmed in the background when the pool is first created and replenished by the retain cycle after <code>server_lifetime</code> expiry. Pools with <code>default_min_pool_size &gt; 0</code> are never garbage-collected. Default is <code>0</code> (no prewarm — backward compatible). Note: total backend connections scale as <code>active_users × default_min_pool_size</code>.</p>
+<p><strong><code>min_pool_size</code> for dynamic auth_query passthrough pools</strong>: New <code>auth_query.min_pool_size</code> setting controls the minimum number of backend connections maintained per dynamic user pool in passthrough mode. Connections are prewarmed in the background when the pool is first created and replenished by the retain cycle after <code>server_lifetime</code> expiry. Pools with <code>min_pool_size &gt; 0</code> are never garbage-collected. Default is <code>0</code> (no prewarm — backward compatible). Note: total backend connections scale as <code>active_users × min_pool_size</code>.</p>
 </li>
 </ul>
 <h3 id="331-feb-26-2026"><a class="header" href="#331-feb-26-2026">3.3.1 <small>Feb 26, 2026</small></a></h3>
