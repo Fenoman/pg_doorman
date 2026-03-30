@@ -791,6 +791,10 @@ fn write_general_section(w: &mut ConfigWriter, config: &Config) {
     w.kv(fi, "server_round_robin", &w.bool_val(g.server_round_robin));
     w.blank();
 
+    write_field_comment(w, fi, "general", "oldest_first");
+    w.kv(fi, "oldest_first", &w.bool_val(g.oldest_first));
+    w.blank();
+
     write_field_comment(w, fi, "general", "sync_server_parameters");
     w.kv(
         fi,

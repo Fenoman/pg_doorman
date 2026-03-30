@@ -2,29 +2,71 @@ use dashmap::DashMap;
 use log::warn;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::messages::Parse;
 use crate::utils::dashmap::new_dashmap_with_capacity;
 
 /// Global query string interner.
 /// This ensures that identical query texts share the same Arc<str> allocation,
-/// even when Arc<Parse> is evicted from the pool cache.
-/// The interner never evicts entries - they are kept as long as any client holds a reference.
-static QUERY_INTERNER: Lazy<DashMap<u64, Arc<str>>> = Lazy::new(|| DashMap::with_capacity(8192));
+/// while avoiding a permanent strong-reference root that would grow RSS forever.
+///
+/// Entries are stored as Weak<str> and are cleaned lazily, so query text is kept only
+/// while some live Parse still references it.
+static QUERY_INTERNER: Lazy<DashMap<u64, Weak<str>>> = Lazy::new(|| DashMap::with_capacity(8192));
+static QUERY_INTERNER_INSERTIONS: AtomicU64 = AtomicU64::new(0);
+const QUERY_INTERNER_CLEANUP_INTERVAL: u64 = 1024;
+const QUERY_INTERNER_MIN_CLEANUP_LEN: usize = 8192;
+
+fn cleanup_query_interner() {
+    if QUERY_INTERNER.len() < QUERY_INTERNER_MIN_CLEANUP_LEN {
+        return;
+    }
+    QUERY_INTERNER.retain(|_, value| value.strong_count() > 0);
+}
 
 /// Interns a query string, returning a shared Arc<str>.
 /// If the query was already interned, returns the existing Arc<str>.
 /// This is used to ensure query texts are shared between all Parse instances.
+///
+/// Uses DashMap entry API to avoid a race where two threads intern the same
+/// query simultaneously and end up with separate Arc<str> allocations.
 pub fn intern_query(query: &str, hash: u64) -> Arc<str> {
-    // Fast path: check if already interned
+    // Fast path (lock-free read): reuse live interned string if it is still around.
     if let Some(existing) = QUERY_INTERNER.get(&hash) {
-        return existing.clone();
+        if let Some(interned) = existing.value().upgrade() {
+            if &*interned == query {
+                return interned;
+            }
+        }
     }
 
-    // Slow path: intern the query
+    // Slow path: use entry API for atomic check-and-insert to prevent races.
     let arc_str: Arc<str> = Arc::from(query);
-    QUERY_INTERNER.entry(hash).or_insert(arc_str).clone()
+    let weak = Arc::downgrade(&arc_str);
+
+    match QUERY_INTERNER.entry(hash) {
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            // Another thread may have inserted between our get() and entry() call.
+            if let Some(existing) = entry.get().upgrade() {
+                if &*existing == query {
+                    return existing;
+                }
+            }
+            // Weak expired or hash collision — replace with our new entry.
+            entry.insert(weak);
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(weak);
+        }
+    }
+
+    let insertions = QUERY_INTERNER_INSERTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if insertions % QUERY_INTERNER_CLEANUP_INTERVAL == 0 {
+        cleanup_query_interner();
+    }
+
+    arc_str
 }
 
 /// Entry in the prepared statement cache with LRU ordering.
@@ -171,5 +213,30 @@ impl PreparedStatementCache {
         if let Some(name) = evicted_name {
             warn!("Evicted prepared statement {} from cache", name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{intern_query, QUERY_INTERNER};
+
+    #[test]
+    fn test_query_interner_does_not_keep_strong_references() {
+        let hash = 0xD00D_F00D_u64;
+        let query = "select 1";
+
+        let interned = intern_query(query, hash);
+        assert_eq!(std::sync::Arc::strong_count(&interned), 1);
+
+        let weak = QUERY_INTERNER
+            .get(&hash)
+            .expect("query should be interned")
+            .clone();
+
+        drop(interned);
+        assert!(
+            weak.upgrade().is_none(),
+            "global interner must not keep a strong reference alive"
+        );
     }
 }

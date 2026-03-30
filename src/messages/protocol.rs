@@ -535,6 +535,35 @@ pub fn command_complete(command: &str) -> BytesMut {
     res
 }
 
+/// Create a bind complete message.
+pub fn bind_complete() -> BytesMut {
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'2');
+    bytes.put_i32(4);
+    bytes
+}
+
+/// Create a parameter description message with the provided parameter types.
+pub fn parameter_description(param_types: &[i32]) -> BytesMut {
+    let mut bytes = BytesMut::new();
+    let len = 4 + 2 + 4 * param_types.len() as i32;
+    bytes.put_u8(b't');
+    bytes.put_i32(len);
+    bytes.put_i16(param_types.len() as i16);
+    for param in param_types {
+        bytes.put_i32(*param);
+    }
+    bytes
+}
+
+/// Create a no-data message.
+pub fn no_data() -> BytesMut {
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'n');
+    bytes.put_i32(4);
+    bytes
+}
+
 /// Create a notification message.
 /// NotificationResponse format (PostgreSQL protocol):
 ///   'A' (1 byte) + length (4 bytes) + process_id (4 bytes) + channel (null-terminated) + payload (null-terminated)

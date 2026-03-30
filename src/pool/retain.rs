@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -6,64 +7,141 @@ use rand::seq::SliceRandom;
 
 use crate::config::get_config;
 
+use super::APPLICATION_NAME_SUFFIX;
 use super::{get_all_pools, ConnectionPool};
 
 impl ConnectionPool {
     /// Retain pool connections based on idle timeout and lifetime settings.
     /// Returns the number of connections closed.
     /// If `max` is 0, all expired connections will be closed (unlimited).
-    /// If `max` > 0, at most `max` connections will be closed across all pools,
-    /// prioritizing the oldest connections first.
     pub fn retain_pool_connections(&self, count: Arc<AtomicUsize>, max: usize) -> usize {
-        // Closure to determine if a connection should be closed
-        // Uses per-connection timeouts with jitter to prevent mass closures
-        let should_close = |_: &crate::server::Server, metrics: &crate::pool::Metrics| -> bool {
-            // Check idle timeout (per-connection with jitter, 0 = disabled)
-            if metrics.idle_timeout_ms > 0 {
-                if let Some(v) = metrics.recycled {
-                    if (v.elapsed().as_millis() as u64) > metrics.idle_timeout_ms {
-                        return true;
-                    }
-                }
-            }
-            // Check server lifetime (per-connection with jitter, 0 = disabled)
-            if metrics.lifetime_ms > 0 && (metrics.age().as_millis() as u64) > metrics.lifetime_ms {
-                return true;
-            }
-            false
-        };
+        let min_pool_size = self.settings.min_pool_size;
+        let idle_timeout_ms = self.settings.idle_timeout_ms;
+        let life_time_ms = self.settings.life_time_ms;
 
-        // Calculate remaining quota for this pool
         let current_count = count.load(Ordering::Relaxed);
-        if max > 0 && current_count >= max {
-            return 0; // Quota exhausted, skip this pool
-        }
-        let max_to_close = if max > 0 {
-            max - current_count
+        let mut remaining = if max > 0 {
+            max.saturating_sub(current_count)
         } else {
-            0 // 0 means unlimited
+            usize::MAX
+        };
+        if remaining == 0 {
+            return 0;
+        }
+
+        let lifetime_removed = if life_time_ms > 0 {
+            self.database.retain_sorted(
+                |_, metrics| {
+                    metrics.lifetime_ms > 0
+                        && (metrics.age().as_millis() as u64) > metrics.lifetime_ms
+                },
+                |metrics| Reverse(metrics.age()),
+                0,
+                remaining,
+            )
+        } else {
+            0
         };
 
-        // Use retain_oldest_first which sorts by age when max > 0
-        let closed = self
-            .database
-            .retain_oldest_first(should_close, max_to_close);
-        count.fetch_add(closed, Ordering::Relaxed);
-
-        if closed > 0 {
+        if lifetime_removed > 0 {
             info!(
-                "[pool: {}][user: {}] closed {} idle connection{} (base_idle_timeout: {}ms±20%, base_lifetime: {}ms±20%, oldest_first: {})",
+                "[pool: {}][user: {}] rotated {} connection(s) due to server_lifetime (base={}ms±20%)",
                 self.address.pool_name,
                 self.address.username,
-                closed,
-                if closed == 1 { "" } else { "s" },
-                self.settings.idle_timeout_ms,
-                self.settings.life_time_ms,
-                max > 0,
+                lifetime_removed,
+                life_time_ms
             );
         }
 
-        closed
+        remaining = remaining.saturating_sub(lifetime_removed);
+        if remaining == 0 {
+            count.fetch_add(lifetime_removed, Ordering::Relaxed);
+            return lifetime_removed;
+        }
+
+        let idle_removed = if idle_timeout_ms > 0 {
+            self.database.retain_sorted(
+                |_, metrics| {
+                    metrics.idle_timeout_ms > 0
+                        && metrics
+                            .recycled
+                            .map(|v| (v.elapsed().as_millis() as u64) > metrics.idle_timeout_ms)
+                            .unwrap_or(false)
+                },
+                |metrics| metrics.age(),
+                min_pool_size,
+                remaining,
+            )
+        } else {
+            0
+        };
+
+        if idle_removed > 0 {
+            info!(
+                "[pool: {}][user: {}] rotated {} connection(s) due to idle_timeout (base={}ms±20%, min_pool_size={})",
+                self.address.pool_name,
+                self.address.username,
+                idle_removed,
+                idle_timeout_ms,
+                min_pool_size
+            );
+        }
+
+        let removed = lifetime_removed.saturating_add(idle_removed);
+        count.fetch_add(removed, Ordering::Relaxed);
+        removed
+    }
+
+    /// Pre-warm the pool by creating connections up to min_pool_size.
+    /// Avoids spawning many tasks while still forcing new connections to be created.
+    /// Returns the number of connections successfully created.
+    pub async fn warm_up(&self, log_on_startup: bool) -> usize {
+        let min_pool_size = self.settings.min_pool_size;
+        if min_pool_size == 0 {
+            return 0;
+        }
+
+        let size_before = self.pool_state().size;
+        let connections_to_create = min_pool_size.saturating_sub(size_before);
+
+        if connections_to_create == 0 {
+            return 0;
+        }
+
+        if log_on_startup {
+            info!(
+                "[pool: {}][user: {}] Pre-warming pool with {} connections (min_pool_size: {})",
+                self.address.pool_name, self.address.username, connections_to_create, min_pool_size
+            );
+        }
+
+        // Use replenish() instead of get() so warm-up really creates missing backends
+        // even when the pool still has some idle connections available.
+        let created = APPLICATION_NAME_SUFFIX
+            .scope("warm_up".to_string(), async {
+                self.database.replenish(connections_to_create).await
+            })
+            .await;
+
+        if log_on_startup {
+            if created < connections_to_create {
+                warn!(
+                    "[pool: {}][user: {}] Pre-warming completed: {} created, {} failed",
+                    self.address.pool_name,
+                    self.address.username,
+                    created,
+                    connections_to_create - created
+                );
+            } else if created > 0 {
+                info!(
+                    "[pool: {}][user: {}] Pre-warming completed: {} connections created",
+                    self.address.pool_name, self.address.username, created
+                );
+            }
+        }
+
+        let size_after = self.pool_state().size;
+        size_after.saturating_sub(size_before)
     }
 
     /// Drain all idle connections from the pool during graceful shutdown.
@@ -72,7 +150,6 @@ impl ConnectionPool {
         let status_before = self.database.status();
         let idle_before = status_before.available;
 
-        // Close all idle connections by returning false for all
         self.database.retain(|_, _| false);
 
         let status_after = self.database.status();
@@ -109,41 +186,10 @@ pub async fn retain_connections() {
         }
     );
 
-    // Prewarm pools with min_pool_size before the first retain cycle
-    for (_, pool) in get_all_pools().iter() {
-        if let Some(min_pool_size) = pool.settings.user.min_pool_size {
-            let min = min_pool_size as usize;
-            let created = pool.database.replenish(min).await;
-            if created > 0 {
-                info!(
-                    "[pool: {}][user: {}] prewarmed {} connection{} (min_pool_size: {})",
-                    pool.address.pool_name,
-                    pool.address.username,
-                    created,
-                    if created == 1 { "" } else { "s" },
-                    min,
-                );
-            } else {
-                warn!(
-                    "[pool: {}][user: {}] prewarm failed — could not create connections (min_pool_size: {})",
-                    pool.address.pool_name,
-                    pool.address.username,
-                    min,
-                );
-            }
-        }
-    }
-
     loop {
         interval.tick().await;
 
-        // Use a single snapshot for both retain and replenish phases
-        // to avoid inconsistency if POOLS is atomically updated between them.
         let pools = get_all_pools();
-
-        // Shuffle pool iteration order for fair retain_connections_max distribution.
-        // HashMap iteration order is deterministic within a process (fixed RandomState seed),
-        // so without shuffling the same pool always gets the entire quota.
         let mut pool_refs: Vec<_> = pools.values().collect();
         pool_refs.shuffle(&mut rand::rng());
 
@@ -152,14 +198,13 @@ pub async fn retain_connections() {
         }
         count.store(0, Ordering::Relaxed);
 
-        // Replenish pools below min_pool_size
         for pool in &pool_refs {
-            // Don't replenish paused pools — no new connections during PAUSE
             if pool.database.is_paused() {
                 continue;
             }
-            if let Some(min_pool_size) = pool.settings.user.min_pool_size {
-                let min = min_pool_size as usize;
+
+            let min = pool.settings.min_pool_size;
+            if min > 0 {
                 let current_size = pool.database.status().size;
                 if current_size < min {
                     let deficit = min - current_size;
@@ -185,6 +230,20 @@ pub async fn retain_connections() {
                 }
             }
         }
+    }
+}
+
+/// Pre-warm all pools that have min_pool_size configured.
+/// This should be called after pool creation to ensure minimum connections are ready.
+pub async fn warm_up_pools() {
+    let pools = get_all_pools();
+    let mut handles = Vec::new();
+    for (_, pool) in pools.iter() {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move { pool.warm_up(true).await }));
+    }
+    for handle in handles {
+        let _ = handle.await;
     }
 }
 

@@ -365,6 +365,14 @@ impl Bind {
         cursor.read_string()
     }
 
+    /// Gets the portal name from the buffer
+    pub fn get_portal(buf: &BytesMut) -> Result<String, Error> {
+        let mut cursor = std::io::Cursor::new(buf);
+        // Skip the code and length
+        cursor.advance(mem::size_of::<u8>() + mem::size_of::<i32>());
+        cursor.read_string()
+    }
+
     /// Renames the prepared statement to a new name
     pub fn rename(buf: BytesMut, new_name: &str) -> Result<BytesMut, Error> {
         let mut cursor = std::io::Cursor::new(&buf);

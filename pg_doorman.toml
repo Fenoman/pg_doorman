@@ -214,6 +214,10 @@ worker_cpu_affinity_pinning = false
 # Default: false
 server_round_robin = false
 
+# Prefer oldest server connections first (overrides server_round_robin when true).
+# Default: false
+oldest_first = false
+
 # Track and replay a subset of session parameters on each new backend in transaction mode.
 # Tracked parameters: client_encoding, DateStyle, TimeZone, standard_conforming_strings, application_name.
 # Adds a SET roundtrip per checkout. Disabled by default.

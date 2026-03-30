@@ -685,6 +685,20 @@ fields:
         Similar to PgBouncer's `server_round_robin`.
       default: "false"
 
+    oldest_first:
+      config:
+        en: |
+          Prefer oldest idle server connections first.
+          Overrides server_round_robin when enabled.
+        ru: |
+          Предпочитать самые старые простаивающие серверные соединения.
+          При включении имеет приоритет над server_round_robin.
+      doc: |
+        When enabled, pg_doorman returns the oldest idle backend connection first.
+        This helps preserve long-lived connections that may accumulate useful session state
+        such as temp tables. Overrides `server_round_robin`.
+      default: "false"
+
     sync_server_parameters:
       config:
         en: |

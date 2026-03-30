@@ -21,6 +21,12 @@ use crate::server::{Server, ServerParameters};
 use crate::stats::auth_query::AuthQueryStats;
 use crate::stats::{AddressStats, ServerStats};
 
+tokio::task_local! {
+    /// Suffix to append to application_name for connections created in this task.
+    /// Used by warm_up to identify pre-warmed connections.
+    pub static APPLICATION_NAME_SUFFIX: String;
+}
+
 mod errors;
 mod inner;
 mod types;
@@ -218,6 +224,9 @@ pub struct PoolSettings {
 
     idle_timeout_ms: u64,
     life_time_ms: u64,
+
+    /// Minimum pool size to keep warm connections ready.
+    min_pool_size: usize,
 }
 
 impl Default for PoolSettings {
@@ -229,6 +238,7 @@ impl Default for PoolSettings {
             idle_timeout_ms: General::default_idle_timeout().as_millis(),
             life_time_ms: General::default_server_lifetime().as_millis(),
             sync_server_parameters: General::default_sync_server_parameters(),
+            min_pool_size: 0,
         }
     }
 }
@@ -374,16 +384,20 @@ impl ConnectionPool {
                     pool_mode == PoolMode::Session,
                 );
 
-                let queue_strategy = match config.general.server_round_robin {
-                    true => QueueMode::Fifo,
-                    false => QueueMode::Lifo,
+                let queue_strategy = if config.general.oldest_first {
+                    QueueMode::OldestFirst
+                } else if config.general.server_round_robin {
+                    QueueMode::Fifo
+                } else {
+                    QueueMode::Lifo
                 };
 
                 info!("[pool: {}][user: {}]", pool_name, user.username);
 
+                let max_size = user.pool_size as usize;
                 let mut builder_config = Pool::builder(manager);
                 builder_config = builder_config.config(PoolConfig {
-                    max_size: user.pool_size as usize,
+                    max_size,
                     timeouts: Timeouts {
                         wait: Some(config.general.query_wait_timeout.as_std()),
                         create: Some(config.general.connect_timeout.as_std()),
@@ -392,6 +406,15 @@ impl ConnectionPool {
                     queue_mode: queue_strategy,
                     scaling: pool_config.resolve_scaling_config(&config.general),
                 });
+
+                let min_pool_size_raw = user.min_pool_size.unwrap_or(0) as usize;
+                let min_pool_size = min_pool_size_raw.min(max_size);
+                if min_pool_size_raw > max_size {
+                    warn!(
+                        "[pool: {}][user: {}] min_pool_size ({}) exceeds pool_size ({}), clamping",
+                        pool_name, user.username, min_pool_size_raw, max_size
+                    );
+                }
 
                 let pool = builder_config.build();
 
@@ -413,6 +436,7 @@ impl ConnectionPool {
                             .server_lifetime
                             .unwrap_or(config.general.server_lifetime.as_millis()),
                         sync_server_parameters: config.general.sync_server_parameters,
+                        min_pool_size,
                     },
                     prepared_statement_cache: match config.general.prepared_statements {
                         false => None,
@@ -529,9 +553,12 @@ impl ConnectionPool {
                             pool_mode == PoolMode::Session,
                         );
 
-                        let queue_strategy = match config.general.server_round_robin {
-                            true => QueueMode::Fifo,
-                            false => QueueMode::Lifo,
+                        let queue_strategy = if config.general.oldest_first {
+                            QueueMode::OldestFirst
+                        } else if config.general.server_round_robin {
+                            QueueMode::Fifo
+                        } else {
+                            QueueMode::Lifo
                         };
 
                         info!(
@@ -539,9 +566,12 @@ impl ConnectionPool {
                             pool_name, shared_user.username
                         );
 
+                        let max_size = shared_user.pool_size as usize;
+                        let min_pool_size = shared_user.min_pool_size.unwrap_or(0) as usize;
+
                         let pool = Pool::builder(manager)
                             .config(PoolConfig {
-                                max_size: shared_user.pool_size as usize,
+                                max_size,
                                 timeouts: Timeouts {
                                     wait: Some(config.general.query_wait_timeout.as_std()),
                                     create: Some(config.general.connect_timeout.as_std()),
@@ -571,6 +601,7 @@ impl ConnectionPool {
                                     .server_lifetime
                                     .unwrap_or(config.general.server_lifetime.as_millis()),
                                 sync_server_parameters: config.general.sync_server_parameters,
+                                min_pool_size: min_pool_size.min(max_size),
                             },
                             prepared_statement_cache: match config.general.prepared_statements {
                                 false => None,
@@ -873,6 +904,11 @@ impl ServerPool {
 
         stats.register(stats.clone());
 
+        // Check if there's a suffix to append to application_name (used by warm_up)
+        let application_name = APPLICATION_NAME_SUFFIX
+            .try_with(|suffix| format!("{}|{}", self.application_name, suffix))
+            .unwrap_or_else(|_| self.application_name.clone());
+
         // Connect to the PostgreSQL server.
         match Server::startup(
             &self.address,
@@ -883,7 +919,7 @@ impl ServerPool {
             self.cleanup_connections,
             self.log_client_parameter_status_changes,
             self.prepared_statement_cache_size,
-            self.application_name.clone(),
+            application_name,
             self.session_mode,
         )
         .await
@@ -1146,14 +1182,20 @@ pub fn create_dynamic_pool(
         pool_mode == PoolMode::Session,
     );
 
-    let queue_strategy = match config.general.server_round_robin {
-        true => QueueMode::Fifo,
-        false => QueueMode::Lifo,
+    let queue_strategy = if config.general.oldest_first {
+        QueueMode::OldestFirst
+    } else if config.general.server_round_robin {
+        QueueMode::Fifo
+    } else {
+        QueueMode::Lifo
     };
+
+    let max_size = user.pool_size as usize;
+    let min_pool_size = user.min_pool_size.unwrap_or(0) as usize;
 
     let pool = Pool::builder(manager)
         .config(PoolConfig {
-            max_size: user.pool_size as usize,
+            max_size,
             timeouts: Timeouts {
                 wait: Some(config.general.query_wait_timeout.as_std()),
                 create: Some(config.general.connect_timeout.as_std()),
@@ -1180,6 +1222,7 @@ pub fn create_dynamic_pool(
                 .server_lifetime
                 .unwrap_or(config.general.server_lifetime.as_millis()),
             sync_server_parameters: config.general.sync_server_parameters,
+            min_pool_size: min_pool_size.min(max_size),
         },
         prepared_statement_cache: match config.general.prepared_statements {
             false => None,

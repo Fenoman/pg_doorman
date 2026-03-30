@@ -40,7 +40,7 @@ fn gc_idle_dynamic_pools() {
                     continue;
                 }
                 // Don't GC pools with min_pool_size — retain cycle manages them
-                if pool.settings.user.min_pool_size.unwrap_or(0) > 0 {
+                if pool.settings.min_pool_size > 0 {
                     debug!("GC: dynamic pool {id} has min_pool_size > 0, skipping despite size=0");
                     continue;
                 }
