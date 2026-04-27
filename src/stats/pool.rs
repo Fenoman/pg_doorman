@@ -99,8 +99,14 @@ pub struct PoolStats {
     /// Total time clients spent waiting for server connections (microseconds)
     pub wait_time: u64,
 
-    /// Total number of errors encountered
+    /// Average errors per period (from address.averages)
     pub errors: u64,
+
+    /// Cumulative total errors (from address.total)
+    pub total_errors: u64,
+
+    /// Total number of prewarm_query failures
+    pub prewarm_failures: u64,
 
     /// Percentile statistics for transaction execution times (from HDR histogram)
     pub xact_percentile: Percentile,
@@ -233,6 +239,8 @@ impl PoolStats {
             query_time: 0,
             wait_time: 0,
             errors: 0,
+            total_errors: 0,
+            prewarm_failures: 0,
             // Percentiles from HDR histogram
             xact_percentile,
             query_percentile,
@@ -417,6 +425,7 @@ impl PoolStats {
             ("total_query_time", DataType::Numeric),
             ("total_wait_time", DataType::Numeric),
             ("total_errors", DataType::Numeric),
+            ("total_prewarm_failures", DataType::Numeric),
             ("avg_xact_count", DataType::Numeric),
             ("avg_query_count", DataType::Numeric),
             ("avg_recv", DataType::Numeric),
@@ -439,7 +448,8 @@ impl PoolStats {
             Cow::Owned(self.total_xact_time_microseconds.to_string()),
             Cow::Owned(self.total_query_time_microseconds.to_string()),
             Cow::Owned(self.wait_time.to_string()),
-            Cow::Owned(self.errors.to_string()),
+            Cow::Owned(self.total_errors.to_string()),
+            Cow::Owned(self.prewarm_failures.to_string()),
             Cow::Owned(self.avg_xact_count.to_string()),
             Cow::Owned(self.avg_query_count.to_string()),
             Cow::Owned(self.avg_recv.to_string()),
@@ -513,6 +523,8 @@ impl PoolStats {
                 .query_time_microseconds
                 .load(Ordering::Relaxed);
             current.errors = address.averages.errors.load(Ordering::Relaxed);
+            current.total_errors = address.total.errors.load(Ordering::Relaxed);
+            current.prewarm_failures = address.total.prewarm_failures.load(Ordering::Relaxed);
 
             // Load total statistics
             current.bytes_received = address.total.bytes_received.load(Ordering::Relaxed);

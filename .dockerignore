@@ -2,3 +2,10 @@ target/
 .git/
 .claude/
 .claude-memory-compiler/
+.github/
+documentation/
+docs/
+debian/
+scripts/
+*.md
+!README.md

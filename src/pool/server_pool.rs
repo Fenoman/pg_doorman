@@ -12,7 +12,7 @@ use log::{debug, info, warn};
 use tokio::sync::{Notify, Semaphore};
 
 use crate::config::{Address, User};
-use crate::errors::Error;
+use crate::errors::{Error, ServerIdentifier};
 use crate::server::Server;
 use crate::stats::ServerStats;
 use crate::utils::format_duration_ms;
@@ -58,6 +58,12 @@ pub struct ServerPool {
     /// Idle timeout in milliseconds (0 = disabled).
     /// Connections idle longer than this are closed by retain.
     idle_timeout_ms: u64,
+
+    /// SQL executed once after creating a new physical backend connection.
+    prewarm_query: String,
+
+    /// Pool-level release query config. None means use pg_doorman's default.
+    release_query: Option<String>,
 
     /// Time after which idle connections should be checked before reuse (0 = disabled).
     idle_check_timeout_ms: u64,
@@ -134,6 +140,8 @@ impl ServerPool {
             application_name,
             lifetime_ms,
             idle_timeout_ms,
+            prewarm_query: String::new(),
+            release_query: None,
             idle_check_timeout_ms,
             connect_timeout,
             pool_state: AtomicU64::new(0),
@@ -141,6 +149,68 @@ impl ServerPool {
             session_mode,
             fallback_state,
         }
+    }
+
+    pub fn with_prewarm_query(mut self, prewarm_query: String) -> ServerPool {
+        self.prewarm_query = prewarm_query;
+        self
+    }
+
+    pub fn with_release_query(mut self, release_query: Option<String>) -> ServerPool {
+        self.release_query = release_query;
+        self
+    }
+
+    /// Returns the effective username for error reporting in prewarm context.
+    fn prewarm_username(&self) -> String {
+        self.user
+            .server_username
+            .as_deref()
+            .unwrap_or(&self.user.username)
+            .to_string()
+    }
+
+    fn prewarm_server_id(&self) -> ServerIdentifier {
+        ServerIdentifier::new(
+            self.prewarm_username(),
+            &self.database,
+            &self.address.pool_name,
+        )
+    }
+
+    async fn run_prewarm_query(&self, conn: &mut Server) -> Result<(), Error> {
+        if self.prewarm_query.trim().is_empty() {
+            return Ok(());
+        }
+
+        conn.last_error_response = None;
+        if let Err(err) = conn.small_simple_query(&self.prewarm_query).await {
+            self.address.stats.prewarm_failure();
+            warn!(
+                "[{}@{}] prewarm_query I/O error on new server connection: {}",
+                self.address.username, self.address.pool_name, err
+            );
+            conn.mark_bad("prewarm_query I/O error");
+            return Err(Error::ServerStartupError(
+                format!("prewarm_query failed: {err}"),
+                self.prewarm_server_id(),
+            ));
+        }
+
+        if let Some(sql_err) = conn.last_error_response.take() {
+            self.address.stats.prewarm_failure();
+            warn!(
+                "[{}@{}] prewarm_query SQL error on new server connection: {}",
+                self.address.username, self.address.pool_name, sql_err
+            );
+            conn.mark_bad("prewarm_query SQL error");
+            return Err(Error::ServerStartupError(
+                format!("prewarm_query SQL error: {sql_err}"),
+                self.prewarm_server_id(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Attempts to create a new connection.
@@ -285,7 +355,9 @@ impl ServerPool {
         };
 
         match result {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                conn.set_release_query(self.release_query.as_deref());
+                self.run_prewarm_query(&mut conn).await?;
                 // Permit is released automatically when _permit goes out of scope
                 conn.stats.idle(0);
                 Ok(conn)
@@ -414,6 +486,8 @@ impl ServerPool {
 
         match result {
             Ok(mut conn) => {
+                conn.set_release_query(self.release_query.as_deref());
+                self.run_prewarm_query(&mut conn).await?;
                 conn.stats.idle(0);
                 conn.override_lifetime_ms = Some(target.lifetime_ms);
                 Ok(conn)

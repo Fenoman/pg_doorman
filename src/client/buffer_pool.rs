@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 
 const DEFAULT_BUFFER_CAPACITY: usize = 8192;
 const BUFFER_SHRINK_THRESHOLD: usize = 4 * DEFAULT_BUFFER_CAPACITY; // 32KB
-const MAX_POOL_SIZE: usize = 512; // ~5MB per thread
+const MAX_POOL_SIZE: usize = 128; // ~1MB per thread (was 512 = ~5MB)
 
 thread_local! {
     static LOCAL_POOL: RefCell<Vec<BytesMut>> = RefCell::new(Vec::with_capacity(MAX_POOL_SIZE));

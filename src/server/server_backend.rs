@@ -34,6 +34,29 @@ use super::{prepared_statements, protocol_io, startup_cancel};
 /// Buffer flush threshold in bytes (8 KiB).
 /// When the buffer reaches this size, it will be flushed to avoid excessive memory usage.
 const BUFFER_FLUSH_THRESHOLD: usize = 8192;
+const RELEASE_SESSION_QUERY: &str = r#"
+SELECT pg_advisory_unlock_all();
+SELECT public.pgv_free();
+"#;
+
+fn resolve_release_query(configured: Option<&str>) -> Option<Arc<str>> {
+    match configured {
+        None => Some(Arc::from(RELEASE_SESSION_QUERY)),
+        Some("") => None,
+        Some(query) => Some(Arc::from(query)),
+    }
+}
+
+fn sql_string_literal(value: &str) -> String {
+    let mut tag = 0_u32;
+    loop {
+        let delimiter = format!("$pgdoorman{tag}$");
+        if !value.contains(&delimiter) {
+            return format!("{delimiter}{value}{delimiter}");
+        }
+        tag += 1;
+    }
+}
 
 /// Represents a connection to a PostgreSQL server (backend).
 ///
@@ -115,6 +138,10 @@ pub struct Server {
     /// before returning them to the pool. If false, discard dirty connections instead.
     cleanup_connections: bool,
 
+    /// SQL executed after checkin cleanup before returning the connection to the pool.
+    /// None means the release query is disabled for this pool.
+    release_query: Option<Arc<str>>,
+
     /// Configuration flag: if true, log when server parameters change for debugging purposes.
     pub(crate) log_client_parameter_status_changes: bool,
 
@@ -164,6 +191,11 @@ pub struct Server {
     /// Per-connection lifetime override (ms). Set on fallback connections so
     /// they expire before the local backend recovers.
     pub(crate) override_lifetime_ms: Option<u64>,
+
+    /// Captures the last ErrorResponse message from the server.
+    /// Used by callers of `small_simple_query` to detect SQL-level errors
+    /// that are otherwise silently consumed by the simple query protocol handler.
+    pub(crate) last_error_response: Option<String>,
 }
 
 impl std::fmt::Display for Server {
@@ -181,20 +213,43 @@ impl std::fmt::Display for Server {
     }
 }
 
+/// Timeout for housekeeping operations (RESET ALL, DEALLOCATE ALL, alive check, etc.).
+/// These are short queries that should never take more than a few seconds.
+/// If a backend doesn't respond within this time, it is considered dead.
+const HOUSEKEEPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Server {
     /// Execute an arbitrary query against the server.
     /// It will use the simple query protocol.
     /// Result will not be returned, so this is useful for things like `SET` or `ROLLBACK`.
+    ///
+    /// Uses a single HOUSEKEEPING_TIMEOUT deadline for the full send+recv cycle
+    /// to prevent indefinite hangs if the backend stops making progress.
     pub async fn small_simple_query(&mut self, query: &str) -> Result<(), Error> {
         let query = simple_query(query);
-
-        self.send_and_flush(&query).await?;
+        let deadline = tokio::time::Instant::now() + HOUSEKEEPING_TIMEOUT;
+        match tokio::time::timeout_at(deadline, self.send_and_flush(&query)).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                self.mark_bad("housekeeping send timeout in small_simple_query");
+                return Err(Error::SocketError(
+                    "Timeout sending housekeeping query".to_string(),
+                ));
+            }
+        }
 
         let mut noop = tokio::io::sink();
         loop {
-            match self.recv(&mut noop, None).await {
-                Ok(_) => (),
-                Err(err) => return Err(err),
+            match tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await {
+                Ok(Ok(_)) => (),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    self.mark_bad("housekeeping recv timeout in small_simple_query");
+                    return Err(Error::SocketError(
+                        "Timeout waiting for response to housekeeping query".to_string(),
+                    ));
+                }
             }
 
             if !self.data_available {
@@ -206,18 +261,34 @@ impl Server {
     }
 
     /// Check if the connection is alive by sending a minimal query (`;`).
-    /// Uses the provided timeout for the operation.
+    /// Uses the provided timeout for the entire operation (send + recv).
     /// Returns Ok(()) if connection is alive, Err if dead or timeout exceeded.
     pub async fn check_alive(&mut self, timeout: Duration) -> Result<(), Error> {
         let query = simple_query(";");
+        let deadline = tokio::time::Instant::now() + timeout;
 
-        self.send_and_flush_timeout(&query, timeout).await?;
+        match tokio::time::timeout_at(deadline, self.send_and_flush(&query)).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                self.mark_bad("alive check send timeout");
+                return Err(Error::SocketError(
+                    "Timeout sending alive check query".to_string(),
+                ));
+            }
+        }
 
         let mut noop = tokio::io::sink();
         loop {
-            match self.recv(&mut noop, None).await {
-                Ok(_) => (),
-                Err(err) => return Err(err),
+            match tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await {
+                Ok(Ok(_)) => (),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    self.mark_bad("alive check recv timeout");
+                    return Err(Error::SocketError(
+                        "Timeout waiting for alive check response".to_string(),
+                    ));
+                }
             }
 
             if !self.data_available {
@@ -487,6 +558,40 @@ impl Server {
         Ok(())
     }
 
+    /// Perform cleanup and release advisory locks/temp memory before returning to pool.
+    /// If the release query fails (I/O or SQL error), the connection is marked bad
+    /// so it won't be reused with dirty session state.
+    pub async fn finalize_checkin(&mut self) -> Result<(), Error> {
+        // Ensure we're not in async mode before housekeeping queries —
+        // small_simple_query uses recv() which behaves differently in async mode.
+        self.set_async_mode(false);
+        self.set_expected_responses(0);
+        self.checkin_cleanup().await?;
+        let Some(release_query) = self.release_query.clone() else {
+            return Ok(());
+        };
+        self.last_error_response = None;
+        self.small_simple_query(&release_query).await?;
+        if let Some(sql_err) = self.last_error_response.take() {
+            log::warn!(
+                "[{}@{}] finalize_checkin SQL error pid={}: {}",
+                self.address.username,
+                self.address.pool_name,
+                self.process_id,
+                sql_err
+            );
+            self.mark_bad("finalize_checkin SQL error");
+            return Err(Error::SocketError(format!(
+                "finalize_checkin SQL error: {sql_err}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_release_query(&mut self, release_query: Option<&str>) {
+        self.release_query = resolve_release_query(release_query);
+    }
+
     /// We don't buffer all of server responses, e.g. COPY OUT produces too much data.
     /// The client is responsible to call `self.recv()` while this method returns true.
     #[inline(always)]
@@ -538,6 +643,18 @@ impl Server {
             &self.stats,
             name,
         );
+    }
+
+    /// Forget a prepared statement that has been explicitly Closed by the client.
+    ///
+    /// Client Close messages are forwarded inside the current extended-protocol
+    /// batch.  If pg_doorman keeps the server-side name in its LRU or deferred
+    /// eviction list, a following Parse for the same client statement can be
+    /// skipped even though PostgreSQL has just received Close for that server
+    /// name.
+    pub fn forget_prepared_statement(&mut self, name: &str) {
+        self.remove_prepared_statement_from_cache(name);
+        self.deferred_eviction_closes.retain(|n| n != name);
     }
 
     /// Register a prepared statement on the server.
@@ -698,17 +815,30 @@ impl Server {
             return Ok(());
         }
 
-        let mut query = String::from("");
+        let mut query = String::new();
 
         for (key, value) in parameter_diff {
-            query.push_str(&format!("SET {key} TO '{value}';"));
+            // Keys are safe — they come from a fixed whitelist (TRACKED_PARAMETERS),
+            // but values originate from client startup packets (e.g. application_name).
+            query.push_str(&format!("SET {key} TO {};", sql_string_literal(&value)));
         }
 
-        let res = self.small_simple_query(&query).await;
+        self.last_error_response = None;
+        self.small_simple_query(&query).await?;
+        if let Some(sql_err) = self.last_error_response.take() {
+            warn!(
+                "[{}@{}] sync_parameters SQL error pid={}: {}",
+                self.address.username, self.address.pool_name, self.process_id, sql_err
+            );
+            self.mark_bad("sync_parameters SQL error");
+            return Err(Error::SocketError(format!(
+                "sync_parameters SQL error: {sql_err}"
+            )));
+        }
 
         self.cleanup_state.reset();
 
-        res
+        Ok(())
     }
 
     /// Issue a query cancellation request to the server.
@@ -964,6 +1094,7 @@ impl Server {
                         application_name,
                         last_activity: SystemTime::now(),
                         cleanup_connections,
+                        release_query: resolve_release_query(None),
                         log_client_parameter_status_changes,
                         prepared_statement_cache: match prepared_statement_cache_size {
                             0 => None,
@@ -981,6 +1112,7 @@ impl Server {
                         pending_large_message: None,
                         close_reason: None,
                         override_lifetime_ms: None,
+                        last_error_response: None,
                     };
                     server.stats.update_process_id(process_id);
                     server.stats.set_tls(connected_with_tls);
@@ -1012,6 +1144,8 @@ impl Drop for Server {
             let mut guard = CANCELED_PIDS.lock();
             guard.remove(&self.process_id);
         }
+        // Clean up debug protocol state to prevent unbounded PROTOCOL_STATES growth
+        crate::utils::debug_messages::remove_protocol_state(self.process_id);
         if !self.is_bad() {
             let mut bytes = BytesMut::with_capacity(5);
             bytes.put_u8(b'X');
@@ -1048,5 +1182,52 @@ impl Drop for Server {
                 self.address.username, self.address.pool_name, self.process_id, session,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_release_query, sql_string_literal, RELEASE_SESSION_QUERY};
+
+    #[test]
+    fn release_query_absent_uses_historical_default() {
+        let query = resolve_release_query(None).expect("default release query");
+        assert_eq!(&*query, RELEASE_SESSION_QUERY);
+        assert_eq!(
+            &*query,
+            r#"
+SELECT pg_advisory_unlock_all();
+SELECT public.pgv_free();
+"#
+        );
+        assert!(!query.contains("to_regprocedure"));
+    }
+
+    #[test]
+    fn release_query_empty_disables_release_cleanup() {
+        assert!(resolve_release_query(Some("")).is_none());
+    }
+
+    #[test]
+    fn release_query_custom_is_used_exactly() {
+        let query = " SELECT 1;  ";
+        let resolved = resolve_release_query(Some(query)).expect("custom release query");
+        assert_eq!(&*resolved, query);
+    }
+
+    #[test]
+    fn sql_string_literal_uses_safe_dollar_quote() {
+        assert_eq!(
+            sql_string_literal("app'; RESET ALL; --"),
+            "$pgdoorman0$app'; RESET ALL; --$pgdoorman0$"
+        );
+    }
+
+    #[test]
+    fn sql_string_literal_chooses_unused_delimiter() {
+        assert_eq!(
+            sql_string_literal("prefix $pgdoorman0$ suffix"),
+            "$pgdoorman1$prefix $pgdoorman0$ suffix$pgdoorman1$"
+        );
     }
 }

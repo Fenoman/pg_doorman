@@ -31,6 +31,9 @@ pub struct AddressStatFields {
 
     /// Number of errors encountered
     pub errors: AtomicU64,
+
+    /// Number of prewarm_query failures during connection creation
+    pub prewarm_failures: AtomicU64,
 }
 
 /// Maximum trackable time in microseconds for HDR histogram (10 minutes)
@@ -151,6 +154,10 @@ impl IntoIterator for &AddressStats {
             (
                 "total_errors".to_string(),
                 self.total.errors.load(Ordering::Relaxed) as f64,
+            ),
+            (
+                "total_prewarm_failures".to_string(),
+                self.total.prewarm_failures.load(Ordering::Relaxed) as f64,
             ),
             // Average statistics
             (
@@ -332,6 +339,15 @@ impl AddressStats {
         self.current.errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the prewarm failure counter. Called only on the error path
+    /// of connection creation when prewarm_query fails (I/O or SQL error).
+    pub fn prewarm_failure(&self) {
+        self.total.prewarm_failures.fetch_add(1, Ordering::Relaxed);
+        self.current
+            .prewarm_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns transaction time percentiles (p50, p90, p95, p99) in microseconds.
     ///
     /// Uses HDR histogram for O(1) percentile calculation.
@@ -494,6 +510,11 @@ impl AddressStats {
         self.averages
             .errors
             .store(current_errors / stat_period_per_second, Ordering::Relaxed);
+
+        let current_prewarm = self.current.prewarm_failures.load(Ordering::Relaxed);
+        self.averages
+            .prewarm_failures
+            .store(current_prewarm / stat_period_per_second, Ordering::Relaxed);
     }
 
     /// Resets all current period counters to zero.
@@ -519,6 +540,7 @@ impl AddressStats {
         // Reset wait time and error counters
         self.current.wait_time.store(0, Ordering::Relaxed);
         self.current.errors.store(0, Ordering::Relaxed);
+        self.current.prewarm_failures.store(0, Ordering::Relaxed);
     }
 
     /// Populates a row vector with string representations of all statistics.
@@ -923,7 +945,7 @@ mod tests {
         stats.populate_row(&mut row);
 
         // Check that the row has the expected number of elements
-        assert_eq!(row.len(), 16); // 8 total stats + 8 average stats
+        assert_eq!(row.len(), 17); // 9 total stats + 8 average stats
 
         // Check that the first element is "10" (total_xact_count)
         assert_eq!(row[0], "10");

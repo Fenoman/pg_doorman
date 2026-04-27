@@ -1,11 +1,11 @@
 @rust @rust-deferred-begin-bug
-Feature: Deferred BEGIN optimization bug with extended protocol
-  Test that pg_doorman correctly handles transaction state when deferred BEGIN
-  is followed by ROLLBACK without any actual queries in extended protocol.
+Feature: BEGIN/ROLLBACK transaction state does not desync
+  Test that pg_doorman correctly handles transaction state when an empty
+  transaction is followed by ROLLBACK before the connection is reused.
 
-  This reproduces the bug where:
-  1. Client sends BEGIN (deferred - no server connection allocated)
-  2. pg_doorman responds with ReadyForQuery('T') synthetically
+  This guards against a stale state bug where:
+  1. Client sends BEGIN
+  2. pg_doorman responds with ReadyForQuery('T')
   3. Client sends ROLLBACK and closes connection
   4. Connection returned to pool with stale transaction state
   5. Next client reuses connection and gets InterfaceError
@@ -56,11 +56,10 @@ Feature: Deferred BEGIN optimization bug with extended protocol
     And session "session1" should receive CommandComplete "BEGIN"
     And session "session1" should receive ReadyForQuery "T"
 
-    # Check that no server backend is actually allocated
+    # Extended protocol goes through the backend to get a real ParseComplete.
     When we create admin session "admin" to pg_doorman as "admin" with password "admin"
     And we execute "show pools" on admin session "admin" and store response
-    # sv_active should be 0 because BEGIN was deferred
-    Then admin session "admin" column "sv_active" should be between 0 and 0
+    Then admin session "admin" column "sv_active" should be between 1 and 1
 
     # Now send ROLLBACK and disconnect
     And we send Parse "" with query "ROLLBACK" to session "session1"
@@ -101,7 +100,6 @@ Feature: Deferred BEGIN optimization bug with extended protocol
 
     Then session "session2" should receive ParseComplete
     And session "session2" should receive BindComplete
-    And session "session2" should receive RowDescription with 1 fields
     And session "session2" should receive DataRow
     And session "session2" should receive CommandComplete "SELECT 1"
     And session "session2" should receive ReadyForQuery "T"
@@ -112,8 +110,8 @@ Feature: Deferred BEGIN optimization bug with extended protocol
 
     When we create session "client1" to pg_doorman as "example_user_1" with password "" and database "example_db"
 
-    # Send BEGIN - deferred optimization
-    And we send SimpleQuery "BEGIN" to session "client1"
+    # Send BEGIN - deferred optimization for standalone simple-query BEGIN;
+    And we send SimpleQuery "BEGIN;" to session "client1"
 
     # Verify ReadyForQuery('T') received
     Then session "client1" should receive CommandComplete "BEGIN"
@@ -206,7 +204,6 @@ Feature: Deferred BEGIN optimization bug with extended protocol
 
     Then session "client" should receive ParseComplete
     And session "client" should receive BindComplete
-    And session "client" should receive RowDescription with 1 fields
     And session "client" should receive DataRow
     And session "client" should receive CommandComplete "SELECT 1"
     And session "client" should receive ReadyForQuery "T"
@@ -243,7 +240,6 @@ Feature: Deferred BEGIN optimization bug with extended protocol
 
     Then session "client" should receive ParseComplete
     And session "client" should receive BindComplete
-    And session "client" should receive RowDescription with 1 fields
     And session "client" should receive DataRow
     And session "client" should receive CommandComplete "SELECT 1"
     And session "client" should receive ReadyForQuery "I"

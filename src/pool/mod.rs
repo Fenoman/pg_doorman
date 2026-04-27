@@ -436,7 +436,13 @@ impl ConnectionPool {
                     config.general.connect_timeout.as_std(),
                     pool_mode == PoolMode::Session,
                     fallback_state,
-                );
+                )
+                .with_prewarm_query(
+                    user.prewarm_query
+                        .clone()
+                        .unwrap_or_else(|| pool_config.prewarm_query.clone()),
+                )
+                .with_release_query(pool_config.release_query.clone());
 
                 let queue_strategy = match config.general.server_round_robin {
                     true => QueueMode::Fifo,
@@ -603,7 +609,9 @@ impl ConnectionPool {
                             config.general.connect_timeout.as_std(),
                             pool_mode == PoolMode::Session,
                             fallback_state,
-                        );
+                        )
+                        .with_prewarm_query(pool_config.prewarm_query.clone())
+                        .with_release_query(pool_config.release_query.clone());
 
                         let queue_strategy = match config.general.server_round_robin {
                             true => QueueMode::Fifo,
@@ -728,6 +736,10 @@ impl ConnectionPool {
         }
 
         // 3. Carry over surviving dynamic pools
+        // NOTE: surviving dynamic pools inherit the old ServerPool config (including prewarm_query).
+        // If prewarm_query changes on RELOAD, dynamic pools will not pick up the new value until
+        // they are garbage-collected and recreated. This is acceptable because dynamic pools are
+        // short-lived by nature (auth_query passthrough mode, GC'd when idle).
         let old_pools = POOLS.load();
         for id in DYNAMIC_POOLS.load().iter() {
             if pools_to_remove.contains(id) {

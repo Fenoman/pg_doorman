@@ -111,6 +111,7 @@ pub fn generate_config_with_client(
                 server_lifetime: None,
                 server_username: None,
                 server_password: None,
+                prewarm_query: None,
                 auth_pam_service: None,
             };
             users.push(user);
@@ -139,6 +140,8 @@ pub fn generate_config_with_client(
                     connect_timeout: None,
                     idle_timeout: None,
                     server_lifetime: None,
+                    prewarm_query: String::new(),
+                    release_query: None,
                     cleanup_server_connections: false,
                     log_client_parameter_status_changes: false,
                     application_name: None,

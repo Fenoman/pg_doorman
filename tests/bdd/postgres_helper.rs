@@ -12,6 +12,22 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
+const PGV_FREE_FALLBACK_SQL: &str = r#"
+DO $pg_doorman$
+BEGIN
+    IF to_regprocedure('public.pgv_free()') IS NULL THEN
+        CREATE FUNCTION public.pgv_free()
+        RETURNS void
+        LANGUAGE plpgsql
+        AS $pgv$
+        BEGIN
+        END;
+        $pgv$;
+    END IF;
+END
+$pg_doorman$;
+"#;
+
 /// Build a PostgreSQL command, running as postgres user if we are root
 fn pg_command_builder(cmd: &str, args: &[&str]) -> Command {
     if is_root() {
@@ -23,6 +39,92 @@ fn pg_command_builder(cmd: &str, args: &[&str]) -> Command {
         command.args(args);
         command
     }
+}
+
+fn run_psql(port: u16, database: &str, args: &[&str]) -> std::process::Output {
+    let port = port.to_string();
+    let mut command = pg_command_builder("psql", &[]);
+    command
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port,
+            "-U",
+            "postgres",
+            "-d",
+            database,
+        ])
+        .args(args)
+        .output()
+        .expect("Failed to run psql")
+}
+
+fn ensure_pgv_free_available(port: u16, database: &str) {
+    let available = run_psql(
+        port,
+        database,
+        &[
+            "-XAtq",
+            "-c",
+            "SELECT 1 FROM pg_available_extensions WHERE name = 'pg_variables'",
+        ],
+    );
+    if !available.status.success() {
+        eprintln!(
+            "pg_available_extensions check failed for database {database}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&available.stdout),
+            String::from_utf8_lossy(&available.stderr)
+        );
+        panic!("Failed to check pg_variables availability");
+    }
+
+    let sql = if String::from_utf8_lossy(&available.stdout).trim() == "1" {
+        "CREATE EXTENSION IF NOT EXISTS pg_variables"
+    } else {
+        PGV_FREE_FALLBACK_SQL
+    };
+    let create = run_psql(port, database, &["-v", "ON_ERROR_STOP=1", "-c", sql]);
+    if !create.status.success() {
+        eprintln!(
+            "pgv_free setup failed for database {database}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&create.stdout),
+            String::from_utf8_lossy(&create.stderr)
+        );
+        panic!("Failed to make public.pgv_free() available");
+    }
+
+    let verify = run_psql(
+        port,
+        database,
+        &[
+            "-XAtq",
+            "-c",
+            "SELECT to_regprocedure('public.pgv_free()') IS NOT NULL",
+        ],
+    );
+    let verified = verify.status.success() && String::from_utf8_lossy(&verify.stdout).trim() == "t";
+    if !verified {
+        eprintln!(
+            "pgv_free verification failed for database {database}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&verify.stdout),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        panic!("public.pgv_free() is not available");
+    }
+}
+
+fn database_exists(port: u16, database: &str) -> bool {
+    let output = run_psql(
+        port,
+        "postgres",
+        &[
+            "-XAtq",
+            "-c",
+            &format!("SELECT 1 FROM pg_database WHERE datname = '{database}'"),
+        ],
+    );
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
 }
 
 /// Stream log file to stdout in a background thread
@@ -224,6 +326,8 @@ pub async fn start_postgres(world: &mut DoormanWorld) {
     }
     assert!(success, "Postgres failed to start");
 
+    ensure_pgv_free_available(port, "postgres");
+
     world.pg_tmp_dir = Some(tmp_dir);
     world.pg_port = Some(port);
     world.pg_db_path = Some(db_path);
@@ -253,6 +357,11 @@ pub async fn apply_fixtures(world: &mut DoormanWorld, file_path: String) {
         eprintln!("psql stdout:\n{}", String::from_utf8_lossy(&output.stdout));
         eprintln!("psql stderr:\n{}", String::from_utf8_lossy(&output.stderr));
         panic!("Failed to apply fixtures from {}", file_path);
+    }
+
+    ensure_pgv_free_available(port, "postgres");
+    if database_exists(port, "example_db") {
+        ensure_pgv_free_available(port, "example_db");
     }
 }
 
@@ -412,6 +521,8 @@ async fn start_postgres_internal(world: &mut DoormanWorld, hba_content: &str, ex
         }
     }
     assert!(success, "Postgres failed to start");
+
+    ensure_pgv_free_available(port, "postgres");
 
     world.pg_tmp_dir = Some(tmp_dir);
     world.pg_port = Some(port);

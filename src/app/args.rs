@@ -22,7 +22,11 @@ pub struct Args {
         short,
         long,
         default_value_t = false,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = false,
         env,
+        value_parser = clap::builder::BoolishValueParser::new(),
         help = "disable colors in the log output"
     )]
     pub no_color: bool,
@@ -164,6 +168,7 @@ impl fmt::Display for LogLevel {
 #[derive(ValueEnum, Clone, Debug)]
 pub enum LogFormat {
     Text,
+    #[value(alias = "json")]
     Structured,
     Debug,
 }

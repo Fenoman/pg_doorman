@@ -79,6 +79,16 @@ pub struct Pool {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_lifetime: Option<u64>,
 
+    /// SQL executed once after a new physical backend connection is created.
+    /// Useful for backend-local warmup such as creating temp tables.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prewarm_query: String,
+
+    /// SQL executed whenever a backend connection is released back to the pool.
+    /// None uses pg_doorman's historical default query; Some("") disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_query: Option<String>,
+
     #[serde(default = "Pool::default_cleanup_server_connections")]
     pub cleanup_server_connections: bool,
 
@@ -230,6 +240,21 @@ impl Pool {
             if ratio > 100 {
                 return Err(Error::BadConfig(
                     "scaling_warm_pool_ratio must be 0-100".into(),
+                ));
+            }
+        }
+
+        // Validate prewarm_query
+        if !self.prewarm_query.is_empty() {
+            let trimmed = self.prewarm_query.trim();
+            if trimmed.is_empty() {
+                return Err(Error::BadConfig(
+                    "prewarm_query contains only whitespace".into(),
+                ));
+            }
+            if self.prewarm_query.len() > 4096 {
+                return Err(Error::BadConfig(
+                    "prewarm_query exceeds maximum length of 4096 bytes".into(),
                 ));
             }
         }
@@ -428,6 +453,8 @@ impl Default for Pool {
             connect_timeout: None,
             idle_timeout: None,
             server_lifetime: None,
+            prewarm_query: String::new(),
+            release_query: None,
             cleanup_server_connections: true,
             log_client_parameter_status_changes: false,
             application_name: None,

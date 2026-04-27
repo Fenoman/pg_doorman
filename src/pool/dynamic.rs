@@ -136,7 +136,9 @@ pub fn create_dynamic_pool(
         config.general.connect_timeout.as_std(),
         pool_mode == PoolMode::Session,
         fallback_state,
-    );
+    )
+    .with_prewarm_query(pool_config.prewarm_query.clone())
+    .with_release_query(pool_config.release_query.clone());
 
     let queue_strategy = match config.general.server_round_robin {
         true => QueueMode::Fifo,

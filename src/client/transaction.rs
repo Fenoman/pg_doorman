@@ -14,11 +14,14 @@ use crate::app::server::{
 };
 use crate::client::batch_handling::PARSE_COMPLETE_MSG;
 use crate::client::core::{BatchOperation, Client, PreparedStatementKey};
-use crate::client::util::{is_standalone_begin, QUERY_DEALLOCATE};
+use crate::client::util::{
+    contains_discard_all, is_standalone_begin, simple_query_body, QUERY_DEALLOCATE,
+};
 use crate::errors::Error;
 use crate::messages::{
-    check_query_response, deallocate_response, error_response, error_response_terminal,
-    insert_close_complete_after_last_close_complete, read_message_reuse, write_all_flush,
+    check_query_response, command_complete, deallocate_response, error_response,
+    error_response_terminal, insert_close_complete_after_last_close_complete, read_message_reuse,
+    ready_for_query, write_all_flush,
 };
 use crate::pool::CANCELED_PIDS;
 use crate::server::Server;
@@ -325,6 +328,15 @@ where
             return Ok(true);
         }
 
+        // In transaction pooling, standalone DISCARD ALL is a no-op from the
+        // client's perspective when no server is checked out, so avoid a
+        // checkout/checkin round-trip. In session pooling it must reach the
+        // backend because it is real session cleanup state.
+        if self.transaction_mode && contains_discard_all(simple_query_body(message)) {
+            self.respond_to_simple_discard(false).await?;
+            return Ok(true);
+        }
+
         // Check for DEALLOCATE query and clear client prepared statements cache
         // Format: Q message = [Q:1][length:4][query][null:1]
         // QUERY_DEALLOCATE = "deallocate " (11 bytes)
@@ -370,6 +382,18 @@ where
         Ok(false)
     }
 
+    /// Send a synthetic DISCARD ALL response to the client without forwarding to the server.
+    /// This prevents clearing prepared statements and temp tables on the backend.
+    async fn respond_to_simple_discard(&mut self, in_transaction: bool) -> Result<(), Error> {
+        let mut response = BytesMut::new();
+        response.put(command_complete("DISCARD ALL"));
+        response.put(ready_for_query(in_transaction));
+        write_all_flush(&mut self.write, &response).await?;
+        self.stats.query();
+        self.stats.transaction();
+        Ok(())
+    }
+
     /// Handle simple query (Q message).
     /// Returns the action to take after processing.
     #[inline]
@@ -383,6 +407,22 @@ where
         // to wait for 'Z' instead of using expected_responses counter
         server.set_async_mode(false);
         server.set_expected_responses(0);
+
+        // In transaction pooling, intercept standalone DISCARD ALL outside of
+        // a transaction and release the server back to the pool. In session
+        // pooling it must be forwarded so PostgreSQL clears session state and
+        // pg_doorman observes the CommandComplete tag.
+        if self.transaction_mode
+            && !server.in_transaction()
+            && contains_discard_all(simple_query_body(message))
+        {
+            self.respond_to_simple_discard(false).await?;
+            if !server.in_copy_mode() {
+                self.stats.idle_read();
+                return Ok(TransactionAction::Break);
+            }
+            return Ok(TransactionAction::Continue);
+        }
 
         self.execute_server_roundtrip(Some(message), server).await?;
         self.stats.query();
@@ -919,7 +959,7 @@ where
                                 Err(err) => {
                                     self.stats.disconnect();
                                     self.connected_to_server = false;
-                                    server.checkin_cleanup().await?;
+                                    server.finalize_checkin().await?;
                                     self.release();
                                     return self.process_error(err).await;
                                 }
@@ -956,7 +996,7 @@ where
 
                         // Terminate
                         'X' => {
-                            server.checkin_cleanup().await?;
+                            server.finalize_checkin().await?;
                             self.stats.disconnect();
                             self.connected_to_server = false;
                             self.release();
@@ -989,7 +1029,6 @@ where
                         // Execute a prepared statement prepared in `P` and bound in `B`.
                         'E' => {
                             self.buffer.put(&message[..]);
-                            // Track Execute for correct ParseComplete insertion position
                             self.prepared.batch_operations.push(BatchOperation::Execute);
                             TransactionAction::Continue
                         }
@@ -997,7 +1036,7 @@ where
                         // Close
                         // Close the prepared statement.
                         'C' => {
-                            self.process_close_immediate(message)?;
+                            self.process_close_immediate(message, server)?;
                             TransactionAction::Continue
                         }
 
@@ -1038,7 +1077,7 @@ where
                 if shutdown_in_progress {
                     server.mark_bad("graceful shutdown - releasing server connection");
                 } else if !server.is_async() {
-                    server.checkin_cleanup().await?;
+                    server.finalize_checkin().await?;
                 }
                 if self.transaction_mode {
                     server

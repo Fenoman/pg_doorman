@@ -137,6 +137,8 @@ pub fn generate_reference_config(format: ConfigFormat, russian: bool) -> String 
         connect_timeout: None,
         idle_timeout: None,
         server_lifetime: None,
+        prewarm_query: String::new(),
+        release_query: None,
         cleanup_server_connections: true,
         log_client_parameter_status_changes: false,
         application_name: None,
@@ -167,6 +169,7 @@ pub fn generate_reference_config(format: ConfigFormat, russian: bool) -> String 
             server_lifetime: None,
             server_username: None,
             server_password: None,
+            prewarm_query: None,
             auth_pam_service: None,
         }],
     };
@@ -1194,6 +1197,22 @@ fn write_single_pool(w: &mut ConfigWriter, pool_name: &str, pool: &Pool) {
         w.kv(fi, "server_lifetime", &w.num_val(val));
     } else {
         w.commented_kv(fi, "server_lifetime", "300000");
+    }
+    w.blank();
+
+    write_field_desc(w, fi, "pool", "prewarm_query");
+    if !pool.prewarm_query.is_empty() {
+        w.kv(fi, "prewarm_query", &w.str_val(&pool.prewarm_query));
+    } else {
+        w.commented_kv(fi, "prewarm_query", "\"\"");
+    }
+    w.blank();
+
+    write_field_desc(w, fi, "pool", "release_query");
+    if let Some(ref query) = pool.release_query {
+        w.kv(fi, "release_query", &w.str_val(query));
+    } else {
+        w.commented_kv(fi, "release_query", "\"\"");
     }
     w.blank();
 

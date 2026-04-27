@@ -398,6 +398,23 @@ impl Bind {
         Ok(String::from_utf8_lossy(&data[stmt_start..stmt_end]).into_owned())
     }
 
+    /// Gets the portal name from the buffer.
+    pub fn get_portal(buf: &BytesMut) -> Result<String, Error> {
+        let data = &buf[..];
+        if data.len() < 5 {
+            return Err(Error::ParseBytesError("Bind message too short".to_string()));
+        }
+        let header_end = 5;
+        let portal_end = data[header_end..]
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| {
+                Error::ParseBytesError("Bind: missing portal null terminator".to_string())
+            })?
+            + header_end;
+        Ok(String::from_utf8_lossy(&data[header_end..portal_end]).into_owned())
+    }
+
     /// Renames the prepared statement to a new name.
     /// Zero-copy: scans for null terminators in-place, no String/Vec/CString allocations.
     pub fn rename(buf: BytesMut, new_name: &str) -> Result<BytesMut, Error> {

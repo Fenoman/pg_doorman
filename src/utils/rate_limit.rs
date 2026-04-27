@@ -1,7 +1,6 @@
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
-use tokio::time::sleep;
-use tokio::time::{Duration, Instant};
+use tokio::time::{sleep_until, Duration, Instant};
 
 #[derive(Debug)]
 struct Message {
@@ -31,20 +30,23 @@ impl RateLimiter {
     }
     fn spawn_receiver(mut receiver: Receiver<Message>, count: usize, duration: Duration) {
         tokio::spawn(async move {
-            let mut queue = Vec::with_capacity(count);
+            let mut queue = std::collections::VecDeque::with_capacity(count + 1);
             while let Some(message) = receiver.recv().await {
-                while !queue.is_empty() && queue[0] <= Instant::now() {
-                    queue.remove(0);
+                let now = Instant::now();
+                while queue.front().map_or(false, |&t| t <= now) {
+                    queue.pop_front();
                 }
-                if queue.len() > count {
-                    let alarm = queue.remove(0);
-                    sleep(alarm - Instant::now()).await;
+                if queue.len() >= count {
+                    if let Some(&alarm) = queue.front() {
+                        sleep_until(alarm).await;
+                        queue.pop_front();
+                    }
                 }
                 message
                     .sender
                     .send(())
                     .expect("unable to send to rate limiter client channel");
-                queue.push(Instant::now() + duration);
+                queue.push_back(Instant::now() + duration);
             }
         });
     }

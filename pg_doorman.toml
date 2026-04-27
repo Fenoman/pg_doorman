@@ -461,6 +461,17 @@ pool_mode = "transaction"
 # Override global server_lifetime for this pool (in milliseconds).
 # server_lifetime = 300000
 
+# SQL executed once after a new physical backend connection is created.
+# If the query fails (SQL error or I/O error), the connection is rejected.
+# Maximum length: 4096 bytes.
+# prewarm_query = ""
+
+# SQL executed when a backend connection is released back to the pool.
+# If omitted, pg_doorman uses its historical default:
+# SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();
+# Set to an empty string to disable the release query.
+# release_query = ""
+
 # Reset session state (SET, prepared statements, cursors) when returning a connection to pool.
 # ROLLBACK for open transactions is always executed regardless of this setting.
 # Prevents state leaking between clients in transaction mode.

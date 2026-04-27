@@ -80,6 +80,63 @@ async fn test_config() {
 
 #[tokio::test]
 #[serial]
+async fn test_release_query_config_semantics() {
+    let config_content = r#"
+[general]
+host = "127.0.0.1"
+port = 6432
+admin_username = "admin"
+admin_password = "admin_password"
+
+[pools.default_release]
+server_host = "localhost"
+server_port = 5432
+
+[[pools.default_release.users]]
+username = "example_user_1"
+password = ""
+pool_size = 1
+
+[pools.disabled_release]
+server_host = "localhost"
+server_port = 5432
+release_query = ""
+
+[[pools.disabled_release.users]]
+username = "example_user_1"
+password = ""
+pool_size = 1
+
+[pools.custom_release]
+server_host = "localhost"
+server_port = 5432
+release_query = " SELECT 1;  "
+
+[[pools.custom_release.users]]
+username = "example_user_1"
+password = ""
+pool_size = 1
+"#;
+    let mut temp_file = NamedTempFile::with_suffix(".toml").unwrap();
+    temp_file.write_all(config_content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    parse(temp_file.path().to_str().unwrap()).await.unwrap();
+    let config = get_config();
+
+    assert_eq!(config.pools["default_release"].release_query, None);
+    assert_eq!(
+        config.pools["disabled_release"].release_query,
+        Some(String::new())
+    );
+    assert_eq!(
+        config.pools["custom_release"].release_query,
+        Some(" SELECT 1;  ".to_string())
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_serialize_configs() {
     let temp_file = create_temp_config();
     let file_path = temp_file.path().to_str().unwrap();

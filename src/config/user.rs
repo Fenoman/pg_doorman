@@ -27,6 +27,11 @@ pub struct User {
     pub server_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_password: Option<String>,
+    /// SQL executed once after a new physical backend connection is created for this user.
+    /// Overrides pool-level prewarm_query when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewarm_query: Option<String>,
+
     // Pam auth
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_pam_service: Option<String>,
@@ -43,6 +48,7 @@ impl Default for User {
             server_lifetime: None,
             server_username: None,
             server_password: None,
+            prewarm_query: None,
             auth_pam_service: None,
         }
     }

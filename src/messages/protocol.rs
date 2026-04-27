@@ -587,6 +587,37 @@ pub fn parse_complete() -> BytesMut {
     bytes
 }
 
+/// Create a bind complete message.
+#[inline]
+pub fn bind_complete() -> BytesMut {
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'2');
+    bytes.put_i32(4);
+    bytes
+}
+
+/// Create a parameter description message with the provided parameter types.
+pub fn parameter_description(param_types: &[i32]) -> BytesMut {
+    let mut bytes = BytesMut::new();
+    let len = 4 + 2 + 4 * param_types.len() as i32;
+    bytes.put_u8(b't');
+    bytes.put_i32(len);
+    bytes.put_i16(param_types.len() as i16);
+    for param in param_types {
+        bytes.put_i32(*param);
+    }
+    bytes
+}
+
+/// Create a no-data message.
+#[inline]
+pub fn no_data() -> BytesMut {
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'n');
+    bytes.put_i32(4);
+    bytes
+}
+
 /// Create a check query response message.
 pub fn check_query_response() -> BytesMut {
     let mut bytes = BytesMut::with_capacity(11);

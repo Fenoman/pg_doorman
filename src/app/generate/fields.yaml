@@ -1140,6 +1140,47 @@ fields:
       doc: "Close server connections in this pool that have been opened for longer than this value, in milliseconds. Only applied to idle connections. If not specified, the global server_lifetime setting is used."
       default: "None (uses global setting)"
 
+    prewarm_query:
+      config:
+        en: |
+          SQL executed once after a new physical backend connection is created.
+          If the query fails (SQL error or I/O error), the connection is rejected.
+          Maximum length: 4096 bytes.
+        ru: |
+          SQL, который выполняется один раз после создания нового физического backend-соединения.
+          Если запрос завершится ошибкой (SQL или I/O), соединение отклоняется.
+          Максимальная длина: 4096 байт.
+      doc: |
+        When non-empty, pg_doorman executes this SQL once immediately after a new PostgreSQL
+        backend connection reaches ReadyForQuery, before the connection is returned to the pool.
+        If the query fails, the connection is rejected. Failures are tracked in total_prewarm_failures
+        counter visible via SHOW STATS. Standalone simple-query DISCARD ALL (outside transactions)
+        is intercepted by pg_doorman and does not reach the backend, preserving prewarm state.
+        Extended protocol, multi-statement, and in-transaction DISCARD ALL pass through normally.
+        Maximum query length: 4096 bytes.
+      default: '"" (disabled)'
+
+    release_query:
+      config:
+        en: |
+          SQL executed when a backend connection is released back to the pool.
+          If omitted, pg_doorman uses its historical default:
+          SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();
+          Set to an empty string to disable the release query.
+        ru: |
+          SQL, который выполняется при возврате backend-соединения в пул.
+          Если параметр не задан, pg_doorman использует исторический запрос:
+          SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();
+          Пустая строка отключает release-запрос.
+      doc: |
+        Controls the SQL pg_doorman runs after checkin cleanup and before returning a backend
+        connection to the pool. The setting applies to both transaction and session pooling modes.
+        If omitted, pg_doorman uses the historical default release query:
+        `SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();`.
+        If set to an empty string, no release query is executed. If set to a non-empty string,
+        pg_doorman executes exactly that SQL string.
+      default: "None (uses default release query)"
+
     cleanup_server_connections:
       config:
         en: |
@@ -1426,6 +1467,17 @@ fields:
         en: "Override pool-level server_lifetime for this user (in milliseconds)."
         ru: "Переопределить server_lifetime пула для этого пользователя (в миллисекундах)."
       doc: "Close server connections for this user that have been opened for longer than this value, in milliseconds. Only applied to idle connections. If not specified, the pool's server_lifetime setting is used."
+      default: "None (uses pool setting)"
+
+    prewarm_query:
+      config:
+        en: "Override pool-level prewarm_query for this user."
+        ru: "Переопределить prewarm_query пула для этого пользователя."
+      doc: |
+        SQL executed once after a new physical backend connection is created for this user.
+        If set, overrides the pool-level prewarm_query. If not set (null), the pool-level
+        prewarm_query is used. Set to empty string to explicitly disable prewarm for this user
+        even when pool-level prewarm_query is configured.
       default: "None (uses pool setting)"
 
     server_username:

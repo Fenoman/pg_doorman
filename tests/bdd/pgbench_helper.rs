@@ -3,9 +3,12 @@ use crate::world::DoormanWorld;
 use cucumber::{gherkin::Step, given, then, when};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// Default timeout for pgbench commands (60 seconds)
 const PGBENCH_TIMEOUT_SECS: u64 = 60;
@@ -34,6 +37,49 @@ struct PgbenchResult {
     status: PgbenchStatus,
     /// Temp directory containing --log files (auto-cleaned on drop)
     log_dir: Option<TempDir>,
+}
+
+#[cfg(unix)]
+fn configure_child_process_group(cmd: &mut Command) {
+    // pgbench is launched through a shell to support inline env prefixes.
+    // Put that shell in a new process group so timeout cleanup kills pgbench too.
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn signal_process_group(pgid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .arg(format!("-{}", signal))
+        .arg("--")
+        .arg(format!("-{}", pgid))
+        .status();
+}
+
+fn terminate_pgbench_process(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id();
+
+        signal_process_group(pgid, "TERM");
+        for _ in 0..20 {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        signal_process_group(pgid, "KILL");
+        let _ = child.wait();
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Compute a specific percentile index for a given collection size.
@@ -142,6 +188,7 @@ fn run_pgbench(command: &str, target: &str, timeout: Duration) -> PgbenchResult 
     cmd.arg(shell_arg).arg(&command);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
     // Clone target for use in threads
     let target_stdout = target.to_string();
@@ -225,8 +272,7 @@ fn run_pgbench(command: &str, target: &str, timeout: Duration) -> PgbenchResult 
                         let elapsed = start.elapsed();
 
                         if elapsed > timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            terminate_pgbench_process(&mut child);
 
                             if let Some(t) = stdout_thread {
                                 let _ = t.join();

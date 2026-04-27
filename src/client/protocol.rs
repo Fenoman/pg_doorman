@@ -131,14 +131,16 @@ where
         pool: &ConnectionPool,
         server: &mut Server,
     ) -> Result<(), Error> {
+        let parse: Parse = (&message).try_into()?;
+        let client_given_name = parse.name.clone();
+
         // Avoid parsing if prepared statements not enabled
         if !self.prepared.enabled {
             debug!(
                 "[{}@{} #c{}] prepared statements disabled, forwarding Parse as-is",
                 self.username, self.pool_name, self.connection_id,
             );
-            let first_char_in_name = *message.get(5).unwrap_or(&0);
-            if first_char_in_name != 0 {
+            if !client_given_name.is_empty() {
                 // This is a named prepared statement while prepared statements are disabled
                 // Server connection state will need to be cleared at checkin
                 server.mark_dirty();
@@ -153,9 +155,6 @@ where
                 });
             return Ok(());
         }
-
-        let client_given_name = Parse::get_name(&message)?;
-        let parse: Parse = (&message).try_into()?;
 
         // Compute the hash of the parse statement
         let hash = parse.get_hash();
@@ -351,6 +350,8 @@ where
         pool: &ConnectionPool,
         server: &mut Server,
     ) -> Result<(), Error> {
+        let client_given_name = Bind::get_name(&message)?;
+
         // Avoid parsing if prepared statements not enabled
         if !self.prepared.enabled {
             debug!(
@@ -364,8 +365,6 @@ where
             });
             return Ok(());
         }
-
-        let client_given_name = Bind::get_name(&message)?;
         let lookup_key = self
             .get_prepared_statement_lookup_key(&client_given_name)
             .await?;
@@ -444,6 +443,8 @@ where
         pool: &ConnectionPool,
         server: &mut Server,
     ) -> Result<(), Error> {
+        let describe: Describe = (&message).try_into()?;
+
         // Avoid parsing if prepared statements not enabled
         if !self.prepared.enabled {
             debug!(
@@ -454,8 +455,7 @@ where
             // Track operation for correct expected_responses calculation in Flush
             // Describe message format: 'D' + len(4) + target(1) + name + '\0'
             // target is at byte 5: 'S' for statement (2 responses), 'P' for portal (1 response)
-            let target = *message.get(5).unwrap_or(&b'S') as char;
-            if target == 'P' {
+            if describe.target == 'P' {
                 self.prepared
                     .batch_operations
                     .push(BatchOperation::DescribePortal);
@@ -469,7 +469,6 @@ where
             return Ok(());
         }
 
-        let describe: Describe = (&message).try_into()?;
         if describe.target == 'P' {
             debug!(
                 "[{}@{} #c{}] describe portal (not statement), passing through",
@@ -571,20 +570,50 @@ where
     /// For prepared statements: removes from cache and increments pending_close_complete counter.
     /// For others: adds data directly to self.buffer.
     #[inline]
-    pub(crate) fn process_close_immediate(&mut self, message: BytesMut) -> Result<(), Error> {
+    pub(crate) fn process_close_immediate(
+        &mut self,
+        message: BytesMut,
+        server: &mut Server,
+    ) -> Result<(), Error> {
         let close: Close = (&message).try_into()?;
+        let mut message_to_backend = message;
+        let mut cache_modified = false;
 
-        // Always add Close to buffer in extended query protocol
-        // This ensures Close is sent to server when followed by Flush
-        self.buffer.put(&message[..]);
+        // Prepared statements are renamed on the backend. Close must target the
+        // server-side name; forwarding the client name would leave stale state or
+        // produce "prepared statement does not exist" for async/rewritten clients.
+        if self.prepared.enabled && close.is_prepared_statement() {
+            let cache_key = if close.anonymous() {
+                self.prepared
+                    .last_anonymous_hash
+                    .map(PreparedStatementKey::Anonymous)
+            } else {
+                Some(PreparedStatementKey::Named(close.name.clone()))
+            };
+
+            if let Some(key) = cache_key {
+                if let Some(cached) = self.prepared.cache.pop(&key) {
+                    cache_modified = true;
+                    let server_name = cached.server_name().to_string();
+                    let rewritten_close: BytesMut = Close::new(&server_name).try_into()?;
+                    message_to_backend = rewritten_close;
+                    server.forget_prepared_statement(&server_name);
+                }
+                if matches!(key, PreparedStatementKey::Anonymous(_)) {
+                    self.prepared.last_anonymous_hash = None;
+                }
+            }
+        }
+
+        // Always add Close to buffer in extended query protocol.
+        // This ensures Close is sent to server when followed by Flush.
+        self.buffer.put(&message_to_backend[..]);
 
         // Track Close operation for correct ParseComplete insertion order
         self.prepared.batch_operations.push(BatchOperation::Close);
 
-        // Remove from prepared statements cache if it's a named prepared statement
-        if self.prepared.enabled && close.is_prepared_statement() && !close.anonymous() {
-            let key = PreparedStatementKey::Named(close.name.clone());
-            self.prepared.cache.pop(&key);
+        if cache_modified {
+            self.update_prepared_cache_stats();
         }
 
         Ok(())
@@ -594,7 +623,6 @@ where
     pub(crate) fn reset_buffered_state(&mut self) {
         self.buffer.clear();
         self.prepared.pending_close_complete = 0;
-        self.prepared.skipped_parses.clear();
-        self.prepared.parses_sent_in_batch = 0;
+        self.prepared.reset_batch();
     }
 }

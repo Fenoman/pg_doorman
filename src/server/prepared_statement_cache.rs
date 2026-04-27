@@ -2,29 +2,71 @@ use dashmap::DashMap;
 use log::info;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::messages::Parse;
 use crate::utils::dashmap::new_dashmap_with_capacity;
 
 /// Global query string interner.
 /// This ensures that identical query texts share the same Arc<str> allocation,
-/// even when Arc<Parse> is evicted from the pool cache.
-/// The interner never evicts entries - they are kept as long as any client holds a reference.
-static QUERY_INTERNER: Lazy<DashMap<u64, Arc<str>>> = Lazy::new(|| DashMap::with_capacity(8192));
+/// while avoiding a permanent strong-reference root that would grow RSS forever.
+///
+/// Entries are stored as Weak<str> and are cleaned lazily, so query text is kept only
+/// while some live Parse still references it.
+static QUERY_INTERNER: Lazy<DashMap<u64, Weak<str>>> = Lazy::new(|| DashMap::with_capacity(8192));
+static QUERY_INTERNER_INSERTIONS: AtomicU64 = AtomicU64::new(0);
+const QUERY_INTERNER_CLEANUP_INTERVAL: u64 = 1024;
+const QUERY_INTERNER_MIN_CLEANUP_LEN: usize = 8192;
+
+fn cleanup_query_interner() {
+    if QUERY_INTERNER.len() < QUERY_INTERNER_MIN_CLEANUP_LEN {
+        return;
+    }
+    QUERY_INTERNER.retain(|_, value| value.strong_count() > 0);
+}
 
 /// Interns a query string, returning a shared Arc<str>.
 /// If the query was already interned, returns the existing Arc<str>.
 /// This is used to ensure query texts are shared between all Parse instances.
+///
+/// Uses DashMap entry API to avoid a race where two threads intern the same
+/// query simultaneously and end up with separate Arc<str> allocations.
 pub fn intern_query(query: &str, hash: u64) -> Arc<str> {
-    // Fast path: check if already interned
+    // Fast path (lock-free read): reuse live interned string if it is still around.
     if let Some(existing) = QUERY_INTERNER.get(&hash) {
-        return existing.clone();
+        if let Some(interned) = existing.value().upgrade() {
+            if &*interned == query {
+                return interned;
+            }
+        }
     }
 
-    // Slow path: intern the query
+    // Slow path: use entry API for atomic check-and-insert to prevent races.
     let arc_str: Arc<str> = Arc::from(query);
-    QUERY_INTERNER.entry(hash).or_insert(arc_str).clone()
+    let weak = Arc::downgrade(&arc_str);
+
+    match QUERY_INTERNER.entry(hash) {
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            // Another thread may have inserted between our get() and entry() call.
+            if let Some(existing) = entry.get().upgrade() {
+                if &*existing == query {
+                    return existing;
+                }
+            }
+            // Weak expired or hash collision — replace with our new entry.
+            entry.insert(weak);
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(weak);
+        }
+    }
+
+    let insertions = QUERY_INTERNER_INSERTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if insertions % QUERY_INTERNER_CLEANUP_INTERVAL == 0 {
+        cleanup_query_interner();
+    }
+
+    arc_str
 }
 
 /// Entry in the prepared statement cache with LRU ordering.
@@ -80,10 +122,15 @@ impl PreparedStatementCache {
     pub fn get_or_insert(&self, parse: &Parse, hash: u64) -> Arc<Parse> {
         let timestamp = self.counter.fetch_add(1, Ordering::Relaxed);
 
-        // Fast path: check if already exists
+        // Fast path: check if already exists.
+        // A hash collision must not reuse another client's Parse message.
         if let Some(mut entry) = self.cache.get_mut(&hash) {
-            entry.count_used = timestamp;
-            return entry.parse.clone();
+            if entry.parse.query() == parse.query()
+                && entry.parse.param_types() == parse.param_types()
+            {
+                entry.count_used = timestamp;
+                return entry.parse.clone();
+            }
         }
 
         // Slow path: insert new entry
@@ -145,15 +192,11 @@ impl PreparedStatementCache {
         }
     }
 
-    /// Evict the oldest entry from the cache (approximate LRU).
+    /// Evict the least recently used entry from the cache.
     fn evict_oldest(&self) {
-        // Find the entry with the smallest count_used timestamp
         let mut oldest_key: Option<u64> = None;
         let mut oldest_time = u64::MAX;
 
-        // Sample entries to find the oldest one
-        // We iterate through all entries but this is still efficient because
-        // DashMap uses sharding and we only read, not write
         for entry in self.cache.iter() {
             if entry.count_used < oldest_time {
                 oldest_time = entry.count_used;
@@ -161,19 +204,17 @@ impl PreparedStatementCache {
             }
         }
 
-        // Remove the oldest entry
         if let Some(key) = oldest_key {
             if let Some((_, entry)) = self.cache.remove(&key) {
-                let query = entry.parse.query().replace(['\n', '\r'], " ");
-                let truncated: String = query.chars().take(80).collect();
-                let ellipsis = if query.chars().count() > 80 {
-                    "..."
+                let query = entry.parse.query();
+                let truncated_query = if query.chars().count() > 100 {
+                    format!("{}...", query.chars().take(100).collect::<String>())
                 } else {
-                    ""
+                    query.to_string()
                 };
                 info!(
-                    "Pool cache eviction: hash={:#x}, name={}, query=\"{truncated}{ellipsis}\", size={}/{}",
-                    key, entry.parse.name, self.cache.len(), self.max_size,
+                    "evicting prepared statement from cache: name='{}', query='{}'",
+                    entry.parse.name, truncated_query
                 );
             }
         }
@@ -254,5 +295,40 @@ mod tests {
             max,
             threads,
         );
+    }
+
+    #[test]
+    fn test_query_interner_does_not_keep_strong_references() {
+        let hash = 0xD00D_F00D_u64;
+        let query = "select 1";
+
+        let interned = intern_query(query, hash);
+        assert_eq!(std::sync::Arc::strong_count(&interned), 1);
+
+        let weak = QUERY_INTERNER
+            .get(&hash)
+            .expect("query should be interned")
+            .clone();
+
+        drop(interned);
+        assert!(
+            weak.upgrade().is_none(),
+            "global interner must not keep a strong reference alive"
+        );
+    }
+
+    #[test]
+    fn hash_collision_does_not_reuse_wrong_parse() {
+        let cache = PreparedStatementCache::new(10, 1);
+        let hash = 0xCAFE_BABE_u64;
+        let first = make_parse("stmt1", "SELECT 1");
+        let second = make_parse("stmt2", "SELECT 2");
+
+        let cached_first = cache.get_or_insert(&first, hash);
+        let cached_second = cache.get_or_insert(&second, hash);
+
+        assert_eq!(cached_first.query(), "SELECT 1");
+        assert_eq!(cached_second.query(), "SELECT 2");
+        assert_ne!(cached_first.name, cached_second.name);
     }
 }

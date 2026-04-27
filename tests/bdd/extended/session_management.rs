@@ -30,6 +30,19 @@ pub async fn create_named_session(
 }
 
 #[when(
+    regex = r#"^we create extended session "([^"]+)" to pg_doorman as "([^"]+)" with password "([^"]*)" and database "([^"]+)"$"#
+)]
+pub async fn create_extended_named_session(
+    world: &mut DoormanWorld,
+    session_name: String,
+    user: String,
+    password: String,
+    database: String,
+) {
+    create_named_session(world, session_name, user, password, database).await;
+}
+
+#[when(
     regex = r#"^we create TLS session "([^"]+)" to pg_doorman as "([^"]+)" with password "([^"]*)" and database "([^"]+)"$"#
 )]
 pub async fn create_tls_named_session(
@@ -86,6 +99,7 @@ pub async fn create_named_session_to_postgres(
 }
 
 #[when(regex = r#"^we send SimpleQuery "([^"]+)" to session "([^"]+)"$"#)]
+#[then(regex = r#"^we send SimpleQuery "([^"]+)" to session "([^"]+)"$"#)]
 pub async fn send_simple_query_to_session(
     world: &mut DoormanWorld,
     query: String,
@@ -98,10 +112,14 @@ pub async fn send_simple_query_to_session(
         .expect("Failed to send query");
 
     // Read all messages until ReadyForQuery
-    let _messages = conn
+    let messages = conn
         .read_all_messages_until_ready()
         .await
         .expect("Failed to read messages");
+
+    world
+        .session_messages
+        .insert(session_name.clone(), messages);
 }
 
 #[when(regex = r#"^we send SimpleQuery "([^"]+)" to session "([^"]+)" and store backend_pid$"#)]
@@ -419,7 +437,114 @@ pub async fn send_sync_to_session(world: &mut DoormanWorld, session_name: String
         .insert(session_name.clone(), messages);
 }
 
+fn take_next_session_message(world: &mut DoormanWorld, session_name: &str) -> (char, Vec<u8>) {
+    let messages = world
+        .session_messages
+        .get_mut(session_name)
+        .unwrap_or_else(|| panic!("No messages stored for session '{}'", session_name));
+
+    if messages.is_empty() {
+        panic!("No unread messages remain for session '{}'", session_name);
+    }
+
+    messages.remove(0)
+}
+
+fn assert_next_message_type(
+    world: &mut DoormanWorld,
+    session_name: &str,
+    expected_type: char,
+    expected_name: &str,
+) -> Vec<u8> {
+    let (actual_type, data) = take_next_session_message(world, session_name);
+    assert_eq!(
+        actual_type,
+        expected_type,
+        "Session '{}': expected next message {}, got {}",
+        session_name,
+        expected_name,
+        super::helpers::format_message_details(actual_type, &data)
+    );
+    data
+}
+
+#[then(regex = r#"^session "([^"]+)" should receive ParseComplete$"#)]
+pub async fn session_should_receive_parse_complete(world: &mut DoormanWorld, session_name: String) {
+    assert_next_message_type(world, &session_name, '1', "ParseComplete");
+}
+
+#[then(regex = r#"^session "([^"]+)" should receive BindComplete$"#)]
+pub async fn session_should_receive_bind_complete(world: &mut DoormanWorld, session_name: String) {
+    assert_next_message_type(world, &session_name, '2', "BindComplete");
+}
+
+#[then(regex = r#"^session "([^"]+)" should receive CommandComplete "([^"]+)"$"#)]
+pub async fn session_should_receive_command_complete(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected_tag: String,
+) {
+    let data = assert_next_message_type(world, &session_name, 'C', "CommandComplete");
+    let tag = data
+        .split(|b| *b == 0)
+        .next()
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
+    assert_eq!(
+        tag, expected_tag,
+        "Session '{}': expected CommandComplete tag '{}', got '{}'",
+        session_name, expected_tag, tag
+    );
+}
+
+#[then(regex = r#"^session "([^"]+)" should receive ReadyForQuery "([^"]+)"$"#)]
+pub async fn session_should_receive_ready_for_query(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected_status: String,
+) {
+    let data = assert_next_message_type(world, &session_name, 'Z', "ReadyForQuery");
+    let actual_status = data.first().copied().unwrap_or_default() as char;
+    let expected_status = expected_status
+        .chars()
+        .next()
+        .expect("Expected ReadyForQuery status cannot be empty");
+    assert_eq!(
+        actual_status, expected_status,
+        "Session '{}': expected ReadyForQuery '{}', got '{}'",
+        session_name, expected_status, actual_status
+    );
+}
+
+#[then(regex = r#"^session "([^"]+)" should receive RowDescription with (\d+) fields$"#)]
+pub async fn session_should_receive_row_description(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected_fields: u16,
+) {
+    let data = assert_next_message_type(world, &session_name, 'T', "RowDescription");
+    assert!(
+        data.len() >= 2,
+        "Session '{}': RowDescription payload is too short",
+        session_name
+    );
+    let actual_fields = u16::from_be_bytes([data[0], data[1]]);
+    assert_eq!(
+        actual_fields, expected_fields,
+        "Session '{}': expected {} RowDescription fields, got {}",
+        session_name, expected_fields, actual_fields
+    );
+}
+
+#[then(regex = r#"^session "([^"]+)" should receive DataRow$"#)]
+pub async fn session_should_receive_any_datarow(world: &mut DoormanWorld, session_name: String) {
+    assert_next_message_type(world, &session_name, 'D', "DataRow");
+}
+
 #[when(regex = r#"^we close session "([^"]+)"$"#)]
+#[then(regex = r#"^we close session "([^"]+)"$"#)]
+#[when(regex = r#"^we disconnect session "([^"]+)"$"#)]
+#[then(regex = r#"^we disconnect session "([^"]+)"$"#)]
 pub async fn close_session(world: &mut DoormanWorld, session_name: String) {
     world
         .named_sessions

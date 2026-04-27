@@ -293,6 +293,12 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
             details.push_str(&format!(", detail=\"{}\"", sanitize_for_log(detail)));
         }
         error!("{details}");
+
+        // Capture for callers that need to detect SQL-level errors
+        server.last_error_response = Some(format!(
+            "{}: {} (SQLSTATE {})",
+            msg.severity, msg.message, msg.code
+        ));
     } else {
         error!(
             "[{}@{}] server error pid={}: could not parse error details",
@@ -300,6 +306,7 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
             server.address.pool_name,
             server.get_process_id(),
         );
+        server.last_error_response = Some("unparseable ErrorResponse".to_string());
     }
 
     // Exit COPY mode on error

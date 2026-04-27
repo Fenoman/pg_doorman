@@ -279,6 +279,8 @@ fn write_pool_fields(out: &mut String, f: &FieldsData) {
         "idle_timeout",
         "server_lifetime",
         "pool_mode",
+        "prewarm_query",
+        "release_query",
         "log_client_parameter_status_changes",
         "cleanup_server_connections",
         "scaling_warm_pool_ratio",
