@@ -161,56 +161,767 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="changelog"><a class="header" href="#changelog">Changelog</a></h1>
-<h3 id="340-apr-1-2026"><a class="header" href="#340-apr-1-2026">3.4.0 <small>Apr 1, 2026</small></a></h3>
-<p><strong>New Features:</strong></p>
+<h3 id="3106"><a class="header" href="#3106">3.10.6</a></h3>
+<h4 id="binary-upgrade-no-longer-carries-migrated-client-fds-into-the-next-generation"><a class="header" href="#binary-upgrade-no-longer-carries-migrated-client-fds-into-the-next-generation">Binary upgrade no longer carries migrated client fds into the next generation</a></h4>
+<p>Client fds received over the SIGUSR2 migration socket are now marked
+close-on-exec in the new process. A chained binary upgrade used to inherit
+stale copies of already-migrated client sockets, so every generation could
+start with extra fds and eventually fail with <code>Too many open files</code> under
+load.</p>
+<p>The foreground upgrade path also marks inherited service fds close-on-exec
+after startup and cleans up unexpected inherited descriptors before config
+load when the process starts as a binary-upgrade child. This lets an upgraded
+binary recover from a parent that was already polluted by older non-CLOEXEC
+fds instead of preserving that fd garbage forever.</p>
+<h4 id="local-fd-exhaustion-no-longer-enters-patroni-assisted-fallback"><a class="header" href="#local-fd-exhaustion-no-longer-enters-patroni-assisted-fallback">Local fd exhaustion no longer enters Patroni-assisted fallback</a></h4>
+<p>Backend connection failures caused by pg_doorman's own <code>EMFILE</code>/<code>ENFILE</code>
+state are now classified as local resource exhaustion, not as PostgreSQL
+unreachability. Those errors no longer blacklist the local backend or enter
+the Patroni-assisted fallback discovery path, so fd pressure does not amplify
+itself with fallback connection attempts and noisy discovery failures.</p>
+<h4 id="web-admin-sockets-use-the-safe-tcp-policy"><a class="header" href="#web-admin-sockets-use-the-safe-tcp-policy">Web admin sockets use the safe TCP policy</a></h4>
+<p>Accepted Web UI and <code>/metrics</code> TCP sockets now receive the same low-risk TCP
+keepalive, buffer-size and user-timeout configuration as other TCP sockets,
+but do not inherit the pooler client <code>SO_LINGER</code> policy. This avoids abortive
+HTTP closes when <code>general.tcp_so_linger = 0</code> while still bounding web socket
+resource usage.</p>
+<h3 id="3105"><a class="header" href="#3105">3.10.5</a></h3>
+<h4 id="binary-upgrade-survives-a-tight-rlimit_nofile"><a class="header" href="#binary-upgrade-survives-a-tight-rlimit_nofile">Binary upgrade survives a tight <code>RLIMIT_NOFILE</code></a></h4>
+<p>SIGUSR2 binary upgrade now handles <code>EMFILE</code>/<code>ENFILE</code> from the old
+process without spinning in the accept loop or overfilling the migration
+queue.</p>
 <ul>
 <li>
-<p><strong>Pool Coordinator — database-level connection limits.</strong> New <code>max_db_connections</code> setting caps total server connections per database across all user pools. When the limit is reached, the coordinator evicts idle connections from users with the largest surplus (respecting <code>min_guaranteed_pool_size</code>), then waits for a connection to be returned, and falls back to a reserve pool as last resort. Disabled by default (<code>max_db_connections = 0</code>) — zero overhead when not configured. Five new pool-level config fields: <code>max_db_connections</code>, <code>min_connection_lifetime</code> (eviction age threshold), <code>reserve_pool_size</code> (extra slots beyond the limit), <code>reserve_pool_timeout</code> (wait before using reserve), <code>min_guaranteed_pool_size</code> (per-user eviction protection independent of <code>min_pool_size</code>).</p>
+<p>The TCP and Unix accept loops treat <code>EMFILE</code>/<code>ENFILE</code> as local resource
+pressure: they sleep for 10 ms and log at most once every 5 seconds.
+Other accept errors still log normally.</p>
 </li>
 <li>
-<p><strong><code>SHOW POOL_COORDINATOR</code> admin command.</strong> Displays per-database coordinator status: configured limits, current connection count, reserve usage, cumulative evictions, reserve acquisitions, and client exhaustion errors.</p>
+<p>The migration channel is no longer fixed at 4096 entries. At upgrade
+time pg_doorman reads the current <code>RLIMIT_NOFILE</code>, counts open fds via
+<code>/proc/self/fd</code>, reserves headroom for the handoff pipe/socketpair and
+per-client fd work, and caps the queue by the remaining budget. If no
+safe headroom remains, pg_doorman starts the new process without client
+migration and logs the budget decision.</p>
 </li>
 <li>
-<p><strong>Pool Coordinator Prometheus metrics.</strong> Seven new metrics under <code>pg_doorman_pool_coordinator{type, database}</code>: <code>connections</code> (current), <code>reserve_in_use</code> (current), <code>max_connections</code> (configured limit), <code>reserve_pool_size</code> (configured reserve), <code>evictions_total</code>, <code>reserve_acquisitions_total</code>, <code>exhaustions_total</code> (client errors from full exhaustion — primary pager signal).</p>
-</li>
-<li>
-<p><strong>Reserve pressure relief.</strong> Idle reserve connections (created under <code>max_db_connections</code> pressure) are closed early by the retain cycle once idle longer than <code>min_connection_lifetime</code>, returning reserve capacity before the regular <code>idle_timeout</code> fires.</p>
-</li>
-<li>
-<p><strong>Runtime log level control via admin <code>SET</code> command.</strong> Change log level without restarting the pooler: <code>SET log_level = 'debug'</code> for global, <code>SET log_level = 'warn,pg_doorman::pool::pool_coordinator=debug'</code> for per-module (RUST_LOG syntax). View current level with <code>SHOW LOG_LEVEL</code>. Changes are ephemeral (lost on restart). Zero overhead on the hot path at production log levels — filtering uses lock-free <code>ArcSwap</code> instead of <code>RwLock</code>.</p>
-</li>
-<li>
-<p><strong>Anticipation + bounded burst for connection creation.</strong> Replaces the per-task blind cooldown sleep with two coordinated mechanisms that suppress thundering-herd backend connects under load. (1) Returns to the idle pool now signal a <code>tokio::sync::Notify</code>. Callers that miss the idle pool above the warm threshold enter an event-driven loop: register the notify, try recycle, wait on <code>select{notify, sleep}</code>, try recycle again, and on a race loss (a peer waiter popped the return first) loop back and wait for the next return. The loop exits on a successful recycle, a sleep-driven wake with no notify in flight, or when its deadline is reached. The deadline is the client's remaining <code>query_wait_timeout</code> minus a 500 ms reserve for the create path, measured against a single <code>start</code> timestamp captured at the top of <code>timeout_get</code> so Phase 1/2 semaphore wait and the anticipation loop share one budget. (2) Concurrent server creates per pool are capped by an atomic burst gate; overflow callers wait for either an idle return or a peer create completion before retrying recycle. The legacy <code>scaling_cooldown_sleep</code> knob is replaced by <code>scaling_max_parallel_creates</code> (default <code>2</code>, the per-pool create cap), a global setting — per-pool overrides are intentionally not supported. The retain-loop replenish path also respects the burst cap so background replenishment does not compete with client-driven creates during a load spike. On a busy shard with ~55% Phase B race loss rate, the loop fix drove <code>create_fallback</code> to zero and cut <code>creates_started</code> by 90× against the same workload. Hot-path overhead is ~3 ns on the burst gate atomic and ~104 ns on a buffered notify wake.</p>
+<p>Client migration reserves a channel slot before calling <code>dup()</code> on the
+client fd. A full channel now applies backpressure before creating an
+extra fd.</p>
 </li>
 </ul>
+<p>If the pre-flight <code>pg_doorman -t</code> spawn fails with local <code>EMFILE</code>/<code>ENFILE</code>,
+pg_doorman skips that validation step and continues with the binary
+upgrade. Other validation failures still abort the upgrade before shutdown.</p>
+<h4 id="metrics-scrape-uses-cached-socket-state-counts"><a class="header" href="#metrics-scrape-uses-cached-socket-state-counts"><code>/metrics</code> scrape uses cached socket-state counts</a></h4>
+<p><code>/metrics</code> no longer walks <code>/proc/PID/net/tcp</code> and <code>/proc/PID/net/unix</code>
+on the request path. On hosts with thousands of sockets, that synchronous
+walk could hold worker threads long enough for regular Prometheus scrapes
+to increase client p99.</p>
+<p>Socket-state counts now live in a cached <code>ArcSwap</code> snapshot refreshed by a
+background <code>spawn_blocking</code> task. The <code>/metrics</code> handler, periodic
+<code>print_all_stats</code> output, and admin <code>SHOW SOCKETS</code> command read the cached
+snapshot. The Web UI sockets endpoint still refreshes socket details on
+demand for operator use.</p>
+<p>The cache keeps scrape cost independent of the number of live sockets in
+the common Prometheus path.</p>
+<h3 id="3101"><a class="header" href="#3101">3.10.1</a></h3>
+<h4 id="configurable-kernel-tcp-socket-buffer-size"><a class="header" href="#configurable-kernel-tcp-socket-buffer-size">Configurable kernel TCP socket buffer size</a></h4>
+<p>New <code>general.tcp_socket_buffer_size</code> (<code>ByteSize</code>, default <code>0</code>). When set
+to a non-zero value, pg_doorman calls <code>setsockopt(SO_RCVBUF/SO_SNDBUF)</code>
+on every accepted client TCP socket and outbound backend TCP socket,
+sets fixed send/receive buffer limits, and disables Linux TCP autotuning
+for that socket. Linux applies/reports doubled values and may clamp them
+by <code>net.core.rmem_max</code> / <code>net.core.wmem_max</code>.</p>
+<p>The default <code>0</code> keeps the current behaviour (autotuning on). Operators
+who observe <code>MemFree</code> jumping back up after a <code>pg_doorman</code> restart with
+many long-lived idle clients may be seeing kernel TCP buffer
+accumulation. This memory is not process RSS; depending on kernel and
+cgroup mode it may show up as socket memory, for example <code>sock</code> in
+cgroup v2 <code>memory.stat</code>. Those deployments can bound per-socket kernel
+buffer limits by setting this knob to a value in the <code>64 KiB – 256 KiB</code>
+range suitable for OLTP traffic in one datacenter. See the
+<a href="reference/general.html#tcp_socket_buffer_size"><code>tcp_socket_buffer_size</code></a>
+reference for details and trade-offs.</p>
+<p>Config reloads do not resize already-open sockets. During <code>SIGUSR2</code>
+binary upgrade, migrated client sockets are reconfigured in the new
+process; backend sockets pick up the value only when opened or
+reconnected.</p>
+<p>Equivalent of PgBouncer's <code>tcp_socket_buffer</code> parameter. Odyssey and
+PgCat have no analogue.</p>
+<h3 id="3100"><a class="header" href="#3100">3.10.0</a></h3>
+<h4 id="prepared-statements-and-startup-time-planner-parameters"><a class="header" href="#prepared-statements-and-startup-time-planner-parameters">Prepared statements and startup-time planner parameters</a></h4>
+<p><code>sync_server_parameters</code> now replays safe parameters sent by the client
+in <code>StartupMessage</code>, not only the small set of PostgreSQL-reported
+<code>ParameterStatus</code> values. This lets transaction-mode pools preserve
+startup-time session state such as <code>search_path</code>,
+<code>default_transaction_isolation</code>, and <code>role</code> when a client transaction
+lands on a different backend connection. Configured
+<code>startup_parameters</code> still win over client-supplied values.</p>
+<p>The prepared-statement cache key now includes a digest of the
+startup-time planner parameters that pg_doorman can safely replay:
+<code>search_path</code>, <code>default_transaction_isolation</code>,
+<code>default_transaction_read_only</code>, <code>default_text_search_config</code>, and
+<code>role</code>. Two clients that prepare the same query under different
+<code>search_path</code> values now get separate server-side prepared statements
+instead of sharing one PostgreSQL plan.</p>
+<p>Runtime <code>SET</code> for planner parameters that PostgreSQL does not report is
+still not tracked. Clients that need to change those values after
+connection startup should set them in <code>StartupMessage</code>, reconnect or
+run <code>DISCARD ALL</code> after changing them, or disable <code>prepared_statements</code>
+for that pool.</p>
+<p>PgDoorman also rolls back optimistic per-backend prepared-statement LRU
+entries when PostgreSQL rejects <code>Parse</code>. Reusing the same client
+statement name after a failed Parse now forces a fresh Parse instead of
+hitting a stale <code>DOORMAN_&lt;N&gt;</code> entry and surfacing SQLSTATE <code>26000</code>.</p>
+<p>Per-pool response cache for <code>general.pooler_check_query</code>. The first
+matching SimpleQuery in each pool's lifetime is forwarded to PostgreSQL;
+every subsequent matching probe is answered from the cache without
+touching the backend.</p>
+<h4 id="behavior-change-for-cold-pools"><a class="header" href="#behavior-change-for-cold-pools">Behavior change for cold pools</a></h4>
+<p>Before this release pg_doorman answered any <code>pooler_check_query</code> match
+locally with a hardcoded empty result. The default <code>;</code> came back instantly
+without ever talking to PostgreSQL, and a non-empty value such as <code>select 1</code>
+returned an empty response that did not match what a real PostgreSQL would
+have produced.</p>
+<p>The first probe per pool now does one PostgreSQL round-trip and captures
+the real response. If PostgreSQL is unreachable at that moment, the
+probing client sees a probe failure instead of an unconditional OK; the
+earlier hardcode reported the pooler as healthy even when PostgreSQL was
+down. Typical JDBC keepalive queries such as <code>select 1</code> (WildFly, HikariCP)
+and <code>select 'pg_doorman'</code> now return the expected row.</p>
+<h4 id="cache-lifecycle"><a class="header" href="#cache-lifecycle">Cache lifecycle</a></h4>
+<p>The cache is per pool and keyed by the query string. A <code>RELOAD</code> that
+changes <code>pooler_check_query</code> invalidates the cache on the next ping; the
+new value triggers one fresh backend probe and is then served from cache
+until the value changes again. A reload that keeps the same value keeps
+the cached response. <code>ErrorResponse</code> from the backend is forwarded to
+the client unchanged and is never cached, so the next probe retries
+against PostgreSQL.</p>
+<h4 id="operator-contract"><a class="header" href="#operator-contract">Operator contract</a></h4>
+<p><code>pooler_check_query</code> must be stable: the same input must produce the
+same bytes, with no side effects. Safe values: <code>;</code>, <code>select 1</code>,
+<code>select 'pg_doorman'</code>, <code>select version()</code>.</p>
+<p>Unsafe values that the cache will silently freeze:</p>
+<ul>
+<li><code>select now()</code>, <code>select clock_timestamp()</code> — the cached timestamp
+never advances.</li>
+<li><code>select pg_is_in_recovery()</code> — a failover flips the role on
+PostgreSQL but the cached response still reports the old role.</li>
+<li><code>select count(*) from &lt;table&gt;</code> — the cached count is whatever the
+first probe observed.</li>
+<li><code>UPDATE</code>, <code>INSERT</code>, <code>DELETE</code>, <code>CALL</code>, <code>DO</code> — the side effect runs
+once and the success response is cached forever.</li>
+</ul>
+<h4 id="new-metrics"><a class="header" href="#new-metrics">New metrics</a></h4>
+<ul>
+<li><code>pg_doorman_pooler_check_query_backend_total</code> — counter, increments
+on each probe forwarded to PostgreSQL (cache miss or
+RELOAD-induced re-probe).</li>
+<li><code>pg_doorman_pooler_check_query_cache_total</code> — counter, increments
+on each probe served from the cache.</li>
+</ul>
+<p>The ratio <code>cache_total / (cache_total + backend_total)</code> is the cache
+hit rate.</p>
+<h4 id="eviction-visibility-for-prepared-statement-caches"><a class="header" href="#eviction-visibility-for-prepared-statement-caches">Eviction visibility for prepared-statement caches</a></h4>
+<p>Per-eviction events from the named and anonymous query interner and
+from the per-client anonymous LRU are now emitted as <code>TRACE</code> log
+lines. The default <code>INFO</code> level is unchanged; turn them on at
+runtime with</p>
+<pre><code>SET log_level = 'info,pg_doorman::server::prepared_statement_cache=trace,pg_doorman::client::protocol=trace';
+</code></pre>
+<p>The GC sweep task additionally emits one <code>DEBUG</code> aggregate line per
+cycle that actually evicted something. Operators that previously had
+only the aggregate <code>pg_doorman_query_interner_evictions_total</code> and
+<code>pg_doorman_clients_prepared_anonymous_evictions_total</code> Prometheus
+counters can now follow individual evictions during an incident.</p>
+<p>The 80-char-with-ellipsis and 120-char preview helpers used in those
+log lines live in a new <code>utils::strings</code> module and replace three
+inline copies that had drifted apart.</p>
+<h4 id="web-ui-lifecycle-events"><a class="header" href="#web-ui-lifecycle-events">Web UI lifecycle events</a></h4>
+<p>The sidebar used to toast "pg_doorman restarted — rate baseline reset"
+on every routine RELOAD. Totals are summed across the live pool set,
+and RELOAD plus dynamic-pool GC drop pools from that set, so the sum
+legitimately falls without the process going anywhere. The heuristic
+is gone. A real restart is detected by a change in <code>pid</code>,
+<code>started_at_ms</code>, or <code>uptime_seconds</code>.</p>
+<p><code>/api/events</code> grows two new event targets:</p>
+<ul>
+<li><code>PROCESS_START</code> — emitted once when setup finishes; carries the
+binary version and pid.</li>
+<li><code>CONFIG_VALIDATION_ERROR</code> — emitted when SIGHUP, admin RELOAD, or
+<code>/api/admin/reload</code> rejects the new config. Rate-limited to one
+per second per target so a SIGHUP loop with a bad config cannot
+fill the 1024-entry ring with duplicates.</li>
+</ul>
+<p>A persistent banner across the top of the UI replaces the transient
+toast for conditions an operator must not miss:</p>
+<ul>
+<li><code>shutdown_in_progress</code> — pg_doorman is draining.</li>
+<li><code>migration_in_progress</code> — binary upgrade in flight.</li>
+<li>Last unresolved <code>CONFIG_VALIDATION_ERROR</code> — stays up until a
+successful <code>RELOAD</code> clears it.</li>
+<li><code>/api/overview</code> silent for &gt;15 s — banner switches to
+"pg_doorman unreachable — last contact 23s ago", so the operator
+knows the rest of the page is no longer trustworthy.</li>
+</ul>
+<p>A no-op SIGHUP (config file re-parsed identically) now emits a
+<code>RELOAD</code> entry with message <code>config unchanged</code> instead of going
+silent — one event per signal keeps the audit timeline complete.</p>
+<p><code>/api/events</code> and <code>/api/overview</code> send <code>Cache-Control: no-store</code> so
+intermediate proxies cannot collapse two consecutive polls into the
+same response.</p>
+<h3 id="391"><a class="header" href="#391">3.9.1</a></h3>
+<p>Web admin console refresh and a follow-up pass on <code>startup_parameters</code>.</p>
+<p>Upgrade notes for operators monitoring 3.9.0:</p>
+<ul>
+<li>The pg_doorman-side budget rejection now returns <code>SQLSTATE 53400</code>
+(<code>configuration_limit_exceeded</code>) instead of <code>54000</code>. Alert rules
+and log filters keyed on <code>54000</code> need to switch.</li>
+<li><code>PgDoormanStartupParameterPgRejection</code> is now <code>severity: warning</code>
+(was <code>critical</code> in 3.9.0). Cascade-overflow stays <code>critical</code>. Review
+the Alertmanager / on-call routing if you key on severity to page.</li>
+</ul>
+<h4 id="web-admin-console"><a class="header" href="#web-admin-console">Web admin console</a></h4>
+<ul>
+<li>Light theme by default. Three-position theme toggle (Light / System / Dark)
+in the sidebar footer; choice persists in localStorage.</li>
+<li>New <code>/servers</code> page reads SHOW SERVERS. Filters (database, user, state,
+application_name) and pagination live in the URL.</li>
+<li>New "Top SQLSTATE codes" card on Overview aggregating
+<code>errors_by_sqlstate</code> across pools.</li>
+<li>Patroni-assisted fallback banner on Overview when any pool reports
+<code>fallback_active=true</code>.</li>
+<li>Global RELOAD button on Config with typed confirmation.</li>
+<li>Logs and Clients filters move to URL parameters; deep links are
+shareable.</li>
+<li>Cmd+K / Ctrl-K command palette for navigation and pool lookup.</li>
+<li><code>?</code> opens a keyboard-shortcut sheet. Esc dismisses popovers and
+leaves the war room.</li>
+<li><code>/wall</code> requests a screen wake lock so a TV stays on past the OS
+screensaver timeout.</li>
+<li>Structured (i) popovers everywhere — definition, admin SHOW source,
+formula, thresholds, related metrics, link to docs.</li>
+<li>Sonner toast notifications for admin actions.</li>
+<li>Persistent transport indicator (http/https) in the sidebar footer.</li>
+<li>Counter-reset detection: a pg_doorman restart no longer renders as
+silent "0 qps" in the sidebar.</li>
+<li>Storage keys gained a host suffix, so two tabs against different
+poolers keep separate rolling buffers.</li>
+<li>Clients table memoises rows; poll cadence relaxed to 3 s. Resolves
+a memory growth reported on long sessions.</li>
+<li>Sidebar collapses below <code>md</code> (mobile navigation via Cmd+K and URL).</li>
+<li>Trimmed embedded font bundle: 5 woff2 (~146 KB) down from 9.</li>
+</ul>
+<p>Backend: <code>web/access_log.rs</code> demotes authenticated 2xx reads to debug.
+<code>info</code> covers admin actions, personal-data paths, <code>/api/auth/</code>,
+<code>/api/sso/</code>, and any non-2xx.</p>
+<p>Docs: <code>guides/web-ui.md</code> rewritten for the new pages and shortcuts.</p>
+<h4 id="startup_parameters-follow-up"><a class="header" href="#startup_parameters-follow-up">startup_parameters follow-up</a></h4>
+<ul>
+<li>If the resolved <code>startup_parameters</code> set exceeds the startup packet
+budget, backend startup now fails with <code>SQLSTATE 53400</code>. A
+deterministic <code>general + pool</code> overflow is rejected at config load.</li>
+<li>The final <code>ParameterStatus</code> messages sent to the client no longer
+overwrite operator-managed GUC names, so the client-visible values
+match the backend checkout state.</li>
+<li><code>auth_query</code> now rebuilds a dynamic pool after a successful MD5
+refetch, rejects the stale-overlay race in <code>create_dynamic_pool</code>, and
+accepts native <code>json</code>/<code>jsonb</code> startup_parameter columns without a
+<code>::text</code> cast.</li>
+<li><code>/api/config</code> and <code>/api/pools</code> show literal startup_parameter values
+only to <code>Admin</code>; SSO readers get the masked view. <code>/api/config</code> also
+marks <code>general.host</code>, <code>general.port</code>, <code>web.host</code>, and <code>web.port</code> as
+restart-required.</li>
+<li>Prometheus rules now cover PostgreSQL-side rejection, budget overflow,
+malformed auth_query columns, dedicated-mode drops, and rejected SSO
+credentials sent over insecure transport.</li>
+<li>Each pool now precomputes the merged startup map, budget decision, and
+canonical operator-key set. Backend checkout reuses those cached
+values instead of cloning and recalculating the map each time.</li>
+</ul>
+<h3 id="390"><a class="header" href="#390">3.9.0</a></h3>
+<p>Per-pool PostgreSQL startup parameters. pg_doorman can now add
+configured GUCs to each backend <code>StartupMessage</code>. Values apply in
+three layers: <code>general.startup_parameters</code>, <code>pools.&lt;name&gt;.startup_parameters</code>,
+and the optional <code>startup_parameters</code> column returned by passthrough
+<code>auth_query</code>.</p>
+<p>PostgreSQL stores these values as the session reset defaults, so
+client-side <code>RESET ALL</code> and <code>DISCARD ALL</code> return to the configured value.
+This gives one pool a different <code>plan_cache_mode</code>, <code>statement_timeout</code>,
+<code>work_mem</code>, or <code>idle_in_transaction_session_timeout</code> without changing
+<code>postgresql.conf</code>, <code>ALTER ROLE</code>, or <code>ALTER DATABASE</code>.</p>
+<h4 id="cascade-resolution"><a class="header" href="#cascade-resolution">Cascade resolution</a></h4>
+<ul>
+<li><code>general.startup_parameters</code>, <code>pools.&lt;name&gt;.startup_parameters</code>, and
+the optional <code>startup_parameters</code> text column on an <code>auth_query</code> row
+are applied in order. Later layers override earlier ones per key.</li>
+<li>Dedicated <code>auth_query</code> mode uses a shared <code>server_user</code>, so
+pg_doorman ignores the per-user column there and logs one warning per
+pool and username.</li>
+<li>A reload that changes startup parameters recycles the affected pools.
+Idle backends with the old reset defaults are not reused.</li>
+</ul>
+<h4 id="validation-and-protocol-safety"><a class="header" href="#validation-and-protocol-safety">Validation and protocol safety</a></h4>
+<ul>
+<li>Reserved protocol keys (<code>user</code>, <code>database</code>, <code>replication</code>,
+<code>options</code>, the <code>_pq_.*</code> extension prefix) are refused at config load.</li>
+<li>Keys must match the PG GUC naming shape <code>[A-Za-z_][A-Za-z0-9_.]*</code>,
+values must not contain null bytes, and each level fits the startup-parameter
+budget of <code>MAX_STARTUP_PACKET_LENGTH - 512</code> bytes.</li>
+<li>The resolved parameter set is checked before each backend startup
+against PG's 10 000-byte <code>MAX_STARTUP_PACKET_LENGTH</code>. If only the
+auth_query layer overflows the packet, pg_doorman drops that layer and
+keeps the general/pool baseline. If the baseline itself does not fit,
+pg_doorman skips all configured keys for that spawn and logs the
+byte counts.</li>
+</ul>
+<h4 id="behaviour-on-pg-side-rejection"><a class="header" href="#behaviour-on-pg-side-rejection">Behaviour on PG-side rejection</a></h4>
+<ul>
+<li>If PostgreSQL rejects a configured startup parameter at backend
+startup, pg_doorman returns PostgreSQL's <code>ErrorResponse</code> to the
+client unchanged. pg_doorman does not retry without the key and does
+not disable the key automatically for the pool. Fix the parameter in
+the config; until then, backend startup for that pool fails with
+PostgreSQL's own SQLSTATE and message.</li>
+<li>SQLSTATEs with the <code>57P</code> prefix (server unavailable) keep mapping to
+<code>ServerUnavailableError</code> first so the Patroni-assisted fallback
+path can route around the failed node before the startup-parameter
+log line fires.</li>
+<li>The configured parameter wins over the client sync path:
+even if the client connect string carries an <code>application_name</code>
+(or another tracked GUC like <code>TimeZone</code>), the per-checkout
+<code>sync_parameters</code> call no longer overrides the configured value on
+the backend. That default stands until an
+explicit <code>SET</code> statement on the client session changes it.</li>
+</ul>
+<h4 id="reload-coherence"><a class="header" href="#reload-coherence">RELOAD coherence</a></h4>
+<ul>
+<li>A SIGHUP that changes <code>general.startup_parameters</code> drains pools that
+inherit that baseline. The per-pool config hash includes the general
+startup map, and carried-over dynamic <code>auth_query</code> pools are recycled
+when the baseline changes.</li>
+</ul>
+<h4 id="observability"><a class="header" href="#observability">Observability</a></h4>
+<ul>
+<li><code>pg_doorman_backend_startup_parameter_errors_total{pool, sqlstate}</code>
+counts backend startups PostgreSQL rejected because of an
+configured startup parameter. The failing parameter name and username are
+written to the warning log line, not to metric labels.</li>
+<li><code>SHOW STARTUP_PARAMETERS</code> (admin SQL console) lists the per-pool
+resolved parameters with the source of each value. <code>psql</code> tab
+completion on <code>SHOW &lt;TAB&gt;</code> now includes the command.</li>
+<li>The Web UI pool detail page shows the same rows in a "Startup
+parameters (configured)" section, driven by the new
+<code>startup_parameters[]</code> field on <code>/api/pools</code>.</li>
+</ul>
+<p>See <a href="tutorials/startup-parameters.html">PostgreSQL startup parameters</a>
+for the configuration walkthrough, plus <a href="reference/general.html">General Settings</a>
+and <a href="reference/pool.html">Pool Settings</a> for the full parameter list.</p>
+<h3 id="385"><a class="header" href="#385">3.8.5</a></h3>
+<p>The web console now accepts JWTs issued by an external SSO proxy
+alongside the existing Basic auth. The listener resolves every
+request to one of three roles — <code>Anonymous</code>, <code>Sso</code> (read-only,
+including logs and SQL text), and <code>Admin</code> (full access, including
+<code>POST /api/admin/*</code>) — and a JWT can reach the <code>Admin</code> role through a
+configurable group claim, so SSO operators run mutating admin actions
+without sharing the Basic password. A per-request access log on a
+dedicated logger target makes role transitions and 401/403 spikes
+visible from <code>journalctl</code>. Full reference and an oauth2-proxy example
+live in <a href="guides/web-ui.html"><code>guides/web-ui.md</code></a>.</p>
+<h4 id="sso-authentication"><a class="header" href="#sso-authentication">SSO authentication</a></h4>
+<ul>
+<li>New <code>[web]</code> fields wire the SSO branch: <code>sso_enabled</code>,
+<code>sso_proxy_url</code>, <code>sso_public_key_file</code>, <code>sso_audience</code>,
+<code>sso_allowed_users</code>, <code>sso_groups_claim</code>, <code>sso_admin_groups</code>. JWTs
+are validated as RS256 against the PEM-encoded public key; the
+parsed key reloads on <code>RELOAD</code>.</li>
+<li>A JWT whose <code>sso_groups_claim</code> value intersects <code>sso_admin_groups</code>
+resolves to <code>Admin</code> with <code>auth_source = sso</code>. Empty
+<code>sso_admin_groups</code> (the default) keeps every SSO login on the
+read-only <code>Sso</code> role.</li>
+<li>Tokens are accepted from <code>Authorization: Bearer</code>, the
+<code>sso_access_token</code> cookie, or the <code>?token=</code> query parameter, in
+that priority order. Basic still wins over SSO when both are
+presented; a wrong Basic password no longer blocks a valid SSO
+token.</li>
+<li><code>GET /api/auth/config</code> reports <code>sso_enabled</code>, <code>sso_proxy_url</code>,
+<code>sso_admin_groups_configured</code>, <code>sso_config_error</code>, and the resolved
+<code>current_user</code>, so the SPA renders the role-aware sign-in modal
+and sidebar without a second probe.</li>
+</ul>
+<h4 id="role-aware-gating"><a class="header" href="#role-aware-gating">Role-aware gating</a></h4>
+<ul>
+<li><code>[web].ui_anonymous = false</code> now requires the <code>Sso</code> role for the
+public <code>/api/*</code> endpoints; previously every authenticated request
+needed <code>Admin</code>. Read-only privileged endpoints (<code>/api/logs</code>,
+<code>/api/prepared/text/*</code>, <code>/api/interner/top</code>, <code>/api/top/queries</code>)
+are reachable by <code>Sso</code> users. <code>POST /api/admin/*</code> remains
+<code>Admin</code>-only.</li>
+<li>Insufficient-role rejections return <code>403 Forbidden</code> with body
+<code>{"error":"forbidden","message":"admin role required"}</code>. Missing or
+invalid credentials still produce <code>401</code>. The SPA re-opens the
+sign-in modal on <code>401</code> and renders a non-blocking "admin role
+required" banner on <code>403</code>.</li>
+</ul>
+<h4 id="browser-sign-in-flow"><a class="header" href="#browser-sign-in-flow">Browser sign-in flow</a></h4>
+<ul>
+<li>The sign-in modal shows a <strong>Sign in via SSO</strong> button next to the
+Basic form when the backend reports <code>sso_proxy_url</code>. The proxy
+bounces the browser back with <code>?token=&lt;jwt&gt;</code>, which the SPA stores
+in <code>localStorage</code> and rewrites out of the URL.</li>
+<li>A silent-refresh poller (every 60 s, fires when <code>exp</code> is under
+90 s) opens a hidden iframe at <code>${origin}/?sso_silent=1</code>. The
+iframe renders a minimal <code>SilentCallback</code> and posts the new token
+to the parent. If silent refresh fails and a Basic credential is
+available, the SPA falls back to Basic without redirecting;
+otherwise it performs a full redirect through the SSO proxy.</li>
+<li>The SPA never sends cookies (<code>credentials: "omit"</code>); cookie auth
+remains available for curl, sidecars, and oauth2-proxy variants
+that paste the token into a cookie on the shared domain.</li>
+</ul>
+<h4 id="access-log"><a class="header" href="#access-log">Access log</a></h4>
+<ul>
+<li>Every response (200/401/403/404/5xx, <code>/metrics</code> scrapes included)
+emits one logfmt line on the dedicated <code>pg_doorman::web::access</code>
+target with <code>method</code>, <code>path</code>, <code>query</code> (presence flag only —
+raw query strings are never logged), <code>status</code>, <code>bytes</code>,
+<code>latency_ms</code>, <code>peer</code>, <code>auth_role</code>, <code>auth_source</code>, and <code>auth_user</code>.
+Bodies are not logged.</li>
+<li>Levels are picked per request. Admin actions, personal-data reads,
+every non-2xx response, and any authenticated request log at
+<code>info</code>. Anonymous successful reads of public APIs and <code>/metrics</code>
+scrapes log at <code>debug</code>, so <code>RUST_LOG=info</code> no longer drowns in
+scrape noise.</li>
+</ul>
+<h4 id="real-client-ip-behind-a-reverse-proxy"><a class="header" href="#real-client-ip-behind-a-reverse-proxy">Real client IP behind a reverse proxy</a></h4>
+<ul>
+<li>New <code>[web].trusted_proxies</code> CIDR list. When the TCP peer falls in
+this list, the access log parses <code>X-Forwarded-For</code> (or RFC 7239
+<code>Forwarded</code>), walks the chain right-to-left skipping further
+trusted hops, and uses the first untrusted address as <code>peer</code>. An
+untrusted client that sends <code>X-Forwarded-For</code> is ignored, so the
+field cannot be spoofed.</li>
+</ul>
+<h4 id="observability-1"><a class="header" href="#observability-1">Observability</a></h4>
+<ul>
+<li>New gauges <code>pg_doorman_web_sso_enabled</code> and
+<code>pg_doorman_web_sso_config_error</code>. The latter stays at <code>1</code> while
+<code>sso_enabled = true</code> but the runtime failed to load (missing PEM
+file, empty audience, unparsable PEM). The exact reason is
+exported through <code>/api/auth/config.sso_config_error</code> and rendered
+as a banner in the SPA.</li>
+<li>New counters <code>pg_doorman_web_auth_attempts_total{role,source}</code>,
+<code>pg_doorman_web_requests_total{status_class,role}</code>, and
+<code>pg_doorman_web_sso_validation_errors_total{reason}</code> (reasons:
+<code>signature</code>, <code>expired</code>, <code>audience</code>, <code>no_username</code>, <code>allowlist</code>).
+Operators alert on SSO degradation without grepping logs.</li>
+</ul>
+<h3 id="380"><a class="header" href="#380">3.8.0</a></h3>
+<h4 id="added"><a class="header" href="#added">Added</a></h4>
+<p><strong>Built-in operator dashboard.</strong> pg_doorman exposes a single-page
+diagnostic console on the same port as <code>/metrics</code>, served from
+inside the binary and gated on <code>[web].ui = true</code> plus a non-default
+<code>admin_password</code>. Getting comparable detail from the existing psql
+admin console means running <code>SHOW POOLS</code>, <code>SHOW CLIENTS</code>,
+<code>SHOW STATS</code> and friends in a loop, computing rates by hand between
+two snapshots, and joining the rows mentally. The dashboard does
+that on a 1.5 s tick.</p>
+<p>What it shows that the psql admin console does not:</p>
+<ul>
+<li><strong>Live time-series, not snapshots.</strong> Latency p95/p99, qps,
+errors/s and connection saturation render as sparklines, so
+"spiking now" is visually distinct from "always been like this".</li>
+<li><strong>Errors broken down by SQLSTATE per pool.</strong> Plus top-N stuck
+queries by <code>current_query_age_ms</code>, top-N noisy clients by
+errors, top-N hottest prepared statements by hit rate.</li>
+<li><strong>Process memory by category.</strong> RSS split into jemalloc live
+allocations, jemalloc fragmentation, internal pg_doorman caches,
+code + libs, stacks + page tables, swap and anonymous remainder,
+with cgroup current / max alongside. Every category carries a
+one-line explanation on hover.</li>
+<li><strong>Per-thread tokio-worker CPU.</strong> Drill-down from the threads
+count to per-thread utilisation, so a stuck worker is visible
+without <code>perf top</code> on the host.</li>
+<li><strong>Live log tail.</strong> An in-process LogTap activates on the first
+<code>/api/logs</code> request and self-disables two minutes after the last
+viewer. Level and target filters apply client-side over the
+rolling buffer.</li>
+<li><strong>Sortable, filterable tables.</strong> Pools, Clients, Apps and Caches
+sort by any column and filter by substring; Prepared statements
+adds a kind dropdown on top.</li>
+</ul>
+<p>The dashboard is read-only by default. Pause / Resume / Reconnect /
+Reload are the four writes, scoped to one pool via
+<code>?pool=user@db</code>, to every pool of a database via <code>?db=</code>, or
+globally — the same semantics as the admin protocol.</p>
+<h4 id="notes"><a class="header" href="#notes">Notes</a></h4>
+<ul>
+<li><code>[web].ui_anonymous</code> (default <code>false</code>) controls whether the
+read-only <code>/api/*</code> endpoints answer without basic auth. Admin-
+only endpoints (<code>/api/logs</code>, <code>/api/admin/*</code>,
+<code>/api/prepared/text/{hash}</code>, <code>/api/interner/top</code>,
+<code>/api/top/queries</code>) always require it regardless of that flag.</li>
+<li>The dashboard polls every 1.5 s, but a 250 ms shared snapshot
+feeds <code>/api/overview</code>, <code>/api/pools</code>, <code>/api/clients</code>,
+<code>/api/servers</code>, <code>/api/apps</code>, <code>/api/stats</code> and <code>/metrics</code>, so a
+multi-tab dashboard does not multiply pool-stats work by the
+number of open tabs.</li>
+</ul>
+<h3 id="370"><a class="header" href="#370">3.7.0</a></h3>
+<h4 id="action-required-before-upgrading-to-370"><a class="header" href="#action-required-before-upgrading-to-370">ACTION REQUIRED before upgrading to 3.7.0</a></h4>
+<ul>
+<li><strong>SQLSTATE for missing prepared statements changed from <code>58000</code> to
+<code>26000</code>.</strong> Any <code>Bind</code> or <code>Describe</code> referencing a prepared statement
+that pg_doorman cannot resolve now returns SQLSTATE <code>26000</code>
+(<code>invalid_sql_statement_name</code>), matching native PostgreSQL.
+Audit dashboards, log searches, alert rules, and retry middleware
+that filter on <code>58000</code> for this condition (Splunk saved searches,
+Grafana log alerts, custom retry policies). Drivers that auto-retry
+on <code>26000</code> (pgjdbc, pgx with <code>cache_describe</code>) now do so;
+drivers that closed the connection on <code>58000</code> will no longer.</li>
+<li><strong>Migration format v1 is no longer accepted.</strong> Upgrades from a
+pg_doorman that emitted v1 (3.5.0–3.5.x) must hop through
+3.6.x first; from 3.4 and earlier no migration support existed,
+so the upgrade is unaffected.</li>
+<li><strong><code>client_prepared_statements_cache_size</code> is deprecated.</strong> It
+remains a serde alias of <code>client_anonymous_prepared_cache_size</code>,
+with a <code>WARN</code> at startup. Planned for removal in 3.9; rename in
+configs now.</li>
+<li><strong>Anonymous prepared statements have a TTL by default.</strong> The
+query interner evicts an anonymous entry after
+<code>query_interner_anon_idle_ttl_seconds</code> (default 60) of idle time.
+Drivers like pgjdbc and <code>pgx</code> with <code>cache_describe</code> re-issue
+<code>Parse</code> transparently when the next <code>Bind</code> returns SQLSTATE
+<code>26000</code>. If your driver relies on cross-batch unnamed prepared
+statements without a re-Parse, set
+<code>query_interner_anon_idle_ttl_seconds: 0</code> to keep the pre-3.7
+unbounded behaviour.</li>
+</ul>
+<h4 id="added-1"><a class="header" href="#added-1">Added</a></h4>
+<ul>
+<li>The query interner is split into NAMED (passive <code>Arc::strong_count</code>
+GC) and ANON (idle TTL). Two general knobs control the GC:
+<code>query_interner_gc_interval_seconds</code> (default 60, restart-only) and
+<code>query_interner_anon_idle_ttl_seconds</code> (default 60; <code>0</code> disables
+TTL and restores pre-3.7 unbounded behaviour; live-reloadable).
+A two-cycle mark-and-sweep grace prevents eviction of entries
+touched between cycles.</li>
+<li><code>SHOW INTERNER</code> reports entries and bytes per kind;
+<code>SHOW INTERNER N</code> lists the top N by interned text length with
+hash, kind, idle_ms, and a 120-character preview; <code>RESET INTERNER</code>
+clears both halves (diagnostics-only).</li>
+<li>Prometheus interner metrics:
+<code>pg_doorman_query_interner_entries{kind}</code>,
+<code>_bytes{kind}</code>, <code>_evictions_total{kind, reason}</code>,
+<code>_synthetic_misses_total</code>, <code>_gc_duration_seconds</code>.</li>
+<li><code>server_prepared_statements_cache_size</code> (general + per-pool)
+sizes the per-backend server-level prepared-statement LRU.
+When unset, inherits <code>prepared_statements_cache_size</code>.</li>
+<li><code>client_anonymous_prepared_cache_size</code> bounds the Anonymous part
+of the per-client cache; named statements remain unbounded. The
+knob is now optional and inherits <code>prepared_statements_cache_size</code>
+when unset (<code>0</code> still means unlimited).</li>
+<li><code>kind</code> column appended to <code>SHOW PREPARED_STATEMENTS</code>
+(<code>named</code> / <code>anonymous</code> / <code>mixed</code>).</li>
+<li><code>SHOW POOLS_MEMORY</code> gains <code>client_named_count</code>,
+<code>client_anonymous_count</code>, and <code>client_anonymous_evictions_alive</code>
+(a gauge of evictions across currently connected clients; the
+authoritative cumulative counter lives in Prometheus as
+<code>pg_doorman_clients_prepared_anonymous_evictions_total</code>). The
+matching gauges <code>pg_doorman_clients_prepared_named_entries</code> /
+<code>..._anonymous_entries</code> round out the surface.</li>
+</ul>
+<h4 id="changed"><a class="header" href="#changed">Changed</a></h4>
+<ul>
+<li>The per-client prepared-statement cache is split into Named
+(unbounded) and Anonymous (LRU). Fixes a bug where the previous
+combined LRU could evict a Named entry and cause the next <code>Bind</code>
+to fail with <code>prepared statement does not exist</code>.</li>
+<li><code>Bind</code> against an anonymous prepared statement that is no longer
+cached anywhere (interner, pool, client) now returns SQLSTATE
+<code>26000</code> (<code>invalid_sql_statement_name</code>) instead of <code>58000</code>,
+matching native PostgreSQL. Standard drivers re-issue <code>Parse</code>
+transparently.</li>
+</ul>
+<h4 id="deprecated"><a class="header" href="#deprecated">Deprecated</a></h4>
+<ul>
+<li><code>client_prepared_statements_cache_size</code> is renamed to
+<code>client_anonymous_prepared_cache_size</code>. The old name remains a
+serde alias and logs a <code>WARN</code> at startup; rename it in your
+config.</li>
+</ul>
+<h4 id="removed"><a class="header" href="#removed">Removed</a></h4>
+<ul>
+<li>Migration format v1 is no longer accepted. Upgrades from versions
+that emitted v1 (3.4 and earlier) must hop through a 3.5–3.6
+binary first; <code>deserialize_state</code> returns <code>unsupported version 1</code>
+otherwise.</li>
+</ul>
+<h3 id="365-may-4-2026"><a class="header" href="#365-may-4-2026">3.6.5 <small>May 4, 2026</small></a></h3>
+<h4 id="fix-stuck-cl_activesv_active-after-large-datarow-client-disconnect-under-pressure"><a class="header" href="#fix-stuck-cl_activesv_active-after-large-datarow-client-disconnect-under-pressure">Fix: stuck <code>cl_active/sv_active</code> after large DataRow client disconnect under pressure</a></h4>
+<p>When a large <code>DataRow</code> was deferred via <code>pending_large_message</code>, <code>recv()</code> cleared the deferred header before streaming. If the client disconnected during streaming write, the next drain/read path lost frame boundaries and could block in <code>wait_available()</code>. Under full pressure, this left <code>cl_active</code>/<code>sv_active</code> pinned at pool size and prevented normal <code>server_lifetime</code> recycling.</p>
+<p><code>recv()</code> now keeps <code>pending_large_message</code> until large-message handling succeeds and clears it only on <code>Ok</code>. On error, the next <code>recv()</code> still has correct frame context, allowing cleanup to complete and active counters to drop as expected.</p>
+<h4 id="observability-oldest_active_age_ms-per-pool"><a class="header" href="#observability-oldest_active_age_ms-per-pool">Observability: <code>oldest_active_age_ms</code> per pool</a></h4>
+<p><code>SHOW POOLS</code> exposes a new <code>oldest_active_age_ms</code> column and Prometheus exports <code>pg_doorman_pools_oldest_active_age_ms{user, database}</code>. The gauge reports the maximum age in milliseconds among ACTIVE servers in each pool, taken at snapshot time, and falls back to <code>0</code> when no server is currently ACTIVE. Sustained non-zero values flag stuck checkouts before pool exhaustion.</p>
+<h3 id="364-apr-29-2026"><a class="header" href="#364-apr-29-2026">3.6.4 <small>Apr 29, 2026</small></a></h3>
+<h4 id="fallback-resilience"><a class="header" href="#fallback-resilience">Fallback resilience</a></h4>
+<p>Patroni-assisted fallback now races <code>Server::startup</code> against every alive cluster member in parallel, with a strict sync_standby priority that protects write traffic during a local-backend outage. See <a href="tutorials/patroni-assisted-fallback.html">Patroni-assisted fallback</a> for operator-level details.</p>
+<ul>
+<li><strong>Startup deadline per candidate.</strong> <code>Server::startup</code> runs under <code>tokio::time::timeout</code>. Main path: <code>connect_timeout</code> (default <code>3s</code>), now also covers the StartupMessage round-trip. Fallback path: <code>fallback_connect_timeout</code> (default <code>5s</code>) per candidate. Raise <code>connect_timeout</code> if local startup legitimately exceeds 3s (large WAL replay after restart).</li>
+<li><strong>Two-wave parallel race.</strong> Wave 1 races startup against every <code>sync_standby</code> in parallel and takes the first success; wave 2 (replica + leader) runs only if every sync_standby failed or none existed. While any sync_standby is still in-flight, a replica that already finished startup is intentionally not used — the user-facing requirement is "sync wins if it's alive at all", because the sync_standby is the lowest-data-loss promotion target. On full exhaustion the doorman log records <code>all fallback candidates rejected (3 startup_error, 1 timeout)</code> with a deterministic per-reason breakdown; the client always sees the sanitized <code>Unable to retrieve server parameters … may be unavailable or misconfigured</code> FATAL — read the doorman log for the wave/winner trace.</li>
+<li><strong>Per-host cooldown with exponential backoff.</strong> Failed candidate is marked unhealthy for <code>fallback_connect_timeout</code>, doubling on consecutive failures up to <code>60s</code>; resets to base after the window elapses. The cooldown map is pruned of expired entries at the start of each discovery cycle, so its size stays linear in actively-failing candidates rather than accumulating dead pod IPs.</li>
+<li><strong>Soft outer deadline.</strong> The full fallback path runs under <code>query_wait_timeout</code> (default <code>5s</code>). If it fires, pg_doorman aborts cleanly with <code>fallback: outer deadline {ms}ms exceeded</code> in the log and returns the sanitized FATAL to the client. Per-candidate timeouts are the hard guarantee against hangs; the outer deadline is a soft cap on how long the client itself is willing to wait.</li>
+<li><strong>Whitelist post-failure rediscovery.</strong> Stale cached host failure clears the cache and runs one extra discovery round.</li>
+<li><strong>Log rate-limit.</strong> Per-candidate <code>WARN</code> rate-limited to 1 per 10s per <code>(pool, host:port)</code>; suppressed lines log at DEBUG.</li>
+<li><strong><code>pg_doorman_fallback_host</code> cleanup on switchover.</strong> Old <code>(host, port)</code> label removed when whitelist changes.</li>
+<li><strong>New metric</strong> <code>pg_doorman_fallback_candidate_failures_total{pool, reason}</code>. Reasons: <code>connect_error</code>, <code>startup_error</code>, <code>server_unavailable</code>, <code>timeout</code>, <code>other</code>.</li>
+</ul>
+<p>Use IP addresses (not hostnames) in <code>member.host</code>: a 5s DNS hang consumes the full per-candidate budget.</p>
+<h3 id="363-apr-28-2026"><a class="header" href="#363-apr-28-2026">3.6.3 <small>Apr 28, 2026</small></a></h3>
+<h4 id="fix-per-connection-read-buffer-leak-under-multi-mib-simple-query-inserts"><a class="header" href="#fix-per-connection-read-buffer-leak-under-multi-mib-simple-query-inserts">Fix: per-connection read buffer leak under multi-MiB simple-query INSERTs</a></h4>
+<p>Per-connection reusable read buffers (<code>Client.read_buf</code>, <code>Server.read_buf</code>) retained the largest allocation each connection had served. After one multi-MiB simple-query INSERT, every subsequent small message split out of that allocation, and the reusable buffer reclaimed the multi-MiB region as soon as the previous <code>BytesMut</code> was dropped. Across thousands of clients in transaction mode, occasional megabyte-sized payloads compounded into a 100 MB → 4 GB pooler RSS regression.</p>
+<p><code>read_message_reuse</code> and <code>read_message_body_reuse</code> now drop the backing allocation before each read when the buffer's capacity exceeds 256 KiB and fall back to a fresh 16 KiB buffer. The steady-state path (capacity within threshold) is unchanged.</p>
+<h3 id="362-apr-27-2026"><a class="header" href="#362-apr-27-2026">3.6.2 <small>Apr 27, 2026</small></a></h3>
+<p><strong>New features:</strong></p>
+<ul>
+<li>
+<p><strong>Unix socket listener.</strong> <code>unix_socket_dir</code> creates <code>.s.PGSQL.&lt;port&gt;</code> socket file. Connect with <code>psql -h &lt;dir&gt;</code> or <code>pgbench -h &lt;dir&gt;</code>. No TCP overhead on local connections.</p>
+</li>
+<li>
+<p><strong>HBA <code>local</code> rule matching.</strong> <code>local</code> rules in pg_hba now apply to Unix socket connections. <code>host</code>/<code>hostssl</code>/<code>hostnossl</code> rules apply only to TCP. Previously <code>local</code> rules were parsed but ignored.</p>
+</li>
+<li>
+<p><strong><code>unix_socket_mode</code> controls socket file permissions.</strong> New <code>[general]</code> setting fixes the permission bits on <code>.s.PGSQL.&lt;port&gt;</code> after bind, so the access surface no longer depends on the process umask. Octal string, default <code>"0600"</code> (owner only). Set to <code>"0660"</code> to grant a Unix group, or <code>"0666"</code> to allow any local user. Validated at config load — invalid octal values, setuid/setgid/sticky bits, and overflow into bits above <code>0o777</code> are rejected upfront.</p>
+</li>
+</ul>
+<p><strong>Known limitations (Unix socket):</strong></p>
+<ul>
+<li>Unix listener not handed off during <code>SIGUSR2</code> binary upgrade. New process re-creates the socket; connections refused for ~100ms.</li>
+<li><code>only_ssl_connections</code> does not reject Unix socket connections. Unix sockets do not need TLS for transport security.</li>
+</ul>
+<h3 id="361-apr-27-2026"><a class="header" href="#361-apr-27-2026">3.6.1 <small>Apr 27, 2026</small></a></h3>
+<h4 id="openssl-01078-cve-2026-41678-cve-2026-41681"><a class="header" href="#openssl-01078-cve-2026-41678-cve-2026-41681">openssl 0.10.78 (CVE-2026-41678, CVE-2026-41681)</a></h4>
+<p><code>openssl</code> 0.10.72 is affected by CVE-2026-41678 and CVE-2026-41681; some registry mirrors refuse downloads on that basis. pg_doorman now depends on <code>openssl</code> 0.10.78 and <code>openssl-sys</code> 0.9.114. API-compatible — no source changes.</p>
+<h3 id="360-apr-24-2026"><a class="header" href="#360-apr-24-2026">3.6.0 <small>Apr 24, 2026</small></a></h3>
+<h4 id="patroni-assisted-fallback"><a class="header" href="#patroni-assisted-fallback">Patroni-assisted fallback</a></h4>
+<p>When pg_doorman runs next to PostgreSQL on the same machine and connects via unix socket, a Patroni switchover or PostgreSQL crash leaves the pooler without a backend. With <code>patroni_api_urls</code> configured, pg_doorman queries the Patroni REST API <code>/cluster</code> endpoint, picks a live cluster member, and routes new connections there.</p>
+<p>Candidate selection: <code>sync_standby</code> first (most likely next leader), then <code>replica</code>, then any other member. Members with <code>noloadbalance</code>, <code>nofailover</code>, or <code>archive</code> tags are excluded. All candidates are TCP-probed in parallel; the first responding <code>sync_standby</code> wins immediately.</p>
+<p>The local backend stays in cooldown for <code>fallback_cooldown</code> (default 30s). During the cooldown, subsequent connection requests reuse the cached fallback host without re-querying Patroni. Fallback connections use a short <code>fallback_lifetime</code> (defaults to <code>fallback_cooldown</code>) so the pool returns to the local backend once it recovers.</p>
+<p>Configuration:</p>
+<pre><code class="language-yaml">pools:
+  mydb:
+    patroni_api_urls:
+      - "http://10.0.0.1:8008"
+      - "http://10.0.0.2:8008"
+    fallback_cooldown: "30s"
+    patroni_api_timeout: "5s"
+    fallback_connect_timeout: "5s"
+</code></pre>
+<p>Prometheus metrics: <code>pg_doorman_patroni_api_requests_total</code>, <code>pg_doorman_fallback_connections_total</code>, <code>pg_doorman_patroni_api_errors_total</code>, <code>pg_doorman_fallback_active</code>, <code>pg_doorman_patroni_api_duration_seconds</code>, <code>pg_doorman_fallback_host</code>, <code>pg_doorman_fallback_cache_hits_total</code>.</p>
+<p>If you tracked this feature under its working name in 3.5.x dev builds, the config keys and metric names changed before the public release: <code>patroni_discovery_urls</code> → <code>patroni_api_urls</code>, <code>failover_blacklist_duration</code> → <code>fallback_cooldown</code>, <code>failover_discovery_timeout</code> → <code>patroni_api_timeout</code>, <code>failover_connect_timeout</code> → <code>fallback_connect_timeout</code>, <code>failover_server_lifetime</code> → <code>fallback_lifetime</code>. Old <code>pg_doorman_failover_*</code> metrics are renamed to <code>pg_doorman_patroni_api_*</code> / <code>pg_doorman_fallback_*</code>.</p>
+<h4 id="server-side-tls-pg_doorman--postgresql"><a class="header" href="#server-side-tls-pg_doorman--postgresql">Server-side TLS (pg_doorman → PostgreSQL)</a></h4>
+<p>Six SSL modes matching libpq semantics: <code>disable</code>, <code>allow</code> (default), <code>prefer</code>, <code>require</code>, <code>verify-ca</code>, <code>verify-full</code>. Mutual TLS supported via <code>server_tls_certificate</code> / <code>server_tls_private_key</code>.</p>
+<p>Configuration is per-pool with global defaults in <code>[general]</code>. Cancel requests use TLS when the main connection used TLS.</p>
+<p><strong>Breaking change:</strong> <code>server_tls</code> (bool) and <code>verify_server_certificate</code> (bool) are removed. They were parsed but non-functional. Replace with:</p>
+<div class="table-wrapper"><table><thead><tr><th>Old config</th><th>New config</th></tr></thead><tbody>
+<tr><td><code>server_tls: false</code></td><td><code>server_tls_mode: "disable"</code></td></tr>
+<tr><td><code>server_tls: true</code></td><td><code>server_tls_mode: "require"</code></td></tr>
+<tr><td><code>server_tls: true</code> + <code>verify_server_certificate: true</code></td><td><code>server_tls_mode: "verify-full"</code></td></tr>
+<tr><td>(not set)</td><td><code>server_tls_mode: "allow"</code> (new default)</td></tr>
+</tbody></table>
+</div>
+<p>The new default <code>allow</code> tries plain TCP first. If the server rejects the connection (e.g. <code>pg_hba.conf</code> requires TLS), pg_doorman retries with TLS on a new TCP socket. This matches libpq <code>sslmode=allow</code>.</p>
+<p><code>SHOW SERVERS</code> now includes a <code>tls</code> column showing whether each backend connection uses TLS.</p>
+<h3 id="353-apr-22-2026"><a class="header" href="#353-apr-22-2026">3.5.3 <small>Apr 22, 2026</small></a></h3>
+<h4 id="prepared-statement-cache-overflow-under-concurrent-load"><a class="header" href="#prepared-statement-cache-overflow-under-concurrent-load">Prepared statement cache overflow under concurrent load</a></h4>
+<p>The pool-level prepared statement cache could grow well above its configured <code>prepared_statements_cache_size</code> under concurrent client traffic. Production showed 480 entries with a limit of 300. The check-then-insert sequence in the cache had a race: multiple clients passed the size check simultaneously, each inserted without evicting. Now insertion happens first, followed by eviction in a loop until the cache is within bounds.</p>
+<h3 id="352-apr-21-2026"><a class="header" href="#352-apr-21-2026">3.5.2 <small>Apr 21, 2026</small></a></h3>
+<h4 id="semaphore-permit-leak-on-direct-handoff"><a class="header" href="#semaphore-permit-leak-on-direct-handoff">Semaphore permit leak on direct handoff</a></h4>
+<p>Each <code>return_object</code> handoff (delivering a connection to a waiting client via oneshot channel) permanently consumed one semaphore permit. After <code>max_size</code> handoffs the pool semaphore was fully drained, blocking all new <code>timeout_get</code> callers. The pool could not create connections and stabilized at whatever size it reached during cold start (typically 4-8 out of 40).</p>
+<p>Root cause: <code>wrap_checkout</code> calls <code>permit.forget()</code>, and the handoff path in <code>return_object</code> skipped <code>add_permits(1)</code>. Now <code>return_object</code> restores the permit on both the handoff and idle-queue paths. Compensating <code>add_permits(1)</code> in <code>pre_replace_one</code> removed (no longer needed).</p>
+<h4 id="burst-gate-select-race"><a class="header" href="#burst-gate-select-race">Burst gate select race</a></h4>
+<p>The <code>tokio::select!</code> in the burst gate loop randomly picked among ready branches. When <code>sleep(5ms)</code> or <code>create_done</code> won over an already-delivered oneshot, the connection was silently dropped, inflating <code>slots.size</code> without a live server. Fixed with <code>biased;</code> (oneshot checked first) and a <code>try_recv</code> drain that pushes orphaned connections to idle without double-counting the permit.</p>
+<h4 id="migration-fixes"><a class="header" href="#migration-fixes">Migration fixes</a></h4>
+<ul>
+<li>
+<p><strong>Client ID collision after migration.</strong> The new process started its connection counter at 0, colliding with migrated client IDs. Now the counter advances past the highest migrated ID.</p>
+</li>
+<li>
+<p><strong>SCRAM passthrough state preserved.</strong> The ClientKey from the first client's SCRAM handshake is serialized in the migration payload (v2 format, backward compatible). The new process skips the <code>ScramPending</code> fallback to <code>server_password</code>.</p>
+</li>
+</ul>
+<h4 id="session-mode-statistics-fix"><a class="header" href="#session-mode-statistics-fix">Session mode statistics fix</a></h4>
+<p><code>xact_time</code> percentiles in session mode showed the entire session duration instead of individual transaction time. Now recorded per-transaction at each <code>ReadyForQuery(Idle)</code>, matching transaction mode semantics.</p>
+<p><code>query_time</code> had the same accumulation bug: the timer was set once before the inner loop and never reset, so each subsequent query reported the cumulative session duration. Now reset per-query in session mode.</p>
+<h4 id="adaptive-anticipation-budget"><a class="header" href="#adaptive-anticipation-budget">Adaptive anticipation budget</a></h4>
+<p>Anticipation wait (formerly fixed 300-500ms) scales with real transaction latency: <code>xact_p99 * 2 +/- 20%</code> jitter, clamped to [5ms, 500ms]. Cold start default: 100ms.</p>
+<h4 id="diagnostic-logging"><a class="header" href="#diagnostic-logging">Diagnostic logging</a></h4>
+<p>Slow checkout warnings (&gt;500ms) now include pool state: <code>size</code>, <code>avail</code>, <code>waiting</code>, <code>inflight</code>, <code>creates</code>, <code>gate_waits</code>, <code>antic_ok</code>, <code>antic_to</code>, <code>fallback</code>. Phase-specific warnings added for semaphore timeout, burst gate timeout, coordinator exhaustion, and create failure.</p>
+<h3 id="351-apr-20-2026"><a class="header" href="#351-apr-20-2026">3.5.1 <small>Apr 20, 2026</small></a></h3>
+<h4 id="systemd-typenotify-support"><a class="header" href="#systemd-typenotify-support">systemd Type=notify support</a></h4>
+<p>pg_doorman now sends <code>sd_notify(READY=1)</code> on startup and <code>sd_notify(MAINPID=&lt;child_pid&gt;)</code> during binary upgrade. With <code>Type=notify</code> in the systemd unit, <code>systemctl reload</code> performs a zero-downtime binary upgrade without PID tracking issues — systemd follows the new process correctly and does not restart the service.</p>
+<p>The shipped <code>pg_doorman.service</code> changes from <code>Type=forking</code> + <code>--daemon</code> to <code>Type=notify</code> (foreground). Existing installations using <code>--daemon</code> continue to work but do not benefit from client migration.</p>
+<p>Docker <code>STOPSIGNAL</code> changed from <code>SIGINT</code> to <code>SIGTERM</code> to prevent binary upgrade in containers (where PID 1 exit kills the container).</p>
+<h3 id="350-apr-15-2026"><a class="header" href="#350-apr-15-2026">3.5.0 <small>Apr 15, 2026</small></a></h3>
+<h4 id="client-migration-during-binary-upgrade"><a class="header" href="#client-migration-during-binary-upgrade">Client migration during binary upgrade</a></h4>
+<p>Idle clients now transfer to the new process via Unix socket (<code>SCM_RIGHTS</code>) without reconnecting. Active-transaction clients finish their transaction on the old process, then migrate. Prepared statement caches are serialized and transparently re-parsed on the new backend. The old process exits once all clients have migrated or <code>shutdown_timeout</code> expires.</p>
+<h4 id="tls-connection-migration-opt-in"><a class="header" href="#tls-connection-migration-opt-in">TLS connection migration (opt-in)</a></h4>
+<p>Build with <code>--features tls-migration</code> to migrate TLS sessions without re-handshake. A patched vendored OpenSSL 3.5.5 exports/imports symmetric cipher state (keys, IVs, sequence numbers). Linux-only. Offline builds supported via <code>OPENSSL_SOURCE_TARBALL</code> env var with SHA-256 verification.</p>
+<h3 id="340-apr-11-2026"><a class="header" href="#340-apr-11-2026">3.4.0 <small>Apr 11, 2026</small></a></h3>
+<h4 id="pool-coordinator--database-level-connection-limits"><a class="header" href="#pool-coordinator--database-level-connection-limits">Pool Coordinator — database-level connection limits</a></h4>
+<p>When multiple user pools share one PostgreSQL database, the sum of their <code>pool_size</code> values can exceed <code>max_connections</code>. A spike in one pool starves the others, or PostgreSQL rejects connections outright.</p>
+<p><code>max_db_connections</code> caps total backend connections per database across all user pools. When the cap is reached, the coordinator frees capacity through three mechanisms, tried in order:</p>
+<ol>
+<li>
+<p><strong>Reserve pool.</strong> If <code>reserve_pool_size &gt; 0</code> and the reserve has headroom, a permit is granted immediately — no eviction, no wait. The reserve is a burst buffer: idle reserve connections are upgraded to main permits by the retain cycle once pressure drops, and closed if they stay idle longer than <code>min_connection_lifetime</code>.</p>
+</li>
+<li>
+<p><strong>Eviction.</strong> The coordinator closes one idle connection from a peer pool with the largest surplus above its <code>min_guaranteed_pool_size</code> floor. Candidates are ranked by p95 transaction time — slow pools donate first, because a 1 ms reconnect cost is negligible against a 15 ms p95 but doubles a 0.96 ms one. Only connections older than <code>min_connection_lifetime</code> (default 30 s) are eligible, which suppresses cyclic reconnect between pools that take turns stealing slots.</p>
+</li>
+<li>
+<p><strong>Wait.</strong> If nothing is evictable, the caller parks for up to <code>reserve_pool_timeout</code> (default 3 s), waking on any peer connection return or permit drop. After the wait, the reserve is retried once more before the client receives an error.</p>
+</li>
+</ol>
+<p>Disabled by default (<code>max_db_connections = 0</code>) — zero overhead when not configured. The hot path (idle connection reuse) never touches the coordinator; only new connection creation does, at the cost of one atomic operation.</p>
+<p>New pool-level config fields:</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>max_db_connections</code></td><td><code>0</code> (disabled)</td><td>Hard cap on backend connections per database</td></tr>
+<tr><td><code>min_connection_lifetime</code></td><td><code>30000</code> ms</td><td>Eviction age floor — connections younger than this are immune</td></tr>
+<tr><td><code>reserve_pool_size</code></td><td><code>0</code> (disabled)</td><td>Extra permits above the cap, granted on burst</td></tr>
+<tr><td><code>reserve_pool_timeout</code></td><td><code>3000</code> ms</td><td>Coordinator wait budget before error</td></tr>
+<tr><td><code>min_guaranteed_pool_size</code></td><td><code>0</code></td><td>Per-user eviction protection floor</td></tr>
+</tbody></table>
+</div>
+<p>New admin commands: <code>SHOW POOL_COORDINATOR</code> (per-database coordinator state), <code>SHOW POOL_SCALING</code> (per-pool checkout counters). Both are also exported as Prometheus metrics under <code>pg_doorman_pool_coordinator{type, database}</code> and <code>pg_doorman_pool_scaling{type, user, database}</code>.</p>
+<p>See the <a href="tutorials/pool-pressure.html">pool pressure tutorial</a> for acquisition phases, tuning recipes, and alert examples.</p>
+<h4 id="connection-checkout-under-pressure"><a class="header" href="#connection-checkout-under-pressure">Connection checkout under pressure</a></h4>
+<p>Replaces <code>scaling_cooldown_sleep</code> (a fixed 10 ms delay before creating a backend connection) with a multi-phase checkout that reuses connections about to be returned before resorting to <code>connect()</code>.</p>
+<p>When the idle pool is empty and the pool is above its warm threshold (<code>scaling_warm_pool_ratio</code>, default 20%), a caller first spins briefly (<code>scaling_fast_retries</code>, default 10 yield iterations), then registers a direct-handoff waiter. Connections returned by other clients are delivered through the waiter channel — no idle-queue round-trip, no race with other checkout attempts. The waiter deadline is bounded by <code>query_wait_timeout</code> minus a 500 ms reserve for the create path. If no connection arrives, the caller proceeds to create.</p>
+<p>Backend <code>connect()</code> calls are capped at <code>scaling_max_parallel_creates</code> (default 2) per pool. Callers above the cap wait for a peer create to finish or a connection to be returned. Background replenish (<code>min_pool_size</code>) respects the same cap and defers to the next retain cycle when the gate is full, so it does not compete with client-driven creates during spikes.</p>
+<p>Connections nearing <code>server_lifetime</code> expiry (95% of age) trigger a pre-replacement: a background task creates a successor before the old connection fails recycle, so the next checkout hits the hot path.</p>
+<p>The direct-handoff queue is FIFO. On a 500-client / 40-connection AWS Fargate benchmark, p99/p50 ratio is 1.08 (pg_doorman) vs 25.5 (Odyssey). Every client pays roughly the same queue cost.</p>
+<p><strong>Migration:</strong> remove <code>scaling_cooldown_sleep</code> from your config if present. Replace with <code>scaling_max_parallel_creates</code> (default 2) if you need to tune the concurrency cap.</p>
 <p><strong>Improvements:</strong></p>
 <ul>
 <li>
-<p><strong>Log readability overhaul.</strong> All operational log messages use a consistent <code>[user@pool]</code> identity prefix with <code>pid=N</code> for server connections, replacing three different formats. Stats line switched to logfmt (<code>query_ms p50=... | xact_ms p50=...</code>). Durations formatted as <code>4m30s</code> instead of raw milliseconds or <code>0d 00:04:30.134</code>. PG error messages sanitized (newlines escaped) to prevent log line splitting.</p>
+<p><strong>Runtime log level control.</strong> <code>SET log_level = 'debug'</code> changes the log filter without restart; <code>SET log_level = 'warn,pg_doorman::pool::pool_coordinator=debug'</code> targets specific modules. <code>SHOW LOG_LEVEL</code> displays the current filter. Changes are ephemeral (lost on restart).</p>
 </li>
 <li>
-<p><strong>Auth failure logs include client IP.</strong> SCRAM, MD5, JWT, and PAM authentication failures now show the source address, visible during brute-force attempts.</p>
+<p><strong>Log readability overhaul.</strong> Consistent <code>[user@pool #cN]</code> prefix. Durations as <code>4m30s</code> instead of raw milliseconds. Stats line in logfmt. PG error newlines escaped. Expensive debug computations guarded by <code>log_enabled!()</code> to avoid allocations at production log levels.</p>
 </li>
 <li>
-<p><strong>Replenish failure noise suppression.</strong> When <code>min_pool_size</code> replenish repeatedly fails (e.g., SCRAM user missing on a replica), only the first failure is logged at warn level. Subsequent failures are suppressed with a periodic reminder every ~10 minutes showing the consecutive failure count. Recovery is logged when replenish succeeds after a failure streak.</p>
+<p><strong>Auth failure logs include client IP.</strong> SCRAM, MD5, JWT, and PAM failures show the source address.</p>
 </li>
 <li>
-<p><strong>Client disconnect logs include identity.</strong> Disconnect messages show <code>[user@pool]</code> when the client completed authentication, not just the IP address.</p>
+<p><strong>Replenish failure noise suppression.</strong> Repeated <code>min_pool_size</code> failures log once at warn, then a periodic reminder every ~10 minutes with the failure count.</p>
 </li>
 <li>
-<p><strong>Prepared statement cache eviction log.</strong> Shows truncated query text and current cache size (<code>size=99/100</code>) to help diagnose cache sizing issues.</p>
+<p><strong><code>avg_xact_time</code> column in <code>SHOW POOLS</code>.</strong> Average transaction time per pool, visible alongside existing connection counts.</p>
 </li>
 <li>
-<p><strong><code>min_connection_lifetime</code> default raised from 5 s to 30 s.</strong> With the old 5-second floor, a loaded shard with two or more user pools sharing the same database would thrash idle slots between peers every few seconds: user A's connection would age past the floor, peer B would evict it the next time it needed a permit, A would replace it and start ageing again. Canary observations were in the 120-270 evictions/minute range on busy shards despite no configuration change. The 30-second floor lets connections stay "sticky" to their current user long enough that routine bursts are absorbed by returns rather than cross-pool evictions, reducing eviction churn to the natural rate of sustained imbalance between user pools. Operators with very short, very uneven workloads and real reason to want faster cross-pool rebalancing can still set a smaller value explicitly.</p>
+<p><strong>Smart session cleanup in transaction mode.</strong> pg_doorman tracks which session state a client dirtied (<code>SET</code>, <code>DECLARE CURSOR</code>, prepared statements) and sends the matching reset on checkin. If the client cleaned up after itself — <code>RESET ALL</code>, <code>CLOSE ALL</code>, <code>DEALLOCATE ALL</code>, or <code>DISCARD ALL</code> — pg_doorman sees the confirmation and skips its own reset. Drivers like <code>jackc/pgx</code> that send a cleanup batch on disconnect no longer cause a redundant round-trip to PostgreSQL. A <code>SET</code> without a follow-up reset still triggers cleanup as before.</p>
 </li>
-</ul>
-<p><strong>Security:</strong></p>
-<ul>
-<li><strong>Removed password hash from logs.</strong> The "unsupported password type" warning no longer includes the password hash value.</li>
-</ul>
-<p><strong>Bug Fixes:</strong></p>
-<ul>
-<li><strong>Client-side session reset batch no longer triggers a second <code>RESET ALL</code> on checkin.</strong> When a client (e.g. <code>jackc/pgx</code> on an internal context deadline) kept the server connection alive by running its own cleanup batch (<code>SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; UNLISTEN *; DISCARD PLANS; DISCARD SEQUENCES; DISCARD TEMP</code>), pg_doorman saw only the <code>SET</code> tag from <code>SET SESSION AUTHORIZATION DEFAULT</code>, marked the connection dirty, and sent its own <code>RESET ROLE; RESET ALL;</code> when the connection returned to the pool. Every dangling client query tripled the traffic to PostgreSQL: the original query, the client's cleanup batch, and pg_doorman's redundant reset. Fixed by recognising the CommandComplete tags that restore session state (<code>RESET</code>, <code>CLOSE CURSOR ALL</code>, <code>DEALLOCATE ALL</code>, <code>DISCARD ALL</code>) and clearing the matching <code>needs_cleanup_*</code> flags. Baseline behaviour is unchanged: a <code>SET statement_timeout = 1000</code> without a follow-up reset still provokes <code>RESET ROLE; RESET ALL;</code> on checkin.</li>
 </ul>
 <h3 id="335-mar-31-2026"><a class="header" href="#335-mar-31-2026">3.3.5 <small>Mar 31, 2026</small></a></h3>
 <p><strong>Bug Fixes:</strong></p>
@@ -258,7 +969,7 @@
 <p><strong><code>server_lifetime</code> default changed from 5 minutes to 20 minutes</strong>: The previous default of 5 minutes was shorter than <code>idle_timeout</code> (10 minutes), which meant <code>idle_timeout</code> could never trigger — connections were always killed by <code>server_lifetime</code> first. Changed to 20 minutes so that <code>idle_timeout</code> (10 min) handles idle cleanup while <code>server_lifetime</code> (20 min) rotates long-lived connections. Note: <code>idle_timeout</code> only applies to connections that have been used at least once — prewarmed/replenished connections that were never checked out by a client are not subject to <code>idle_timeout</code> and will only be closed when <code>server_lifetime</code> expires.</p>
 </li>
 <li>
-<p><strong><code>idle_timeout = 0</code> did not disable idle timeout</strong>: Setting <code>idle_timeout</code> to <code>0</code> was supposed to disable idle connection cleanup (consistent with PgBouncer's <code>server_idle_timeout = 0</code> semantics and our own <code>server_lifetime = 0</code> behavior). Instead, it closed connections after ~1ms of being idle. Fixed by adding an <code>idle_timeout_ms &gt; 0</code> guard before the elapsed time check.</p>
+<p><strong><code>idle_timeout = 0</code> did not disable idle timeout</strong>: <code>idle_timeout = 0</code> should disable idle connection cleanup, matching PgBouncer's <code>server_idle_timeout = 0</code> and pg_doorman's <code>server_lifetime = 0</code>. Instead, pg_doorman closed connections after ~1 ms of idle time. Fixed by adding an <code>idle_timeout_ms &gt; 0</code> guard before the elapsed-time check.</p>
 </li>
 <li>
 <p><strong><code>idle_timeout</code> had no jitter — synchronized mass closures</strong>: Unlike <code>server_lifetime</code> which applies ±20% per-connection jitter to prevent thundering herd, <code>idle_timeout</code> used a single pool-wide value. When many connections became idle simultaneously (e.g., after a traffic burst), they all expired at the exact same moment, causing mass closures in one retain cycle. Now <code>idle_timeout</code> applies the same ±20% per-connection jitter as <code>server_lifetime</code>.</p>
@@ -556,7 +1267,7 @@
 </ul>
 <p><strong>Testing:</strong></p>
 <ul>
-<li><strong>Integration fuzz testing framework</strong>: Added comprehensive BDD-based fuzz tests (<code>@fuzz</code> tag) that verify pg_doorman's resilience to malformed PostgreSQL protocol messages.</li>
+<li><strong>Integration fuzz tests</strong>: Added BDD fuzz tests (<code>@fuzz</code> tag) for malformed PostgreSQL protocol messages.</li>
 <li>All fuzz tests connect and authenticate first, then send malformed data to test post-authentication resilience.</li>
 </ul>
 <p><strong>CI/CD:</strong></p>
@@ -581,8 +1292,8 @@
 </ul>
 <p><strong>Testing:</strong></p>
 <ul>
-<li>Added comprehensive .NET client tests for Describe flow with cached prepared statements (<code>describe_flow_cached.cs</code>).</li>
-<li>Added aggressive mixed tests combining batch operations, prepared statements, and extended protocol (<code>aggressive_mixed.cs</code>).</li>
+<li>Added .NET client tests for Describe flow with cached prepared statements (<code>describe_flow_cached.cs</code>).</li>
+<li>Added mixed tests combining batch operations, prepared statements, and extended protocol (<code>aggressive_mixed.cs</code>).</li>
 </ul>
 <h3 id="302-jan-14-2026"><a class="header" href="#302-jan-14-2026">3.0.2 <small>Jan 14, 2026</small></a></h3>
 <p><strong>Bug Fixes:</strong></p>
@@ -599,11 +1310,12 @@
 <li>Extended Node.js client test coverage with additional scenarios for prepared statements, error handling, transactions, and edge cases.</li>
 </ul>
 <h3 id="300-jan-12-2026"><a class="header" href="#300-jan-12-2026">3.0.0 <small>Jan 12, 2026</small></a></h3>
-<p><strong>Major Release — Complete Architecture Refactoring</strong></p>
-<p>This release represents a significant milestone with a complete codebase refactoring that dramatically improves async protocol support, making PgDoorman the most efficient connection pooler for asynchronous PostgreSQL workloads.</p>
+<p><strong>Architecture refactor</strong></p>
+<p>PgDoorman 3.0.0 reorganizes the client, config, admin, auth, and
+prometheus modules, and adds the <code>patroni_proxy</code> binary.</p>
 <p><strong>New Features:</strong></p>
 <ul>
-<li><strong>patroni_proxy</strong> — A new high-performance TCP proxy for Patroni-managed PostgreSQL clusters:
+<li><strong>patroni_proxy</strong> — a TCP proxy for Patroni-managed PostgreSQL clusters:
 <ul>
 <li>Zero-downtime connection management — existing connections are preserved during cluster topology changes</li>
 <li>Hot upstream updates — automatic discovery of cluster members via Patroni REST API without connection drops</li>
@@ -615,18 +1327,17 @@
 </ul>
 <p><strong>Improvements:</strong></p>
 <ul>
-<li><strong>Complete codebase refactoring</strong> — modular architecture with better separation of concerns:
+<li><strong>Module split</strong>:
 <ul>
 <li>Client handling split into dedicated modules (core, entrypoint, protocol, startup, transaction)</li>
 <li>Configuration system reorganized into focused modules (general, pool, user, tls, prometheus, talos)</li>
 <li>Admin, auth, and prometheus subsystems extracted into separate modules</li>
-<li>Improved code maintainability and testability</li>
 </ul>
 </li>
-<li><strong>Enhanced async protocol support</strong> — significantly improved handling of asynchronous PostgreSQL protocol, providing better performance than other connection poolers for async workloads</li>
-<li><strong>Extended protocol improvements</strong> — better client buffering and message handling for extended query protocol</li>
+<li><strong>Async protocol support</strong> — improved handling of asynchronous PostgreSQL protocol messages.</li>
+<li><strong>Extended protocol</strong> — improved client buffering and message handling.</li>
 <li><strong>xxhash3 for prepared statement hashing</strong> — faster hash computation for prepared statement cache</li>
-<li><strong>Comprehensive BDD testing framework</strong> — multi-language integration tests (Go, Rust, Python, Node.js, .NET) with Docker-based reproducible environment</li>
+<li><strong>BDD test framework</strong> — multi-language integration tests (Go, Rust, Python, Node.js, .NET) in a Docker-based environment.</li>
 </ul>
 <h3 id="250-nov-18-2025"><a class="header" href="#250-nov-18-2025">2.5.0 <small>Nov 18, 2025</small></a></h3>
 <p><strong>Improvements:</strong></p>
@@ -836,6 +1547,7 @@
         <!-- Custom JS scripts -->
         <script src="mermaid-init.js"></script>
         <script src="mermaid.min.js"></script>
+        <script src="lang-switcher.js"></script>
 
 
     </div>

@@ -173,7 +173,7 @@
   host: "0.0.0.0"
   port: 6432
   admin_username: "admin"
-  admin_password: "admin"
+  admin_password: "change_me_to_a_long_random_secret"
 
 pools:
   mydb:
@@ -182,7 +182,7 @@ pools:
     pool_mode: "transaction"
     users:
       - username: "myuser"
-        password: "mypassword"
+        password: "md5..."  # hash from pg_shadow / pg_authid
         pool_size: 40
 </code></pre>
 <h3 id="example-toml-configuration-legacy"><a class="header" href="#example-toml-configuration-legacy">Example TOML Configuration (Legacy)</a></h3>
@@ -190,7 +190,7 @@ pools:
 host = "0.0.0.0"
 port = 6432
 admin_username = "admin"
-admin_password = "admin"
+admin_password = "change_me_to_a_long_random_secret"
 
 [pools.mydb]
 server_host = "localhost"
@@ -199,7 +199,7 @@ pool_mode = "transaction"
 
 [[pools.mydb.users]]
 username = "myuser"
-password = "mypassword"
+password = "md5..."  # hash from pg_shadow / pg_authid
 pool_size = 40
 </code></pre>
 <h3 id="generate-command"><a class="header" href="#generate-command">Generate Command</a></h3>
@@ -314,13 +314,13 @@ pg_doorman generate --no-comments --output config.yaml
 </ul>
 <p>Default: <code>"allow"</code>.</p>
 <h3 id="tls_ca_cert"><a class="header" href="#tls_ca_cert">tls_ca_cert</a></h3>
-<p>The file containing the CA certificate to verify the client certificate. This is required when <code>tls_mode</code> is set to <code>verify-full</code>.</p>
+<p>CA certificate file used to verify client certificates. Required when <code>tls_mode</code> is set to <code>verify-full</code>.</p>
 <p>Default: <code>None</code>.</p>
 <h3 id="tls_private_key"><a class="header" href="#tls_private_key">tls_private_key</a></h3>
-<p>The path to the private key file for TLS connections. This is required to enable TLS for incoming client connections. Must be used together with <code>tls_certificate</code>.</p>
+<p>Path to the private key file for TLS connections. Required to enable TLS for incoming client connections. Must be used together with <code>tls_certificate</code>.</p>
 <p>Default: <code>None</code>.</p>
 <h3 id="tls_certificate"><a class="header" href="#tls_certificate">tls_certificate</a></h3>
-<p>The path to the certificate file for TLS connections. This is required to enable TLS for incoming client connections. Must be used together with <code>tls_private_key</code>.</p>
+<p>Path to the certificate file for TLS connections. Required to enable TLS for incoming client connections. Must be used together with <code>tls_private_key</code>.</p>
 <p>Default: <code>None</code>.</p>
 <h3 id="tls_rate_limit_per_second"><a class="header" href="#tls_rate_limit_per_second">tls_rate_limit_per_second</a></h3>
 <p>Limit the number of simultaneous attempts to create a TLS session.
@@ -347,7 +347,7 @@ Also determines the shard count for internal concurrent hash maps (<code>worker_
 In Kubernetes, set this explicitly — automatic CPU detection may report the host's cores instead of the container's limit.</p>
 <p>Default: <code>4</code>.</p>
 <h3 id="worker_cpu_affinity_pinning"><a class="header" href="#worker_cpu_affinity_pinning">worker_cpu_affinity_pinning</a></h3>
-<p>Automatically assign workers to different CPUs (man 3 cpu_set).</p>
+<p>Bind each worker thread to a separate CPU core (sched_setaffinity). Disabled when fewer than 3 cores are available.</p>
 <p>Default: <code>false</code>.</p>
 <h3 id="tokio_global_queue_interval"><a class="header" href="#tokio_global_queue_interval">tokio_global_queue_interval</a></h3>
 <p><a href="https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.global_queue_interval">Tokio runtime settings</a>.
@@ -417,12 +417,47 @@ or PostgreSQL restarts).</p>
 Similar to PgBouncer's <code>server_round_robin</code>.</p>
 <p>Default: <code>false</code>.</p>
 <h3 id="sync_server_parameters"><a class="header" href="#sync_server_parameters">sync_server_parameters</a></h3>
-<p>In transaction mode, each transaction may land on a different backend. With <code>sync_server_parameters = true</code>,
-pg_doorman tracks changes to a fixed set of session parameters and replays them via SET on each new backend
-before executing the transaction. Tracked parameters: <code>client_encoding</code>, <code>DateStyle</code>, <code>TimeZone</code>,
-<code>standard_conforming_strings</code>, <code>application_name</code>. Other SET commands (e.g., <code>statement_timeout</code>, <code>work_mem</code>)
-are NOT tracked. This costs one extra roundtrip per checkout. If you only need <code>application_name</code> visibility
-in <code>pg_stat_activity</code>, use the pool-level <code>application_name</code> setting instead.</p>
+<p>In transaction mode, different transactions from the same client may run on different backend
+connections. With <code>sync_server_parameters = true</code>, pg_doorman applies the client's session
+parameters to the selected backend before the transaction starts.</p>
+<p>Values come from two places:</p>
+<ol>
+<li>
+<p><strong>PostgreSQL <code>ParameterStatus</code> messages</strong>: <code>client_encoding</code>, <code>DateStyle</code>, <code>IntervalStyle</code>,
+<code>TimeZone</code>, <code>standard_conforming_strings</code>, <code>application_name</code>. PostgreSQL reports changes to
+these parameters over the protocol.</p>
+</li>
+<li>
+<p><strong>Safe client <code>StartupMessage</code> parameters</strong> (new in pg_doorman 3.10): any parameter sent by the
+client during connection startup, except server-managed or read-only names (<code>is_superuser</code>,
+<code>server_version</code>, <code>lc_collate</code>, <code>transaction_isolation</code>, ...) and the protocol-reserved <code>_pq_.</code>
+prefix. This lets clients set <code>search_path</code>, <code>default_transaction_isolation</code>, <code>role</code>, and similar
+planner inputs once at connection time. Configured <code>startup_parameters</code> always override
+the client packet.</p>
+</li>
+</ol>
+<p><strong>Important limits:</strong></p>
+<ul>
+<li>
+<p>pg_doorman tracks startup parameters and PostgreSQL-reported parameters only. If a client runs
+<code>SET search_path = ...</code> or changes another unreported planner GUC after connection startup,
+pg_doorman does not see that change. Later prepared-statement reuse can then use a plan built
+under older planner state. Clients that need runtime planner-GUC changes should set those values
+in <code>StartupMessage</code>, run <code>DISCARD ALL</code> or reconnect after changing them, or disable
+<code>prepared_statements</code> for the pool.</p>
+</li>
+<li>
+<p>The prepared-statement cache key includes the query text, parameter OIDs, and a digest of these
+startup-time planner GUCs: <code>search_path</code>, <code>default_transaction_isolation</code>,
+<code>default_transaction_read_only</code>, <code>default_text_search_config</code>, <code>role</code>. Other planner inputs
+(<code>TimeZone</code>, <code>DateStyle</code>, <code>plan_cache_mode</code>, <code>enable_*</code>, JIT cost knobs, extension GUCs) are
+not part of the key. If the same prepared query runs under different values of those parameters,
+disable <code>prepared_statements</code> for the pool or pin the parameters at the role/database level.</p>
+</li>
+</ul>
+<p>Adds one extra SET/RESET round trip only when the backend state differs from the client state. If
+you only need <code>application_name</code> visibility in <code>pg_stat_activity</code>, use the pool-level
+<code>application_name</code> setting instead.</p>
 <p>Default: <code>false</code>.</p>
 <h3 id="tcp_so_linger"><a class="header" href="#tcp_so_linger">tcp_so_linger</a></h3>
 <p>By default, pg_doorman send <code>RST</code> instead of keeping the connection open for a long time.</p>
@@ -445,14 +480,30 @@ the maximum time that transmitted data may remain unacknowledged before TCP will
 connection. This helps detect dead client connections faster than keepalive probes when the connection
 is actively sending data but the remote end has become unreachable (e.g., network failure, client crash).</p>
 <p>When set to a non-zero value, if data remains unacknowledged for this duration, the connection will
-be terminated. This is particularly useful to avoid 15-16 minute delays caused by TCP retransmission
-timeout when keepalive cannot help (e.g., during active data transmission).</p>
+be terminated. Use it to avoid 15-16 minute delays caused by TCP retransmission timeout when
+keepalive cannot help (e.g., during active data transmission).</p>
 <p><strong>Note:</strong> This option is only supported on Linux. On other operating systems, this setting is ignored.</p>
 <p>Set to <code>0</code> to disable (use OS default).</p>
 <p>Default: <code>60</code>.</p>
+<h3 id="tcp_socket_buffer_size"><a class="header" href="#tcp_socket_buffer_size">tcp_socket_buffer_size</a></h3>
+<p>Kernel <code>SO_RCVBUF</code>/<code>SO_SNDBUF</code> limits for accepted client TCP sockets, accepted web TCP sockets, and outbound backend TCP sockets.</p>
+<p>With the default <code>0</code>, pg_doorman does not call <code>setsockopt(SO_RCVBUF/SO_SNDBUF)</code> and Linux TCP autotuning stays in charge. Per-connection receive buffers can grow on demand up to <code>net.ipv4.tcp_rmem[2]</code> (commonly 6 MiB on Ubuntu/RHEL). That memory is not process RSS; depending on kernel and cgroup mode it may appear separately as socket memory, for example as <code>sock</code> in cgroup v2 <code>memory.stat</code>, or mostly as host-level kernel memory. If <code>MemFree</code> jumps after a pg_doorman restart, confirm the source with <code>ss -m</code>, <code>/proc/net/sockstat</code>, cgroup v2 <code>memory.current</code>, and <code>memory.stat</code> key <code>sock</code>.</p>
+<p>Setting a non-zero value calls <code>setsockopt(SO_RCVBUF/SO_SNDBUF)</code> once per configured TCP socket. This disables autotuning for that socket and sets fixed send/receive buffer limits. Linux internally doubles the requested values — see <code>man 7 socket</code> — and may clamp them by <code>net.core.rmem_max</code> / <code>net.core.wmem_max</code>. Check <code>/proc/sys/net/core/rmem_max</code> and <code>/proc/sys/net/core/wmem_max</code> before choosing values above the OS default. <code>getsockopt</code>, <code>ss -m</code>, and pg_doorman <code>DEBUG</code> logs show the kernel-applied values.</p>
+<p>The rough Linux limit is <code>4 * tcp_socket_buffer_size * tcp_socket_count</code>: send and receive buffers are both configured, and Linux doubles each requested value internally. For example, <code>tcp_socket_buffer_size = 65536</code> sets about 256 KiB of send+receive limits per TCP socket, so 60 TCP sockets have about 15 MiB of configured kernel buffer limits before <code>sk_buff</code> overhead. Count client TCP sockets, web TCP sockets, and backend TCP sockets. Actual resident memory still depends on queued data.</p>
+<p>This setting is primarily a memory cap. Suggested starting range for OLTP traffic inside one datacenter: <strong>64 KiB – 256 KiB</strong>. Do not set less than 64 KiB unless measurements show it is safe. WAN links, cross-zone traffic, large result sets, and bulk transfers may need a larger value or the default autotuning behaviour.</p>
+<p>The value is applied when pg_doorman configures a TCP socket: on accepted client sockets, accepted web sockets, outbound backend sockets, and migrated client sockets reconstructed during binary upgrade. <code>SIGHUP</code> reload does not revisit already-open sockets. To apply a new value to existing sessions, use binary upgrade for migrated clients, reconnect/drain pools for backend sockets, or restart when reconnects are acceptable.</p>
+<p>Equivalent of PgBouncer's <code>tcp_socket_buffer</code> parameter. Odyssey and PgCat have no analogue and inherit the kernel autotuner's behaviour.</p>
+<p>Default: <code>0</code>.</p>
 <h3 id="unix_socket_buffer_size"><a class="header" href="#unix_socket_buffer_size">unix_socket_buffer_size</a></h3>
 <p>Buffer size for read and write operations when connecting to PostgreSQL via a unix socket.</p>
 <p>Default: <code>1048576</code>.</p>
+<h3 id="unix_socket_dir"><a class="header" href="#unix_socket_dir">unix_socket_dir</a></h3>
+<p>Directory for Unix domain socket listener. Creates .s.PGSQL.<port> socket file for local client connections.</p>
+<p>Default: <code>null</code>.</p>
+<h3 id="unix_socket_mode"><a class="header" href="#unix_socket_mode">unix_socket_mode</a></h3>
+<p>Permission mode applied to the Unix domain socket file <code>.s.PGSQL.&lt;port&gt;</code> immediately after <code>bind()</code>. Specified as an octal string (e.g. <code>"0600"</code>, <code>"0660"</code>, <code>"0666"</code>). Only the lowest 9 bits are honored — setuid/setgid/sticky bits are rejected.</p>
+<p>The default <code>"0600"</code> restricts socket access to the user running pg_doorman. To let other local users connect, set a more permissive mode such as <code>"0660"</code> (group access) or <code>"0666"</code> (any local user). When loosening the mode, ensure the parent directory permissions allow traversal by the intended group.</p>
+<p>Default: <code>"0600"</code>.</p>
 <h3 id="admin_username"><a class="header" href="#admin_username">admin_username</a></h3>
 <p>Access to the virtual admin database is carried out through the administrator's username and password.</p>
 <p>Default: <code>"admin"</code>.</p>
@@ -461,21 +512,65 @@ timeout when keepalive cannot help (e.g., during active data transmission).</p>
 It should be replaced with your secret.</p>
 <p>Default: <code>"admin"</code>.</p>
 <h3 id="prepared_statements"><a class="header" href="#prepared_statements">prepared_statements</a></h3>
-<p>Switcher to enable/disable caching of prepared statements.</p>
+<p>Enables prepared-statement remapping and caching. When disabled, pg_doorman forwards
+<code>Parse</code> and <code>Bind</code> without rewriting them through the pool-level prepared-statement cache.</p>
+<p>If this is <code>true</code>, <code>prepared_statements_cache_size</code> must be greater than <code>0</code>.</p>
 <p>Default: <code>true</code>.</p>
 <h3 id="prepared_statements_cache_size"><a class="header" href="#prepared_statements_cache_size">prepared_statements_cache_size</a></h3>
 <p>Cache size of prepared statements at the pool level (shared across all clients connecting to the same pool).
 This cache stores the mapping from query hash to rewritten prepared statement name.</p>
+<p>This is not the disable switch. To disable prepared-statement remapping, set
+<code>prepared_statements: false</code>; pg_doorman rejects a general <code>prepared_statements_cache_size</code>
+of <code>0</code> while <code>prepared_statements</code> is enabled.</p>
+<p>For an end-to-end picture of how this knob interacts with <code>server_prepared_statements_cache_size</code>,
+<code>client_anonymous_prepared_cache_size</code>, and the query interner, see the
+<a href="../tutorials/prepared-statements.html">Anonymous Parse caching tutorial</a>.</p>
 <p>Default: <code>8192</code>.</p>
-<h3 id="client_prepared_statements_cache_size"><a class="header" href="#client_prepared_statements_cache_size">client_prepared_statements_cache_size</a></h3>
-<p>Maximum number of prepared statements cached per client connection. This is a protection mechanism against
-malicious or misbehaving clients that don't call <code>DEALLOCATE</code> and could cause memory exhaustion by creating
-unlimited prepared statements over long-running connections.</p>
-<p>When the limit is reached, the oldest entry is evicted from the client's cache. The evicted statement
-can still be re-used later because the pool-level cache (<code>prepared_statements_cache_size</code>) retains the
-query-to-server-name mapping.</p>
-<p>Set to <code>0</code> to disable the limit (unlimited cache size, relies on client calling <code>DEALLOCATE</code>).</p>
-<p>Default: <code>0 (unlimited)</code>.</p>
+<h3 id="server_prepared_statements_cache_size"><a class="header" href="#server_prepared_statements_cache_size">server_prepared_statements_cache_size</a></h3>
+<p>Sizes the per-backend <code>LruCache&lt;String, ()&gt;</code> of <code>DOORMAN_&lt;N&gt;</code> names independently of the pool-level cache.
+When unset (default), inherits the resolved <code>prepared_statements_cache_size</code> for that pool. A per-pool
+override on this field takes precedence over this general value.</p>
+<p>Lower this knob below the pool size when backends carry too many <code>DOORMAN_&lt;N&gt;</code> rows
+(<code>pg_prepared_statements</code> near the cap, plan memory ballooning) or when faster <code>Close</code> recycling is desired
+without shrinking pool-level hit rate. Forced to 0 when <code>prepared_statements: false</code>.</p>
+<p>Default: <code>not set (inherits prepared_statements_cache_size)</code>.</p>
+<h3 id="client_anonymous_prepared_cache_size"><a class="header" href="#client_anonymous_prepared_cache_size">client_anonymous_prepared_cache_size</a></h3>
+<p>Bounds the Anonymous part of the per-client prepared-statement cache. Anonymous statements are issued
+without an explicit name and are typically short-lived; the LRU caps how many of them a single client
+can accumulate before the oldest one is evicted.</p>
+<p>When unset (default), inherits the resolved <code>prepared_statements_cache_size</code> for the pool. Set to <code>0</code> to
+disable the LRU and fall back to an unlimited map for Anonymous entries; set to a number to bound the
+per-client cache independently of the pool size.</p>
+<p>The Named part of the per-client cache (statements created with an explicit name via <code>PREPARE</code> or the
+extended-query Parse) is <strong>always unbounded</strong> — this knob does not affect it. Named statements stay
+cached for the lifetime of the client connection.</p>
+<p>Default: <code>not set (inherits prepared_statements_cache_size)</code>.</p>
+<h3 id="query_interner_gc_interval_seconds"><a class="header" href="#query_interner_gc_interval_seconds">query_interner_gc_interval_seconds</a></h3>
+<p>The query interner runs a two-cycle mark-and-sweep collector. Named entries
+are evicted when nothing outside the interner holds the <code>Arc&lt;str&gt;</code>; anonymous
+entries are evicted when idle longer than <code>query_interner_anon_idle_ttl_seconds</code>.</p>
+<p>This knob controls how often the collector wakes up. The actual sweep tick
+is <code>gc_interval / 4</code>, so an entry marked on cycle N has roughly a
+quarter-interval before cycle N+1 evicts it; any access during that window
+clears the mark.</p>
+<p>Lower values shrink the interner faster after disconnect waves at the cost
+of more CPU. Setting this to <code>0</code> is rejected at startup.</p>
+<p><strong>Restart-only</strong>: changes to this knob take effect only after a restart;
+a config reload won't change the running sweep cadence.</p>
+<p>Default: <code>60</code>.</p>
+<h3 id="query_interner_anon_idle_ttl_seconds"><a class="header" href="#query_interner_anon_idle_ttl_seconds">query_interner_anon_idle_ttl_seconds</a></h3>
+<p>Bounds the upper memory cost of pg_doorman remembering the SQL text of an
+anonymous prepared statement after the last Bind or Parse referencing the
+same hash. Once an anonymous entry has been idle longer than this many
+seconds it is marked, then evicted on the next sweep that still sees it
+as idle.</p>
+<p>Setting this to <code>0</code> disables TTL eviction entirely. Anonymous entries
+live until the process restarts. This matches the pre-3.7 behaviour and
+is the right choice for legacy deployments that rely on cross-batch
+unnamed prepared statements; everywhere else, leave the default.</p>
+<p><strong>Live-reloadable</strong>: re-read on every sweep, so a config reload changes
+the effective TTL without a restart.</p>
+<p>Default: <code>60</code>.</p>
 <h3 id="message_size_to_be_stream"><a class="header" href="#message_size_to_be_stream">message_size_to_be_stream</a></h3>
 <p>When a PostgreSQL DataRow message exceeds this threshold, pg_doorman switches to streaming mode:
 data is forwarded to the client in 4 KB chunks instead of buffering the entire message.
@@ -515,12 +610,26 @@ and free their buffers. Protects the pooler process from OOM under heavy load or
 <h3 id="proxy_copy_data_timeout"><a class="header" href="#proxy_copy_data_timeout">proxy_copy_data_timeout</a></h3>
 <p>Maximum time to wait for data copy operations during proxying, in milliseconds.</p>
 <p>Default: <code>15000 (15 sec)</code>.</p>
-<h3 id="server_tls"><a class="header" href="#server_tls">server_tls</a></h3>
-<p>Enable TLS for connections to the PostgreSQL server. When enabled, pg_doorman will attempt to establish TLS connections to the backend PostgreSQL servers.</p>
-<p>Default: <code>false</code>.</p>
-<h3 id="verify_server_certificate"><a class="header" href="#verify_server_certificate">verify_server_certificate</a></h3>
-<p>Verify the PostgreSQL server's TLS certificate when connecting with TLS. This setting is only relevant when <code>server_tls</code> is enabled.</p>
-<p>Default: <code>false</code>.</p>
+<h3 id="server_tls_mode"><a class="header" href="#server_tls_mode">server_tls_mode</a></h3>
+<p>TLS mode for outgoing connections to PostgreSQL servers.</p>
+<ul>
+<li><code>allow</code> — Try plain first; if server rejects, retry with TLS. Matches libpq sslmode=allow (default).</li>
+<li><code>disable</code> — TLS is not used.</li>
+<li><code>prefer</code> — TLS is used if the server supports it; plain connection otherwise.</li>
+<li><code>require</code> — TLS is required, but the server certificate is not verified.</li>
+<li><code>verify-ca</code> — TLS is required and the server certificate is verified against <code>server_tls_ca_cert</code>.</li>
+<li><code>verify-full</code> — TLS is required, the certificate is verified, and the server hostname must match the certificate.</li>
+</ul>
+<p>Default: <code>"allow"</code>.</p>
+<h3 id="server_tls_ca_cert"><a class="header" href="#server_tls_ca_cert">server_tls_ca_cert</a></h3>
+<p>CA certificate for verifying PostgreSQL server certificates. Required when <code>server_tls_mode</code> is <code>verify-ca</code> or <code>verify-full</code>.</p>
+<p>Default: <code>None</code>.</p>
+<h3 id="server_tls_certificate"><a class="header" href="#server_tls_certificate">server_tls_certificate</a></h3>
+<p>Client certificate for mTLS with PostgreSQL servers. Pair with <code>server_tls_private_key</code>.</p>
+<p>Default: <code>None</code>.</p>
+<h3 id="server_tls_private_key"><a class="header" href="#server_tls_private_key">server_tls_private_key</a></h3>
+<p>Private key for the mTLS client certificate. Pair with <code>server_tls_certificate</code>.</p>
+<p>Default: <code>None</code>.</p>
 <h3 id="hba"><a class="header" href="#hba">hba</a></h3>
 <p>The list of IP addresses from which it is permitted to connect to the pg-doorman.</p>
 <p>Default: <code>[]</code>.</p>
@@ -582,16 +691,49 @@ hostnossl all      all    192.168.1.0/24  trust
 <li>For Talos/JWT/PAM flows configured at the pool/user level, <code>trust</code> still bypasses the client password prompt; however, those modes may be used when <code>trust</code> does not match.</li>
 </ul>
 <h3 id="pooler_check_query"><a class="header" href="#pooler_check_query">pooler_check_query</a></h3>
-<p>When a client sends this exact query as a SimpleQuery, pg_doorman responds immediately
-without forwarding it to PostgreSQL. Useful for health checks from load balancers (HAProxy, pgbouncer-style <code>SELECT 1</code>)
-or application-level keepalive probes. The default <code>;</code> (empty statement) is the lightest possible check.</p>
+<p>When a client sends this exact query as a SimpleQuery, pg_doorman serves it through a per-pool
+response cache. The first matching probe in each pool's lifetime is forwarded to PostgreSQL and
+the full response is captured. Subsequent matching probes are answered from the cache without
+touching the backend.</p>
+<p>The cache is keyed by the query string. A <code>RELOAD</code> that changes <code>pooler_check_query</code> invalidates
+the cache on the next ping; the new value triggers one fresh backend probe and is then served
+from cache until the value changes again. A reload that keeps the same value keeps the cached
+response. <code>ErrorResponse</code> from the backend is forwarded to the client unchanged and is never
+cached, so the next probe retries against PostgreSQL.</p>
+<p>Cold-pool behavior changed: the first probe per pool now does one PostgreSQL round-trip even
+for the default <code>;</code>. If PostgreSQL is unreachable at that moment, the probing client sees a
+probe failure instead of an unconditional OK. The earlier hardcoded local answer reported the
+pooler as healthy even when PostgreSQL was down, and made non-empty values such as <code>select 1</code>
+return an empty response.</p>
+<p><strong>Operator contract.</strong> The query must be stable: the same input must always produce the same
+bytes, with no side effects. Safe values: <code>;</code>, <code>select 1</code>, <code>select 'pg_doorman'</code>, <code>select version()</code>.</p>
+<p>Unsafe values that the cache will silently freeze:</p>
+<ul>
+<li><code>select now()</code>, <code>select clock_timestamp()</code> — the cached timestamp never advances.</li>
+<li><code>select pg_is_in_recovery()</code> — a failover flips the role on PostgreSQL but the cached response
+still reports the old role.</li>
+<li><code>select count(*) from &lt;table&gt;</code> — the cached count is whatever the first probe observed.</li>
+<li><code>UPDATE</code>, <code>INSERT</code>, <code>DELETE</code>, <code>CALL</code>, <code>DO</code> — the side effect runs once and the success
+response is cached forever.</li>
+</ul>
+<p>Cache hit rate is exported as two counters without labels:
+<code>pg_doorman_pooler_check_query_backend_total</code> (probes forwarded to PostgreSQL) and
+<code>pg_doorman_pooler_check_query_cache_total</code> (probes served from cache). The ratio
+<code>cache_total / (cache_total + backend_total)</code> is the hit rate.</p>
 <p>Default: <code>";"</code>.</p>
+<h3 id="startup_parameters"><a class="header" href="#startup_parameters">startup_parameters</a></h3>
+<p>Map of PostgreSQL configuration parameter names to string values. pg_doorman writes them into each new backend <code>StartupMessage</code>; PostgreSQL stores them as the session reset defaults, so client <code>RESET ALL</code> / <code>DISCARD ALL</code> returns to these values.</p>
+<p>Cascade order: <code>general.startup_parameters</code>, then <code>pools.&lt;name&gt;.startup_parameters</code>, then the optional <code>startup_parameters</code> JSON column returned by passthrough <code>auth_query</code>. Later layers win per key. Dedicated-mode <code>auth_query</code> pools ignore the per-user column because one shared backend serves multiple roles.</p>
+<p>Validation at config load rejects reserved protocol keys (<code>user</code>, <code>database</code>, <code>replication</code>, <code>options</code>, anything starting with <code>_pq_.</code>), invalid GUC names, null bytes, and per-level maps that exceed the startup-parameter budget. Before each backend startup, pg_doorman checks the resolved parameter set against PG's <code>MAX_STARTUP_PACKET_LENGTH</code> (10 000 bytes). Any overflow rejects backend startup with SQLSTATE 53400 (<code>configuration_limit_exceeded</code>) instead of sending a partial or empty <code>StartupMessage</code>.</p>
+<p>If PostgreSQL rejects a parameter at backend startup, pg_doorman returns PostgreSQL's <code>ErrorResponse</code> to the client unchanged. There is no retry with the key removed, and pg_doorman does not automatically disable that key for the pool. The cumulative count is exported as <code>pg_doorman_backend_startup_parameter_errors_total{pool, sqlstate}</code>; the parameter name and username are written to the corresponding warning log line.</p>
+<p>Inspect the resolved per-pool values with <code>SHOW STARTUP_PARAMETERS</code> or the <code>/api/pools</code> REST endpoint.</p>
+<p>Default: <code>{} (empty)</code>.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../tutorials/troubleshooting.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../observability/percentiles.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
@@ -605,7 +747,7 @@ or application-level keepalive probes. The default <code>;</code> (empty stateme
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../tutorials/troubleshooting.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../observability/percentiles.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <i class="fa fa-angle-left"></i>
                     </a>
 
@@ -635,6 +777,7 @@ or application-level keepalive probes. The default <code>;</code> (empty stateme
         <!-- Custom JS scripts -->
         <script src="../mermaid-init.js"></script>
         <script src="../mermaid.min.js"></script>
+        <script src="../lang-switcher.js"></script>
 
 
     </div>

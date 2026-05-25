@@ -1,0 +1,733 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Anonymous Parse Caching - PgDoorman Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="../highlight.css">
+        <link rel="stylesheet" href="../tomorrow-night.css">
+        <link rel="stylesheet" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../css/custom.css">
+        <link rel="stylesheet" href="../mdbook-admonish.css">
+
+
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "../";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            html.classList.remove('sidebar-visible');
+            html.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">PgDoorman Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/ozontech/pg_doorman" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/ozontech/pg_doorman/edit/master/documentation/en/src/src/tutorials/prepared-statements.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="anonymous-parse-caching"><a class="header" href="#anonymous-parse-caching">Anonymous Parse caching</a></h1>
+<p>PgDoorman caches anonymous <code>Parse</code> messages for transaction pooling.
+Many drivers send short parameterised queries as <code>Parse</code> with an empty
+statement name. Without a remap, PostgreSQL plans the query again on
+every <code>Bind</code>, so hot OLTP paths pay planner CPU on every call.</p>
+<p>PgDoorman transparently remaps every anonymous <code>Parse</code> to an internal
+<code>DOORMAN_&lt;N&gt;</code> name on the backend. The plan lands in the backend's
+named prepared statement registry and gets reused across <code>Bind</code>s of
+one client and across clients sharing the same pool. The main effect
+is less planner CPU and fewer repeated backend Parses for the same
+query shape.</p>
+<p>The remap is transparent to the driver: clients send and receive
+empty statement names just as they would against a vanilla
+PostgreSQL.</p>
+<p>PgBouncer (1.21+) and Odyssey support prepared statements in
+transaction mode, but only for <strong>named</strong> statements. They forward
+anonymous <code>Parse</code> unchanged. PgDoorman's extra behaviour is the
+anonymous remap. Cache bounds, LRU, TTL, and observability keep that
+remap controlled under dynamic SQL.</p>
+<h2 id="what-gets-faster"><a class="header" href="#what-gets-faster">What gets faster</a></h2>
+<p>Anonymous <code>Parse</code> caching removes repeated work from hot
+parameterised query paths:</p>
+<ul>
+<li>the backend does not receive the same <code>Parse</code> on every reuse of an
+already known query shape;</li>
+<li>PostgreSQL can use a prepared statement already created on that
+backend connection;</li>
+<li>different clients in the same pool share one pool-level entry
+instead of warming the same query independently;</li>
+<li>on a server-cache hit, PgDoorman synthesizes <code>ParseComplete</code>
+without a PostgreSQL round-trip.</li>
+</ul>
+<p>This is primarily a performance optimization for OLTP workloads with
+repeated query shapes. Cache caps, TTL, and the interner exist so the
+speedup does not become unbounded memory growth in the pooler or on
+PostgreSQL backends.</p>
+<h2 id="the-postgresql-baseline"><a class="header" href="#the-postgresql-baseline">The PostgreSQL baseline</a></h2>
+<p>A <code>Parse</code> message carries a statement name. An empty name means
+<strong>anonymous</strong>, anything else means <strong>named</strong>:</p>
+<pre><code class="language-text">                          Lifetime in PG          Plan caching
+  ─────────────────────   ─────────────────       ─────────────────────
+  Anonymous (name="")     Until next anonymous    No named registry
+                          Parse or session end    entry; each new
+                                                   unnamed Parse plans
+  Named (name="stmt_42")  Until Close /           Starts with custom
+                          DEALLOCATE /            plans; may switch to
+                          session end             a generic plan after
+                                                   5 custom executions
+</code></pre>
+<p>Most modern drivers default to <strong>anonymous</strong> for one-shot
+parameterised queries: <code>lib/pq</code> (Go), <code>libpq</code> <code>PQexecParams</code> (C),
+some flows in pgjdbc and psycopg. The application code looks
+identical to a parameterised named-statement query, but the wire
+protocol carries an empty name.</p>
+<h2 id="why-this-is-a-problem-for-transaction-mode-pooling"><a class="header" href="#why-this-is-a-problem-for-transaction-mode-pooling">Why this is a problem for transaction-mode pooling</a></h2>
+<p>Transaction pooling rotates a backend among many clients. If the
+pooler forwards the empty <code>Parse</code> name as-is, every client's <code>Bind</code>
+runs against a backend that has no plan cached for that query. Hot
+OLTP paths pay the planner cost on every call.</p>
+<p>Named prepared statements solve planner performance, but they push
+the bookkeeping problem onto the pooler:</p>
+<ul>
+<li>The pooler must remember each client's named statements until the
+client disconnects, even if the pool-level shared cache evicts the
+entry.</li>
+<li>On every <code>Bind</code>, it must verify the current backend knows the
+name and re-<code>Parse</code> otherwise.</li>
+<li>On client disconnect, it must issue <code>Close</code> or <code>DEALLOCATE</code> to the
+right backend.</li>
+<li>Drivers that mint per-query names (<code>stmt_&lt;seq&gt;</code>) compound the
+per-client cache size: hundreds of entries per client times tens of
+thousands of clients.</li>
+</ul>
+<p>So the choice is: give up plan caching for anonymous traffic, or
+inherit the full cost of named-statement bookkeeping. PgDoorman
+takes a third option.</p>
+<h2 id="what-pgdoorman-does"><a class="header" href="#what-pgdoorman-does">What PgDoorman does</a></h2>
+<p>On every anonymous <code>Parse</code> from the client, PgDoorman:</p>
+<ol>
+<li>Hashes the query text, parameter type OIDs, and a digest of the
+planner GUCs pinned by the client's StartupMessage (<code>search_path</code>,
+<code>default_transaction_isolation</code>, <code>default_transaction_read_only</code>,
+<code>default_text_search_config</code>, <code>role</code>). Two clients that send the
+same query and parameter OIDs but pin different <code>search_path</code> values
+therefore get separate cache entries and separate PostgreSQL plans.
+Planner GUCs outside this list (<code>TimeZone</code>, <code>DateStyle</code>,
+<code>plan_cache_mode</code>, <code>enable_*</code>, JIT cost knobs) are <strong>not</strong> part of
+the key. See the <code>sync_server_parameters</code> reference before mixing
+the same prepared query across different values of those GUCs.</li>
+<li>Looks up the hash in the <strong>pool-level</strong> cache (shared across all
+clients of this pool). On miss, it allocates a fresh
+<code>DOORMAN_&lt;counter&gt;</code> name and registers an <code>Arc&lt;Parse&gt;</code> entry.</li>
+<li>Stores a per-client cache entry keyed by <code>Anonymous(hash)</code> so the
+following <code>Bind</code> can locate the same <code>DOORMAN_&lt;N&gt;</code>.</li>
+<li>Forwards <code>Parse</code> to the backend with the rewritten name.</li>
+<li>On the matching <code>Bind</code> (with empty name), rewrites the statement
+name to <code>DOORMAN_&lt;N&gt;</code> and ensures the current backend already
+holds the named statement; sends a fresh <code>Parse</code> if not.</li>
+</ol>
+<p>The client never sees <code>DOORMAN_&lt;N&gt;</code>: the rewrite lives only on the
+leg between PgDoorman and the backend. When the backend already
+holds the name, PgDoorman synthesises <code>ParseComplete</code> itself and
+skips the round-trip.</p>
+<h3 id="wire-protocol-example"><a class="header" href="#wire-protocol-example">Wire-protocol example</a></h3>
+<p>A Go application running</p>
+<pre><code class="language-go">db.Query("SELECT * FROM t WHERE name = $1", "vasya")
+</code></pre>
+<p>through <code>lib/pq</code> produces this exchange:</p>
+<pre><code class="language-text">  Client                   PgDoorman                  Backend
+  ──────                   ─────────                  ───────
+  Parse("", q)        ────►│ hash, miss → DOORMAN_42
+                            │ pool_cache[hash] = Arc&lt;Parse&gt;
+                            │ client_cache[Anon(hash)] = ...
+                            │             Parse("DOORMAN_42") ────►
+                            │                    ◄── ParseComplete
+                       ◄────│ ParseComplete
+  Bind("", "vasya")   ────►│ rewrite "" → "DOORMAN_42"
+                            │             Bind("DOORMAN_42") ─────►
+                            │             Execute, Sync ──────────►
+                            │                ◄── BindComplete, ...
+                            │                ◄── ReadyForQuery
+                       ◄────│ BindComplete, ...
+</code></pre>
+<p>A second client running the same query in the same pool hits the
+pool cache and skips the backend <code>Parse</code> entirely:</p>
+<pre><code class="language-text">  Client B           PgDoorman                       Backend (same)
+  ────────           ─────────                       ──────────────
+  Parse("", q)  ───►│ hash hit → DOORMAN_42
+                     │ server_cache contains "DOORMAN_42"
+                ◄────│ synthetic ParseComplete       (no message sent)
+  Bind("", v)   ───►│ rewrite "" → "DOORMAN_42"
+                     │           Bind("DOORMAN_42") ────►
+                     │           ...
+</code></pre>
+<h2 id="cache-layers"><a class="header" href="#cache-layers">Cache layers</a></h2>
+<p>PgDoorman keeps prepared-statement state at three levels:</p>
+<pre><code class="language-text">  Pool-level    DashMap&lt;hash, CacheEntry&gt;
+                One per pool. Holds Arc&lt;Parse&gt; with name "DOORMAN_N".
+                Size:    prepared_statements_cache_size (default 8192).
+                Eviction: approximate LRU.
+
+  Client-level  Named:     AHashMap&lt;String, CachedStatement&gt;, unbounded.
+                Anonymous: LruCache&lt;u64, CachedStatement&gt; bounded by
+                           client_anonymous_prepared_cache_size (defaults to
+                           prepared_statements_cache_size when unset),
+                           or AHashMap if size = 0.
+                Eviction of an Anonymous entry is local: the Arc&lt;Parse&gt;
+                is dropped, the underlying DOORMAN_&lt;N&gt; on the backend
+                stays.
+
+  Server-level  LruCache&lt;String, ()&gt;, per backend connection.
+                Tracks which DOORMAN_N this backend already holds.
+                True LRU; on eviction issues Close to the backend.
+</code></pre>
+<p>When the Anonymous LRU evicts an entry, PgDoorman drops the local
+reference and does not send <code>Close</code> to the backend. The underlying
+<code>DOORMAN_&lt;N&gt;</code> is recycled by the server-level LRU or <code>server_lifetime</code>
+(default 20 min), whichever comes first.</p>
+<p>The query text itself is interned via <code>Arc&lt;str&gt;</code>: ten clients sending
+the same anonymous query share one allocation in memory.</p>
+<h2 id="when-the-remap-helps"><a class="header" href="#when-the-remap-helps">When the remap helps</a></h2>
+<ul>
+<li><strong>API workloads with a small set of hot queries.</strong> A handful of
+unique <code>SELECT</code> / <code>INSERT</code> shapes shared across thousands of
+clients. Pool-cache hit rate near 100 %, planner runs once per
+backend per query shape, and later calls go through <code>Bind</code> against
+already prepared backend state.</li>
+<li><strong>Drivers that pin to anonymous prepared.</strong> <code>lib/pq</code>, <code>libpq</code>
+<code>PQexecParams</code>, pgjdbc before the <code>prepareThreshold</code> is reached.
+Without the remap they would re-plan on every call.</li>
+<li><strong>Mixed pools where named and anonymous coexist.</strong> Anonymous
+statements get the same plan-cache benefit as named ones, without
+growing the per-client named cache.</li>
+</ul>
+<h2 id="when-the-remap-doesnt-help"><a class="header" href="#when-the-remap-doesnt-help">When the remap doesn't help</a></h2>
+<ul>
+<li><strong>Ad-hoc / OLAP traffic.</strong> Each query is unique. When the pool cache
+is full, each new query shape must find an old entry to evict with an
+O(N) scan. Disable prepared-statement remapping with
+<code>prepared_statements: false</code> if the instance only serves this traffic.</li>
+<li><strong>Single-statement scripts.</strong> A connect → <code>Parse</code> → 1 <code>Bind</code> →
+disconnect pattern doesn't accumulate enough hits to repay the
+bookkeeping. The overhead per <code>Parse</code> is small (~700 ns) but
+measurable.</li>
+<li><strong>Async drivers in pipeline mode.</strong> Each session gets a unique
+<code>DOORMAN_async_&lt;N&gt;</code> name to avoid name collisions between
+in-flight operations, so the server cache can't reuse entries
+across sessions. The pool-level cache still shares the query text
+across sessions; the backend planner still runs once per session.</li>
+</ul>
+<p>Track effectiveness with
+<code>rate(pg_doorman_servers_prepared_hits_total[5m])</code> and
+<code>rate(pg_doorman_servers_prepared_misses_total[5m])</code>. A sustained miss
+share above 30 % means the remap is spending CPU and memory without
+enough backend plan reuse. Either disable it or raise
+<code>prepared_statements_cache_size</code>.</p>
+<h2 id="how-other-poolers-handle-this"><a class="header" href="#how-other-poolers-handle-this">How other poolers handle this</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Pooler</th><th style="text-align: left">Parse/plan cache for anonymous prepared statements</th></tr></thead><tbody>
+<tr><td><strong>PgDoorman</strong></td><td style="text-align: left">Yes: transparent remap to <code>DOORMAN_&lt;N&gt;</code></td></tr>
+<tr><td>PgBouncer 1.21+</td><td style="text-align: left">No: named only, anonymous forwarded unchanged</td></tr>
+<tr><td>Odyssey</td><td style="text-align: left">No: named only, <code>pool_reserve_prepared_statement</code></td></tr>
+<tr><td>PgCat</td><td style="text-align: left">No: named only</td></tr>
+</tbody></table>
+</div>
+<p>PgBouncer added prepared-statement support in 1.21, but limited it
+to <strong>named</strong> statements: an anonymous <code>Parse</code> is forwarded as-is and
+each <code>Bind</code> re-runs the planner. Odyssey's
+<code>pool_reserve_prepared_statement</code> requires named statements; it does
+nothing for anonymous traffic. PgCat behaves the same way.</p>
+<p>In this comparison, only PgDoorman caches anonymous <code>Parse</code>.</p>
+<h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Setting</th><th style="text-align: center">Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>prepared_statements</code></td><td style="text-align: center"><code>true</code></td><td>Enables prepared-statement remapping and caching. Set <code>false</code> to disable the feature.</td></tr>
+<tr><td><code>prepared_statements_cache_size</code></td><td style="text-align: center">8192</td><td>Pool-level cache size in entries. Must be greater than 0 while <code>prepared_statements</code> is <code>true</code>.</td></tr>
+<tr><td><code>server_prepared_statements_cache_size</code></td><td style="text-align: center">inherits <code>prepared_statements_cache_size</code></td><td>Per-backend LRU size for <code>DOORMAN_&lt;N&gt;</code> names. <code>0</code> disables backend retention but not the pool-level remap.</td></tr>
+<tr><td><code>client_anonymous_prepared_cache_size</code></td><td style="text-align: center">inherits <code>prepared_statements_cache_size</code></td><td>Per-client Anonymous LRU size. <code>0</code> means unlimited. Named is unbounded.</td></tr>
+</tbody></table>
+</div>
+<p>The Named part of the per-client cache is always unlimited and is not
+affected by <code>client_anonymous_prepared_cache_size</code>.</p>
+<p>To disable prepared-statement remapping entirely (rare, for OLAP-only deployments):</p>
+<pre><code class="language-yaml">general:
+  prepared_statements: false
+</code></pre>
+<p>There is no separate anonymous-only switch. Do not use
+<code>prepared_statements_cache_size: 0</code> as the disable switch: pg_doorman
+rejects that general config while <code>prepared_statements</code> is enabled.</p>
+<h2 id="differences-from-postgresql-semantics"><a class="header" href="#differences-from-postgresql-semantics">Differences from PostgreSQL semantics</a></h2>
+<p>The remap changes a few protocol-level behaviours that strict
+applications may rely on:</p>
+<ul>
+<li>The same anonymous <code>Parse</code> issued twice does <strong>not</strong> discard the
+previous one. Each <code>(query, param_types)</code> lives independently in
+the pool cache under a separate <code>DOORMAN_&lt;N&gt;</code>.</li>
+<li><code>Close</code> with an empty name is a no-op for PgDoorman's caches. The
+underlying <code>DOORMAN_&lt;N&gt;</code> lives until pool-level LRU evicts it or
+the pool shuts down.</li>
+<li>PostgreSQL's custom/generic plan decision is shared by all clients
+using the same <code>DOORMAN_&lt;N&gt;</code>. A named statement starts with custom
+plans; after five custom executions PostgreSQL may switch to a
+generic plan if its estimated cost is close enough. With PgDoorman,
+those executions can come from different clients, so a generic-plan
+decision can reflect mixed parameter distributions.</li>
+</ul>
+<p>Applications that depend on PostgreSQL's "anonymous Parse discards
+the previous one" semantics should switch to named statements with
+explicit <code>Close</code>.</p>
+<h2 id="tuning"><a class="header" href="#tuning">Tuning</a></h2>
+<h3 id="sizing-the-cache"><a class="header" href="#sizing-the-cache">Sizing the cache</a></h3>
+<p>PgDoorman's prepared-statement cache has three layers, governed by
+three related config knobs:</p>
+<ul>
+<li><code>prepared_statements_cache_size</code> (default <code>8192</code>) sizes the
+pool-level shared cache — one map per pool, keyed by query hash.
+This is the upper bound on distinct query shapes the pool will
+remember across all clients. Approximate LRU; eviction is O(N) over
+the whole map and never sends Close to a backend (other clients may
+still hold the Arc).</li>
+<li><code>server_prepared_statements_cache_size</code> (default: inherits from
+<code>prepared_statements_cache_size</code>) sizes the per-backend cache —
+one LRU per backend connection, keyed by <code>DOORMAN_&lt;N&gt;</code> name. This
+is the upper bound on distinct prepared statements PgDoorman will
+let a single PostgreSQL backend hold. True LRU (O(1)); eviction
+queues a <code>Close</code> message for the backend, sent on the next Sync or
+Flush — your <code>pg_prepared_statements</code> view may temporarily show
+more rows than the cap until the next Sync arrives.</li>
+<li><code>client_anonymous_prepared_cache_size</code> (default: inherits from
+<code>prepared_statements_cache_size</code>) sizes the per-client Anonymous
+LRU. Set to <code>0</code> to disable the LRU and use an unlimited map; set
+to a number to bound the per-client cache independently of the
+pool size.</li>
+</ul>
+<p>The pool-level and server-level knobs accept per-pool overrides:</p>
+<pre><code class="language-yaml">general:
+  prepared_statements_cache_size: 8192
+  server_prepared_statements_cache_size: 1024  # tighter per-backend
+
+pools:
+  oltp:
+    # inherits both from general
+    pool_mode: "transaction"
+  reporting:
+    # this pool has wider query diversity; let server cache hold more
+    server_prepared_statements_cache_size: 4096
+    pool_mode: "transaction"
+</code></pre>
+<p>Setting <code>prepared_statements: false</code> disables the entire remap and
+forces the pool-level and server-level caches to 0. Setting
+<code>server_prepared_statements_cache_size: 0</code> while leaving the pool
+size positive is allowed but rarely useful — the per-backend cache
+becomes a pass-through that re-Parses on every cross-backend hit.</p>
+<p>When to lower <code>server_prepared_statements_cache_size</code> below the pool
+size:</p>
+<ul>
+<li>Backends carry too many <code>DOORMAN_&lt;N&gt;</code> rows (<code>pg_prepared_statements</code>
+near the cap, plan memory ballooning).</li>
+<li>You want faster <code>Close</code> recycling without shrinking pool-cache hit
+rate.</li>
+</ul>
+<p>When to keep them equal (the default):</p>
+<ul>
+<li>You don't have a measured backend-memory problem. Leave the inheritance.</li>
+</ul>
+<h3 id="sizing-client_anonymous_prepared_cache_size"><a class="header" href="#sizing-client_anonymous_prepared_cache_size">Sizing <code>client_anonymous_prepared_cache_size</code></a></h3>
+<p>When unset, the per-client Anonymous LRU inherits the resolved
+<code>prepared_statements_cache_size</code> for the pool (default <code>8192</code>). Set
+an explicit value to override that inheritance — <code>0</code> disables the
+LRU and uses an unlimited map, any positive number caps the LRU at
+that size.</p>
+<p>Each entry holds a lightweight <code>(hash, async_name?, Arc&lt;Parse&gt;)</code>
+record — the <code>Arc&lt;Parse&gt;</code> is shared with the pool-level cache, so the
+per-client overhead is roughly <code>~80 bytes</code> of bookkeeping per entry.
+At 10 000 connected clients × 256 entries × ~80 bytes that adds up to
+about 200 MB of headroom on the pooler — predictable and bounded.</p>
+<p>Raise the cap when:</p>
+<ul>
+<li>An ORM or generated SQL framework mints <code>stmt_&lt;seq&gt;</code> per query and
+the <code>Anonymous</code> LRU keeps recycling entries (visible as a sustained
+non-zero rate on <code>pg_doorman_clients_prepared_anonymous_evictions_total</code>).</li>
+<li>The application has a known wide working set per session and the
+eviction rate matches that pressure.</li>
+</ul>
+<p>Lower the cap for very large connection counts (50 000+ clients): at
+that scale <code>clients × cache_size × 80 bytes</code> of pooler bookkeeping can
+cross 1 GB, and trimming the cap halves it. <code>max_memory_usage</code> does not
+cap prepared-statement bookkeeping; it protects in-flight query buffers.</p>
+<h3 id="named-is-unbounded-by-design"><a class="header" href="#named-is-unbounded-by-design">Named is unbounded by design</a></h3>
+<p>The Named part of the per-client cache has no upper bound. PgDoorman
+holds the <code>Arc&lt;Parse&gt;</code> for every named statement the client created
+until the client disconnects or sends <code>DEALLOCATE</code> / <code>DEALLOCATE ALL</code>.
+This matches PostgreSQL's own contract — named statements live for the
+session — and avoids the failure mode where evicting a Named entry
+under pressure causes the next <code>Bind</code> to fail with
+<code>prepared statement does not exist</code>.</p>
+<p>The flip side: drivers that mint per-query named statements (some
+pgjdbc and Hibernate flows, some .NET Npgsql configurations) can grow
+the per-client Named map without limit. PgDoorman cannot bound this
+safely; the application is responsible for either reusing names or
+sending <code>DEALLOCATE</code> on names it no longer uses.</p>
+<p>The Anonymous LRU eviction counter
+(<code>pg_doorman_clients_prepared_anonymous_evictions_total</code>) is the only
+side that has a built-in pressure signal. The Named side has none —
+watch the <code>client_named_count</code> column in <code>SHOW POOLS_MEMORY</code> and
+<code>pg_doorman_clients_prepared_named_entries</code> for unexpected growth.</p>
+<h3 id="backend-memory-creep-window"><a class="header" href="#backend-memory-creep-window">Backend memory creep window</a></h3>
+<p>When the Anonymous LRU evicts an entry on the client side, PgDoorman
+drops only the local <code>Arc&lt;Parse&gt;</code>. The corresponding <code>DOORMAN_&lt;N&gt;</code>
+prepared statement stays alive on every PostgreSQL backend that ever
+served it. Two mechanisms eventually clean it up:</p>
+<ul>
+<li><strong>Server-level LRU.</strong> Each backend tracks its own
+<code>LruCache&lt;String, ()&gt;</code> of <code>DOORMAN_&lt;N&gt;</code> names, capped at
+<code>server_prepared_statements_cache_size</code> (or
+<code>prepared_statements_cache_size</code> when unset). When the cap is reached,
+the backend issues <code>Close</code> on the least recently used name, releasing
+the plan.</li>
+<li><strong>Backend rotation.</strong> A backend reaches <code>server_lifetime</code>
+(default 20 min) and pg_doorman closes it; the new backend starts
+with an empty plan cache.</li>
+</ul>
+<p>The worst-case memory footprint per backend is therefore
+<code>server_prepared_statements_cache_size × average plan memory</code>
+(<code>8192 × ~100 KB</code> is about 800 MB) on the PostgreSQL side. To shrink
+the window:</p>
+<ul>
+<li>Lower <code>server_prepared_statements_cache_size</code> so the server-level LRU
+recycles plans sooner.</li>
+<li>Lower <code>server_lifetime</code> so backends rotate faster.</li>
+</ul>
+<p>The PostgreSQL system view <code>pg_prepared_statements</code> reports the names
+held by the current backend. Counting rows there per backend tells
+you how close the backend is to the cap.</p>
+<h2 id="observability"><a class="header" href="#observability">Observability</a></h2>
+<p>Admin commands:</p>
+<ul>
+<li>
+<p><code>SHOW PREPARED_STATEMENTS</code> — pool, hash, name, query text,
+<code>count_used</code>, <code>kind</code>. Top rows by <code>count_used</code> show the hot queries
+that benefit most from the cache. The <code>kind</code> column is the last
+column and reports <code>named</code>, <code>anonymous</code>, or <code>mixed</code> depending on
+how clients have used the entry over its lifetime.</p>
+<p>Example output:</p>
+<pre><code class="language-text"> pool         | hash               | name        | query             | count_used | kind
+--------------+--------------------+-------------+-------------------+------------+-----------
+ sharded.user | 1234567890123456   | DOORMAN_1   | SELECT * FROM t1  |     150234 | anonymous
+ sharded.user | 2345678901234567   | DOORMAN_2   | INSERT INTO t2 .. |      87654 | named
+ sharded.user | 3456789012345678   | DOORMAN_3   | SELECT * FROM t3  |      45678 | mixed
+</code></pre>
+</li>
+<li>
+<p><code>SHOW POOLS_MEMORY</code> — <code>pool_prepared_count</code>,
+<code>client_prepared_count</code>, <code>pool_prepared_bytes</code>,
+<code>client_prepared_bytes</code>, plus the breakdown by kind:
+<code>client_named_count</code>, <code>client_anonymous_count</code>,
+<code>client_anonymous_evictions_alive</code>. The last column sums the
+per-client eviction counters across the currently connected
+clients only — disconnected clients drop out of the sum, so this
+column is <em>not</em> monotonic. For the cumulative counter, scrape
+<code>pg_doorman_clients_prepared_anonymous_evictions_total</code> from the
+Prometheus surface instead.</p>
+</li>
+</ul>
+<p>Prometheus metrics (full list in <a href="../reference/prometheus.html">Prometheus</a>):</p>
+<ul>
+<li><code>pg_doorman_pool_prepared_cache_entries{user, database}</code></li>
+<li><code>pg_doorman_pool_prepared_cache_bytes</code></li>
+<li><code>pg_doorman_clients_prepared_cache_entries</code></li>
+<li><code>pg_doorman_clients_prepared_cache_bytes</code></li>
+<li><code>pg_doorman_clients_prepared_named_entries{user, database}</code></li>
+<li><code>pg_doorman_clients_prepared_anonymous_entries{user, database}</code></li>
+<li><code>pg_doorman_clients_prepared_anonymous_evictions_total{user, database}</code></li>
+<li><code>pg_doorman_servers_prepared_hits{user, database}</code></li>
+<li><code>pg_doorman_servers_prepared_misses{user, database}</code></li>
+<li><code>pg_doorman_servers_prepared_hits_total{user, database}</code></li>
+<li><code>pg_doorman_servers_prepared_misses_total{user, database}</code></li>
+<li><code>pg_doorman_async_clients_count</code></li>
+</ul>
+<p>Use the <code>_total</code> metrics for <code>rate()</code> and alerting. The non-<code>_total</code>
+server metrics are live backend aggregates and can drop when backends
+rotate.</p>
+<h2 id="alerting"><a class="header" href="#alerting">Alerting</a></h2>
+<h3 id="anonymous-lru-eviction-rate"><a class="header" href="#anonymous-lru-eviction-rate">Anonymous LRU eviction rate</a></h3>
+<p>A sustained non-zero rate on the Anonymous eviction counter means the
+LRU is recycling entries faster than the application reuses them.
+Alert template:</p>
+<pre><code class="language-text">rate(pg_doorman_clients_prepared_anonymous_evictions_total[5m]) &gt; 10
+  for 10m
+</code></pre>
+<p>The threshold of 10 evictions/second per pool is a starting point —
+the right value depends on traffic shape and connection count. Treat
+the alert as "the cap is too tight or the application's working set
+is wider than expected", then either raise <code>client_anonymous_prepared_cache_size</code>
+or investigate whether the application is generating unique queries
+on the hot path.</p>
+<h3 id="kind--mixed-interpretation"><a class="header" href="#kind--mixed-interpretation"><code>kind = mixed</code> interpretation</a></h3>
+<p>Each pool-level cache entry remembers whether clients have used it
+under a Named statement name, an Anonymous one, or both. <code>kind = mixed</code>
+means the same <code>(query, param_types)</code> pair has been parsed by at
+least one client as named and at least one client as anonymous in its
+current lifetime. Most workloads do not see <code>mixed</code> rows; a pool
+dominated by <code>mixed</code> entries indicates a heterogeneous client base
+(different drivers or driver configurations against the same database)
+worth verifying — sometimes intentional, sometimes a sign that one of
+the clients is configured wrong.</p>
+<h3 id="backend-prepared-statement-count"><a class="header" href="#backend-prepared-statement-count">Backend prepared statement count</a></h3>
+<p>PostgreSQL exposes <code>pg_prepared_statements</code> per backend. If pooler
+memory is fine but PostgreSQL backend RSS keeps growing, count rows
+per backend:</p>
+<pre><code class="language-sql">SELECT count(*) FROM pg_prepared_statements;
+</code></pre>
+<p>Numbers near <code>server_prepared_statements_cache_size</code> per backend mean
+the server-level LRU is at its cap. Backend rotation is the other
+mechanism that releases plan memory. If the server cache inherits
+<code>prepared_statements_cache_size</code>, use that value as the cap. Lowering
+the server cap or <code>server_lifetime</code> releases plan-memory pressure at
+the cost of more frequent re-Parses on the backend.</p>
+<h2 id="bounded-query-interner"><a class="header" href="#bounded-query-interner">Bounded query interner</a></h2>
+<p>The pool-level interner that deduplicates Parse query texts is split
+into two halves:</p>
+<ul>
+<li><strong>NAMED</strong> — text for named prepared statements. An entry stays alive
+as long as any pool or client cache holds an <code>Arc&lt;str&gt;</code> reference.
+The GC task collects entries when nothing outside the interner
+holds a reference any more, with a two-cycle grace period to avoid
+thrash on cold-but-still-needed hashes.</li>
+<li><strong>ANON</strong> — text for anonymous prepared statements. An entry expires
+after <code>query_interner_anon_idle_ttl_seconds</code> of idle time (default
+60 seconds). Setting the knob to <code>0</code> disables TTL eviction — the
+pre-3.7 unbounded behaviour, kept as an escape hatch for legacy
+deployments.</li>
+</ul>
+<p>If an anonymous <code>Bind</code> or <code>Describe</code> arrives after pg_doorman has lost
+the matching anonymous prepared-statement state, pg_doorman returns
+<code>ERROR: unnamed prepared statement does not exist</code> (SQLSTATE <code>26000</code>).
+Common causes are client Anonymous LRU eviction, <code>RESET INTERNER</code>,
+interner TTL eviction, or a driver pattern that reuses unnamed prepared
+statements across batches. This is the same error native PostgreSQL
+raises for the same condition; standard drivers handle it transparently
+by re-issuing <code>Parse</code>.</p>
+<p>Binary upgrade (<code>SIGUSR2</code>) carries both NAMED and ANON entries to
+the new process. Anonymous entries land in the new ANON interner
+with a fresh <code>last_used</code> timestamp, so the TTL clock starts over at
+the upgrade moment.</p>
+<h3 id="operator-surface"><a class="header" href="#operator-surface">Operator surface</a></h3>
+<p><code>SHOW INTERNER</code> (admin SQL) prints aggregate counts and bytes per
+kind:</p>
+<pre><code>kind      | entries | bytes
+named     |     420 |    87654
+anonymous |    1337 |   234567
+</code></pre>
+<p><code>SHOW INTERNER N</code> returns the top N entries by interned text length
+with <code>hash</code>, <code>kind</code>, <code>bytes</code>, <code>idle_ms</code> (<code>-1</code> for named — the named
+half tracks GC state, not last-used timestamps), and a 120-character
+preview of the SQL.</p>
+<p><code>RESET INTERNER</code> clears both halves. In-flight clients re-Parse on
+next reuse — diagnostics-only.</p>
+<p>The Prometheus surface mirrors <code>SHOW INTERNER</code> plus a histogram for
+sweep duration and a counter for the synthetic <code>26000</code>s. Raise
+<code>query_interner_anon_idle_ttl_seconds</code> only when synthetic misses
+correlate with anonymous TTL evictions or a known cross-batch unnamed
+statement pattern. If misses correlate with
+<code>pg_doorman_clients_prepared_anonymous_evictions_total</code>, increase
+<code>client_anonymous_prepared_cache_size</code> instead.</p>
+<h2 id="reference"><a class="header" href="#reference">Reference</a></h2>
+<ul>
+<li><a href="../concepts/pool-modes.html">Pool Modes</a> — transaction mode, where
+prepared-statement remapping is enabled.</li>
+<li><a href="../reference/general.html">General Settings</a> — <code>prepared_statements_cache_size</code>,
+<code>server_prepared_statements_cache_size</code>,
+<code>client_anonymous_prepared_cache_size</code>,
+<code>query_interner_gc_interval_seconds</code>,
+<code>query_interner_anon_idle_ttl_seconds</code>.</li>
+<li><a href="../observability/admin-commands.html">Admin Commands</a> — <code>SHOW PREPARED_STATEMENTS</code>,
+<code>SHOW POOLS_MEMORY</code>, <code>SHOW INTERNER</code>, <code>RESET INTERNER</code>.</li>
+<li><a href="../reference/prometheus.html">Prometheus</a> — full metric list.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../concepts/pool-coordinator.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../tutorials/startup-parameters.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../concepts/pool-coordinator.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../tutorials/startup-parameters.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../mermaid-init.js"></script>
+        <script src="../mermaid.min.js"></script>
+        <script src="../lang-switcher.js"></script>
+
+
+    </div>
+    </body>
+</html>

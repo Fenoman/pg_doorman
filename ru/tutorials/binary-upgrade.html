@@ -1,0 +1,783 @@
+<!DOCTYPE HTML>
+<html lang="ru" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Плавное обновление бинаря - Документация PgDoorman</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="../highlight.css">
+        <link rel="stylesheet" href="../tomorrow-night.css">
+        <link rel="stylesheet" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../css/custom.css">
+        <link rel="stylesheet" href="../mdbook-admonish.css">
+
+
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "../";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            html.classList.remove('sidebar-visible');
+            html.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Документация PgDoorman</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/ozontech/pg_doorman" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/ozontech/pg_doorman/edit/master/documentation/ru/src/src/tutorials/binary-upgrade.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="Обновление-бинарника-без-переподключения"><a class="header" href="#Обновление-бинарника-без-переподключения">Обновление бинарника без переподключения</a></h1>
+<p>pg_doorman умеет заменить исполняемый файл на работающем сервере по
+<code>SIGUSR2</code>. Свободные клиенты передаются новому процессу через
+Unix-сокет вместе с ключами отмены запросов и кешем prepared statements.
+Клиент остаётся на том же TCP-соединении и не проходит повторное
+подключение.</p>
+<p>Клиенты внутри транзакции продолжают работать на старом процессе и
+переезжают, когда транзакция завершится. Для приложений это убирает
+волну переподключений, а для PostgreSQL — всплеск SCRAM-аутентификаций.</p>
+<div id="admonition-Чем-это-отличается-от-pgbouncer--odyssey" class="admonition admonish-info" role="note" aria-labelledby="admonition-Чем-это-отличается-от-pgbouncer--odyssey-title">
+<div class="admonition-title">
+<div id="admonition-Чем-это-отличается-от-pgbouncer--odyssey-title">
+<p>Чем это отличается от PgBouncer / Odyssey</p>
+</div>
+<a class="admonition-anchor-link" href="#admonition-Чем-это-отличается-от-pgbouncer--odyssey"></a>
+</div>
+<div>
+<p>PgBouncer (<code>-R</code>, устарел с 1.20, или rolling restart через
+<code>so_reuseport</code>) и Odyssey (<code>SIGUSR2</code> + <code>bindwith_reuseport</code>) переводят
+новые подключения на новый процесс, а старые сессии оставляют в старом
+до отключения клиентов. Сессии, prepared statements и TLS-состояние
+между процессами не переносятся.</p>
+<p>pg_doorman передаёт живой клиентский сокет через <code>SCM_RIGHTS</code>, а в
+Linux-сборке с <code>tls-migration</code> может перенести и состояние OpenSSL.</p>
+</div>
+</div>
+<h2 id="Быстрый-старт"><a class="header" href="#Быстрый-старт">Быстрый старт</a></h2>
+<div id="admonition-Используйте-дистрибутивный-пакет-если-он-есть" class="admonition admonish-tip" role="note" aria-labelledby="admonition-Используйте-дистрибутивный-пакет-если-он-есть-title">
+<div class="admonition-title">
+<div id="admonition-Используйте-дистрибутивный-пакет-если-он-есть-title">
+<p>Используйте дистрибутивный пакет, если он есть</p>
+</div>
+<a class="admonition-anchor-link" href="#admonition-Используйте-дистрибутивный-пакет-если-он-есть"></a>
+</div>
+<div>
+<p>Если pg_doorman поставлен через <code>apt install pg-doorman</code> или
+<code>dnf install pg-doorman</code>, заменяйте бинарник через пакетный менеджер.
+Обычный путь — <code>apt-get install --only-upgrade pg-doorman</code> или
+<code>dnf upgrade pg-doorman</code>. Ручной <code>install</code> ниже нужен только там, где
+бинарник раскладывают без пакетного менеджера.</p>
+</div>
+</div>
+<pre><code class="language-bash"># 1. Установите новый бинарник по пути, из которого запущен сервис.
+install -m 0755 pg_doorman_new /usr/bin/pg_doorman
+
+# 2. Проверьте, что новый бинарник принимает текущий конфиг, до того
+#    как запускать обновление. SIGUSR2 тоже прогоняет `-t` и отменяет
+#    обновление при ошибке, но проверка здесь даёт шанс починить конфиг,
+#    не трогая работающий сервер.
+/usr/bin/pg_doorman -t /etc/pg_doorman/pg_doorman.toml
+
+# 3. Запустите обновление. С `ExecReload=/bin/kill -SIGUSR2 $MAINPID`
+#    в юните `systemctl reload` отправляет SIGUSR2 и запускает
+#    обновление бинарника. Дальше pg_doorman проверяет конфиг,
+#    запускает дочерний процесс, мигрирует состояние где возможно и
+#    дренирует старый процесс. systemd шлёт сигнал в MainPID, поэтому
+#    выбирается ровно один процесс, даже если на хосте есть
+#    другие инстансы pg_doorman. Прямой `kill -USR2 $(pgrep -f
+#    /usr/bin/pg_doorman)` работает, но pgrep ищет по командной
+#    строке и может попасть во все инстансы сразу — пакетные
+#    установки используют systemctl.
+sudo systemctl reload pg_doorman.service
+
+# Успешный reload означает только, что systemd отправил SIGUSR2.
+# Проверка конфига, запуск дочернего процесса, MAINPID handoff и
+# миграция клиентов происходят внутри pg_doorman. Проверьте их следующим
+# шагом и по логам.
+
+# 4. Проверьте: systemd подхватил новый MainPID. При Type=notify
+#    дочерний процесс отправляет `MAINPID=&lt;new_pid&gt;` во время передачи
+#    управления. Состояние active и админ-консоль подтверждают, что
+#    клиенты на месте.
+systemctl show -p MainPID --value pg_doorman.service
+psql -h pgdoorman -p 6432 -c 'SHOW POOLS;'  # отвечает новый процесс
+</code></pre>
+<div id="admonition-Установки-без-systemd" class="admonition admonish-tip" role="note" aria-labelledby="admonition-Установки-без-systemd-title">
+<div class="admonition-title">
+<div id="admonition-Установки-без-systemd-title">
+<p>Установки без systemd</p>
+</div>
+<a class="admonition-anchor-link" href="#admonition-Установки-без-systemd"></a>
+</div>
+<div>
+<p>Если процесс не управляется systemd, читайте PID-файл, который пишет
+режим демона (<code>daemon_pid_file</code>, по умолчанию <code>/tmp/pg_doorman.pid</code>),
+вместо парсинга <code>pgrep</code>: <code>kill -USR2 "$(cat /var/run/pg_doorman/pg_doorman.pid)"</code>.
+Для запуска в foreground-режиме без systemd храните PID
+процесса-супервизора и шлите сигнал ему напрямую.</p>
+</div>
+</div>
+<p>То же обновление можно запустить из консоли администратора:</p>
+<pre><code class="language-sql">UPGRADE;
+</code></pre>
+<p><code>UPGRADE</code> шлёт <code>SIGUSR2</code> запущенному процессу — тот же путь, что и
+<code>kill -USR2</code>. Успешный ответ команды означает, что сигнал отправлен, а
+не что проверка и миграция уже закончились.</p>
+<h2 id="Как-работает-обновление"><a class="header" href="#Как-работает-обновление">Как работает обновление</a></h2>
+<pre><code>                        SIGUSR2
+                           |
+                           v
+               +-----------------------+
+               | 1. Проверка конфига   |
+               |    (pg_doorman -t)    |   -- ошибка --&gt; отмена
+               +-----------+-----------+
+                           |
+                           v
+               +-----------------------+
+               | 2. Запуск нового      |
+               |    socketpair()       |
+               |    inherit-fd         |
+               |    readiness pipe     |   — ожидание до 10 с
+               +-----------+-----------+
+                           |
+             +-------------+-------------+
+             |                           |
+             v                           v
+  +---------------------+    +---------------------+
+  | СТАРЫЙ процесс      |    | НОВЫЙ процесс       |
+  |                     |    |                     |
+  | 3. Свободные        |    | migration_receiver  |
+  |    сериализация     +---&gt;+    восстановление   |
+  |    dup() + SCM_RIGHTS    |    запуск клиента   |
+  |                     |    |    handle()         |
+  | 4. Клиенты в tx     |    |                     |
+  |    дождаться COMMIT +---&gt;+ Принимает новые     |
+  |    мигрировать      |    | соединения          |
+  |                     |    |                     |
+  | 5. Таймер выхода    |    +---------------------+
+  |    опрос 250 мс     |
+  |    выход при 0      |
+  +---------------------+
+</code></pre>
+<h3 id="Фаза-1-Проверка-конфига"><a class="header" href="#Фаза-1-Проверка-конфига">Фаза 1: Проверка конфига</a></h3>
+<p>Работающий процесс берёт путь, из которого стартовал сам, и запускает
+его с <code>-t</code> и текущим конфигом. После <code>install</code> из быстрого старта этот
+путь уже указывает на новый бинарник, поэтому проверяется именно тот
+процесс, который должен принять трафик. Если проверка проваливается,
+обновление отменяется, а старый процесс продолжает обслуживать трафик.
+В логах появляется баннер:</p>
+<pre><code>!!!  BINARY UPGRADE ABORTED - SHUTDOWN CANCELLED  !!!
+!!!  FIX THE CONFIGURATION BEFORE ATTEMPTING BINARY UPGRADE AGAIN  !!!
+!!!  THE SERVER WILL CONTINUE RUNNING WITH THE CURRENT BINARY  !!!
+</code></pre>
+<h3 id="Фаза-2-Запуск-нового-процесса"><a class="header" href="#Фаза-2-Запуск-нового-процесса">Фаза 2: Запуск нового процесса</a></h3>
+<p><strong>Foreground-режим:</strong></p>
+<ol>
+<li>Создаётся Unix <code>socketpair()</code> для миграции клиентов.</li>
+<li>Файловый дескриптор слушающего сокета передаётся дочернему
+процессу через <code>--inherit-fd</code>.</li>
+<li>Канал готовности: родитель ждёт до 10 секунд байт от дочернего
+процесса. Дочерний процесс пишет в канал, когда начинает принимать
+соединения.</li>
+<li>Родитель закрывает свой слушающий сокет — новые соединения идут
+в дочерний процесс.</li>
+</ol>
+<p><strong>Режим демона:</strong></p>
+<p>Запускается новый фоновый процесс. Старый закрывает слушающий сокет.
+Миграция клиентов через <code>socketpair()</code> не используется: клиенты
+остаются на старом процессе. По истечении <code>shutdown_timeout</code> старый
+процесс выходит, а оставшиеся клиентские сокеты закрываются. Если
+клиенты должны мигрировать в новый процесс, используйте foreground-режим.</p>
+<h3 id="Фаза-3-Миграция-свободных-клиентов-foreground-режим"><a class="header" href="#Фаза-3-Миграция-свободных-клиентов-foreground-режим">Фаза 3: Миграция свободных клиентов (foreground-режим)</a></h3>
+<p>Когда установлен флаг <code>MIGRATION_IN_PROGRESS</code>, каждый свободный клиент
+(нет активной транзакции, нет отложенного <code>BEGIN</code>, нет
+буферизованных данных на чтение) мигрирует:</p>
+<ol>
+<li><strong>Сериализация</strong>: <code>connection_id</code>, <code>secret_key</code>, имя пула, username,
+параметры сервера, полный кеш prepared statements.</li>
+<li><strong><code>dup()</code> + <code>SCM_RIGHTS</code></strong>: дескриптор клиентского TCP-сокета дублируется и передаётся
+новому процессу через Unix <code>socketpair()</code>.</li>
+<li><strong>Восстановление</strong>: новый процесс заново создаёт структуру клиента,
+подключает к нужному пулу и запускает <code>handle()</code>.</li>
+</ol>
+<p>Клиент не замечает миграции: нет повторного подключения, ошибки или
+повторной аутентификации. TCP-соединение остаётся тем же физическим
+сокетом.</p>
+<h3 id="Фаза-4-Доработка-клиентов-внутри-транзакции"><a class="header" href="#Фаза-4-Доработка-клиентов-внутри-транзакции">Фаза 4: Доработка клиентов внутри транзакции</a></h3>
+<p>Клиент внутри <code>BEGIN ... COMMIT</code> продолжает работать на старом
+процессе. Его серверное соединение остаётся живым. После завершения
+транзакции (COMMIT или ROLLBACK) клиент становится свободным и мигрирует
+на следующей итерации цикла.</p>
+<p>Отложенный <code>BEGIN</code> (сервер ещё не выделен) тоже блокирует миграцию.
+Клиент должен отправить запрос, тем самым материализовать <code>BEGIN</code>,
+затем выполнить <code>COMMIT</code>; после этого соединение можно перенести.</p>
+<h3 id="Фаза-5-Таймер-завершения"><a class="header" href="#Фаза-5-Таймер-завершения">Фаза 5: Таймер завершения</a></h3>
+<p>Таймер завершения опрашивает <code>CURRENT_CLIENT_COUNT</code> каждые 250 мс.
+Когда все клиенты мигрировали или отключились — старый процесс
+вызывает <code>process::exit(0)</code>.</p>
+<p>Если <code>shutdown_timeout</code> истекает раньше, старый процесс выходит
+принудительно, а оставшиеся соединения закрываются.</p>
+<p>Во время миграции <code>drain_all_pools()</code> откладывается: клиентам внутри
+транзакций нужны их серверные соединения. Дренирование пулов начинается
+только после завершения миграции или сброса <code>MIGRATION_IN_PROGRESS</code>.</p>
+<h2 id="Кеш-prepared-statements-при-миграции"><a class="header" href="#Кеш-prepared-statements-при-миграции">Кеш prepared statements при миграции</a></h2>
+<p>Клиентский кеш prepared statements сериализуется при миграции:</p>
+<ul>
+<li>Ключ записи: имя statement или хеш анонимного <code>Parse</code></li>
+<li>Хеш запроса</li>
+<li>Полный текст запроса</li>
+<li>OID типов параметров</li>
+</ul>
+<p>В новом процессе:</p>
+<ol>
+<li>Каждая запись регистрируется в общем кеше пула (<code>DashMap</code>).</li>
+<li>На новых серверных соединениях ещё нет prepared statements.</li>
+<li>При первом <code>Bind</code> к мигрированной записи pg_doorman прозрачно
+отправляет <code>Parse</code> на новое серверное соединение. Клиент не видит
+дополнительного обмена.</li>
+</ol>
+<p><strong>Ограничения:</strong></p>
+<ul>
+<li>Если <code>client_anonymous_prepared_cache_size</code> нового конфига меньше,
+лишние анонимные записи вытесняются по LRU. Именованная часть не
+ограничена и переносится полностью. Оставшиеся записи
+работают нормально.</li>
+<li>Анонимные prepared statements (<code>Parse</code> с пустым именем) переносятся в
+новый процесс, но требуют повторного <code>Parse</code> перед <code>Bind</code>.</li>
+<li><code>DEALLOCATE ALL</code> после миграции очищает переданный кеш. Повторный
+<code>Parse</code> с тем же именем использует новый текст запроса.</li>
+</ul>
+<h2 id="Миграция-tls-сессий"><a class="header" href="#Миграция-tls-сессий">Миграция TLS-сессий</a></h2>
+<p>По умолчанию TLS-клиенты не мигрируют — зашифрованная сессия
+требует ключевой материал, который живёт внутри автомата OpenSSL.
+Такие клиенты дренируются при обновлении: соединение закрывается при
+истечении <code>shutdown_timeout</code>, клиент переподключается к новому процессу.</p>
+<p>Опциональная сборка с <code>tls-migration</code> решает эту проблему. Патченный
+OpenSSL экспортирует состояние симметричного шифрования, передаёт его
+вместе с файловым дескриптором через Unix-сокет, а новый процесс
+импортирует состояние и продолжает шифрование. Клиент не выполняет
+повторное TLS-рукопожатие.</p>
+<h3 id="Что-экспортируется"><a class="header" href="#Что-экспортируется">Что экспортируется</a></h3>
+<p>Патч добавляет <code>SSL_export_migration_state()</code> и
+<code>SSL_import_migration_state()</code> в OpenSSL 3.5.5. Экспортируемые данные:</p>
+<ul>
+<li>Версия TLS-протокола</li>
+<li>ID набора шифров и длина тега</li>
+<li>Симметричные ключи для чтения/записи (входные данные для AES key
+schedule, не развёрнутые ключи)</li>
+<li>IV (nonce) для чтения/записи</li>
+<li>Номера записей для чтения/записи (по 8 байт)</li>
+<li>Для TLS 1.3: секреты клиентского и серверного трафика приложения</li>
+</ul>
+<p>Этого достаточно для восстановления слоя TLS-записей в новом процессе
+и продолжения шифрования/дешифрования на том же TCP-соединении.</p>
+<h3 id="Сборка-с-миграцией-tls"><a class="header" href="#Сборка-с-миграцией-tls">Сборка с миграцией TLS</a></h3>
+<pre><code class="language-bash">cargo build --release --features tls-migration
+</code></pre>
+<p>Требует <code>perl</code> и <code>patch</code> в окружении сборки. Vendored OpenSSL 3.5.5
+собирается из исходников с наложенным патчем.</p>
+<h3 id="Сборка-без-доступа-к-интернету"><a class="header" href="#Сборка-без-доступа-к-интернету">Сборка без доступа к интернету</a></h3>
+<pre><code class="language-bash"># Скачайте архив заранее
+curl -fLO https://github.com/openssl/openssl/releases/download/openssl-3.5.5/openssl-3.5.5.tar.gz
+
+# Собрать с указанием пути
+OPENSSL_SOURCE_TARBALL=./openssl-3.5.5.tar.gz \
+  cargo build --release --features tls-migration
+</code></pre>
+<p>SHA-256 архива проверяется автоматически.</p>
+<h3 id="Ограничения"><a class="header" href="#Ограничения">Ограничения</a></h3>
+<ul>
+<li><strong>Только Linux.</strong> На macOS/Windows миграция TLS не поддерживается
+(native-tls использует Security.framework / SChannel, не OpenSSL).</li>
+<li><strong>Одинаковые сертификаты.</strong> Старый и новый процесс должны
+использовать одни и те же <code>tls_private_key</code> и <code>tls_certificate</code>.
+Состояние шифрования привязано к <code>SSL_CTX</code>, созданному из сертификата.
+Изменённые сертификаты приводят к ошибке импорта и отключению
+клиента.</li>
+<li><strong>FIPS несовместимо.</strong> Vendored OpenSSL не проходит FIPS-валидацию.
+Для FIPS используйте сборку без <code>tls-migration</code> (TLS-клиенты
+будут дренироваться вместо миграции).</li>
+<li><strong>Нет HSM/PKCS#11.</strong> Vendored OpenSSL собирается с <code>no-engine</code>.</li>
+</ul>
+<h3 id="Известные-ограничения"><a class="header" href="#Известные-ограничения">Известные ограничения</a></h3>
+<ul>
+<li>
+<p><strong>TLS 1.3 KeyUpdate меняет ключи шифрования.</strong> Если любая сторона
+отправит KeyUpdate после экспорта состояния шифрования, импортированные
+ключи станут невалидными — соединение упадёт с ошибкой AEAD.</p>
+<p>Поведение драйверов (проверено апрель 2026):</p>
+<div class="table-wrapper"><table><thead><tr><th>Драйвер</th><th>Автоматический KeyUpdate?</th><th>Риск</th></tr></thead><tbody>
+<tr><td>libpq (psql, pgbench)</td><td>Нет — OpenSSL не отправляет</td><td>Нет</td></tr>
+<tr><td>asyncpg (Python)</td><td>Нет — Python ssl = OpenSSL</td><td>Нет</td></tr>
+<tr><td>node-postgres</td><td>Нет — Node.js tls = OpenSSL</td><td>Нет</td></tr>
+<tr><td>Npgsql (.NET)</td><td>Нет — SslStream без KeyUpdate API</td><td>Нет</td></tr>
+<tr><td><strong>pgjdbc (Java)</strong></td><td><strong>Да — JSSE после ~128 GB</strong> (<code>jdk.tls.keyLimits</code>)</td><td><strong>Высокий</strong></td></tr>
+<tr><td><strong>tokio-postgres (rustls)</strong></td><td><strong>Да — rustls при лимите AEAD</strong></td><td><strong>Средний</strong></td></tr>
+<tr><td>PostgreSQL server</td><td>Нет — renegotiation отключён, KeyUpdate не вызывается</td><td>Нет</td></tr>
+</tbody></table>
+</div>
+<p><strong>Java-клиенты</strong>: JSSE автоматически отправляет KeyUpdate после
+~128 GB зашифрованных данных. Баг
+<a href="https://bugs.openjdk.org/browse/JDK-8329548">JDK-8329548</a> может
+вызвать шторм сообщений KeyUpdate. Для Java с долгоживущими
+высоконагруженными соединениями миграция TLS может потерять
+соединения. Обходной путь: увеличить порог через
+<code>jdk.tls.keyLimits</code> в <code>java.security</code>, или отключить TLS между
+Java-клиентом и pg_doorman.</p>
+<p><strong>Rust-клиенты с rustls</strong>: rustls ротирует ключи при лимитах AEAD
+(очень высокий порог, ~2^36 записей для AES-GCM). Для типичных
+PostgreSQL-нагрузок этот порог практически недостижим. Использование
+<code>native-tls</code> (OpenSSL) вместо rustls устраняет риск.</p>
+<p><strong>Все OpenSSL-драйверы безопасны.</strong> OpenSSL явно не выполняет
+автоматический KeyUpdate
+(<a href="https://github.com/openssl/openssl/issues/23566">openssl#23566</a>).</p>
+</li>
+<li>
+<p><strong>Данные <code>SSL_pending</code> не проверяются.</strong> Миграция происходит в точке
+простоя, где нет буферизованных данных приложения. Этот инвариант
+гарантируется состоянием клиента, но явная проверка <code>SSL_pending()</code> не
+выполняется.</p>
+</li>
+<li>
+<p><strong>Привязка к OpenSSL 3.5.5.</strong> Патч модифицирует внутренние
+структуры OpenSSL (<code>ssl_local.h</code>, <code>rec_layer_s3.c</code>, <code>ssl_lib.c</code>).
+При обновлении OpenSSL нужно проверить и переложить патч на новую
+версию.</p>
+</li>
+</ul>
+<h2 id="Сигналы"><a class="header" href="#Сигналы">Сигналы</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Сигнал</th><th>Поведение</th></tr></thead><tbody>
+<tr><td><code>SIGUSR2</code></td><td>Обновление бинарника + дренирование старого процесса. <strong>Рекомендуемый для всех режимов.</strong></td></tr>
+<tr><td><code>SIGINT</code></td><td>В foreground + TTY (Ctrl+C): только завершение, без обновления. В режиме демона или без TTY: обновление бинарника для совместимости со старыми установками.</td></tr>
+<tr><td><code>SIGTERM</code></td><td>Немедленный выход. Транзакции обрываются. Все клиенты отключаются.</td></tr>
+<tr><td><code>SIGHUP</code></td><td>Перечитать конфигурацию без перезапуска. Без простоя.</td></tr>
+<tr><td><code>UPGRADE</code> (admin)</td><td>Отправляет SIGUSR2 текущему процессу. Тот же эффект.</td></tr>
+</tbody></table>
+</div>
+<blockquote>
+<p><strong>Поведение <code>SIGINT</code> для совместимости:</strong>
+<code>SIGINT</code> запускает обновление бинарника в режиме демона или без TTY
+(например, под systemd). В интерактивном терминале Ctrl+C останавливает
+процесс без запуска нового. Используйте <code>kill -USR2</code> или <code>UPGRADE</code> в
+консоли администратора для обновления в foreground-режиме.</p>
+</blockquote>
+<h2 id="Режим-демона-и-foreground-режим"><a class="header" href="#Режим-демона-и-foreground-режим">Режим демона и foreground-режим</a></h2>
+<div class="table-wrapper"><table><thead><tr><th></th><th>Foreground</th><th>Режим демона</th></tr></thead><tbody>
+<tr><td>Миграция клиентов через передачу fd</td><td>Да (<code>socketpair</code>)</td><td>Нет</td></tr>
+<tr><td>Свободные клиенты сохраняются</td><td>Да</td><td>Нет (закрываются при выходе старого процесса)</td></tr>
+<tr><td>Клиенты внутри транзакции</td><td>Завершают транзакцию, затем мигрируют</td><td>Работают до таймаута, затем закрываются</td></tr>
+<tr><td>Запуск нового процесса</td><td>Наследует файловый дескриптор listener</td><td>Запускается независимо</td></tr>
+<tr><td>Рекомендуется для</td><td>systemd, контейнеры, Kubernetes</td><td>Старые установки</td></tr>
+</tbody></table>
+</div>
+<p>Для обновления без простоя и с миграцией клиентов запускайте pg_doorman
+в foreground-режиме. systemd управляет жизненным циклом процесса.
+Используйте <code>Type=notify</code>: юнит становится <code>active</code> только после
+сигнала готовности от pg_doorman, а новый процесс при <code>SIGUSR2</code>
+обновляет <code>MainPID</code> на себя:</p>
+<pre><code class="language-ini">[Service]
+Type=notify
+# Дочерний процесс, который принимает трафик после SIGUSR2, должен
+# отправить READY=1 и MAINPID=&lt;new_pid&gt; во время передачи управления.
+NotifyAccess=exec
+ExecStart=/usr/bin/pg_doorman /etc/pg_doorman/pg_doorman.toml
+# `systemctl reload` запускает обновление бинарника: проверка конфига,
+# новый процесс, миграция клиентов где возможно, затем дренирование
+# старого процесса по shutdown_timeout из конфига pg_doorman.
+ExecReload=/bin/kill -SIGUSR2 $MAINPID
+# `systemctl stop` — немедленное завершение. Это не путь обновления,
+# и он не ждёт миграции активных транзакций.
+ExecStop=/bin/kill -SIGTERM $MAINPID
+# При обновлении новый дочерний процесс становится MainPID через sd_notify.
+# KillMode=mixed при обычном stop шлёт SIGTERM только в MainPID, а
+# оставшиеся процессы cgroup добивает SIGKILL только после TimeoutStopSec.
+KillMode=mixed
+TimeoutStopSec=60
+# Не перезапускать сервис после чистой ручной остановки или после выхода
+# старого процесса, который успешно передал трафик новому при обновлении.
+Restart=on-failure
+Nice=-15
+# pg_doorman активно использует дескрипторы: каждый клиент и каждый
+# бэкенд — отдельный fd, плюс служебные pipe. 65536 покрывает большинство
+# OLTP-пулов; считается как `general.pool_size * num_pools` плюс
+# несколько тысяч на клиентов.
+LimitNOFILE=65536
+# Сервисная учётка, которой принадлежит PID-файл. На многих установках
+# postgres уже существует — переиспользование оставляет владение
+# файлов согласованным с самим PostgreSQL.
+User=postgres
+Group=postgres
+SyslogIdentifier=pg_doorman
+</code></pre>
+<p><code>systemctl reload pg_doorman</code> отправляет <code>SIGUSR2</code>; нулевой код выхода
+означает только, что сигнал доставлен. Затем pg_doorman прогоняет <code>-t</code>
+на новом бинарнике, отменяет обновление при битом конфиге, иначе
+порождает новый процесс и дренирует старый. <code>UPGRADE;</code> из админ-консоли
+идёт по тому же пути. Окно дренирования задаёт <code>shutdown_timeout</code> в
+<code>pg_doorman.toml</code>; <code>TimeoutStopSec</code> относится к обычному
+<code>systemctl stop</code>, а не к тому, сколько <code>systemctl reload</code> ждёт
+мигрировавшие сессии.</p>
+<p>Продакшен-установки часто добавляют сверху ограничения ресурсов:
+<code>MemoryMax=</code>, <code>CPUAffinity=2,3,4,5,6,7,8,9</code>. Это зависит от нагрузки
+и не меняет контракт обновления.</p>
+<h2 id="Конфигурация"><a class="header" href="#Конфигурация">Конфигурация</a></h2>
+<h3 id="shutdown_timeout"><a class="header" href="#shutdown_timeout"><code>shutdown_timeout</code></a></h3>
+<p>Максимальное время ожидания завершения транзакций перед принудительным
+закрытием соединений. Старый процесс завершается по истечении этого
+таймаута вне зависимости от оставшихся клиентов.</p>
+<p>По умолчанию: 10 секунд.</p>
+<p>Рекомендация для продакшена с длинными аналитическими запросами:
+30–60 секунд.</p>
+<pre><code class="language-toml">[general]
+shutdown_timeout = 60000  # миллисекунды
+</code></pre>
+<p>Слишком маленькое значение — риск оборвать активные транзакции. Слишком
+большое — задержка выхода старого процесса при зависшем клиенте
+(например, idle-in-transaction). Выбирайте значение, покрывающее
+самую длинную ожидаемую транзакцию, с запасом.</p>
+<h3 id="tls_private_key--tls_certificate"><a class="header" href="#tls_private_key--tls_certificate"><code>tls_private_key</code> / <code>tls_certificate</code></a></h3>
+<p>Чтобы миграция TLS отработала, оба процесса (старый и новый) должны
+загрузить один и тот же сертификат и приватный ключ для входящих
+клиентских TLS-соединений. Состояние шифрования привязано к <code>SSL_CTX</code>,
+созданному из этих файлов; при несовпадении импорт падает, и затронутые
+клиенты отключаются и переподключаются.</p>
+<p>Клиентский TLS-материал <strong>не</strong> перезагружается по <code>SIGHUP</code> (это
+делает только серверный TLS, см. <a href="../guides/tls.html">горячую перезагрузку TLS</a>).
+Не совмещайте ротацию сертификата для входящих клиентских TLS-соединений
+с обновлением, где вы ожидаете миграцию TLS-сессий. Если файлы
+отличаются между старым и новым процессом, импорт TLS-состояния падает,
+и затронутые клиенты переподключаются даже с включённым
+<code>tls-migration</code>. Ротируйте этот сертификат в окно, где переподключения
+допустимы, либо оставьте те же файлы на время обновления бинарника и
+меняйте сертификат позже через рестарт.</p>
+<h3 id="prepared_statements_cache_size"><a class="header" href="#prepared_statements_cache_size"><code>prepared_statements_cache_size</code></a></h3>
+<p>Кеш prepared statements на уровне пула. Напрямую на миграцию не
+влияет, но кеш в новом процессе должен быть достаточного размера для
+записей от мигрированных клиентов.</p>
+<h3 id="client_anonymous_prepared_cache_size"><a class="header" href="#client_anonymous_prepared_cache_size"><code>client_anonymous_prepared_cache_size</code></a></h3>
+<p>LRU-кеш анонимных записей на клиента. Клиентский кеш (и именованная,
+и анонимная части) сериализуется полностью при миграции. Если новый
+конфиг имеет меньшее значение, LRU вытесняет лишние анонимные записи.
+Именованные записи не ограничены этим параметром и мигрируют целиком.</p>
+<h2 id="Откат"><a class="header" href="#Откат">Откат</a></h2>
+<p>У обновления бинарника нет отдельного пути отмены. Для отката положите
+предыдущий бинарник на тот же путь и запустите ещё одно обновление через
+<code>SIGUSR2</code>. Если проверка конфига провалится, текущий процесс продолжит
+обслуживать трафик. Если новый процесс уже принял трафик, откат
+проходит как обычное обновление в обратную сторону.</p>
+<p>Не используйте <code>systemctl restart</code> или <code>SIGTERM</code> для отката, если
+переподключения недопустимы: оба пути закрывают клиентские сессии, а не
+мигрируют их.</p>
+<h2 id="Мониторинг"><a class="header" href="#Мониторинг">Мониторинг</a></h2>
+<h3 id="Логи"><a class="header" href="#Логи">Логи</a></h3>
+<p>Ключевые строки в логах при миграции:</p>
+<pre><code>INFO  Got SIGUSR2, starting binary upgrade and graceful shutdown
+INFO  Validating configuration with: /usr/bin/pg_doorman -t pg_doorman.toml
+INFO  Configuration validation successful
+INFO  Starting new process with inherited listener fd=5
+INFO  New process signaled readiness
+INFO  Client migration enabled
+INFO  [user@pool #c42] client 10.0.0.1:51234 migrated to new process
+INFO  waiting for 3 clients in transactions
+INFO  All clients disconnected, shutting down
+INFO  Migration sender finished
+</code></pre>
+<p>В новом процессе:</p>
+<pre><code>INFO  migration receiver: listening for migrated clients
+INFO  [user@pool #c42] migrated client accepted from 10.0.0.1:51234
+INFO  migration receiver done: migration socket closed
+INFO  migration receiver: stopped
+</code></pre>
+<h3 id="prometheus-метрики"><a class="header" href="#prometheus-метрики">Prometheus-метрики</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Метрика</th><th>Значение при обновлении</th></tr></thead><tbody>
+<tr><td><code>pg_doorman_pools_clients{status="active"}</code></td><td>Должна упасть до 0 на старом процессе</td></tr>
+<tr><td><code>pg_doorman_pools_clients{status="idle"}</code></td><td>Падает по мере миграции клиентов</td></tr>
+<tr><td><code>pg_doorman_connections_total{type="total"}</code></td><td>Новый процесс принимает свежие подключения; используйте <code>rate()</code> / <code>increase()</code></td></tr>
+<tr><td><code>pg_doorman_clients_prepared_cache_entries</code></td><td>Подтверждает перенос кэша</td></tr>
+</tbody></table>
+</div>
+<h3 id="Консоль-администратора"><a class="header" href="#Консоль-администратора">Консоль администратора</a></h3>
+<pre><code class="language-sql">-- На новом процессе (старый отклоняет не-admin соединения)
+SHOW POOLS;
+SHOW CLIENTS;
+</code></pre>
+<h2 id="Диагностика"><a class="header" href="#Диагностика">Диагностика</a></h2>
+<h3 id="Клиент-получил-58006-или-отключился-вместо-миграции"><a class="header" href="#Клиент-получил-58006-или-отключился-вместо-миграции">Клиент получил 58006 или отключился вместо миграции</a></h3>
+<p><strong>Ctrl+C в foreground-режиме.</strong> <code>SIGINT</code> в TTY означает завершение без
+обновления. Используйте <code>kill -USR2</code> или <code>UPGRADE</code> в консоли
+администратора.</p>
+<p><strong>Режим демона.</strong> В режиме демона нет миграции через файловые
+дескрипторы. Существующие клиенты остаются на старом процессе и
+закрываются, когда он выходит. Переключитесь на foreground-режим.</p>
+<p><strong><code>PG_DOORMAN_CI_SHUTDOWN_ONLY=1</code> установлен.</strong> Эта переменная
+окружения принудительно включает режим только завершения (используется
+в CI-тестах). Уберите её.</p>
+<h3 id="Старый-процесс-не-завершается"><a class="header" href="#Старый-процесс-не-завершается">Старый процесс не завершается</a></h3>
+<p><strong>Длинная транзакция.</strong> Клиент застрял в <code>BEGIN</code> без <code>COMMIT</code>.
+Дождитесь <code>shutdown_timeout</code> или завершите транзакцию вручную.</p>
+<p><strong>Административные соединения.</strong> Они не мигрируют. Закройте
+административную сессию на старом процессе.</p>
+<p><strong>Принудительный выход:</strong> <code>kill -TERM &lt;old_pid&gt;</code> отправляет <code>SIGTERM</code>
+и завершает процесс без ожидания миграции.</p>
+<h3 id="tls-соединение-оборвалось-после-обновления"><a class="header" href="#tls-соединение-оборвалось-после-обновления">TLS-соединение оборвалось после обновления</a></h3>
+<p><strong>Бинарник собран без <code>--features tls-migration</code>.</strong> TLS-клиенты
+дренируются вместо миграции. Пересоберите с <code>--features tls-migration</code>.</p>
+<p><strong>Запуск не на Linux.</strong> Миграция TLS работает только на Linux.</p>
+<p><strong>Сертификат или ключ изменились.</strong> Старый процесс экспортировал состояние
+шифрования, привязанное к старому сертификату для входящих клиентских
+TLS-соединений. Если нужна миграция TLS-сессий, используйте те же файлы
+в обоих процессах. Ротация этого сертификата требует рестарта или окна,
+где переподключения допустимы.</p>
+<h3 id="tls-migration-not-available-в-логах"><a class="header" href="#tls-migration-not-available-в-логах">"TLS migration not available" в логах</a></h3>
+<p>Новый процесс получил пакет миграции с TLS-данными, но собран
+без <code>--features tls-migration</code> или запущен не на Linux. Клиент
+отключается. Пересоберите новый бинарник с <code>--features tls-migration</code>.</p>
+<h3 id="migration-channel-not-ready-в-логах"><a class="header" href="#migration-channel-not-ready-в-логах">"migration channel not ready" в логах</a></h3>
+<p>Канал <code>MIGRATION_TX</code> ещё не инициализирован. Новый процесс не
+завершил запуск, когда клиент попытался мигрировать. Клиент
+повторит попытку на следующей итерации простоя (через миллисекунды).</p>
+<h3 id="migration-channel-send-failed-в-логах"><a class="header" href="#migration-channel-send-failed-в-логах">"migration channel send failed" в логах</a></h3>
+<p>Канал миграции переполнен (capacity: 4096). Возможно при одновременной
+миграции тысяч клиентов. Клиент повторит попытку на следующей
+итерации простоя.</p>
+<h3 id="prepare_migration-failed-в-логах"><a class="header" href="#prepare_migration-failed-в-логах">"prepare_migration failed" в логах</a></h3>
+<p>Исходный fd клиента недоступен или <code>dup()</code> не удался. Возможные причины:
+исчерпание файловых дескрипторов, или клиент подключился через
+ветку кода, которая не сохраняет исходный fd. Проверьте <code>ulimit -n</code>.</p>
+<blockquote>
+<p><strong>Совместимость с клиентскими библиотеками:</strong>
+Библиотеки вроде <code>github.com/lib/pq</code> или Go <code>database/sql</code> могут
+потребовать настройки для обработки переподключения, если клиент не
+мигрировал и получил 58006 или закрытие соединения. См.
+<a href="https://github.com/lib/pq/issues/939">issue</a>.</p>
+</blockquote>
+<h2 id="Чек-лист-перед-продакшеном"><a class="header" href="#Чек-лист-перед-продакшеном">Чек-лист перед продакшеном</a></h2>
+<p>Перед выкатом обновления бинарника:</p>
+<ul>
+<li><input disabled="" type="checkbox"/>
+Запуск в <strong>foreground-режиме</strong> (не <code>daemon</code>) для миграции через файловые дескрипторы</li>
+<li><input disabled="" type="checkbox"/>
+<code>shutdown_timeout</code> покрывает самую длинную ожидаемую транзакцию
+(рекомендация: 30–60 секунд для OLTP, больше для аналитики)</li>
+<li><input disabled="" type="checkbox"/>
+Если используете TLS: сборка с <code>--features tls-migration</code>,
+оба процесса используют одинаковые файлы сертификата и ключа</li>
+<li><input disabled="" type="checkbox"/>
+Протестировать обновление на staging: открыть сессию, отправить
+SIGUSR2, убедиться что сессия продолжает работать</li>
+<li><input disabled="" type="checkbox"/>
+В systemd-юните указано <code>Type=notify</code> с <code>NotifyAccess=exec</code>,
+<code>ExecReload=/bin/kill -SIGUSR2 $MAINPID</code> (тогда <code>systemctl     reload</code> запускает обновление бинарника с проверкой конфига),
+<code>KillMode=mixed</code> и <code>Restart=on-failure</code></li>
+<li><input disabled="" type="checkbox"/>
+Мониторинг логов на ошибки миграции после первого обновления в
+продакшене</li>
+<li><input disabled="" type="checkbox"/>
+Подтвердить что старый процесс завершился (PID-файл или <code>pgrep</code>)</li>
+<li><input disabled="" type="checkbox"/>
+Проверить Prometheus-метрики: клиенты на новом процессе</li>
+</ul>
+<div id="admonition-prometheus-во-время-дренирования" class="admonition admonish-note" role="note" aria-labelledby="admonition-prometheus-во-время-дренирования-title">
+<div class="admonition-title">
+<div id="admonition-prometheus-во-время-дренирования-title">
+<p>Prometheus во время дренирования</p>
+</div>
+<a class="admonition-anchor-link" href="#admonition-prometheus-во-время-дренирования"></a>
+</div>
+<div>
+<p>HTTP-слушатель, который отдаёт <code>/metrics</code>, использует <code>SO_REUSEPORT</code>. Пока
+старый процесс дренируется, а новый принимает клиентов, оба процесса
+делят один порт, и ядро распределяет scrape-запросы между ними. На
+отдельном scrape счётчики могут выглядеть так, будто откатились назад,
+пока старый процесс не завершится. Это окно длится не дольше
+<code>shutdown_timeout</code>.</p>
+</div>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../tutorials/patroni-proxy.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../operations/signals.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../tutorials/patroni-proxy.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../operations/signals.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../mermaid-init.js"></script>
+        <script src="../mermaid.min.js"></script>
+        <script src="../lang-switcher.js"></script>
+
+
+    </div>
+    </body>
+</html>
