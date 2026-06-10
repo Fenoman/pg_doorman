@@ -20,7 +20,7 @@ use crate::pool::{get_all_pools, get_client_server_map, ConnectionPool, PoolIden
 /// Scope filter for `pause` / `resume` / `reconnect`. The REST surface
 /// accepts both `?db=<name>` (every user@db pool of one database) and
 /// `?pool=<user>@<db>` (one specific pool); the admin protocol path
-/// historically only takes a database name, so it always passes
+/// currently only takes a database name, so it always passes
 /// [`AdminScope::Database`] or [`AdminScope::AllPools`].
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum AdminScope {
@@ -58,6 +58,14 @@ pub enum AdminEffect {
     Applied { affected: Vec<PoolIdentifier> },
 }
 
+fn reload_event_message(changed: bool) -> &'static str {
+    if changed {
+        "config reloaded"
+    } else {
+        "config unchanged"
+    }
+}
+
 /// Reload the configuration file. Equivalent to `RELOAD` on the admin
 /// protocol; emits the same RELOAD event. Returns `true` when the config
 /// actually changed and pools were reconciled, `false` when the file
@@ -76,7 +84,7 @@ pub async fn reload_now() -> Result<bool, Error> {
             return Err(e);
         }
     };
-    crate::admin::events::push_event("RELOAD", "config reloaded".to_string());
+    crate::admin::events::push_event("RELOAD", reload_event_message(changed).to_string());
     crate::config::get_config().show();
     Ok(changed)
 }
@@ -141,4 +149,37 @@ where
         affected.push(identifier.clone());
     }
     AdminEffect::Applied { affected }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reload_event_message;
+
+    #[test]
+    fn reload_event_message_distinguishes_changed_and_unchanged() {
+        assert_eq!(reload_event_message(true), "config reloaded");
+        assert_eq!(reload_event_message(false), "config unchanged");
+    }
+
+    #[test]
+    fn rest_reload_event_uses_changed_flag() {
+        let src = include_str!("operations.rs");
+        let start = src
+            .find("pub async fn reload_now")
+            .expect("reload_now exists");
+        let end = src[start..]
+            .find("/// Pause every pool")
+            .map(|offset| start + offset)
+            .expect("pause docs follow reload_now");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("reload_event_message(changed)"),
+            "REST reload event must distinguish changed and unchanged reloads"
+        );
+        assert!(
+            !body.contains("push_event(\"RELOAD\", \"config reloaded\".to_string());"),
+            "REST reload must not report no-op reloads as config reloaded"
+        );
+    }
 }
