@@ -177,6 +177,9 @@ pub fn generate_reference_config(format: ConfigFormat, russian: bool) -> String 
         auth_query: None,
         sync_server_parameters: None,
         startup_parameters: std::collections::BTreeMap::new(),
+        release_query: None,
+        prewarm_query: String::new(),
+        intercept_discard_all: true,
         users: vec![User {
             username: "app_user".to_string(),
             password: "md5dd9a0f26a4302744db881776a09bbfad".to_string(),
@@ -186,6 +189,7 @@ pub fn generate_reference_config(format: ConfigFormat, russian: bool) -> String 
             server_lifetime: None,
             server_username: None,
             server_password: None,
+            prewarm_query: None,
             auth_pam_service: None,
         }],
     };
@@ -556,6 +560,34 @@ fn write_general_section(w: &mut ConfigWriter, config: &Config) {
         "60s",
         "",
     );
+
+    write_field_desc(w, fi, "general", "dead_backend_check_timeout");
+    write_duration_value(
+        w,
+        fi,
+        "dead_backend_check_timeout",
+        g.dead_backend_check_timeout.as_millis(),
+        "2s",
+        "",
+    );
+
+    write_field_desc(w, fi, "general", "dead_backend_check_max_per_cycle");
+    w.kv(
+        fi,
+        "dead_backend_check_max_per_cycle",
+        &w.num_val(g.dead_backend_check_max_per_cycle as u64),
+    );
+    w.blank();
+
+    // optional TOML override for the runtime log filter.
+    // `None` emits the field commented-out so operators see the knob
+    // exists; `Some` emits the configured string value.
+    write_field_desc(w, fi, "general", "log_level");
+    match g.log_level.as_deref() {
+        Some(level) => w.kv(fi, "log_level", &w.str_val(level)),
+        None => w.commented_kv(fi, "log_level", &w.str_val("warn")),
+    }
+    w.blank();
 
     write_field_desc(w, fi, "general", "shutdown_timeout");
     write_duration_value(
@@ -1202,7 +1234,7 @@ fn write_web_section(w: &mut ConfigWriter, web: &Web) {
         let rendered = web
             .sso_audience
             .iter()
-            .map(|s| format!("\"{}\"", s))
+            .map(|s| format!("\"{s}\""))
             .collect::<Vec<_>>()
             .join(", ");
         w.kv(fi, "sso_audience", &format!("[{rendered}]"));
@@ -1213,7 +1245,7 @@ fn write_web_section(w: &mut ConfigWriter, web: &Web) {
     let rendered = web
         .sso_allowed_users
         .iter()
-        .map(|s| format!("\"{}\"", s))
+        .map(|s| format!("\"{s}\""))
         .collect::<Vec<_>>()
         .join(", ");
     w.kv(fi, "sso_allowed_users", &format!("[{rendered}]"));
@@ -1226,7 +1258,7 @@ fn write_web_section(w: &mut ConfigWriter, web: &Web) {
         let rendered = web
             .trusted_proxies
             .iter()
-            .map(|n| format!("\"{}\"", n))
+            .map(|n| format!("\"{n}\""))
             .collect::<Vec<_>>()
             .join(", ");
         w.kv(fi, "trusted_proxies", &format!("[{rendered}]"));
@@ -1244,7 +1276,7 @@ fn write_web_section(w: &mut ConfigWriter, web: &Web) {
         let rendered = web
             .sso_admin_groups
             .iter()
-            .map(|s| format!("\"{}\"", s))
+            .map(|s| format!("\"{s}\""))
             .collect::<Vec<_>>()
             .join(", ");
         w.kv(fi, "sso_admin_groups", &format!("[{rendered}]"));
@@ -1253,6 +1285,20 @@ fn write_web_section(w: &mut ConfigWriter, web: &Web) {
 
     write_field_comment(w, fi, "web", "sso_require_https");
     w.kv(fi, "sso_require_https", &web.sso_require_https.to_string());
+    w.blank();
+
+    // emit the allowlist as TOML/YAML array. Empty
+    // default ([]) preserves legacy Host-matching behaviour.
+    write_field_comment(w, fi, "web", "allowed_admin_origins");
+    let formatted = format!(
+        "[{}]",
+        web.allowed_admin_origins
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    w.kv(fi, "allowed_admin_origins", &formatted);
     w.blank();
 }
 
@@ -1273,6 +1319,11 @@ fn write_talos_section(w: &mut ConfigWriter) {
                 &format!("# {}", f.text("talos_databases").get(w.russian)),
             );
             w.comment(0, "databases = [\"talos_db1\", \"talos_db2\"]");
+            w.comment(
+                0,
+                &format!("# {}", f.text("talos_resource_prefixes").get(w.russian)),
+            );
+            w.comment(0, "resource_prefixes = [\"postgres.stg\"]");
         }
         ConfigFormat::Yaml => {
             w.comment(0, "talos:");
@@ -1287,6 +1338,12 @@ fn write_talos_section(w: &mut ConfigWriter) {
             w.comment(0, "  databases:");
             w.comment(0, "    - \"talos_db1\"");
             w.comment(0, "    - \"talos_db2\"");
+            w.comment(
+                0,
+                &format!("  # {}", f.text("talos_resource_prefixes").get(w.russian)),
+            );
+            w.comment(0, "  resource_prefixes:");
+            w.comment(0, "    - \"postgres.stg\"");
         }
     }
     w.blank();
@@ -1547,6 +1604,37 @@ fn write_single_pool(w: &mut ConfigWriter, pool_name: &str, pool: &Pool) {
     }
     w.blank();
 
+    // --- Per-pool release_query ---
+    write_field_comment(w, fi, "pool", "release_query");
+    if let Some(ref rq) = pool.release_query {
+        // Materialised value: serialise as a normal SQL string literal.
+        w.kv(fi, "release_query", &w.str_val(rq));
+    } else {
+        // Default (None) -> iServ-compatible behavior. Show a commented-out
+        // empty-string example so operators see how to disable the feature
+        // for vanilla PostgreSQL without the `pg_variables` extension.
+        w.commented_kv(fi, "release_query", "\"\"");
+    }
+    w.blank();
+
+    // --- Per-pool prewarm_query ---
+    write_field_comment(w, fi, "pool", "prewarm_query");
+    if !pool.prewarm_query.is_empty() {
+        w.kv(fi, "prewarm_query", &w.str_val(&pool.prewarm_query));
+    } else {
+        w.commented_kv(fi, "prewarm_query", "\"SELECT 1\"");
+    }
+    w.blank();
+
+    // --- Per-pool DISCARD ALL interception switch ---
+    write_field_comment(w, fi, "pool", "intercept_discard_all");
+    w.kv(
+        fi,
+        "intercept_discard_all",
+        &w.bool_val(pool.intercept_discard_all),
+    );
+    w.blank();
+
     write_pool_users(w, pool_name, &pool.users);
     write_auth_query_commented_example(w);
 }
@@ -1646,6 +1734,14 @@ fn write_user_fields_toml(w: &mut ConfigWriter, user: &User, fi: usize) {
     } else {
         w.commented_kv(fi, "auth_pam_service", "\"pg_doorman\"");
     }
+    w.blank();
+
+    write_field_desc(w, fi, "user", "prewarm_query");
+    if let Some(ref pw) = user.prewarm_query {
+        w.kv(fi, "prewarm_query", &w.str_val(pw));
+    } else {
+        w.commented_kv(fi, "prewarm_query", "\"\"");
+    }
 }
 
 fn write_user_fields_yaml(w: &mut ConfigWriter, user: &User) {
@@ -1718,6 +1814,14 @@ fn write_user_fields_yaml(w: &mut ConfigWriter, user: &User) {
         let _ = writeln!(w.output, "{indent}  auth_pam_service: \"{pam}\"");
     } else {
         let _ = writeln!(w.output, "{indent}  # auth_pam_service: \"pg_doorman\"");
+    }
+    w.blank();
+
+    write_field_desc(w, 3, "user", "prewarm_query");
+    if let Some(ref pw) = user.prewarm_query {
+        let _ = writeln!(w.output, "{indent}  prewarm_query: \"{pw}\"");
+    } else {
+        let _ = writeln!(w.output, "{indent}  # prewarm_query: \"\"");
     }
 }
 
@@ -1925,7 +2029,7 @@ fn write_pool_examples(w: &mut ConfigWriter) {
             w.comment(0, "username = \"jwt_user\"");
             w.comment(
                 0,
-                "password = \"jwt-pkey-fpath:/etc/pg_doorman/jwt/public.pem\"",
+                "password = \"jwt-pkey-fpath:/etc/pg_doorman/jwt/public.pem?iss=issuer&aud=audience\"",
             );
             w.comment(0, "pool_size = 30");
             w.comment(0, "server_username = \"actual_db_user\"");
@@ -1981,7 +2085,7 @@ fn write_pool_examples(w: &mut ConfigWriter) {
             w.comment(1, "    - username: \"jwt_user\"");
             w.comment(
                 1,
-                "      password: \"jwt-pkey-fpath:/etc/pg_doorman/jwt/public.pem\"",
+                "      password: \"jwt-pkey-fpath:/etc/pg_doorman/jwt/public.pem?iss=issuer&aud=audience\"",
             );
             w.comment(1, "      pool_size: 30");
             w.comment(1, "      server_username: \"actual_db_user\"");

@@ -203,6 +203,38 @@ pub struct PoolStats {
 
     /// Configured maximum pool size (from user config or default)
     pub pool_size: u32,
+
+    /// Cumulative number of idle backends probed by the dead-backend
+    /// liveness scan (`Pool::evict_dead_backends`) since process start.
+    /// Sourced from `AddressStats::dead_backends_probed_total`.
+    pub total_dead_backends_probed: u64,
+
+    /// Cumulative number of backends actually dropped by the liveness scan
+    /// because their `check_alive` failed. Sourced from
+    /// `AddressStats::dead_backends_evicted_total`. A non-zero delta between
+    /// scrapes is the canonical signature of a PostgreSQL restart healed
+    /// by the scan without operator action.
+    pub total_dead_backends_evicted: u64,
+
+    /// Cumulative count of prewarm-query failures since process start. Bumped
+    /// every time `ServerPool::run_prewarm_query` rejects a freshly created
+    /// backend. Sourced from `AddressStats::prewarm_failures_total`.
+    pub total_prewarm_failures: u64,
+
+    /// Cumulative count of `DISCARD ALL` simple-queries that the per-pool
+    /// `intercept_discard_all` fast path absorbed (synthetic
+    /// CommandComplete + ReadyForQuery response, no backend round trip).
+    /// Sourced from `AddressStats::discard_all_intercepted_total`. A flat
+    /// value while clients keep losing temp-table state is the signature
+    /// of a regression that silently bypassed the gate.
+    pub total_discard_all_intercepted: u64,
+
+    /// cumulative count of CancelRequest messages routed at
+    /// this pool's address since process start. Replaces the misuse of
+    /// `cl_cancel_req` (pgbouncer-compat gauge that should stay 0) with
+    /// a dedicated monotonic counter that operators can `rate()` over
+    /// for cancel-storm detection.
+    pub total_cancel_requests: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -298,6 +330,11 @@ impl PoolStats {
             fallback_active: false,
             source_generation: 0,
             pool_size: 0,
+            total_dead_backends_probed: 0,
+            total_dead_backends_evicted: 0,
+            total_prewarm_failures: 0,
+            total_discard_all_intercepted: 0,
+            total_cancel_requests: 0,
         }
     }
 
@@ -321,7 +358,18 @@ impl PoolStats {
         // This ordering reduces a race with dynamic pool GC: if a pool is removed
         // from POOLS before our snapshot, its servers should already be disconnected
         // from SERVER_STATS (retain closes them before GC removes the pool).
-        Self::initialize_pool_stats(&mut virtual_map);
+        Self::initialize_pool_stats(&mut virtual_map, false);
+        let client_map = super::get_client_stats();
+        let server_map = super::get_server_stats();
+
+        Self::update_client_server_states(&mut virtual_map, &client_map, &server_map);
+        Self::aggregate_pool_stats(virtual_map)
+    }
+
+    pub fn construct_pool_lookup_fresh_percentiles() -> HashMap<PoolIdentifier, PoolStats> {
+        let mut virtual_map: HashMap<PoolIdentifier, PoolStats> = HashMap::new();
+
+        Self::initialize_pool_stats(&mut virtual_map, true);
         let client_map = super::get_client_stats();
         let server_map = super::get_server_stats();
 
@@ -346,7 +394,17 @@ impl PoolStats {
         server_map: &HashMap<i32, Arc<ServerStats>>,
     ) -> HashMap<PoolIdentifier, PoolStats> {
         let mut virtual_map: HashMap<PoolIdentifier, PoolStats> = HashMap::new();
-        Self::initialize_pool_stats(&mut virtual_map);
+        Self::initialize_pool_stats(&mut virtual_map, false);
+        Self::update_client_server_states(&mut virtual_map, client_map, server_map);
+        Self::aggregate_pool_stats(virtual_map)
+    }
+
+    pub fn construct_pool_lookup_from_fresh_percentiles(
+        client_map: &HashMap<u64, Arc<ClientStats>>,
+        server_map: &HashMap<i32, Arc<ServerStats>>,
+    ) -> HashMap<PoolIdentifier, PoolStats> {
+        let mut virtual_map: HashMap<PoolIdentifier, PoolStats> = HashMap::new();
+        Self::initialize_pool_stats(&mut virtual_map, true);
         Self::update_client_server_states(&mut virtual_map, client_map, server_map);
         Self::aggregate_pool_stats(virtual_map)
     }
@@ -479,6 +537,9 @@ impl PoolStats {
     }
 
     pub fn generate_show_stats_header() -> Vec<(&'static str, DataType)> {
+        // Append-only: SHOW STATS column order is a public contract that
+        // dashboards, exporters, and tests rely on. New columns go at the
+        // end so existing consumers do not shift.
         vec![
             ("database", DataType::Text),
             ("user", DataType::Text),
@@ -498,6 +559,11 @@ impl PoolStats {
             ("avg_xact_time", DataType::Numeric),
             ("avg_query_time", DataType::Numeric),
             ("avg_wait_time", DataType::Numeric),
+            ("total_dead_backends_probed", DataType::Numeric),
+            ("total_dead_backends_evicted", DataType::Numeric),
+            ("total_prewarm_failures", DataType::Numeric),
+            ("total_discard_all_intercepted", DataType::Numeric),
+            ("total_cancel_requests", DataType::Numeric),
         ]
     }
 
@@ -521,6 +587,11 @@ impl PoolStats {
             Cow::Owned(self.avg_xact_time_microsecons.to_string()),
             Cow::Owned(self.avg_query_time_microseconds.to_string()),
             Cow::Owned(self.avg_wait_time.to_string()),
+            Cow::Owned(self.total_dead_backends_probed.to_string()),
+            Cow::Owned(self.total_dead_backends_evicted.to_string()),
+            Cow::Owned(self.total_prewarm_failures.to_string()),
+            Cow::Owned(self.total_discard_all_intercepted.to_string()),
+            Cow::Owned(self.total_cancel_requests.to_string()),
         ]
     }
 
@@ -533,14 +604,33 @@ impl PoolStats {
     /// # Arguments
     ///
     /// * `map` - A mutable reference to the map of pool statistics
-    fn initialize_pool_stats(map: &mut HashMap<PoolIdentifier, PoolStats>) {
+    fn initialize_pool_stats(
+        map: &mut HashMap<PoolIdentifier, PoolStats>,
+        fresh_percentiles: bool,
+    ) {
         for (identifier, pool) in get_all_pools().iter() {
             // Get address stats for this pool
             let address = pool.address().stats.clone();
-            // Get percentiles directly from HDR histograms (O(1) operation)
-            let (query_p50, query_p90, query_p95, query_p99) = address.get_query_percentiles();
-            let (xact_p50, xact_p90, xact_p95, xact_p99) = address.get_xact_percentiles();
-            let (wait_p50, wait_p90, wait_p95, wait_p99) = address.get_wait_percentiles();
+            if fresh_percentiles {
+                address.refresh_percentile_cache();
+            }
+            // read percentiles from atomic cache (was
+            // 3 blocking histogram mutexes per pool per scrape, now
+            // 12 atomic loads - bounded by the freshness of the 15s
+            // Collector cycle). For 1000 pools at 15s scrape this is
+            // 12000 atomic loads vs 3000 blocking lock acquires.
+            let query_p50 = address.p50_query_time_us.load(Ordering::Relaxed);
+            let query_p90 = address.p90_query_time_us.load(Ordering::Relaxed);
+            let query_p95 = address.p95_query_time_us.load(Ordering::Relaxed);
+            let query_p99 = address.p99_query_time_us.load(Ordering::Relaxed);
+            let xact_p50 = address.p50_xact_time_us.load(Ordering::Relaxed);
+            let xact_p90 = address.p90_xact_time_us.load(Ordering::Relaxed);
+            let xact_p95 = address.p95_xact_time_us.load(Ordering::Relaxed);
+            let xact_p99 = address.p99_xact_time_us.load(Ordering::Relaxed);
+            let wait_p50 = address.p50_wait_time_us.load(Ordering::Relaxed);
+            let wait_p90 = address.p90_wait_time_us.load(Ordering::Relaxed);
+            let wait_p95 = address.p95_wait_time_us.load(Ordering::Relaxed);
+            let wait_p99 = address.p99_wait_time_us.load(Ordering::Relaxed);
 
             // Create a new PoolStats instance for this pool with pre-calculated percentiles
             let mut current = PoolStats::new_with_percentiles(
@@ -630,6 +720,29 @@ impl PoolStats {
                 .query_time_microseconds
                 .load(Ordering::Relaxed);
 
+            // Dead-backend liveness scan counters (see Pool::evict_dead_backends).
+            current.total_dead_backends_probed =
+                address.dead_backends_probed_total.load(Ordering::Relaxed);
+            current.total_dead_backends_evicted =
+                address.dead_backends_evicted_total.load(Ordering::Relaxed);
+            current.total_prewarm_failures = address.prewarm_failures_total.load(Ordering::Relaxed);
+            current.total_discard_all_intercepted = address
+                .discard_all_intercepted_total
+                .load(Ordering::Relaxed);
+
+            // cumulative cancel counter
+            // into `cl_cancel_req`. That column in pgbouncer is a GAUGE
+            // ("clients currently waiting for cancel ack") and our
+            // cumulative value broke `rate(...)` dashboards (always
+            // monotonic) plus `cl_cancel_req > N` alerts (fire forever
+            // after the Nth cancel). Keep `cl_cancel_req` at 0 to match
+            // pgbouncer semantics; the cumulative value is surfaced via
+            // the new `total_cancel_requests` column in the extended
+            // SHOW POOLS output and via Prometheus
+            // `pg_doorman_pools_cancel_requests_total`.
+            current.cl_cancel_req = 0;
+            current.total_cancel_requests = address.cancel_requests_total.load(Ordering::Relaxed);
+
             // Calculate average wait time if there are transactions
             if current.avg_xact_count > 0 {
                 current.avg_wait_time =
@@ -662,7 +775,7 @@ impl PoolStats {
             // Try to find the pool for this client
             match pool_map.get_mut(&PoolIdentifier {
                 db: client.pool_name().to_string(),
-                user: client.username().to_string(),
+                user: client.pool_user().to_string(),
             }) {
                 Some(pool_stats) => {
                     // Update client state counter based on client state
@@ -800,6 +913,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_state_aggregation_uses_route_pool_user() {
+        let percentile = Percentile {
+            p99: 0,
+            p95: 0,
+            p90: 0,
+            p50: 0,
+        };
+        let mut pool_map = HashMap::new();
+        pool_map.insert(
+            PoolIdentifier::new("db", "authenticated_user"),
+            PoolStats::new_with_percentiles(
+                PoolIdentifier::new("db", "authenticated_user"),
+                PoolMode::Transaction,
+                percentile.clone(),
+                percentile.clone(),
+                percentile.clone(),
+            ),
+        );
+        pool_map.insert(
+            PoolIdentifier::new("db", "shared_backend_user"),
+            PoolStats::new_with_percentiles(
+                PoolIdentifier::new("db", "shared_backend_user"),
+                PoolMode::Transaction,
+                percentile.clone(),
+                percentile.clone(),
+                percentile,
+            ),
+        );
+
+        let client = Arc::new(ClientStats::new_with_pool_user(
+            1,
+            "app",
+            "authenticated_user",
+            "db",
+            "shared_backend_user",
+            "127.0.0.1:5432",
+            crate::utils::clock::now(),
+            false,
+        ));
+        client.waiting();
+        let mut client_map = HashMap::new();
+        client_map.insert(client.connection_id(), client);
+        let server_map = HashMap::new();
+
+        PoolStats::update_client_server_states(&mut pool_map, &client_map, &server_map);
+
+        assert_eq!(
+            pool_map
+                .get(&PoolIdentifier::new("db", "authenticated_user"))
+                .unwrap()
+                .cl_waiting,
+            0
+        );
+        assert_eq!(
+            pool_map
+                .get(&PoolIdentifier::new("db", "shared_backend_user"))
+                .unwrap()
+                .cl_waiting,
+            1
+        );
+    }
+
     /// Pin the SHOW STATS row layout so the per-second running mean and
     /// the cumulative counter never collapse back into a single source.
     /// The original bug emitted both columns from the same field, so a
@@ -869,5 +1045,92 @@ mod tests {
             wrapper_keys, explicit_keys,
             "the two entry points should report the same pool set"
         );
+    }
+
+    /// Append-only contract for SHOW STATS: the new iServ-backport columns
+    /// MUST sit at the tail of the row, after `avg_wait_time`. Operators and
+    /// dashboards rely on the existing column order - inserting in the
+    /// middle would silently shift every downstream consumer.
+    #[test]
+    fn show_stats_header_appends_iserv_columns_at_tail() {
+        let header = PoolStats::generate_show_stats_header();
+        let names: Vec<&str> = header.iter().map(|(n, _)| *n).collect();
+
+        // Original final column from upstream.
+        let avg_wait_idx = names
+            .iter()
+            .position(|n| *n == "avg_wait_time")
+            .expect("avg_wait_time must remain present in SHOW STATS");
+
+        // New columns must appear after avg_wait_time, in this order.
+        let dead_detected_idx = names
+            .iter()
+            .position(|n| *n == "total_dead_backends_probed")
+            .expect("total_dead_backends_probed missing from SHOW STATS header");
+        let dead_evicted_idx = names
+            .iter()
+            .position(|n| *n == "total_dead_backends_evicted")
+            .expect("total_dead_backends_evicted missing from SHOW STATS header");
+        let prewarm_failures_idx = names
+            .iter()
+            .position(|n| *n == "total_prewarm_failures")
+            .expect("total_prewarm_failures missing from SHOW STATS header");
+
+        assert!(
+            avg_wait_idx < dead_detected_idx
+                && dead_detected_idx < dead_evicted_idx
+                && dead_evicted_idx < prewarm_failures_idx,
+            "iServ columns must follow avg_wait_time in dead_detected -> dead_evicted -> \
+             prewarm_failures order; got positions avg_wait={avg_wait_idx} \
+             dead_detected={dead_detected_idx} dead_evicted={dead_evicted_idx} \
+             prewarm_failures={prewarm_failures_idx}"
+        );
+    }
+
+    /// Row values for the new iServ columns must come from the PoolStats
+    /// fields (not from a placeholder). A regression that wires the
+    /// values to the wrong field would silently report 0 forever.
+    #[test]
+    fn show_stats_row_surfaces_iserv_counter_values() {
+        let percentile = Percentile {
+            p99: 0,
+            p95: 0,
+            p90: 0,
+            p50: 0,
+        };
+        let mut stats = PoolStats::new_with_percentiles(
+            PoolIdentifier::new("shop", "alice"),
+            PoolMode::Transaction,
+            percentile.clone(),
+            percentile.clone(),
+            percentile,
+        );
+
+        // Use distinct values so a miswire (e.g. detected <-> evicted swap)
+        // shows up immediately.
+        stats.total_dead_backends_probed = 1234;
+        stats.total_dead_backends_evicted = 56;
+        stats.total_prewarm_failures = 9;
+
+        let header = PoolStats::generate_show_stats_header();
+        let row = stats.generate_show_stats_row();
+        assert_eq!(header.len(), row.len(), "header/row width mismatch");
+
+        let position_of = |name: &str| -> usize {
+            header
+                .iter()
+                .position(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("column {name} missing from header"))
+        };
+
+        assert_eq!(
+            row[position_of("total_dead_backends_probed")].as_ref(),
+            "1234"
+        );
+        assert_eq!(
+            row[position_of("total_dead_backends_evicted")].as_ref(),
+            "56"
+        );
+        assert_eq!(row[position_of("total_prewarm_failures")].as_ref(), "9");
     }
 }

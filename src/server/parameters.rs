@@ -1,11 +1,21 @@
+use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, BytesMut};
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::config::VERSION;
 
-static TRACKED_PARAMETERS: Lazy<HashSet<String>> = Lazy::new(|| {
-    let mut set = HashSet::new();
+// every `set_param` (called on every backend
+// ParameterStatus frame plus every checkout-sync SET) hashed the GUC
+// name with stdlib SipHash-1-3. Profile attributed
+// `core::hash::sip::Hasher::write` 0.30 % S2 + `prepared_statements::has`
+// 0.30 % to this lookup family. SipHash is the std `RandomState` default
+// because it's a security-grade HashDoS mitigation - overkill for
+// in-process maps whose keys are GUC identifiers, not adversary-
+// controlled hash inputs. AHash is ~2.5-8× faster on short keys and is
+// already a project dependency.
+static TRACKED_PARAMETERS: Lazy<AHashSet<String>> = Lazy::new(|| {
+    let mut set = AHashSet::new();
     set.insert("client_encoding".to_string());
     set.insert("DateStyle".to_string());
     set.insert("IntervalStyle".to_string());
@@ -18,8 +28,8 @@ static TRACKED_PARAMETERS: Lazy<HashSet<String>> = Lazy::new(|| {
 /// Names that must never be emitted as `SET` or `RESET` during checkout
 /// sync. PostgreSQL either owns them or rejects changes to them, and a
 /// rejected sync query makes the pooled backend unusable for that checkout.
-static SET_FORBIDDEN_PARAMETERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    let mut s = HashSet::new();
+static SET_FORBIDDEN_PARAMETERS: Lazy<AHashSet<&'static str>> = Lazy::new(|| {
+    let mut s = AHashSet::new();
     // Read-only or server-supplied GUCs.
     s.insert("is_superuser");
     s.insert("session_authorization");
@@ -57,8 +67,8 @@ static SET_FORBIDDEN_PARAMETERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 /// Startup-time GUCs that affect prepared-statement planning and are safe
 /// to replay at session level. They become part of the prepared-cache key.
 /// Names are stored in canonical form.
-static PLANNER_KEYS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    let mut s = HashSet::new();
+static PLANNER_KEYS: Lazy<AHashSet<&'static str>> = Lazy::new(|| {
+    let mut s = AHashSet::new();
     // lc_collate and lc_ctype affect planning too, but PostgreSQL will not
     // let a session change them, so they stay in SET_FORBIDDEN_PARAMETERS.
     s.insert("search_path");
@@ -102,12 +112,20 @@ pub fn is_safe_client_startup_key(key: &str) -> bool {
 /// ParameterStatus names keep PostgreSQL's spelling; other names are
 /// folded to ASCII lower case for stable comparisons and config merges.
 pub fn canonicalize_param_name(key: String) -> String {
+    // cheap length prefilter before the case-insensitive
+    // compare. `eq_ignore_ascii_case` walks both strings; comparing
+    // `len()` first (a single field read) skips that walk for every
+    // tracked name whose length differs from `key`, which is the common
+    // case for untracked GUCs. Behavior-identical: ASCII case folding
+    // never changes byte length, so a length mismatch cannot be a
+    // case-insensitive match.
+    let key_len = key.len();
     for tracked in TRACKED_PARAMETERS.iter() {
-        if key.eq_ignore_ascii_case(tracked) {
+        if tracked.len() == key_len && key.eq_ignore_ascii_case(tracked) {
             return tracked.clone();
         }
     }
-    if key.chars().any(|c| c.is_ascii_uppercase()) {
+    if key.bytes().any(|b| b.is_ascii_uppercase()) {
         key.to_ascii_lowercase()
     } else {
         key
@@ -126,7 +144,13 @@ pub enum ParamAction {
 #[derive(Debug)]
 pub struct ServerParameters {
     // Kept `pub(crate)` to preserve current internal usage patterns during refactor.
-    pub(crate) parameters: HashMap<String, String>,
+    //
+    // `AHashMap` (ahash::RandomState) replaces stdlib
+    // `HashMap` so the per-`set_param` lookup hot path no longer pays
+    // SipHash-1-3. External callers that need owned `HashMap<String,
+    // String>` (e.g. `server_parameters_as_hashmap`) materialise it on
+    // demand from the iterator.
+    pub(crate) parameters: AHashMap<String, String>,
 
     /// Lazy hash of planner-relevant parameters. Atomic keeps the
     /// containing async types `Send + Sync` while allowing cache updates.
@@ -156,7 +180,7 @@ impl Default for ServerParameters {
 impl ServerParameters {
     pub fn new() -> Self {
         ServerParameters {
-            parameters: HashMap::new(),
+            parameters: AHashMap::new(),
             planner_hash_cache: std::sync::atomic::AtomicU64::new(PLANNER_HASH_UNSET),
         }
     }
@@ -167,7 +191,7 @@ impl ServerParameters {
 
     pub fn admin() -> Self {
         let mut server_parameters = ServerParameters {
-            parameters: HashMap::new(),
+            parameters: AHashMap::new(),
             planner_hash_cache: std::sync::atomic::AtomicU64::new(PLANNER_HASH_UNSET),
         };
 
@@ -194,6 +218,28 @@ impl ServerParameters {
         startup: bool,
     ) -> bool {
         let key = canonicalize_param_name(key.into());
+
+        // backend-supplied `ParameterStatus` frames
+        // and per-statement `SET` echoes flow into this same map via
+        // `startup=true` / `startup=false` calls. Those bytes are
+        // attacker-controlled when `server_tls_mode != "verify-full"`
+        // (MITM on the pg_doorman->backend link). The downstream
+        // `sync_parameters` path interpolates `{key}` raw into
+        // `SET {key} TO …;` / `RESET {key};` SQL; a tampered key
+        // shaped like `"application_name;DROP DATABASE x--"` becomes
+        // an injection executed with the backend's privileges on the
+        // next client checkout. `canonicalize_param_name` only lowers
+        // case - it does NOT enforce identifier shape. Reject anything
+        // that is not a valid GUC name BEFORE it enters the map.
+        if !crate::config::startup_parameters::is_valid_guc_name(&key) {
+            log::warn!(
+                "[parameters] refused to set unsafe GUC key (shape violates \
+                 [A-Za-z_][A-Za-z0-9_.]*): {key:?} - possible MITM-injected \
+                 ParameterStatus frame; tighten server_tls_mode"
+            );
+            return false;
+        }
+
         let value = value.into();
 
         if TRACKED_PARAMETERS.contains(&key) || startup {
@@ -234,7 +280,29 @@ impl ServerParameters {
     /// Planner keys invalidate the cached planner hash.
     pub fn remove_param(&mut self, key: &str) {
         let canonical = canonicalize_param_name(key.to_string());
+        // Defense in depth: refuse to remove keys that should never have
+        // entered the map per set_param's shape check.
+        if !crate::config::startup_parameters::is_valid_guc_name(&canonical) {
+            return;
+        }
         if self.parameters.remove(&canonical).is_some() && is_planner_key(&canonical) {
+            self.planner_hash_cache
+                .store(PLANNER_HASH_UNSET, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Drop session GUCs that PostgreSQL resets without sending
+    /// ParameterStatus, after confirmed `RESET ALL` / `DISCARD ALL`.
+    pub(crate) fn remove_startup_only_params_after_session_reset(&mut self) {
+        let mut planner_changed = false;
+        self.parameters.retain(|key, _| {
+            let keep = TRACKED_PARAMETERS.contains(key) || is_set_forbidden(key);
+            if !keep && is_planner_key(key) {
+                planner_changed = true;
+            }
+            keep
+        });
+        if planner_changed {
             self.planner_hash_cache
                 .store(PLANNER_HASH_UNSET, std::sync::atomic::Ordering::Relaxed);
         }
@@ -274,13 +342,27 @@ impl ServerParameters {
         diff
     }
 
-    pub fn get_application_name(&self) -> &String {
-        // Can unwrap because we set it in the constructor.
-        self.parameters.get("application_name").unwrap()
+    pub fn get_application_name(&self) -> &str {
+        // `ServerParameters::new()` does not set application_name
+        // (only `::admin()` does) and a client RESET can remove it, so a
+        // bare `.unwrap()` here was reachable unsoundness. Fall back to an
+        // empty name instead of panicking; the contract stays `&str` so
+        // the (stats-recording) callers are unchanged.
+        self.parameters
+            .get("application_name")
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     pub fn as_hashmap(&self) -> HashMap<String, String> {
-        self.parameters.clone()
+        // external API stays std `HashMap` so callers
+        // (e.g. `client/migration.rs` snapshot serialiser) don't have
+        // to switch to `AHashMap` upstream. The conversion is cheap
+        // (per-entry clone) and runs off the hot per-query path.
+        self.parameters
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Digest of the planner-relevant parameter set. Returns `0` when
@@ -363,8 +445,8 @@ impl From<&ServerParameters> for BytesMut {
 
 /// StartupMessage protocol fields that must not be serialized as
 /// ParameterStatus.
-static PARAMETER_STATUS_SUPPRESSED: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    let mut s = HashSet::new();
+static PARAMETER_STATUS_SUPPRESSED: Lazy<AHashSet<&'static str>> = Lazy::new(|| {
+    let mut s = AHashSet::new();
     s.insert("user");
     s.insert("database");
     s.insert("replication");
@@ -650,6 +732,47 @@ mod tests {
         assert!(!is_safe_client_startup_key("_PQ_.foo"));
     }
 
+    /// a key shaped like a SQL
+    /// injection payload reaches `set_param` only from
+    /// backend-controlled bytes (ParameterStatus / SET-echo) when
+    /// `server_tls_mode != "verify-full"`. The shape gate must reject
+    /// it BEFORE it enters the map so the downstream
+    /// `sync_parameters` interpolation can never produce a multi-
+    /// statement SET.
+    #[test]
+    fn set_param_rejects_backend_supplied_injection_shaped_key() {
+        let mut sp = ServerParameters::new();
+        // Inject via the same code path the wire-level
+        // ParameterStatus handler uses.
+        let changed = sp.set_param("application_name;DROP DATABASE production--", "x", true);
+        assert!(!changed, "injection-shaped key must not be set");
+        // The map must not now hold the malicious key.
+        assert!(
+            !sp.parameters
+                .keys()
+                .any(|k| k.contains(';') || k.contains("--")),
+            "ServerParameters map contains injection-shaped key after set_param: {:?}",
+            sp.parameters
+        );
+        // Several variants must all be rejected.
+        for bad in [
+            "foo bar",
+            "foo'bar",
+            "foo\"bar",
+            "1foo",
+            "",
+            "x; DEALLOCATE ALL; --",
+            "x/*comment*/",
+        ] {
+            let changed = sp.set_param(bad, "y", true);
+            assert!(!changed, "key {bad:?} must be rejected");
+            assert!(
+                !sp.parameters.contains_key(bad),
+                "key {bad:?} must not be in map"
+            );
+        }
+    }
+
     #[test]
     fn clone_resets_planner_hash_cache() {
         // A clone starts with an empty planner-hash cache.
@@ -662,5 +785,52 @@ mod tests {
             .planner_hash_cache
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(raw, PLANNER_HASH_UNSET);
+    }
+
+    // Note: get_application_name must not panic when
+    // application_name is absent. ServerParameters::new() does NOT set
+    // it (only ::admin() does), and a client RESET can remove it, so the
+    // old `.unwrap()` was reachable unsoundness. The fix keeps the `&str`
+    // contract (callers pass it straight into stats recorders) but falls
+    // back to "" instead of panicking.
+    #[test]
+    fn get_application_name_empty_when_absent() {
+        let sp = ServerParameters::new();
+        // Would have panicked before the fix.
+        assert_eq!(sp.get_application_name(), "");
+    }
+
+    #[test]
+    fn get_application_name_empty_after_reset() {
+        let mut sp = ServerParameters::admin();
+        assert_eq!(sp.get_application_name(), "pg_doorman");
+        sp.remove_param("application_name");
+        assert_eq!(sp.get_application_name(), "");
+    }
+
+    #[test]
+    fn get_application_name_returns_value_when_set() {
+        let sp = ServerParameters::admin();
+        assert_eq!(sp.get_application_name(), "pg_doorman");
+    }
+
+    #[test]
+    fn compare_params_detects_application_name_change() {
+        // A differing application_name must surface in the diff returned by
+        // compare_params - this is the branch that drives the SET/RESET
+        // round-trip counted by pg_doorman_sync_params_applied_total.
+        let mut current = ServerParameters::new();
+        current.set_param("application_name", "svc-old", false);
+        let mut incoming = ServerParameters::new();
+        incoming.set_param("application_name", "svc-new", false);
+        let diff = current.compare_params(&incoming);
+        assert!(
+            diff.contains_key("application_name"),
+            "application_name change must appear in the diff (drives sync_applied)"
+        );
+        assert!(matches!(
+            diff.get("application_name"),
+            Some(ParamAction::SetTo(value)) if value == "svc-new"
+        ));
     }
 }

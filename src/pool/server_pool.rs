@@ -17,7 +17,7 @@ use crate::config::{Address, User};
 use crate::errors::Error;
 use crate::patroni::types::Role;
 use crate::server::Server;
-use crate::stats::ServerStats;
+use crate::stats::{AddressStats, ServerStats};
 use crate::utils::format_duration_ms;
 
 use super::errors::{RecycleError, RecycleResult};
@@ -48,6 +48,44 @@ enum BudgetDecision {
 enum BudgetReason {
     CascadeBudgetExceeded,
     PacketCapExceeded,
+}
+
+struct PrewarmFailureGuard {
+    stats: Arc<AddressStats>,
+    username: String,
+    pool_name: String,
+    server_user: String,
+    active: bool,
+}
+
+impl PrewarmFailureGuard {
+    fn new(pool: &ServerPool) -> Self {
+        Self {
+            stats: pool.address.stats.clone(),
+            username: pool.address.username.clone(),
+            pool_name: pool.address.pool_name.clone(),
+            server_user: pool.prewarm_username().to_string(),
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PrewarmFailureGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.stats.prewarm_failure();
+        warn!(
+            "[{}@{}] prewarm_query cancelled before completion on new backend (server_user={}); \
+             create timeout or task cancellation dropped the backend",
+            self.username, self.pool_name, self.server_user,
+        );
+    }
 }
 
 impl BudgetReason {
@@ -256,6 +294,28 @@ pub struct ServerPool {
     /// together with the map so the spawn path skips the re-validation
     /// walk on every backend create.
     resolved_startup_decision: BudgetDecision,
+
+    /// Pool-level `release_query` config snapshot. `None` => use the
+    /// iServ-compatible default (`RELEASE_SESSION_QUERY`); `Some("")` => disable the
+    /// release query entirely; `Some(custom)` => execute exactly that SQL.
+    /// Installed via `ServerPool::with_release_query` from `mod.rs` /
+    /// `dynamic.rs`; consumed in `create()` and `create_fallback_connection_inner()`
+    /// to call `Server::set_release_query` right after startup.
+    release_query: Option<String>,
+
+    /// Effective `prewarm_query` for this pool - already resolved against the
+    /// per-user override at construction time. Empty string disables the
+    /// prewarm. Executed once after `Server::startup` in `create()` and
+    /// `create_fallback_connection_inner()`; a SQL or transport failure marks
+    /// the backend bad so the connection never reaches the idle queue.
+    prewarm_query: String,
+
+    /// Pool-level switch for the DISCARD ALL synthetic-response fast path
+    /// (see `Pool.intercept_discard_all` for the operator-facing semantics).
+    /// Propagated to each `Server` via `set_intercept_discard_all` right
+    /// after startup so the per-backend gate in `handle_simple_query` does
+    /// not need to look the config up on every query.
+    intercept_discard_all: bool,
 }
 
 impl std::fmt::Debug for ServerPool {
@@ -348,6 +408,108 @@ impl ServerPool {
             operator_managed_startup_keys,
             resolved_startup_map,
             resolved_startup_decision,
+            release_query: None,
+            prewarm_query: String::new(),
+            // Default-safe: honour the iServ contract even when nobody
+            // calls `with_intercept_discard_all` (test helpers, GC paths).
+            intercept_discard_all: true,
+        }
+    }
+
+    /// Builder-style override for the resolved release-query of this pool.
+    /// Called by the static (`pool/mod.rs`) and dynamic (`pool/dynamic.rs`)
+    /// pool init paths to forward `pool_config.release_query`. The default
+    /// (constructed in `ServerPool::new`) is `None`, which means
+    /// `resolve_release_query` will materialise the iServ-compatible default
+    /// when the backend is created.
+    pub fn with_release_query(mut self, release_query: Option<String>) -> ServerPool {
+        self.release_query = release_query;
+        self
+    }
+
+    /// Builder-style override for the effective prewarm SQL. Callers must
+    /// resolve the per-user override against `pool_config.prewarm_query`
+    /// before invoking this (`user.prewarm_query` wins entirely when `Some`,
+    /// even `Some(String::new())` which disables the prewarm for that user).
+    /// Empty string here means "no prewarm".
+    pub fn with_prewarm_query(mut self, prewarm_query: String) -> ServerPool {
+        self.prewarm_query = prewarm_query;
+        self
+    }
+
+    /// Builder-style override for the DISCARD ALL interception fast path.
+    /// Mirrors `Pool.intercept_discard_all`: `true` (default) makes
+    /// pg_doorman synthesise the response locally without forwarding;
+    /// `false` lets the query reach PostgreSQL as a normal simple query.
+    pub fn with_intercept_discard_all(mut self, intercept: bool) -> ServerPool {
+        self.intercept_discard_all = intercept;
+        self
+    }
+
+    /// Effective backend username for prewarm error reporting. Mirrors the
+    /// rule used by `Server::startup` so the log line points at the actual
+    /// PostgreSQL role rather than the pool's frontend role.
+    fn prewarm_username(&self) -> &str {
+        self.user
+            .server_username
+            .as_deref()
+            .unwrap_or(self.user.username.as_str())
+    }
+
+    /// Execute the configured prewarm SQL once on a freshly authenticated
+    /// backend. The wrapper around `small_simple_query` here keeps the
+    /// call-site in `create()` short and ensures failures (transport `Err`,
+    /// SQL `ErrorResponse`, or cancellation by the caller's create timeout)
+    /// emit a warn log and bump the per-address counter. Explicit query
+    /// errors also mark the backend bad before the `?` exit at the call-site
+    /// drops the connection.
+    ///
+    /// **Timeout note**: `small_simple_query` enforces the housekeeping
+    /// deadline (30s, see `HOUSEKEEPING_TIMEOUT` in `server_backend.rs`).
+    /// The same cap applies here - a slow prewarm statement (`VACUUM
+    /// ANALYZE`, `pg_prewarm`, large-table cache hydration) that does not
+    /// complete within 30s will be killed and the backend marked bad,
+    /// causing every new connection to churn. Keep `prewarm_query` to
+    /// inexpensive setup SQL (planner GUCs, lightweight `SELECT 1`, plan
+    /// warming via `EXECUTE`), not to bulk data preload. The 4096-byte
+    /// config validation cap (`config/pool.rs`) is an additional defence
+    /// against pasting an entire migration script in here.
+    async fn run_prewarm_query(&self, conn: &mut crate::server::Server) -> Result<(), Error> {
+        if self.prewarm_query.trim().is_empty() {
+            return Ok(());
+        }
+        let mut failure_guard = PrewarmFailureGuard::new(self);
+        match conn.small_simple_query(&self.prewarm_query).await {
+            Ok(()) => {
+                if let Some(violation) = conn.recycle_safety_violation() {
+                    failure_guard.disarm();
+                    self.address.stats.prewarm_failure();
+                    let reason = format!("prewarm_query left backend non-recyclable: {violation}");
+                    warn!(
+                        "[{}@{}] prewarm_query left new backend unsafe for pooling \
+                         (server_user={}): {violation}",
+                        self.address.username,
+                        self.address.pool_name,
+                        self.prewarm_username(),
+                    );
+                    conn.mark_bad(&reason);
+                    return Err(Error::ProtocolSyncError(reason));
+                }
+                failure_guard.disarm();
+                Ok(())
+            }
+            Err(err) => {
+                failure_guard.disarm();
+                self.address.stats.prewarm_failure();
+                warn!(
+                    "[{}@{}] prewarm_query failed on new backend (server_user={}): {err}",
+                    self.address.username,
+                    self.address.pool_name,
+                    self.prewarm_username(),
+                );
+                conn.mark_bad("prewarm_query failed");
+                Err(err)
+            }
         }
     }
 
@@ -504,8 +666,17 @@ impl ServerPool {
         };
 
         match result {
-            Ok(conn) => {
+            Ok(mut conn) => {
                 active_registration.release();
+                // Forward the pool-level release_query onto this backend before
+                // it joins the idle set. Empty / None / custom are all decided
+                // by `resolve_release_query`.
+                conn.set_release_query(self.release_query.as_deref());
+                conn.set_intercept_discard_all(self.intercept_discard_all);
+                // Run prewarm_query (if configured). On failure the backend is
+                // marked bad inside the helper; we surface the error so the
+                // pool drops this connection (Server::Drop closes the socket).
+                self.run_prewarm_query(&mut conn).await?;
                 // Permit is released automatically when _permit goes out of scope
                 conn.stats.idle(0);
                 Ok(conn)
@@ -514,9 +685,13 @@ impl ServerPool {
                 // The local attempt ended before fallback or backoff starts.
                 // Remove its login row before the next attempt publishes one.
                 drop(active_registration);
+                // Local backend unreachable + Patroni-assisted fallback configured: route via fallback.
                 if is_backend_unreachable(&err) {
                     if let Some(ref fallback) = self.fallback_state {
                         fallback.blacklist();
+                        crate::web::metrics::record_pool_only_fallback_tls_label(
+                            &self.address.pool_name,
+                        );
                         crate::web::metrics::FALLBACK_ACTIVE
                             .with_label_values(&[&self.address.pool_name])
                             .set(1.0);
@@ -673,12 +848,10 @@ impl ServerPool {
                 body_bytes,
                 packet_bytes,
             } => {
-                crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                    .with_label_values(&[
-                        self.address.pool_name.as_str(),
-                        "auth_query_overlay_oversize",
-                    ])
-                    .inc();
+                crate::web::metrics::observe_startup_parameters_dropped(
+                    self.address.pool_name.as_str(),
+                    "auth_query_overlay_oversize",
+                );
                 Err(Error::ServerStartupParameterRejection {
                     sqlstate: "53400".to_string(),
                     message: format!(
@@ -705,9 +878,10 @@ impl ServerPool {
                 body_bytes,
                 packet_bytes,
             } => {
-                crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                    .with_label_values(&[self.address.pool_name.as_str(), reason.as_str()])
-                    .inc();
+                crate::web::metrics::observe_startup_parameters_dropped(
+                    self.address.pool_name.as_str(),
+                    reason.as_str(),
+                );
                 Err(Error::ServerStartupParameterRejection {
                     sqlstate: "53400".to_string(),
                     message: format!(
@@ -810,9 +984,7 @@ impl ServerPool {
         let (targets, source) = match fallback.get_fallback_targets().await {
             Ok(pair) => pair,
             Err(e) => {
-                crate::web::metrics::PATRONI_API_ERRORS_TOTAL
-                    .with_label_values(&[&self.address.pool_name])
-                    .inc();
+                crate::web::metrics::record_pool_only_fallback_tls_label(&self.address.pool_name);
                 warn!(
                     "[{}@{}] fallback: discovery failed: {e}",
                     self.address.username, self.address.pool_name,
@@ -854,14 +1026,12 @@ impl ServerPool {
                 target.port,
                 target.role
             );
-            crate::web::metrics::FALLBACK_CONNECTIONS_TOTAL
-                .with_label_values(&[&self.address.pool_name])
-                .inc();
             return match self
                 .try_fallback_target(&target, &startup_parameters_round)
                 .await
             {
                 Ok(server) => {
+                    record_fallback_connection_outcome(&self.address.pool_name, true);
                     fallback.set_whitelisted(target.host, target.port, target.role);
                     (Ok(server), source)
                 }
@@ -972,10 +1142,6 @@ impl ServerPool {
         source: super::fallback::TargetSource,
         startup_parameters: &BTreeMap<String, String>,
     ) -> Option<Server> {
-        // Count one fallback use per wave, not per candidate.
-        crate::web::metrics::FALLBACK_CONNECTIONS_TOTAL
-            .with_label_values(&[&self.address.pool_name])
-            .inc();
         let _ = source; // reserved for future wave-source-specific logic
 
         let futures: Vec<futures::future::BoxFuture<'_, Result<Server, Error>>> = targets
@@ -986,6 +1152,7 @@ impl ServerPool {
         match race_first_success(futures).await {
             Ok((server, idx)) => {
                 let winner = &targets[idx];
+                record_fallback_connection_outcome(&self.address.pool_name, true);
                 info!(
                     "[{}@{}] fallback: winner {}:{} (role={:?}) — startup ok",
                     self.address.username,
@@ -1131,6 +1298,12 @@ impl ServerPool {
         match result {
             Ok(mut conn) => {
                 active_registration.release();
+                // Same release_query / prewarm_query installation as the main
+                // `create()` path so fallback backends honour the operator
+                // config too.
+                conn.set_release_query(self.release_query.as_deref());
+                conn.set_intercept_discard_all(self.intercept_discard_all);
+                self.run_prewarm_query(&mut conn).await?;
                 conn.stats.idle(0);
                 conn.override_lifetime_ms = Some(target.lifetime_ms);
                 Ok(conn)
@@ -1243,10 +1416,7 @@ impl ServerPool {
             if let Some(recycled) = metrics.recycled {
                 let idle_time_ms = recycled.elapsed().as_millis() as u64;
                 if idle_time_ms > self.idle_check_timeout_ms {
-                    debug!(
-                        "Connection {} idle for {}ms, checking alive...",
-                        conn, idle_time_ms
-                    );
+                    debug!("Connection {conn} idle for {idle_time_ms}ms, checking alive...");
                     if conn.check_alive(self.connect_timeout).await.is_err() {
                         conn.close_reason = Some(format!(
                             "failed alive check after {} idle",
@@ -1254,7 +1424,7 @@ impl ServerPool {
                         ));
                         return Err(RecycleError::StaticMessage("Connection failed alive check"));
                     }
-                    debug!("Connection {} passed alive check", conn);
+                    debug!("Connection {conn} passed alive check");
                 }
             }
         }
@@ -1455,6 +1625,47 @@ fn is_host_independent_error(e: &Error) -> bool {
     )
 }
 
+fn record_fallback_connection_outcome(pool_name: &str, established: bool) {
+    if established {
+        crate::web::metrics::record_pool_only_fallback_tls_label(pool_name);
+        crate::web::metrics::FALLBACK_CONNECTIONS_TOTAL
+            .with_label_values(&[pool_name])
+            .inc();
+    }
+}
+
+struct ServerStatsRegistrationGuard {
+    stats: Arc<ServerStats>,
+    armed: bool,
+}
+
+impl ServerStatsRegistrationGuard {
+    fn register(stats: Arc<ServerStats>) -> Self {
+        stats.register(stats.clone());
+        Self { stats, armed: true }
+    }
+
+    fn disconnect(mut self) {
+        if self.armed {
+            self.stats.disconnect();
+            self.armed = false;
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ServerStatsRegistrationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stats.disconnect();
+            self.armed = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1463,6 +1674,30 @@ mod tests {
 
     fn metrics_with_lifetime(lifetime_ms: u64) -> Metrics {
         Metrics::new(lifetime_ms, 0, 0)
+    }
+
+    fn test_server_pool_with_prewarm(prewarm_query: &str) -> ServerPool {
+        ServerPool::new(
+            crate::config::Address::default(),
+            crate::config::User::default(),
+            "test_db",
+            Arc::new(dashmap::DashMap::new()),
+            false,
+            false,
+            0,
+            "test_app".to_string(),
+            1,
+            60_000,
+            60_000,
+            60_000,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            false,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        )
+        .with_prewarm_query(prewarm_query.to_string())
     }
 
     fn rejection_err() -> Error {
@@ -1525,6 +1760,71 @@ mod tests {
         assert!(
             !is_backend_unreachable(&resource_exhausted_err()),
             "EMFILE/ENFILE is pg_doorman resource exhaustion, not backend unreachability"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canceling_prewarm_query_counts_failure() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let pool = test_server_pool_with_prewarm("SELECT pg_sleep(60)");
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            pool.run_prewarm_query(&mut server),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "silent peer must keep prewarm pending until the outer create timeout cancels it"
+        );
+
+        let mut observed = [0_u8; 64];
+        let n = tokio::time::timeout(Duration::from_millis(50), peer.read(&mut observed))
+            .await
+            .expect("test peer must observe the prewarm query write before cancellation")
+            .expect("reading from test peer must succeed");
+        assert!(
+            n > 0,
+            "test precondition: prewarm bytes must reach the peer"
+        );
+
+        assert_eq!(
+            pool.address
+                .stats
+                .prewarm_failures_total
+                .load(Ordering::Relaxed),
+            1,
+            "cancelled prewarm must be counted as a prewarm failure"
+        );
+    }
+
+    #[test]
+    fn prewarm_query_requires_recycle_safe_backend_before_publish() {
+        let src = include_str!("server_pool.rs");
+        let start = src
+            .find("async fn run_prewarm_query")
+            .expect("run_prewarm_query must exist");
+        let block = &src[start..];
+        let end = block
+            .find("/// See `operator_managed_startup_keys` field.")
+            .expect("run_prewarm_query block should end before operator key accessor");
+        let block = &block[..end];
+
+        assert!(
+            block.contains("recycle_safety_violation"),
+            "successful prewarm_query must prove the backend is idle/clean before publishing it"
+        );
+        assert!(
+            block.contains("conn.mark_bad"),
+            "a backend that is not recycle-safe after prewarm must be marked bad"
+        );
+        assert!(
+            block.contains("prewarm_failure"),
+            "post-prewarm recycle-safety failures must increment prewarm failure stats"
         );
     }
 
@@ -1650,7 +1950,7 @@ mod tests {
         // Sleep well past it, then assert we report the breach.
         thread::sleep(Duration::from_millis(5));
         let age = lifetime_exceeded(&metrics, false).expect("must exceed lifetime");
-        assert!(age >= 1, "reported age {} must be > limit 1", age);
+        assert!(age >= 1, "reported age {age} must be > limit 1");
     }
 
     #[test]
@@ -1724,6 +2024,68 @@ mod tests {
     fn failure_summary_format_no_candidates_when_empty() {
         let s = FailureSummary::default();
         assert_eq!(s.format(), "no candidates");
+    }
+
+    #[test]
+    fn fallback_connection_counter_only_records_established_connections() {
+        let pool = "test_pool_fallback_established_counter";
+        let before = crate::web::metrics::FALLBACK_CONNECTIONS_TOTAL
+            .with_label_values(&[pool])
+            .get();
+
+        record_fallback_connection_outcome(pool, false);
+        assert_eq!(
+            crate::web::metrics::FALLBACK_CONNECTIONS_TOTAL
+                .with_label_values(&[pool])
+                .get()
+                - before,
+            0
+        );
+
+        record_fallback_connection_outcome(pool, true);
+        assert_eq!(
+            crate::web::metrics::FALLBACK_CONNECTIONS_TOTAL
+                .with_label_values(&[pool])
+                .get()
+                - before,
+            1
+        );
+    }
+
+    #[test]
+    fn server_stats_registration_guard_disconnects_on_drop_until_disarmed() {
+        let pool = "test_pool_stats_registration_guard";
+        let address = crate::config::Address {
+            pool_name: pool.to_string(),
+            ..crate::config::Address::default()
+        };
+        let stats = Arc::new(ServerStats::new(address, crate::utils::clock::now()));
+
+        {
+            let _guard = ServerStatsRegistrationGuard::register(stats.clone());
+            assert!(
+                crate::stats::get_server_stats()
+                    .values()
+                    .any(|registered| registered.pool_name() == pool),
+                "guard must publish stats while startup is in flight"
+            );
+        }
+        assert!(
+            !crate::stats::get_server_stats()
+                .values()
+                .any(|registered| registered.pool_name() == pool),
+            "dropping an armed guard must remove the in-flight stats"
+        );
+
+        let guard = ServerStatsRegistrationGuard::register(stats.clone());
+        guard.disarm();
+        assert!(
+            crate::stats::get_server_stats()
+                .values()
+                .any(|registered| registered.pool_name() == pool),
+            "disarmed guard hands lifecycle ownership to Server"
+        );
+        stats.disconnect();
     }
 
     #[tokio::test]
