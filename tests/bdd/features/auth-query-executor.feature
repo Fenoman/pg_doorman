@@ -41,7 +41,7 @@ Feature: AuthQueryExecutor — credential fetching from PostgreSQL
   Scenario: Multiple rows for same user returns config error
     Given auth_query executor connected with query "SELECT username, password FROM auth_users WHERE username = $1" and pool_size 2
     When auth_query fetches password for user "duplicate_user"
-    Then auth_query result should be config error containing "expected 0 or 1"
+    Then auth_query result should be config error containing "more than 1 row"
 
   Scenario: Executor handles sequential fetches correctly
     Given auth_query executor connected with query "SELECT username, password FROM auth_users WHERE username = $1" and pool_size 2

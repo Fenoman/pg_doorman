@@ -49,16 +49,26 @@ fn main() {
 
         let not_todo_skip = TagOperation::Not(Box::new(TagOperation::Tag("todo-skip".to_string())));
 
-        // On non-Linux platforms, also skip @linux-only scenarios
-        // (TLS migration requires patched OpenSSL which only builds on Linux)
-        #[cfg(not(target_os = "linux"))]
+        // On non-Linux platforms, skip @linux-only scenarios. TLS migration
+        // scenarios also require the optional `tls-migration` cargo feature:
+        // without it the old process can only keep TLS clients alive until
+        // shutdown_timeout, which makes single-upgrade tests false positives.
         let base_filter = {
-            let not_linux_only =
-                TagOperation::Not(Box::new(TagOperation::Tag("linux-only".to_string())));
-            TagOperation::And(Box::new(not_todo_skip), Box::new(not_linux_only))
+            let filter = not_todo_skip;
+            #[cfg(not(target_os = "linux"))]
+            let filter = {
+                let not_linux_only =
+                    TagOperation::Not(Box::new(TagOperation::Tag("linux-only".to_string())));
+                TagOperation::And(Box::new(filter), Box::new(not_linux_only))
+            };
+            #[cfg(not(feature = "tls-migration"))]
+            let filter = {
+                let not_tls_migration =
+                    TagOperation::Not(Box::new(TagOperation::Tag("tls-migration".to_string())));
+                TagOperation::And(Box::new(filter), Box::new(not_tls_migration))
+            };
+            filter
         };
-        #[cfg(target_os = "linux")]
-        let base_filter = not_todo_skip;
 
         // Combine with existing tags filter if present
         cli.tags_filter = match cli.tags_filter.take() {
@@ -92,9 +102,8 @@ fn main() {
                             elapsed_minutes += 1;
                             eprintln!(
                                 "\n🐢🐢🐢 SLOW TEST 🐢🐢🐢\n\
-                                 >>> Test '{}' (feature '{}') is RUNNING for {} minute(s) <<<\n\
-                                 🐢🐢🐢 SLOW TEST 🐢🐢🐢\n",
-                                scenario_name, feature_name, elapsed_minutes
+                                 >>> Test '{scenario_name}' (feature '{feature_name}') is RUNNING for {elapsed_minutes} minute(s) <<<\n\
+                                 🐢🐢🐢 SLOW TEST 🐢🐢🐢\n"
                             );
                         }
                     });

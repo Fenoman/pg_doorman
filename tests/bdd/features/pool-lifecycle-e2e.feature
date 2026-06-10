@@ -56,6 +56,11 @@ Feature: Pool lifecycle end-to-end (prewarm → scale up → shrink)
     And we send SimpleQuery "BEGIN" to session "s3"
     And we send SimpleQuery "BEGIN" to session "s4"
     And we send SimpleQuery "BEGIN" to session "s5"
+    And we send SimpleQuery "SELECT 1" to session "s1"
+    And we send SimpleQuery "SELECT 1" to session "s2"
+    And we send SimpleQuery "SELECT 1" to session "s3"
+    And we send SimpleQuery "SELECT 1" to session "s4"
+    And we send SimpleQuery "SELECT 1" to session "s5"
     # All 5 backends should be in use
     And we execute "SHOW SERVERS" on admin session "admin1" and store row count
     Then admin session "admin1" row count should be 5
@@ -132,6 +137,11 @@ Feature: Pool lifecycle end-to-end (prewarm → scale up → shrink)
     And we send SimpleQuery "BEGIN" to session "s3"
     And we send SimpleQuery "BEGIN" to session "s4"
     And we send SimpleQuery "BEGIN" to session "s5"
+    And we send SimpleQuery "SELECT 1" to session "s1"
+    And we send SimpleQuery "SELECT 1" to session "s2"
+    And we send SimpleQuery "SELECT 1" to session "s3"
+    And we send SimpleQuery "SELECT 1" to session "s4"
+    And we send SimpleQuery "SELECT 1" to session "s5"
     # All 5 data backends should be in use (+ possibly 1 executor connection)
     When we create admin session "admin1" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW SERVERS" on admin session "admin1" and store row count

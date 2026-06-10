@@ -106,7 +106,7 @@ pub async fn create_pgbench_script_file(world: &mut DoormanWorld, step: &Step) {
     let script_file = create_temp_file(&script_content);
 
     eprintln!("Created pgbench script file: {:?}", script_file.path());
-    eprintln!("Script content:\n{}", script_content);
+    eprintln!("Script content:\n{script_content}");
 
     world.pgbench_script_file = Some(script_file);
 }
@@ -129,11 +129,7 @@ fn run_pgbench(command: &str, target: &str, timeout: Duration) -> PgbenchResult 
     let log_dir = TempDir::new().ok();
     let command = if let Some(ref dir) = log_dir {
         let prefix = format!("{}/pgbench_log", dir.path().display());
-        command.replacen(
-            "pgbench ",
-            &format!("pgbench -l --log-prefix={} ", prefix),
-            1,
-        )
+        command.replacen("pgbench ", &format!("pgbench -l --log-prefix={prefix} "), 1)
     } else {
         command.to_string()
     };
@@ -165,7 +161,7 @@ fn run_pgbench(command: &str, target: &str, timeout: Duration) -> PgbenchResult 
                     let reader = BufReader::new(stdout);
                     let mut collected = String::new();
                     for line in reader.lines().map_while(Result::ok) {
-                        eprintln!("[{} stdout] {}", target_stdout, line);
+                        eprintln!("[{target_stdout} stdout] {line}");
                         collected.push_str(&line);
                         collected.push('\n');
                     }
@@ -179,7 +175,7 @@ fn run_pgbench(command: &str, target: &str, timeout: Duration) -> PgbenchResult 
                     let reader = BufReader::new(stderr);
                     let mut collected = String::new();
                     for line in reader.lines().map_while(Result::ok) {
-                        eprintln!("[{} stderr] {}", target_stderr, line);
+                        eprintln!("[{target_stderr} stderr] {line}");
                         collected.push_str(&line);
                         collected.push('\n');
                     }
@@ -204,7 +200,7 @@ fn run_pgbench(command: &str, target: &str, timeout: Duration) -> PgbenchResult 
 
                         return if status.success() {
                             PgbenchResult {
-                                output: format!("{}\n{}", stdout, stderr),
+                                output: format!("{stdout}\n{stderr}"),
                                 status: PgbenchStatus::Success,
                                 log_dir,
                             }
@@ -253,7 +249,7 @@ fn run_pgbench(command: &str, target: &str, timeout: Duration) -> PgbenchResult 
                     }
                     Err(e) => {
                         return PgbenchResult {
-                            output: format!("Error waiting for pgbench: {}", e),
+                            output: format!("Error waiting for pgbench: {e}"),
                             status: PgbenchStatus::SpawnError,
                             log_dir,
                         };
@@ -262,7 +258,7 @@ fn run_pgbench(command: &str, target: &str, timeout: Duration) -> PgbenchResult 
             }
         }
         Err(e) => PgbenchResult {
-            output: format!("Failed to execute pgbench: {}", e),
+            output: format!("Failed to execute pgbench: {e}"),
             status: PgbenchStatus::SpawnError,
             log_dir,
         },
@@ -342,7 +338,7 @@ fn handle_pgbench_result(
     match result.status {
         PgbenchStatus::Success => {
             if let Some(tps) = parse_tps(&result.output) {
-                eprintln!("\x1b[1;32m✓ TPS for {}: {:.2}\x1b[0m", target, tps);
+                eprintln!("\x1b[1;32m✓ TPS for {target}: {tps:.2}\x1b[0m");
                 bench_results.insert(target.to_string(), tps);
             } else {
                 panic!(
@@ -356,8 +352,7 @@ fn handle_pgbench_result(
                 && result.output.contains("does not exist")
             {
                 eprintln!(
-                    "\x1b[1;33m⚠ TPS for {}: 0.00 (prepared statements not supported)\x1b[0m",
-                    target
+                    "\x1b[1;33m⚠ TPS for {target}: 0.00 (prepared statements not supported)\x1b[0m"
                 );
                 bench_results.insert(target.to_string(), 0.0);
             } else {
@@ -369,14 +364,12 @@ fn handle_pgbench_result(
                 parse_tps(&result.output).or_else(|| parse_progress_tps(&result.output))
             {
                 eprintln!(
-                    "\x1b[1;33m⚠ TPS for {} (from progress, timed out): {:.2}\x1b[0m",
-                    target, tps
+                    "\x1b[1;33m⚠ TPS for {target} (from progress, timed out): {tps:.2}\x1b[0m"
                 );
                 bench_results.insert(target.to_string(), tps);
             } else {
                 eprintln!(
-                    "\x1b[1;31m✗ TPS for {}: 0.00 (timed out, no progress data)\x1b[0m",
-                    target
+                    "\x1b[1;31m✗ TPS for {target}: 0.00 (timed out, no progress data)\x1b[0m"
                 );
                 bench_results.insert(target.to_string(), 0.0);
             }
@@ -411,7 +404,7 @@ pub async fn run_pgbench_for_target(world: &mut DoormanWorld, target: String, st
 
     let command = world.replace_placeholders(&command);
 
-    eprintln!("Running pgbench for {}: {}", target, command);
+    eprintln!("Running pgbench for {target}: {command}");
 
     let result = run_pgbench(&command, &target, Duration::from_secs(PGBENCH_TIMEOUT_SECS));
     handle_pgbench_result(
@@ -438,9 +431,9 @@ pub async fn run_pgbench_for_target_inline(
     let options = world.replace_placeholders(&options);
 
     // Build the full pgbench command
-    let command = format!("pgbench {}", options);
+    let command = format!("pgbench {options}");
 
-    eprintln!("Running pgbench for {}: {}", target, command);
+    eprintln!("Running pgbench for {target}: {command}");
 
     let result = run_pgbench(&command, &target, Duration::from_secs(PGBENCH_TIMEOUT_SECS));
     handle_pgbench_result(
@@ -468,9 +461,9 @@ pub async fn run_pgbench_for_target_with_env(
     let options = world.replace_placeholders(&options);
 
     // Build the full pgbench command with env prefix
-    let command = format!("{} pgbench {}", env_vars, options);
+    let command = format!("{env_vars} pgbench {options}");
 
-    eprintln!("Running pgbench for {}: {}", target, command);
+    eprintln!("Running pgbench for {target}: {command}");
 
     let result = run_pgbench(&command, &target, Duration::from_secs(PGBENCH_TIMEOUT_SECS));
     handle_pgbench_result(
@@ -508,16 +501,10 @@ pub async fn run_pgbench_with_script(
     let (env_prefix, pgbench_options) = extract_env_prefix(&options);
 
     // Build the pgbench command with -f option
-    let command = format!(
-        "{}pgbench -f {} {}",
-        env_prefix, script_path, pgbench_options
-    );
+    let command = format!("{env_prefix}pgbench -f {script_path} {pgbench_options}");
 
-    eprintln!(
-        "Running pgbench for {} with script file: {}",
-        target, command
-    );
-    eprintln!("Script content:\n{}", script_content);
+    eprintln!("Running pgbench for {target} with script file: {command}");
+    eprintln!("Script content:\n{script_content}");
 
     let result = run_pgbench(&command, &target, Duration::from_secs(PGBENCH_TIMEOUT_SECS));
     handle_pgbench_result(
@@ -574,20 +561,19 @@ pub async fn print_benchmark_results(world: &mut DoormanWorld) {
     let client_counts = ["c1", "c10", "c50", "c100", "c200"];
 
     for client_count in &client_counts {
-        let baseline_key = format!("postgresql_{}", client_count);
+        let baseline_key = format!("postgresql_{client_count}");
         let baseline_tps = world.bench_results.get(&baseline_key).copied();
 
         eprintln!("\n--- {} clients ---", &client_count[1..]); // Remove 'c' prefix for display
 
         // Print baseline first
         if let Some(tps) = baseline_tps {
-            eprintln!("  postgresql: {:.2} tps (baseline)", tps);
+            eprintln!("  postgresql: {tps:.2} tps (baseline)");
         }
 
         // Print other results for this client count
         for (target, tps) in &world.bench_results {
-            if target.ends_with(&format!("_{}", client_count)) && !target.starts_with("postgresql_")
-            {
+            if target.ends_with(&format!("_{client_count}")) && !target.starts_with("postgresql_") {
                 let latency_info = world
                     .bench_latency
                     .get(target)
@@ -603,15 +589,14 @@ pub async fn print_benchmark_results(world: &mut DoormanWorld) {
                     if baseline > 0.0 {
                         let normalized = tps / baseline;
                         let pooler_name = target
-                            .strip_suffix(&format!("_{}", client_count))
+                            .strip_suffix(&format!("_{client_count}"))
                             .unwrap_or(target);
                         eprintln!(
-                            "  {}: {:.2} tps (normalized: {:.4}x){}",
-                            pooler_name, tps, normalized, latency_info
+                            "  {pooler_name}: {tps:.2} tps (normalized: {normalized:.4}x){latency_info}"
                         );
                     }
                 } else {
-                    eprintln!("  {}: {:.2} tps{}", target, tps, latency_info);
+                    eprintln!("  {target}: {tps:.2} tps{latency_info}");
                 }
             }
         }
@@ -639,14 +624,14 @@ pub async fn generate_benchmark_markdown_table(world: &mut DoormanWorld) {
                     "≈0%".to_string()
                 } else if percent > 100.0 {
                     // More than 2x faster - show as multiplier
-                    format!("x{:.1}", ratio)
+                    format!("x{ratio:.1}")
                 } else if percent < -50.0 {
                     // More than 2x slower - show as multiplier
-                    format!("x{:.1}", ratio)
+                    format!("x{ratio:.1}")
                 } else if percent > 0.0 {
-                    format!("+{:.0}%", percent)
+                    format!("+{percent:.0}%")
                 } else {
-                    format!("{:.0}%", percent)
+                    format!("{percent:.0}%")
                 }
             }
             Some(_) if doorman > 0.0 => "∞".to_string(), // competitor failed, pg_doorman wins
@@ -664,9 +649,9 @@ pub async fn generate_benchmark_markdown_table(world: &mut DoormanWorld) {
         rows.push("|------|--------------|------------|".to_string());
 
         for (suffix, display_name) in configs {
-            let doorman_key = format!("pg_doorman_{}", suffix);
-            let pgbouncer_key = format!("pgbouncer_{}", suffix);
-            let odyssey_key = format!("odyssey_{}", suffix);
+            let doorman_key = format!("pg_doorman_{suffix}");
+            let pgbouncer_key = format!("pgbouncer_{suffix}");
+            let odyssey_key = format!("odyssey_{suffix}");
 
             let doorman_tps = results.get(&doorman_key).copied();
             let pgbouncer_tps = results.get(&pgbouncer_key).copied();
@@ -774,12 +759,12 @@ pub async fn generate_benchmark_markdown_table(world: &mut DoormanWorld) {
             };
 
             for (suffix, display_name) in configs {
-                let doorman_key = format!("pg_doorman_{}", suffix);
+                let doorman_key = format!("pg_doorman_{suffix}");
                 if !latency.contains_key(&doorman_key) {
                     continue;
                 }
-                let pgbouncer_key = format!("pgbouncer_{}", suffix);
-                let odyssey_key = format!("odyssey_{}", suffix);
+                let pgbouncer_key = format!("pgbouncer_{suffix}");
+                let odyssey_key = format!("odyssey_{suffix}");
 
                 rows.push(format!(
                     "| {} | {} | {} | {} |",
@@ -818,18 +803,16 @@ pub async fn generate_benchmark_markdown_table(world: &mut DoormanWorld) {
         let vcpu = cpu.parse::<f64>().unwrap_or(0.0) / 1024.0;
         let gb = mem.parse::<f64>().unwrap_or(0.0) / 1024.0;
         env_info.push(format!(
-            "- **Instance**: AWS Fargate ({:.0} vCPU, {:.0} GB RAM)",
-            vcpu, gb
+            "- **Instance**: AWS Fargate ({vcpu:.0} vCPU, {gb:.0} GB RAM)"
         ));
     }
 
     env_info.push(format!(
-        "- **Workers**: pg_doorman: {}, odyssey: {}",
-        doorman_workers, odyssey_workers
+        "- **Workers**: pg_doorman: {doorman_workers}, odyssey: {odyssey_workers}"
     ));
 
     if let Some(jobs) = pgbench_jobs {
-        env_info.push(format!("- **pgbench jobs**: {} (global override)", jobs));
+        env_info.push(format!("- **pgbench jobs**: {jobs} (global override)"));
     } else {
         env_info.push(
             "- **pgbench jobs**: variable (c1: 1, c40: 4, c120: 4, c500: 4, c10k: 4)".to_string(),
@@ -932,17 +915,11 @@ Last updated: {}
     let file_path = "documentation/en/src/benchmarks.md";
     match std::fs::write(file_path, &full_markdown) {
         Ok(_) => {
-            eprintln!(
-                "\x1b[1;32m✓ Benchmark table written to {}\x1b[0m",
-                file_path
-            );
-            eprintln!("\n{}", header);
+            eprintln!("\x1b[1;32m✓ Benchmark table written to {file_path}\x1b[0m");
+            eprintln!("\n{header}");
         }
         Err(e) => {
-            eprintln!(
-                "\x1b[1;31m✗ Failed to write benchmark table to {}: {}\x1b[0m",
-                file_path, e
-            );
+            eprintln!("\x1b[1;31m✗ Failed to write benchmark table to {file_path}: {e}\x1b[0m");
         }
     }
 }

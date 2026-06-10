@@ -9,7 +9,7 @@ pub(crate) fn get_session<'a>(
 ) -> &'a mut PgConnection {
     named_sessions
         .get_mut(session_name)
-        .unwrap_or_else(|| panic!("Session '{}' not found", session_name))
+        .unwrap_or_else(|| panic!("Session '{session_name}' not found"))
 }
 
 pub(crate) fn single_char(value: &str, label: &str) -> char {
@@ -277,12 +277,12 @@ pub(crate) fn get_admin_response(
 ) -> String {
     let messages = session_messages
         .get(session_name)
-        .unwrap_or_else(|| panic!("No response stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No response stored for session '{session_name}'"));
 
     if let Some((_, data)) = messages.first() {
         String::from_utf8_lossy(data).to_string()
     } else {
-        panic!("No response content for session '{}'", session_name);
+        panic!("No response content for session '{session_name}'");
     }
 }
 
@@ -299,12 +299,7 @@ pub(crate) fn find_column_index(header_line: &str, column_name: &str) -> (usize,
     let idx = headers
         .iter()
         .position(|h| h.eq_ignore_ascii_case(column_name))
-        .unwrap_or_else(|| {
-            panic!(
-                "Column '{}' not found in headers: {:?}",
-                column_name, headers
-            )
-        });
+        .unwrap_or_else(|| panic!("Column '{column_name}' not found in headers: {headers:?}"));
 
     (idx, use_pipe)
 }
@@ -330,7 +325,7 @@ pub(crate) fn format_message_details(msg_type: char, data: &[u8]) -> String {
             // Authentication request
             if data.len() >= 4 {
                 let auth_type = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                details.push_str(&format!(" [AuthenticationRequest type={}]", auth_type));
+                details.push_str(&format!(" [AuthenticationRequest type={auth_type}]"));
             }
         }
         'S' => {
@@ -343,7 +338,7 @@ pub(crate) fn format_message_details(msg_type: char, data: &[u8]) -> String {
                         .next()
                         .unwrap_or(&[]),
                 );
-                details.push_str(&format!(" [ParameterStatus {}={}]", name, value));
+                details.push_str(&format!(" [ParameterStatus {name}={value}]"));
             }
         }
         'K' => {
@@ -351,7 +346,7 @@ pub(crate) fn format_message_details(msg_type: char, data: &[u8]) -> String {
             if data.len() >= 8 {
                 let pid = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 let key = i32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-                details.push_str(&format!(" [BackendKeyData pid={} key={}]", pid, key));
+                details.push_str(&format!(" [BackendKeyData pid={pid} key={key}]"));
             }
         }
         'Z' => {
@@ -363,28 +358,28 @@ pub(crate) fn format_message_details(msg_type: char, data: &[u8]) -> String {
                     b'E' => "FailedTransaction",
                     _ => "Unknown",
                 };
-                details.push_str(&format!(" [ReadyForQuery status={}]", status));
+                details.push_str(&format!(" [ReadyForQuery status={status}]"));
             }
         }
         'T' => {
             // RowDescription
             if data.len() >= 2 {
                 let field_count = i16::from_be_bytes([data[0], data[1]]);
-                details.push_str(&format!(" [RowDescription fields={}]", field_count));
+                details.push_str(&format!(" [RowDescription fields={field_count}]"));
             }
         }
         'D' => {
             // DataRow
             if data.len() >= 2 {
                 let field_count = i16::from_be_bytes([data[0], data[1]]);
-                details.push_str(&format!(" [DataRow fields={}]", field_count));
+                details.push_str(&format!(" [DataRow fields={field_count}]"));
             }
         }
         'C' => {
             // CommandComplete: tag\0
             if let Some(null_pos) = data.iter().position(|&b| b == 0) {
                 let tag = String::from_utf8_lossy(&data[..null_pos]);
-                details.push_str(&format!(" [CommandComplete tag='{}']", tag));
+                details.push_str(&format!(" [CommandComplete tag='{tag}']"));
             }
         }
         'E' => {
@@ -400,9 +395,9 @@ pub(crate) fn format_message_details(msg_type: char, data: &[u8]) -> String {
                 if let Some(null_pos) = data[pos..].iter().position(|&b| b == 0) {
                     let value = String::from_utf8_lossy(&data[pos..pos + null_pos]);
                     match field_type {
-                        'S' => details.push_str(&format!(" severity={}", value)),
-                        'C' => details.push_str(&format!(" code={}", value)),
-                        'M' => details.push_str(&format!(" message={}", value)),
+                        'S' => details.push_str(&format!(" severity={value}")),
+                        'C' => details.push_str(&format!(" code={value}")),
+                        'M' => details.push_str(&format!(" message={value}")),
                         _ => {}
                     }
                     pos += null_pos + 1;
@@ -425,9 +420,9 @@ pub(crate) fn format_message_details(msg_type: char, data: &[u8]) -> String {
                 if let Some(null_pos) = data[pos..].iter().position(|&b| b == 0) {
                     let value = String::from_utf8_lossy(&data[pos..pos + null_pos]);
                     match field_type {
-                        'S' => details.push_str(&format!(" severity={}", value)),
-                        'C' => details.push_str(&format!(" code={}", value)),
-                        'M' => details.push_str(&format!(" message={}", value)),
+                        'S' => details.push_str(&format!(" severity={value}")),
+                        'C' => details.push_str(&format!(" code={value}")),
+                        'M' => details.push_str(&format!(" message={value}")),
                         _ => {}
                     }
                     pos += null_pos + 1;
@@ -449,7 +444,7 @@ pub(crate) fn format_message_details(msg_type: char, data: &[u8]) -> String {
             // ParameterDescription
             if data.len() >= 2 {
                 let param_count = i16::from_be_bytes([data[0], data[1]]);
-                details.push_str(&format!(" [ParameterDescription params={}]", param_count));
+                details.push_str(&format!(" [ParameterDescription params={param_count}]"));
             }
         }
         'n' => {
@@ -465,7 +460,7 @@ pub(crate) fn format_message_details(msg_type: char, data: &[u8]) -> String {
             let preview_len = data.len().min(32);
             let hex_preview: String = data[..preview_len]
                 .iter()
-                .map(|b| format!("{:02x}", b))
+                .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
             details.push_str(&format!(

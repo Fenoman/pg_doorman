@@ -11,10 +11,7 @@ pub async fn read_bytes_from_session(world: &mut DoormanWorld, bytes: usize, ses
         .await
         .expect("Failed to read bytes from session");
 
-    eprintln!(
-        "Session '{}': read {} bytes (requested {})",
-        session_name, bytes_read, bytes
-    );
+    eprintln!("Session '{session_name}': read {bytes_read} bytes (requested {bytes})");
 }
 
 #[when(regex = r#"^we send SimpleQuery "([^"]+)" to session "([^"]+)" and verify no stale data$"#)]
@@ -59,10 +56,7 @@ pub async fn send_query_and_verify_no_stale_data(
             'E' => {
                 // Error - unexpected
                 let error_str = String::from_utf8_lossy(&data);
-                panic!(
-                    "Session '{}': received unexpected error: {}",
-                    session_name, error_str
-                );
+                panic!("Session '{session_name}': received unexpected error: {error_str}");
             }
             _ => {
                 // Other messages - store them
@@ -92,7 +86,7 @@ pub async fn verify_clean_response_with_marker(
     let messages = world
         .session_messages
         .get(&session_name)
-        .unwrap_or_else(|| panic!("No messages stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
 
     let data_content = if let Some((_, data)) = messages.first() {
         String::from_utf8_lossy(data).to_string()
@@ -104,10 +98,7 @@ pub async fn verify_clean_response_with_marker(
     // and no stale data (like 'X', 'A', 'B', 'C', 'T' repeated patterns from previous queries)
     assert!(
         data_content.contains(&expected_marker),
-        "Session '{}': expected response to contain marker '{}', got '{}'",
-        session_name,
-        expected_marker,
-        data_content
+        "Session '{session_name}': expected response to contain marker '{expected_marker}', got '{data_content}'"
     );
 
     // Check for stale data patterns (large repeated characters from previous queries)
@@ -122,10 +113,7 @@ pub async fn verify_clean_response_with_marker(
         );
     }
 
-    eprintln!(
-        "Session '{}': verified clean response with marker '{}'",
-        session_name, expected_marker
-    );
+    eprintln!("Session '{session_name}': verified clean response with marker '{expected_marker}'");
 }
 
 // =============================================================================
@@ -139,10 +127,7 @@ pub async fn send_sync_to_session_no_wait(world: &mut DoormanWorld, session_name
     let conn = super::helpers::get_session(&mut world.named_sessions, &session_name);
 
     conn.send_sync().await.expect("Failed to send Sync");
-    eprintln!(
-        "Session '{}': Sync sent (not waiting for response)",
-        session_name
-    );
+    eprintln!("Session '{session_name}': Sync sent (not waiting for response)");
 }
 
 /// Freeze PostgreSQL with SIGSTOP to block all I/O.
@@ -156,7 +141,7 @@ pub async fn freeze_postgres(world: &mut DoormanWorld) {
         .expect("PostgreSQL not started (no db_path)");
     let pid_file = db_path.join("postmaster.pid");
     let pid_content = std::fs::read_to_string(&pid_file)
-        .unwrap_or_else(|e| panic!("Failed to read postmaster.pid at {:?}: {}", pid_file, e));
+        .unwrap_or_else(|e| panic!("Failed to read postmaster.pid at {pid_file:?}: {e}"));
     let pid: i32 = pid_content
         .lines()
         .next()
@@ -168,10 +153,7 @@ pub async fn freeze_postgres(world: &mut DoormanWorld) {
     // Send SIGSTOP to ALL PostgreSQL processes: the postmaster and all backend
     // children. We use pgrep to find child processes because process group
     // signaling may not cover backends on all platforms.
-    eprintln!(
-        "Freezing PostgreSQL: finding all child processes of postmaster PID {}",
-        pid
-    );
+    eprintln!("Freezing PostgreSQL: finding all child processes of postmaster PID {pid}");
 
     // Find all child processes using pgrep (works on both Linux and macOS)
     let children = std::process::Command::new("pgrep")
@@ -190,7 +172,7 @@ pub async fn freeze_postgres(world: &mut DoormanWorld) {
 
     // SIGSTOP all processes (children first, then postmaster)
     for &p in stopped_pids.iter().rev() {
-        eprintln!("Sending SIGSTOP to PG process {}", p);
+        eprintln!("Sending SIGSTOP to PG process {p}");
         unsafe {
             libc::kill(p, libc::SIGSTOP);
         }
@@ -215,7 +197,7 @@ pub async fn unfreeze_postgres(world: &mut DoormanWorld) {
         .expect("PostgreSQL not started (no db_path)");
     let pid_file = db_path.join("postmaster.pid");
     let pid_content = std::fs::read_to_string(&pid_file)
-        .unwrap_or_else(|e| panic!("Failed to read postmaster.pid at {:?}: {}", pid_file, e));
+        .unwrap_or_else(|e| panic!("Failed to read postmaster.pid at {pid_file:?}: {e}"));
     let pid: i32 = pid_content
         .lines()
         .next()
@@ -241,7 +223,7 @@ pub async fn unfreeze_postgres(world: &mut DoormanWorld) {
 
     // SIGCONT all processes (postmaster first, then children)
     for &p in &pids {
-        eprintln!("Sending SIGCONT to PG process {}", p);
+        eprintln!("Sending SIGCONT to PG process {p}");
         unsafe {
             libc::kill(p, libc::SIGCONT);
         }
@@ -270,7 +252,7 @@ pub async fn send_large_parse_batch(
     let base_query = "SELECT 1";
     let padding_size = query_kb * 1024 - base_query.len() - 6; // 6 for "/* */"
     let padding: String = "x".repeat(padding_size);
-    let large_query = format!("{}/* {} */", base_query, padding);
+    let large_query = format!("{base_query}/* {padding} */");
 
     eprintln!(
         "Sending {} Parse messages (~{}KB each, ~{}MB total) to session '{}'",
@@ -281,17 +263,14 @@ pub async fn send_large_parse_batch(
     );
 
     for i in 0..count {
-        let stmt_name = format!("flush_test_{}", i);
+        let stmt_name = format!("flush_test_{i}");
         if let Err(e) = conn.send_parse(&stmt_name, &large_query).await {
-            eprintln!(
-                "Write failed at message {} (expected after buffer fills): {}",
-                i, e
-            );
+            eprintln!("Write failed at message {i} (expected after buffer fills): {e}");
             break;
         }
     }
 
-    eprintln!("Finished sending batch to session '{}'", session_name);
+    eprintln!("Finished sending batch to session '{session_name}'");
 }
 
 /// Send a large SimpleQuery to a session to fill TCP send buffers.
@@ -311,18 +290,12 @@ pub async fn send_large_simple_query_no_wait(
     let base_query = "SELECT 1";
     let padding_size = size_kb * 1024 - base_query.len() - 6; // 6 for "/* */"
     let padding: String = "x".repeat(padding_size);
-    let large_query = format!("{}/* {} */", base_query, padding);
+    let large_query = format!("{base_query}/* {padding} */");
 
-    eprintln!(
-        "Sending large SimpleQuery (~{}KB) to session '{}'",
-        size_kb, session_name
-    );
+    eprintln!("Sending large SimpleQuery (~{size_kb}KB) to session '{session_name}'");
 
     if let Err(e) = conn.send_simple_query(&large_query).await {
-        eprintln!(
-            "Write failed for large SimpleQuery (expected after buffer fills): {}",
-            e
-        );
+        eprintln!("Write failed for large SimpleQuery (expected after buffer fills): {e}");
     }
 }
 
@@ -352,7 +325,7 @@ pub async fn verify_error_response_on_flush_timeout(
         match tokio::time::timeout(std::time::Duration::from_secs(2), conn.read_message()).await {
             Ok(Ok((msg_type, data))) => {
                 let desc = format!("type='{}' len={}", msg_type, data.len());
-                eprintln!("Session '{}': received message {}", session_name, desc);
+                eprintln!("Session '{session_name}': received message {desc}");
                 messages_received.push((msg_type, data));
 
                 if msg_type == 'E' {
@@ -366,18 +339,14 @@ pub async fn verify_error_response_on_flush_timeout(
             Ok(Err(e)) => {
                 // Connection error (EOF, reset, etc.)
                 eprintln!(
-                    "Session '{}': connection error (this is the bug - no ErrorResponse sent): {}",
-                    session_name, e
+                    "Session '{session_name}': connection error (this is the bug - no ErrorResponse sent): {e}"
                 );
                 got_eof = true;
                 break;
             }
             Err(_) => {
                 // Timeout - no more messages
-                eprintln!(
-                    "Session '{}': read timeout (no more messages)",
-                    session_name
-                );
+                eprintln!("Session '{session_name}': read timeout (no more messages)");
                 break;
             }
         }
@@ -403,10 +372,7 @@ pub async fn verify_error_response_on_flush_timeout(
         }
     );
 
-    eprintln!(
-        "Session '{}': correctly received ErrorResponse on flush timeout",
-        session_name
-    );
+    eprintln!("Session '{session_name}': correctly received ErrorResponse on flush timeout");
 }
 
 /// Assert that the session received an ErrorResponse with the given SQLSTATE.
@@ -451,14 +417,12 @@ pub async fn verify_error_response_with_sqlstate(
 
     let got = got_error.unwrap_or_else(|| {
         panic!(
-            "Session '{}': expected ErrorResponse with SQLSTATE '{}' but no ErrorResponse received",
-            session_name, expected_sqlstate
+            "Session '{session_name}': expected ErrorResponse with SQLSTATE '{expected_sqlstate}' but no ErrorResponse received"
         )
     });
     assert_eq!(
         got, expected_sqlstate,
-        "Session '{}': SQLSTATE mismatch (expected '{}', got '{}')",
-        session_name, expected_sqlstate, got
+        "Session '{session_name}': SQLSTATE mismatch (expected '{expected_sqlstate}', got '{got}')"
     );
 }
 
@@ -554,11 +518,11 @@ pub async fn truncate_postgres_log(world: &mut DoormanWorld) {
     let path = pg_log_path(world);
     // Ignore NotFound: if the log does not exist yet there is nothing to truncate.
     match std::fs::File::create(&path) {
-        Ok(_) => eprintln!("Truncated PostgreSQL log at {:?}", path),
+        Ok(_) => eprintln!("Truncated PostgreSQL log at {path:?}"),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("PostgreSQL log at {:?} does not exist yet, skipping", path)
+            eprintln!("PostgreSQL log at {path:?} does not exist yet, skipping")
         }
-        Err(err) => panic!("Failed to truncate PostgreSQL log at {:?}: {}", path, err),
+        Err(err) => panic!("Failed to truncate PostgreSQL log at {path:?}: {err}"),
     }
 }
 

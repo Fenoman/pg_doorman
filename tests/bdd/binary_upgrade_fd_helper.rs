@@ -35,7 +35,7 @@ fn captured_pid(world: &DoormanWorld, name: &str) -> u32 {
 
 fn store_inventory_counters(world: &mut DoormanWorld, key: &str, inv: &FdInventory) {
     let summary_line = summary(inv);
-    info!("[binary-upgrade-fd] capture '{}': {}", key, summary_line);
+    info!("[binary-upgrade-fd] capture '{key}': {summary_line}");
     world
         .vars
         .insert(format!("{key}_summary"), summary_line.clone());
@@ -225,10 +225,7 @@ pub async fn stored_pids_differ(world: &mut DoormanWorld, a: String, b: String) 
 #[when(regex = r#"^we send SIGUSR2 to pg_doorman process at stored PID "([^"]+)"$"#)]
 pub async fn send_sigusr2_to_stored_pid(world: &mut DoormanWorld, name: String) {
     let pid = captured_pid(world, &name);
-    info!(
-        "[binary-upgrade-fd] sending SIGUSR2 to stored PID '{}' = {}",
-        name, pid
-    );
+    info!("[binary-upgrade-fd] sending SIGUSR2 to stored PID '{name}' = {pid}");
     // SAFETY: kill(2) with a non-zero pid signals that process id.
     // The scenario stores this PID immediately after external listener discovery.
     let rc = unsafe { libc::kill(pid as i32, libc::SIGUSR2) };

@@ -286,7 +286,7 @@ impl DoormanWorld {
 
         // Replace dynamic variables from self.vars (e.g., extracted password hashes)
         for (key, value) in &self.vars {
-            result = result.replace(&format!("${{{}}}", key), value);
+            result = result.replace(&format!("${{{key}}}"), value);
         }
 
         result

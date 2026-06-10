@@ -33,7 +33,7 @@ use tokio::time::sleep;
 #[given(regex = r"^we start hung TCP listener as '(.+)'$")]
 pub async fn start_hung_tcp_listener(world: &mut DoormanWorld, name: String) {
     let port = portpicker::pick_unused_port().expect("no free ports");
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
         .expect("failed to bind hung TCP listener");
     tokio::spawn(async move {
@@ -165,7 +165,7 @@ pub async fn pg_doorman_log_matches(world: &mut DoormanWorld, pattern: String) {
         .as_ref()
         .expect("log capture not enabled — add `Given pg_doorman log capture enabled`");
     let body = std::fs::read_to_string(path).expect("failed to read doorman log file");
-    let re = regex::Regex::new(&format!("(?m){}", pattern))
+    let re = regex::Regex::new(&format!("(?m){pattern}"))
         .unwrap_or_else(|e| panic!("invalid regex {pattern:?}: {e}"));
     assert!(
         re.is_match(&body),

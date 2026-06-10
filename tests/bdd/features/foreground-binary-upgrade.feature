@@ -125,6 +125,41 @@ Feature: Foreground mode binary upgrade
     When we create session "after_upgrade" to pg_doorman as "example_user_1" with password "" and database "example_db"
     Then session "after_upgrade" should be connected
 
+  @unix-socket-upgrade
+  Scenario: SIGUSR2 foreground binary upgrade preserves configured Unix socket
+    Given pg_doorman hba file contains:
+      """
+      local all all trust
+      host all all 0.0.0.0/0 trust
+      """
+    And pg_doorman started with config:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+      pool_mode = "transaction"
+      unix_socket_dir = "${PG_TEMP_DIR}"
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = ""
+      pool_size = 1
+      """
+    When we sleep 1000ms
+    Then psql query "SELECT 1" via pg_doorman unix socket as user "example_user_1" to database "example_db" returns "1"
+    When we store foreground pg_doorman PID as "original"
+    And we send SIGUSR2 to foreground pg_doorman
+    And we wait for foreground binary upgrade to complete
+    Then foreground pg_doorman PID should be different from stored "original"
+    And psql query "SELECT 2" via pg_doorman unix socket as user "example_user_1" to database "example_db" returns "2"
+
   @grac-shutdown-debug
   Scenario: Graceful shutdown rejects new queries after transaction completes
     Given pg_doorman shutdown-only mode

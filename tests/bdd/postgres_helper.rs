@@ -1,6 +1,6 @@
 use crate::utils::is_root;
 use crate::world::DoormanWorld;
-use cucumber::{gherkin::Step, given, then};
+use cucumber::{gherkin::Step, given, then, when};
 use portpicker::pick_unused_port;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -12,6 +12,29 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
+/// Fallback definition of `public.pgv_free()` for PostgreSQL instances that
+/// do not have the `pg_variables` extension available (vanilla pgcr installs,
+/// CI images, etc.). The iServ-compatible `release_query`
+/// (`pg_advisory_unlock_all() + pgv_free()`) panics on a missing function and
+/// would mark every test backend bad - making the entire `release-query.feature`
+/// suite red on machines without `pg_variables`. The no-op shim keeps the SQL
+/// well-formed without changing the contract.
+const PGV_FREE_FALLBACK_SQL: &str = r#"
+DO $pg_doorman$
+BEGIN
+    IF to_regprocedure('public.pgv_free()') IS NULL THEN
+        CREATE FUNCTION public.pgv_free()
+        RETURNS void
+        LANGUAGE plpgsql
+        AS $pgv$
+        BEGIN
+        END;
+        $pgv$;
+    END IF;
+END
+$pg_doorman$;
+"#;
+
 /// Build a PostgreSQL command, running as postgres user if we are root
 fn pg_command_builder(cmd: &str, args: &[&str]) -> Command {
     if is_root() {
@@ -22,6 +45,100 @@ fn pg_command_builder(cmd: &str, args: &[&str]) -> Command {
         let mut command = Command::new(cmd);
         command.args(args);
         command
+    }
+}
+
+/// Shortcut for `psql -h 127.0.0.1 -p <port> -U postgres -d <database>` with the
+/// caller-supplied extra args. Captures stdout/stderr so the iServ helpers below
+/// can pretty-print failures.
+fn run_psql(port: u16, database: &str, args: &[&str]) -> std::process::Output {
+    let port = port.to_string();
+    let mut command = pg_command_builder("psql", &[]);
+    command
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port,
+            "-U",
+            "postgres",
+            "-d",
+            database,
+        ])
+        .args(args)
+        .output()
+        .expect("Failed to run psql")
+}
+
+/// True if `database` exists on the running test PostgreSQL instance.
+fn database_exists(port: u16, database: &str) -> bool {
+    let output = run_psql(
+        port,
+        "postgres",
+        &[
+            "-XAtq",
+            "-c",
+            &format!("SELECT 1 FROM pg_database WHERE datname = '{database}'"),
+        ],
+    );
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+}
+
+/// Make `public.pgv_free()` resolvable on `database`. If the `pg_variables`
+/// extension is available, install it (real function); otherwise install the
+/// `PGV_FREE_FALLBACK_SQL` no-op shim. Panics on SQL failure to fail tests fast
+/// instead of letting the rest of the scenario time out with cryptic errors.
+fn ensure_pgv_free_available(port: u16, database: &str) {
+    let available = run_psql(
+        port,
+        database,
+        &[
+            "-XAtq",
+            "-c",
+            "SELECT 1 FROM pg_available_extensions WHERE name = 'pg_variables'",
+        ],
+    );
+    if !available.status.success() {
+        eprintln!(
+            "pg_available_extensions check failed for database {database}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&available.stdout),
+            String::from_utf8_lossy(&available.stderr)
+        );
+        panic!("Failed to check pg_variables availability");
+    }
+
+    let sql = if String::from_utf8_lossy(&available.stdout).trim() == "1" {
+        "CREATE EXTENSION IF NOT EXISTS pg_variables"
+    } else {
+        PGV_FREE_FALLBACK_SQL
+    };
+    let create = run_psql(port, database, &["-v", "ON_ERROR_STOP=1", "-c", sql]);
+    if !create.status.success() {
+        eprintln!(
+            "pgv_free setup failed for database {database}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&create.stdout),
+            String::from_utf8_lossy(&create.stderr)
+        );
+        panic!("Failed to make public.pgv_free() available");
+    }
+
+    let verify = run_psql(
+        port,
+        database,
+        &[
+            "-XAtq",
+            "-c",
+            "SELECT to_regprocedure('public.pgv_free()') IS NOT NULL",
+        ],
+    );
+    let verified = verify.status.success() && String::from_utf8_lossy(&verify.stdout).trim() == "t";
+    if !verified {
+        eprintln!(
+            "pgv_free verification failed for database {database}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&verify.stdout),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        panic!("public.pgv_free() is not available");
     }
 }
 
@@ -77,7 +194,7 @@ fn stream_log_file(log_path: PathBuf) -> Arc<AtomicBool> {
                     }
                 }
                 Ok(_) => {
-                    eprint!("[PG_LOG] {}", line);
+                    eprint!("[PG_LOG] {line}");
                 }
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -136,7 +253,7 @@ pub async fn start_postgres(world: &mut DoormanWorld) {
             "-D",
             db_path.to_str().unwrap(),
             "-o",
-            &format!("-p {} -F -k {}", port, socket_dir),
+            &format!("-p {port} -F -k {socket_dir}"),
             "start",
         ],
     )
@@ -161,7 +278,7 @@ pub async fn start_postgres(world: &mut DoormanWorld) {
             "-l",
             log_path.to_str().unwrap(),
             "-o",
-            &format!("-p {} -F -k {}", port, socket_dir),
+            &format!("-p {port} -F -k {socket_dir}"),
             "start",
         ],
     )
@@ -198,7 +315,7 @@ pub async fn start_postgres(world: &mut DoormanWorld) {
 
     if !success {
         if let Ok(log_content) = std::fs::read_to_string(&log_path) {
-            eprintln!("Postgres log:\n{}", log_content);
+            eprintln!("Postgres log:\n{log_content}");
         }
         // Try one more time with psql just to be sure
         let check_psql = pg_command_builder(
@@ -223,6 +340,10 @@ pub async fn start_postgres(world: &mut DoormanWorld) {
         }
     }
     assert!(success, "Postgres failed to start");
+
+    // Make `public.pgv_free()` resolvable so the iServ-compatible release_query
+    // default works on machines without `pg_variables`.
+    ensure_pgv_free_available(port, "postgres");
 
     world.pg_tmp_dir = Some(tmp_dir);
     world.pg_port = Some(port);
@@ -252,7 +373,15 @@ pub async fn apply_fixtures(world: &mut DoormanWorld, file_path: String) {
     if !output.status.success() {
         eprintln!("psql stdout:\n{}", String::from_utf8_lossy(&output.stdout));
         eprintln!("psql stderr:\n{}", String::from_utf8_lossy(&output.stderr));
-        panic!("Failed to apply fixtures from {}", file_path);
+        panic!("Failed to apply fixtures from {file_path}");
+    }
+
+    // Re-install the pgv_free shim on both the default database and any
+    // `example_db` that fixtures might have just created. The iServ-compatible
+    // release_query references `public.pgv_free()` per-database, not globally.
+    ensure_pgv_free_available(port, "postgres");
+    if database_exists(port, "example_db") {
+        ensure_pgv_free_available(port, "example_db");
     }
 }
 
@@ -327,9 +456,9 @@ async fn start_postgres_internal(world: &mut DoormanWorld, hba_content: &str, ex
 
     // Build pg_ctl options with extra options if provided
     let pg_options = if extra_options.is_empty() {
-        format!("-p {} -F -k {}", port, socket_dir)
+        format!("-p {port} -F -k {socket_dir}")
     } else {
-        format!("-p {} -F -k {} {}", port, socket_dir, extra_options)
+        format!("-p {port} -F -k {socket_dir} {extra_options}")
     };
 
     // pg_ctl start (suppress output, logs go to pg.log)
@@ -387,7 +516,7 @@ async fn start_postgres_internal(world: &mut DoormanWorld, hba_content: &str, ex
 
     if !success {
         if let Ok(log_content) = std::fs::read_to_string(&log_path) {
-            eprintln!("Postgres log:\n{}", log_content);
+            eprintln!("Postgres log:\n{log_content}");
         }
         // Try one more time with psql just to be sure
         let check_psql = pg_command_builder(
@@ -412,6 +541,11 @@ async fn start_postgres_internal(world: &mut DoormanWorld, hba_content: &str, ex
         }
     }
     assert!(success, "Postgres failed to start");
+
+    // Same pgv_free pre-flight as the plain start_postgres path - fixtures
+    // typically run on the default database and any `example_db` they create
+    // is dealt with in `apply_fixtures`.
+    ensure_pgv_free_available(port, "postgres");
 
     world.pg_tmp_dir = Some(tmp_dir);
     world.pg_port = Some(port);
@@ -508,9 +642,7 @@ pub async fn psql_connection_fails(
         .expect("Failed to run psql");
     assert!(
         !status.success(),
-        "psql connection should have failed (user: {}, database: {})",
-        user,
-        database
+        "psql connection should have failed (user: {user}, database: {database})"
     );
 }
 
@@ -528,9 +660,7 @@ pub async fn psql_connection_without_password_succeeds(
         .expect("Failed to run psql");
     assert!(
         status.success(),
-        "psql without password failed (user: {}, database: {})",
-        user,
-        database
+        "psql without password failed (user: {user}, database: {database})"
     );
 }
 
@@ -550,9 +680,7 @@ pub async fn psql_connection_without_password_fails(
         .expect("Failed to run psql");
     assert!(
         !status.success(),
-        "psql without password should have failed (user: {}, database: {})",
-        user,
-        database
+        "psql without password should have failed (user: {user}, database: {database})"
     );
 }
 
@@ -576,9 +704,7 @@ pub async fn psql_query_fails(
         .expect("Failed to run psql");
     assert!(
         !status.success(),
-        "psql query should have failed (user: {}, database: {})",
-        user,
-        database
+        "psql query should have failed (user: {user}, database: {database})"
     );
 }
 
@@ -619,10 +745,7 @@ pub async fn psql_query_returns(
 #[given(expr = "password hash for PG user {string} is stored as {string}")]
 pub async fn store_password_hash(world: &mut DoormanWorld, pg_user: String, var_name: String) {
     let port = world.pg_port.expect("PG not started");
-    let query = format!(
-        "SELECT rolpassword FROM pg_authid WHERE rolname = '{}'",
-        pg_user
-    );
+    let query = format!("SELECT rolpassword FROM pg_authid WHERE rolname = '{pg_user}'");
     let output = pg_command_builder(
         "psql",
         &[
@@ -653,8 +776,7 @@ pub async fn store_password_hash(world: &mut DoormanWorld, pg_user: String, var_
     let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert!(
         !hash.is_empty(),
-        "Password hash for user '{}' is empty — user may not exist",
-        pg_user
+        "Password hash for user '{pg_user}' is empty - user may not exist"
     );
 
     world.vars.insert(var_name, hash);
@@ -771,8 +893,7 @@ pub async fn psql_unix_query_returns(
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "psql unix query failed: stderr: {}",
-        stderr,
+        "psql unix query failed: stderr: {stderr}",
     );
     assert!(
         stdout.contains(&expected),
@@ -821,8 +942,7 @@ pub async fn psql_unix_query_with_password_returns(
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "psql unix query failed: stderr: {}",
-        stderr,
+        "psql unix query failed: stderr: {stderr}",
     );
     assert!(
         stdout.contains(&expected),
@@ -930,9 +1050,73 @@ pub async fn psql_unix_connection_fails_with(
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(&expected_error),
-        "expected stderr to contain '{}', got: {}",
-        expected_error,
-        stderr,
+        "expected stderr to contain '{expected_error}', got: {stderr}",
+    );
+}
+
+/// Restart the PostgreSQL instance that the BDD scenario already started.
+///
+/// Used by the dead-backend-detection scenario to simulate a real PostgreSQL
+/// restart: existing TCP-level backend connections held by pg_doorman become
+/// stale (the kernel closes them once the new postmaster comes up on the
+/// same port), and the iServ `evict_dead_backends` scan must notice and
+/// drop them so `replenish` can refill the pool.
+///
+/// Uses `pg_ctl restart -m fast` to drain the running instance gracefully
+/// and bring it back on the same data dir and port. Caller must have started
+/// PostgreSQL via `start_postgres` / `start_postgres_with_options_and_hba`
+/// first so `world.pg_db_path` is populated.
+#[when("PostgreSQL is restarted")]
+pub async fn restart_postgres(world: &mut DoormanWorld) {
+    let db_path = world
+        .pg_db_path
+        .clone()
+        .expect("PostgreSQL must be started before it can be restarted");
+    let port = world.pg_port.expect("pg_port not set");
+
+    let status = pg_command_builder(
+        "pg_ctl",
+        &[
+            "-D",
+            db_path.to_str().unwrap(),
+            "restart",
+            "-m",
+            "fast",
+            "-w",
+            "-t",
+            "30",
+        ],
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .expect("Failed to invoke pg_ctl restart");
+    assert!(
+        status.success(),
+        "pg_ctl restart returned non-zero status: {status:?}"
+    );
+
+    // Wait for the new postmaster to accept connections - `pg_ctl -w` already
+    // does that internally but we double-check with `pg_isready` to fail fast
+    // if the restart half-succeeded.
+    let mut ready = false;
+    for _ in 0..20 {
+        let check = pg_command_builder(
+            "pg_isready",
+            &["-p", &port.to_string(), "-h", "127.0.0.1", "-t", "1"],
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+        if matches!(check, Ok(s) if s.success()) {
+            ready = true;
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        ready,
+        "PostgreSQL did not become ready within 5s after restart on port {port}"
     );
 }
 

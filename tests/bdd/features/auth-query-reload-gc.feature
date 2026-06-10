@@ -145,8 +145,18 @@ Feature: Auth query RELOAD and idle pool GC
           server_port: ${PG_PORT}
           pool_mode: "transaction"
           users:
+            # Use an MD5 verifier (md5 + md5(password + username)) so the
+            # static auth method matches the pg_hba above (`host all all
+            # 127.0.0.1/32 md5`). A plain password here would make
+            # pg_doorman derive a SCRAM-SHA-256 verifier, then challenge
+            # the client with SCRAM, which pg_hba rejects with 28000.
+            # The dynamic-to-static promotion preserves the static entry, so
+            # this scenario must use an honest verifier for the static auth
+            # path instead of passing accidentally through auth_query.
+            #
+            # md5_verifier = md5("md5_pass" + "pt_md5_user") prefixed `md5`:
             - username: "pt_md5_user"
-              password: "md5_pass"
+              password: "md53888bcccb34c83e0129c32354510baa4"
               pool_size: 10
               server_username: "pt_md5_user"
               server_password: "md5_pass"
@@ -163,7 +173,7 @@ Feature: Auth query RELOAD and idle pool GC
     When we create admin session "adm1" to pg_doorman as "admin" with password "admin"
     And we execute "RELOAD" on admin session "adm1" and store response
     And we sleep for 500 milliseconds
-    # Connection should still work (via static user now)
+    # Connection should still work via the static user after demotion.
     Then psql query "SELECT current_user" via pg_doorman as user "pt_md5_user" to database "postgres" with password "md5_pass" returns "pt_md5_user"
 
   Scenario: Idle dynamic pool GC removes empty pools

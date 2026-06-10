@@ -96,6 +96,17 @@ Feature: Client session reset batch suppresses doorman-side cleanup
     Then PostgreSQL log should contain exactly 1 occurrences of "RESET ALL"
     And PostgreSQL log should contain "RESET ROLE"
 
+  @client-session-reset-cleanup-session-auth-reset-all
+  Scenario: RESET ALL after SET SESSION AUTHORIZATION still resets session authorization on checkin
+    When we create session "authz" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "SELECT 1" to session "authz"
+    And we sleep 100ms
+    When we truncate PostgreSQL log
+    And we send SimpleQuery "SET SESSION AUTHORIZATION example_user_2; RESET ALL" to session "authz"
+    And we sleep 300ms
+    Then PostgreSQL log should contain "RESET SESSION AUTHORIZATION"
+    And PostgreSQL log should contain "RESET ROLE"
+
   @client-session-reset-cleanup-discard-all
   Scenario: DISCARD ALL after SET suppresses doorman-side cleanup (session mode)
     # DISCARD ALL cannot run inside an implicit transaction block, so it has to
@@ -139,23 +150,22 @@ Feature: Client session reset batch suppresses doorman-side cleanup
     And PostgreSQL log should not contain "RESET ROLE"
 
   @client-session-reset-cleanup-per-guc-reset
-  Scenario: Per-GUC RESET disarms set-cleanup
-    # PostgreSQL returns the same `RESET` tag for `RESET ALL` and `RESET foo`,
-    # so a per-GUC RESET after a SET on the same GUC leaves the session clean
-    # as far as pg_doorman is concerned. Documents the intentional trade-off:
-    # `SET a=1; SET b=2; RESET a;` would also be treated as clean, because
-    # pg_doorman only tracks a single cleanup bit and cannot distinguish which
-    # GUCs are still modified.
+  Scenario: Per-GUC RESET keeps set-cleanup armed
+    # PostgreSQL returns the same `RESET` tag for `RESET ALL` and `RESET foo`.
+    # A per-GUC reset cannot prove that every dirty GUC was restored; production
+    # clients also set `client.app_user`, so treating `RESET statement_timeout`
+    # as a full cleanup would leak audit context to the next checkout.
     When we create session "five" to pg_doorman as "example_user_1" with password "" and database "example_db_session"
     And we send SimpleQuery "SELECT 1" to session "five"
     And we sleep 100ms
     When we truncate PostgreSQL log
-    And we send SimpleQuery "SET statement_timeout = 1000" to session "five"
+    And we send SimpleQuery "SET client.app_user = 'u'; SET statement_timeout = 1000" to session "five"
     And we send SimpleQuery "RESET statement_timeout" to session "five"
     And we close session "five"
     And we sleep 300ms
     Then PostgreSQL log should contain "RESET statement_timeout"
-    And PostgreSQL log should not contain "RESET ROLE"
+    And PostgreSQL log should contain "RESET ROLE"
+    And PostgreSQL log should contain exactly 1 occurrences of "RESET ALL"
 
   @client-session-reset-cleanup-single-close-keeps-armed
   Scenario: Closing one named cursor does not disarm declare-cleanup

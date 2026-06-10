@@ -13,6 +13,7 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -97,7 +98,7 @@ public class Main {
                         try (Connection conn = dataSource.getConnection()) {
                             conn.setAutoCommit(false);
                             for (int round = 0; round < 15; round++) {
-                                barrier.await();
+                                barrier.await(30, TimeUnit.SECONDS);
 
                                 if (id % 3 == 0) {
                                     // Batch operations
@@ -536,7 +537,7 @@ public class Main {
                         try (Connection conn = dataSource.getConnection()) {
                             conn.setAutoCommit(false);
                             for (int round = 0; round < 20; round++) {
-                                barrier.await();
+                                barrier.await(30, TimeUnit.SECONDS);
 
                                 int pattern = (id + round) % 5;
 
