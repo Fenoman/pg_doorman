@@ -31,6 +31,7 @@ pub struct User {
     /// Per-user override of the pool-level `prewarm_query`. When `Some`, it
     /// replaces the pool's value entirely (even when set to `Some(String::new())`
     /// - i.e. an explicit empty string disables prewarm for this user only).
+    ///
     /// When `None`, the pool-level value is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewarm_query: Option<String>,
