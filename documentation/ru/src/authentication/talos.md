@@ -9,10 +9,10 @@ Talos — схема аутентификации на основе JWT, раз�
 1. Клиент подключается с именем пользователя `talos` и JWT в качестве пароля.
 2. pg_doorman читает поле `kid` из заголовка JWT и ищет соответствующий публичный ключ в `general.talos.keys`.
 3. Токен проверяется (RS256, `exp`, `nbf`).
-4. pg_doorman обходит ключи `resource_access`, разбивает каждый по `:` и сверяет часть **после двоеточия** с `general.talos.databases`. То есть ключ вида `"postgres.stg:billing"` совпадает с базой `billing`. Роли из всех совпавших записей собираются вместе; побеждает наивысшая (`owner` > `read_write` > `read_only`).
+4. pg_doorman строит точные разрешённые ключи `resource_access` из `general.talos.resource_prefixes` и запрошенной базы, затем принимает только эти ключи. Например, префикс `"postgres.stg"` и база `billing` принимают `"postgres.stg:billing"` и отвергают `"postgres.dev:billing"`. Роли из всех совпавших записей собираются вместе; побеждает наивысшая (`owner` > `read_write` > `read_only`).
 5. Соединение аутентифицируется против пользователя пула, имя которого совпадает с ролью: `owner`, `read_write` или `read_only`. Этот пользователь должен существовать в пуле с заданными `server_username` и `server_password`.
 
-Идентичность клиента (`clientId` из токена) сохраняется в `application_name` и audit logs.
+Идентичность клиента (`clientId` из токена) сохраняется в `application_name` и reviews.
 
 ## Конфигурация
 
@@ -27,6 +27,8 @@ general:
     databases:
       - "billing"
       - "inventory"
+    resource_prefixes:
+      - "postgres.stg"
 
 pools:
   billing:
@@ -50,7 +52,7 @@ pools:
 
 Имя файла каждого ключа без расширения (`abc123`, `def456`) — это `kid`, который сверяется с заголовком JWT.
 
-`databases` — фильтр: только перечисленные базы допускаются для Talos. Токен без записи для запрошенной базы будет отвергнут.
+`databases` - фильтр: только перечисленные базы допускаются для Talos. `resource_prefixes` ограничивает, какие Talos-ресурсы принимаются для этих баз. Токен без точной записи `resource_prefix:database` для запрошенной базы будет отвергнут.
 
 ## Структура токена
 
@@ -71,7 +73,7 @@ pools:
 }
 ```
 
-Ключи `resource_access` обязаны содержать двоеточие. pg_doorman игнорирует всё до него и сверяет суффикс с `general.talos.databases`. Токен, собранный без префикса с двоеточием, не даст ни одной роли, и аутентификация провалится с сообщением «Token may not contain valid roles for the requested databases».
+Ключи `resource_access` должны совпадать с одним из настроенных `resource_prefixes` плюс запрошенная база. pg_doorman не принимает совпадение только по суффиксу; токен для другого resource prefix не даст ни одной роли, и аутентификация провалится с сообщением «Token may not contain valid roles for the requested database».
 
 Клиент, подключающийся к `inventory` с этим токеном, попадает в пользователя `read_write` (максимум из двух перечисленных ролей).
 
