@@ -44,7 +44,7 @@ impl PatroniProxyWorld {
 
         // Replace mock Patroni server ports by index (e.g., ${PATRONI_PORT_0})
         for (i, port) in self.mock_patroni_ports.iter().enumerate() {
-            let placeholder = format!("${{PATRONI_PORT_{}}}", i);
+            let placeholder = format!("${{PATRONI_PORT_{i}}}");
             result = result.replace(&placeholder, &port.to_string());
         }
 

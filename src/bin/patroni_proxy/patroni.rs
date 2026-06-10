@@ -1,11 +1,26 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::fs;
 use std::time::{Duration, Instant};
+
+// parking_lot::RwLock has no lock poisoning: a panic while a guard is held
+// cannot permanently poison the lock and kill the single failover-tracking
+// update loop (std::sync::RwLock would panic on every later .read()/.write()
+// .unwrap() after a poison). It also returns the guard directly (no Result).
+use parking_lot::RwLock;
+
+use crate::config::TlsConfig;
+use bytes::{Bytes, BytesMut};
 
 /// HTTP request timeout for Patroni API
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum accepted Patroni /cluster response body size.
+const MAX_CLUSTER_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Maximum accepted Patroni members in one /cluster response.
+const MAX_CLUSTER_MEMBERS: usize = 1024;
 
 /// Duration in seconds for which a host stays in the blacklist (down upstreams)
 const BLACKLIST_DURATION_SECS: u64 = 10;
@@ -106,15 +121,33 @@ pub enum PatroniError {
     AllHostsUnavailable,
     /// Request timeout
     Timeout,
+    /// Patroni response body exceeds the configured cap
+    BodyTooLarge { limit: usize },
+    /// Patroni response contains too many members
+    TooManyMembers { count: usize, limit: usize },
+    /// The endpoint responded with a non-2xx HTTP status (carries the code).
+    /// This is transient (e.g. a healthy follower replying 503 during an
+    /// election); unlike connect/parse failures it must NOT blacklist the host.
+    ServerError(u16),
 }
 
 impl std::fmt::Display for PatroniError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PatroniError::HttpError(e) => write!(f, "HTTP error: {}", e),
-            PatroniError::ParseError(e) => write!(f, "Parse error: {}", e),
+            PatroniError::HttpError(e) => write!(f, "HTTP error: {e}"),
+            PatroniError::ParseError(e) => write!(f, "Parse error: {e}"),
             PatroniError::AllHostsUnavailable => write!(f, "All hosts unavailable"),
             PatroniError::Timeout => write!(f, "Request timeout"),
+            PatroniError::BodyTooLarge { limit } => {
+                write!(f, "Patroni /cluster response exceeds {limit} bytes")
+            }
+            PatroniError::TooManyMembers { count, limit } => write!(
+                f,
+                "Patroni /cluster response contains {count} members; limit is {limit}"
+            ),
+            PatroniError::ServerError(status) => {
+                write!(f, "Patroni endpoint returned HTTP {status}")
+            }
         }
     }
 }
@@ -152,7 +185,7 @@ impl HostBlacklist {
 
     /// Check if host is in the blacklist
     fn is_blacklisted(&self, host: &str) -> bool {
-        let entries = self.entries.read().unwrap();
+        let entries = self.entries.read();
         if let Some(added_at) = entries.get(host) {
             added_at.elapsed().as_secs() < BLACKLIST_DURATION_SECS
         } else {
@@ -162,19 +195,19 @@ impl HostBlacklist {
 
     /// Add host to the blacklist
     fn add(&self, host: &str) {
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write();
         entries.insert(host.to_string(), Instant::now());
     }
 
     /// Remove host from the blacklist (on successful connection)
     fn remove(&self, host: &str) {
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write();
         entries.remove(host);
     }
 
     /// Clean up expired entries
     fn cleanup(&self) {
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write();
         entries.retain(|_, added_at| added_at.elapsed().as_secs() < BLACKLIST_DURATION_SECS);
     }
 }
@@ -189,8 +222,45 @@ pub struct PatroniClient {
 
 impl PatroniClient {
     /// Create a new Patroni API client
-    pub fn new() -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
+    pub fn new() -> Result<Self, String> {
+        Self::new_with_tls(None)
+    }
+
+    /// Create a new Patroni API client with optional TLS settings from config.
+    pub fn new_with_tls(tls: Option<&TlsConfig>) -> Result<Self, String> {
+        let mut builder = reqwest::Client::builder().timeout(HTTP_TIMEOUT);
+
+        if let Some(tls) = tls {
+            if tls.skip_verify.unwrap_or(false) {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+
+            if let Some(ca_cert) = &tls.ca_cert {
+                let pem = fs::read(ca_cert)
+                    .map_err(|e| format!("failed to read Patroni TLS ca_cert {ca_cert}: {e}"))?;
+                let cert = reqwest::Certificate::from_pem(&pem)
+                    .map_err(|e| format!("invalid Patroni TLS ca_cert {ca_cert}: {e}"))?;
+                builder = builder.add_root_certificate(cert);
+            }
+
+            match (&tls.client_cert, &tls.client_key) {
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "Patroni TLS client_cert/client_key are not supported by this build"
+                            .to_string(),
+                    );
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(
+                        "Patroni TLS client_cert and client_key must be configured together"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        let client = builder.build().map_err(|e| e.to_string())?;
 
         Ok(Self {
             client,
@@ -205,8 +275,16 @@ impl PatroniClient {
     pub async fn fetch_cluster(&self, url: &str) -> Result<Cluster, PatroniError> {
         let cluster_url = format!("{}/cluster", url.trim_end_matches('/'));
         let response = self.client.get(&cluster_url).send().await?;
-        let cluster: Cluster = response.json().await?;
-        Ok(cluster)
+        // Check the HTTP status before parsing. A healthy follower can reply
+        // 503 during an election; that body is not JSON, and feeding it to
+        // serde_json would yield a ParseError that fetch_members blacklists for
+        // the full duration. Treat non-2xx as a transient ServerError instead
+        // (mirrors src/patroni/client.rs status().is_success() handling).
+        if !response.status().is_success() {
+            return Err(PatroniError::ServerError(response.status().as_u16()));
+        }
+        let body = read_limited_body(response).await?;
+        parse_cluster_body(&body)
     }
 
     /// Fetch cluster members by iterating through hosts
@@ -251,6 +329,17 @@ impl PatroniClient {
                     self.blacklist.remove(host);
                     return Ok(cluster.members);
                 }
+                // Transient non-2xx (e.g. a follower's 503 during an election):
+                // the endpoint is reachable but not currently serving the
+                // cluster view. Log and move on WITHOUT blacklisting, so we do
+                // not drop a healthy host for the full blacklist duration.
+                Err(PatroniError::ServerError(status)) => {
+                    tracing::warn!(
+                        "Patroni endpoint {} returned transient HTTP {}; not blacklisting",
+                        host,
+                        status
+                    );
+                }
                 Err(e) => {
                     // Add to blacklist
                     tracing::warn!("Failed to fetch cluster from {}: {}", host, e);
@@ -267,6 +356,14 @@ impl PatroniClient {
                         self.blacklist.remove(host);
                         return Ok(cluster.members);
                     }
+                    // Transient non-2xx: do not extend/refresh the blacklist.
+                    Err(PatroniError::ServerError(status)) => {
+                        tracing::warn!(
+                            "Patroni endpoint {} returned transient HTTP {}; not blacklisting",
+                            host,
+                            status
+                        );
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to fetch cluster from {}: {}", host, e);
                         self.blacklist.add(host);
@@ -277,6 +374,47 @@ impl PatroniClient {
 
         Err(PatroniError::AllHostsUnavailable)
     }
+}
+
+async fn read_limited_body(mut response: reqwest::Response) -> Result<Bytes, PatroniError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_CLUSTER_RESPONSE_BYTES as u64)
+    {
+        return Err(PatroniError::BodyTooLarge {
+            limit: MAX_CLUSTER_RESPONSE_BYTES,
+        });
+    }
+
+    let mut body = BytesMut::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_CLUSTER_RESPONSE_BYTES {
+            return Err(PatroniError::BodyTooLarge {
+                limit: MAX_CLUSTER_RESPONSE_BYTES,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body.freeze())
+}
+
+fn parse_cluster_body(body: &[u8]) -> Result<Cluster, PatroniError> {
+    if body.len() > MAX_CLUSTER_RESPONSE_BYTES {
+        return Err(PatroniError::BodyTooLarge {
+            limit: MAX_CLUSTER_RESPONSE_BYTES,
+        });
+    }
+
+    let cluster: Cluster = serde_json::from_slice(body)?;
+    if cluster.members.len() > MAX_CLUSTER_MEMBERS {
+        return Err(PatroniError::TooManyMembers {
+            count: cluster.members.len(),
+            limit: MAX_CLUSTER_MEMBERS,
+        });
+    }
+
+    Ok(cluster)
 }
 
 impl Default for PatroniClient {
@@ -385,6 +523,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_cluster_body_rejects_oversized_body_before_json() {
+        let body = vec![b' '; MAX_CLUSTER_RESPONSE_BYTES + 1];
+        let err = parse_cluster_body(&body).expect_err("oversized body must be rejected");
+
+        assert!(matches!(err, PatroniError::BodyTooLarge { .. }));
+    }
+
+    #[test]
+    fn parse_cluster_body_rejects_too_many_members() {
+        let member = r#"{
+            "name": "node",
+            "role": "replica",
+            "state": "running",
+            "api_url": "http://192.168.0.2:8008/patroni",
+            "host": "192.168.0.2",
+            "port": 5432,
+            "timeline": 1
+        }"#;
+        let members = vec![member; MAX_CLUSTER_MEMBERS + 1].join(",");
+        let body = format!(r#"{{"scope":"my_cluster","members":[{members}]}}"#);
+
+        let err = parse_cluster_body(body.as_bytes()).expect_err("oversized member list must fail");
+
+        assert!(matches!(err, PatroniError::TooManyMembers { .. }));
+    }
+
+    #[test]
     fn test_blacklist() {
         let blacklist = HostBlacklist::new();
 
@@ -395,5 +560,105 @@ mod tests {
 
         blacklist.remove("host1");
         assert!(!blacklist.is_blacklisted("host1"));
+    }
+
+    // guards HostBlacklist add/contains/remove/cleanup behavior across
+    // the std::sync::RwLock -> parking_lot::RwLock swap (parking_lot has no lock
+    // poisoning, so a panic-while-locked can no longer permanently kill the
+    // single failover-tracking update loop).
+    #[test]
+    fn host_blacklist_add_contains_remove_cleanup() {
+        let bl = HostBlacklist::new();
+
+        assert!(!bl.is_blacklisted("http://h1"));
+        bl.add("http://h1");
+        assert!(bl.is_blacklisted("http://h1"));
+
+        // A second host is tracked independently.
+        bl.add("http://h2");
+        assert!(bl.is_blacklisted("http://h2"));
+
+        // remove() clears only the named host.
+        bl.remove("http://h1");
+        assert!(!bl.is_blacklisted("http://h1"));
+        assert!(bl.is_blacklisted("http://h2"));
+
+        // cleanup() keeps still-fresh entries (well within BLACKLIST_DURATION_SECS).
+        bl.cleanup();
+        assert!(bl.is_blacklisted("http://h2"));
+    }
+
+    // a healthy follower returning 503 must surface as a transient
+    // ServerError, NOT a ParseError. Previously fetch_cluster never checked the
+    // HTTP status, so the non-JSON 503 body flowed into serde_json -> ParseError,
+    // which fetch_members blacklists for the full duration -- dropping a
+    // perfectly reachable endpoint.
+    #[tokio::test]
+    async fn fetch_cluster_returns_server_error_on_503() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let body = "503 Service Unavailable";
+            let resp = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let client = PatroniClient::new().unwrap();
+        let endpoint = format!("http://{addr}");
+        let err = client.fetch_cluster(&endpoint).await.unwrap_err();
+
+        assert!(
+            matches!(err, PatroniError::ServerError(503)),
+            "503 must be a transient ServerError(503), got {err:?}"
+        );
+        assert!(
+            !matches!(err, PatroniError::ParseError(_)),
+            "503 must not be misclassified as a parse failure"
+        );
+
+        let _ = server.await;
+    }
+
+    // A transient ServerError from one host must NOT add it to the blacklist.
+    #[tokio::test]
+    async fn fetch_members_does_not_blacklist_on_server_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let body = "503";
+            let resp = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let client = PatroniClient::new().unwrap();
+        let host = format!("http://{addr}");
+        let _ = client.fetch_members(std::slice::from_ref(&host)).await;
+
+        assert!(
+            !client.blacklist.is_blacklisted(&host),
+            "a transient 503 must not blacklist the endpoint"
+        );
+
+        let _ = server.await;
     }
 }
