@@ -22,7 +22,7 @@ pub async fn attempt_create_idle_sessions(
     database: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     let step_timeout = Duration::from_millis(2000);
 
@@ -110,7 +110,7 @@ pub async fn fresh_pg_session_succeeds(
     database: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
     let attempt_timeout = Duration::from_secs(3);
     let overall_budget = Duration::from_secs(20);
     let retry_delay = Duration::from_millis(250);
@@ -321,7 +321,7 @@ pub async fn create_named_session(
     database: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     // Connect to pg_doorman
     let mut conn = PgConnection::connect(&doorman_addr)
@@ -351,7 +351,7 @@ pub async fn create_named_session_with_startup_params(
     extras: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     let parsed: Vec<(String, String)> = extras
         .split(',')
@@ -394,10 +394,10 @@ pub async fn create_sessions_with_prefix(
     database: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     for idx in 1..=count {
-        let session_name = format!("{}{}", prefix, idx);
+        let session_name = format!("{prefix}{idx}");
         let mut conn = PgConnection::connect(&doorman_addr)
             .await
             .expect("Failed to connect to pg_doorman");
@@ -422,7 +422,7 @@ pub async fn create_tls_named_session(
     database: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     let mut conn = PgConnection::connect(&doorman_addr)
         .await
@@ -451,7 +451,7 @@ pub async fn create_named_session_to_postgres(
     database: String,
 ) {
     let pg_port = world.pg_port.expect("PostgreSQL not started");
-    let pg_addr = format!("127.0.0.1:{}", pg_port);
+    let pg_addr = format!("127.0.0.1:{pg_port}");
 
     let mut conn = PgConnection::connect(&pg_addr)
         .await
@@ -550,7 +550,7 @@ pub async fn send_simple_query_to_sessions_with_prefix_without_waiting(
     prefix: String,
 ) {
     for idx in 1..=count {
-        let session_name = format!("{}{}", prefix, idx);
+        let session_name = format!("{prefix}{idx}");
         let conn = super::helpers::get_session(&mut world.named_sessions, &session_name);
         conn.send_simple_query(&query)
             .await
@@ -569,7 +569,7 @@ pub async fn read_simple_query_response_within_timeout(
     let duration = std::time::Duration::from_millis(timeout_ms);
     let messages = tokio::time::timeout(duration, conn.read_all_messages_until_ready())
         .await
-        .unwrap_or_else(|_| panic!("Response not received within {}ms", timeout_ms))
+        .unwrap_or_else(|_| panic!("Response not received within {timeout_ms}ms"))
         .expect("Failed to read messages");
 
     world.session_messages.insert(session_name, messages);
@@ -658,21 +658,17 @@ pub async fn send_simple_query_to_session_expecting_connection_close(
         return;
     }
 
-    match conn.read_all_messages_until_ready().await {
-        Ok(messages) => {
-            let has_error = messages.iter().any(|(msg_type, _)| *msg_type == 'E');
-            if has_error {
-                world
-                    .session_messages
-                    .insert(session_name.clone(), messages);
-                return;
-            }
-            panic!(
-                "Expected connection close or error for session '{}', but got successful response",
-                session_name
-            );
+    if let Ok(messages) = conn.read_all_messages_until_ready().await {
+        let has_error = messages.iter().any(|(msg_type, _)| *msg_type == 'E');
+        if has_error {
+            world
+                .session_messages
+                .insert(session_name.clone(), messages);
+            return;
         }
-        Err(_) => {}
+        panic!(
+            "Expected connection close or error for session '{session_name}', but got successful response"
+        );
     }
 }
 
@@ -795,21 +791,23 @@ pub async fn send_sync_to_session(world: &mut DoormanWorld, session_name: String
 }
 
 #[when(regex = r#"^we close session "([^"]+)"$"#)]
+#[when(regex = r#"^we disconnect session "([^"]+)"$"#)]
+#[then(regex = r#"^we disconnect session "([^"]+)"$"#)]
 pub async fn close_session(world: &mut DoormanWorld, session_name: String) {
     world
         .named_sessions
         .remove(&session_name)
-        .unwrap_or_else(|| panic!("Session '{}' not found", session_name));
+        .unwrap_or_else(|| panic!("Session '{session_name}' not found"));
 }
 
 #[when(regex = r#"^we close (\d+) sessions with prefix "([^"]+)"$"#)]
 pub async fn close_sessions_with_prefix(world: &mut DoormanWorld, count: usize, prefix: String) {
     for idx in 1..=count {
-        let session_name = format!("{}{}", prefix, idx);
+        let session_name = format!("{prefix}{idx}");
         world
             .named_sessions
             .remove(&session_name)
-            .unwrap_or_else(|| panic!("Session '{}' not found", session_name));
+            .unwrap_or_else(|| panic!("Session '{session_name}' not found"));
     }
 }
 
@@ -818,7 +816,7 @@ pub async fn abort_session_tcp_connection(world: &mut DoormanWorld, session_name
     let conn = world
         .named_sessions
         .remove(&session_name)
-        .unwrap_or_else(|| panic!("Session '{}' not found", session_name));
+        .unwrap_or_else(|| panic!("Session '{session_name}' not found"));
 
     conn.abort_connection().await;
 }
@@ -828,7 +826,7 @@ pub async fn abort_session_tcp_connection_with_rst(world: &mut DoormanWorld, ses
     let conn = world
         .named_sessions
         .remove(&session_name)
-        .unwrap_or_else(|| panic!("Session '{}' not found", session_name));
+        .unwrap_or_else(|| panic!("Session '{session_name}' not found"));
 
     conn.abort_connection_with_rst().await;
 }
@@ -842,7 +840,7 @@ pub async fn session_should_receive_datarow(
     let messages = world
         .session_messages
         .get(&session_name)
-        .unwrap_or_else(|| panic!("No messages stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
 
     let mut found_value: Option<String> = None;
     for (msg_type, data) in messages {
@@ -866,17 +864,48 @@ pub async fn session_should_receive_datarow(
     }
 
     let actual_value = found_value.unwrap_or_else(|| {
-        panic!(
-            "No DataRow received from session '{}', expected '{}'",
-            session_name, expected_value
-        )
+        panic!("No DataRow received from session '{session_name}', expected '{expected_value}'")
     });
 
     assert_eq!(
         actual_value, expected_value,
-        "Session '{}': expected '{}', got '{}'",
-        session_name, expected_value, actual_value
+        "Session '{session_name}': expected '{expected_value}', got '{actual_value}'"
     );
+}
+
+#[then(regex = r#"^session "([^"]+)" should receive RowDescription with (\d+) fields$"#)]
+pub async fn session_should_receive_row_description_with_fields(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected_fields: u16,
+) {
+    let messages = world
+        .session_messages
+        .get(&session_name)
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
+
+    for (msg_type, data) in messages {
+        if *msg_type != 'T' {
+            continue;
+        }
+        assert!(
+            data.len() >= 2,
+            "RowDescription for session '{session_name}' is truncated: {data:?}"
+        );
+        let actual_fields = u16::from_be_bytes([data[0], data[1]]);
+        assert_eq!(
+            actual_fields, expected_fields,
+            "Session '{session_name}': expected RowDescription with {expected_fields} fields, got {actual_fields}"
+        );
+        return;
+    }
+
+    panic!("No RowDescription received from session '{session_name}'");
+}
+
+#[then(regex = r#"^session "([^"]+)" should receive DataRow$"#)]
+pub async fn session_should_receive_any_datarow(world: &mut DoormanWorld, session_name: String) {
+    expect_message_tag(world, &session_name, 'D', "DataRow", None);
 }
 
 #[then(regex = r#"^session "([^"]+)" should receive ParseComplete$"#)]
@@ -967,8 +996,7 @@ pub async fn session_should_receive_ready_for_query(
     assert_eq!(
         expected.len(),
         1,
-        "ReadyForQuery status must be a single byte ('I'/'T'/'E'), got {:?}",
-        expected_status
+        "ReadyForQuery status must be a single byte ('I'/'T'/'E'), got {expected_status:?}"
     );
     expect_message_tag(world, &session_name, 'Z', "ReadyForQuery", Some(expected));
 }
@@ -987,7 +1015,7 @@ fn expect_message_tag(
     let messages = world
         .session_messages
         .get(session_name)
-        .unwrap_or_else(|| panic!("No messages stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
 
     for (msg_type, data) in messages {
         if *msg_type != tag {
@@ -1022,7 +1050,7 @@ pub async fn session_should_receive_error_containing(
     let messages = world
         .session_messages
         .get(&session_name)
-        .unwrap_or_else(|| panic!("No messages stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
 
     let mut found_error: Option<String> = None;
     for (msg_type, data) in messages {
@@ -1035,8 +1063,7 @@ pub async fn session_should_receive_error_containing(
 
     let error_msg = found_error.unwrap_or_else(|| {
         panic!(
-            "No ErrorResponse received from session '{}', expected error containing '{}'",
-            session_name, expected_text
+            "No ErrorResponse received from session '{session_name}', expected error containing '{expected_text}'"
         )
     });
 
@@ -1044,10 +1071,7 @@ pub async fn session_should_receive_error_containing(
         error_msg
             .to_lowercase()
             .contains(&expected_text.to_lowercase()),
-        "Session '{}': expected error containing '{}', got '{}'",
-        session_name,
-        expected_text,
-        error_msg
+        "Session '{session_name}': expected error containing '{expected_text}', got '{error_msg}'"
     );
 }
 
@@ -1063,7 +1087,7 @@ pub async fn session_should_receive_error_containing_with_code(
     let messages = world
         .session_messages
         .get(&session_name)
-        .unwrap_or_else(|| panic!("No messages stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
 
     let mut found_error: Option<(String, String)> = None;
     for (msg_type, data) in messages {
@@ -1097,8 +1121,7 @@ pub async fn session_should_receive_error_containing_with_code(
 
     let (error_msg, error_code) = found_error.unwrap_or_else(|| {
         panic!(
-            "No ErrorResponse received from session '{}', expected error containing '{}' with code '{}'",
-            session_name, expected_text, expected_code
+            "No ErrorResponse received from session '{session_name}', expected error containing '{expected_text}' with code '{expected_code}'"
         )
     });
 
@@ -1106,16 +1129,12 @@ pub async fn session_should_receive_error_containing_with_code(
         error_msg
             .to_lowercase()
             .contains(&expected_text.to_lowercase()),
-        "Session '{}': expected error containing '{}', got '{}'",
-        session_name,
-        expected_text,
-        error_msg
+        "Session '{session_name}': expected error containing '{expected_text}', got '{error_msg}'"
     );
 
     assert_eq!(
         error_code, expected_code,
-        "Session '{}': expected error code '{}', got '{}'",
-        session_name, expected_code, error_code
+        "Session '{session_name}': expected error code '{expected_code}', got '{error_code}'"
     );
 }
 
@@ -1163,4 +1182,177 @@ pub async fn send_copy_from_stdin_to_session_expecting_error(
     messages.extend(remaining);
 
     world.session_messages.insert(session_name, messages);
+}
+
+// ---------------------------------------------------------------------------
+// setapp-piggyback steps: prove the deferred `SET application_name`
+// is piggybacked ahead of a fresh client's FIRST simple query on a warm
+// pool_size=1 backend. These reuse the long-lived per-name `PgConnection` in
+// `world.named_sessions` so that a later "session X sees application_name"
+// re-checks out X's OWN pooled backend - that is what proves no cross-client
+// leak. Opening a fresh connection per step would defeat the test.
+// Per-session query responses are stored in the existing
+// `world.session_messages` map (no new World field needed).
+// ---------------------------------------------------------------------------
+
+/// Open a named session against pg_doorman carrying a custom `application_name`
+/// in its StartupMessage. The feature's Background pins user/db, so they are
+/// fixed here: `example_user_1` (empty password) / `example_db`.
+#[when(regex = r#"^I open session "([^"]+)" with application_name "([^"]+)"$"#)]
+pub async fn open_session_with_application_name(
+    world: &mut DoormanWorld,
+    session_name: String,
+    application_name: String,
+) {
+    let doorman_port = world.doorman_port.expect("pg_doorman not started");
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
+
+    let mut conn = PgConnection::connect(&doorman_addr)
+        .await
+        .expect("Failed to connect to pg_doorman");
+    conn.send_startup_with_params(
+        "example_user_1",
+        "example_db",
+        &[("application_name", application_name.as_str())],
+    )
+    .await
+    .expect("Failed to send startup with application_name to pg_doorman");
+    conn.authenticate("example_user_1", "")
+        .await
+        .expect("Failed to authenticate to pg_doorman");
+
+    world.named_sessions.insert(session_name, conn);
+}
+
+/// Run a simple query on a named session and store the full response (until
+/// ReadyForQuery) under that session name, so a later `last query returned`
+/// assertion can inspect the first DataRow.
+#[when(regex = r#"^session "([^"]+)" runs simple query "([^"]+)"$"#)]
+pub async fn session_runs_simple_query(
+    world: &mut DoormanWorld,
+    session_name: String,
+    query: String,
+) {
+    let conn = super::helpers::get_session(&mut world.named_sessions, &session_name);
+
+    conn.send_simple_query(&query)
+        .await
+        .expect("Failed to send simple query");
+    let messages = conn
+        .read_all_messages_until_ready()
+        .await
+        .expect("Failed to read simple query response");
+
+    world.session_messages.insert(session_name, messages);
+}
+
+/// Assert the last stored simple-query response for a session yielded a
+/// DataRow whose first column equals the expected value (e.g. "1" for
+/// `SELECT 1`, or the app_name for `current_setting('application_name')`).
+#[then(regex = r#"^session "([^"]+)" last query returned "([^"]+)"$"#)]
+pub async fn session_last_query_returned(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected_value: String,
+) {
+    let messages = world
+        .session_messages
+        .get(&session_name)
+        .unwrap_or_else(|| panic!("No stored query response for session '{session_name}'"));
+
+    let mut found_value: Option<String> = None;
+    for (msg_type, data) in messages {
+        match msg_type {
+            'D' => {
+                if let Some(first) = super::helpers::parse_datarow_fields(data)
+                    .into_iter()
+                    .next()
+                {
+                    found_value = Some(first);
+                    break;
+                }
+            }
+            'E' => {
+                panic!(
+                    "Session '{}' last query returned an error: {:?}",
+                    session_name,
+                    String::from_utf8_lossy(data)
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let actual_value = found_value.unwrap_or_else(|| {
+        panic!(
+            "Session '{session_name}': no DataRow in last query response, expected '{expected_value}'"
+        )
+    });
+
+    assert_eq!(
+        actual_value, expected_value,
+        "Session '{session_name}': expected last query to return '{expected_value}', got '{actual_value}'"
+    );
+}
+
+/// Canonical re-check of a session's application_name: run
+/// `SELECT current_setting('application_name')` on the session's OWN pooled
+/// connection and assert the first cell equals the expected value. In
+/// pool_size=1 transaction mode, re-checkout must keep returning this
+/// session's own app_name with no cross-client leak and no protocol error.
+#[then(regex = r#"^session "([^"]+)" sees application_name "([^"]+)"$"#)]
+pub async fn session_sees_application_name(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected_value: String,
+) {
+    let conn = super::helpers::get_session(&mut world.named_sessions, &session_name);
+
+    conn.send_simple_query("SELECT current_setting('application_name')")
+        .await
+        .expect("Failed to send current_setting('application_name') query");
+    let messages = conn
+        .read_all_messages_until_ready()
+        .await
+        .expect("Failed to read current_setting('application_name') response");
+
+    let mut found_value: Option<String> = None;
+    for (msg_type, data) in &messages {
+        match msg_type {
+            'D' => {
+                if let Some(first) = super::helpers::parse_datarow_fields(data)
+                    .into_iter()
+                    .next()
+                {
+                    found_value = Some(first);
+                    break;
+                }
+            }
+            'E' => {
+                panic!(
+                    "Session '{}' SHOW application_name returned an error: {:?}",
+                    session_name,
+                    String::from_utf8_lossy(data)
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Keep the stored response consistent with the simple-query path so a
+    // following `last query returned` (if any) sees the latest result too.
+    world
+        .session_messages
+        .insert(session_name.clone(), messages);
+
+    let actual_value = found_value.unwrap_or_else(|| {
+        panic!(
+            "Session '{session_name}': no DataRow for current_setting('application_name'), expected '{expected_value}'"
+        )
+    });
+
+    assert_eq!(
+        actual_value, expected_value,
+        "Session '{session_name}': expected to see application_name '{expected_value}', got '{actual_value}'"
+    );
 }

@@ -14,7 +14,7 @@ pub async fn generate_config(world: &mut DoormanWorld, args: String, format: Str
     let extension = match format.as_str() {
         "toml" => ".toml",
         "yaml" | "yml" => ".yaml",
-        other => panic!("Unsupported format: {}", other),
+        other => panic!("Unsupported format: {other}"),
     };
 
     // Create temp file with the right extension
@@ -28,7 +28,7 @@ pub async fn generate_config(world: &mut DoormanWorld, args: String, format: Str
     let doorman_binary = env!("CARGO_BIN_EXE_pg_doorman");
 
     // Build the full command: pg_doorman generate {args} -o {output_path}
-    let full_command = format!("{} generate {} -o {}", doorman_binary, args, output_path);
+    let full_command = format!("{doorman_binary} generate {args} -o {output_path}");
 
     let output = Command::new("sh")
         .arg("-c")
@@ -47,11 +47,11 @@ pub async fn generate_config(world: &mut DoormanWorld, args: String, format: Str
     world.generated_config_file = Some(output_file);
 }
 
-/// Start pg_doorman with a previously generated config file.
+/// Start pg_doorman with a earlier generated config file.
 /// Patches the config to use a random free port and adds pg_hba trust rule.
 #[given("pg_doorman started with generated config")]
 pub async fn start_doorman_with_generated_config(world: &mut DoormanWorld) {
-    // Stop any previously running pg_doorman
+    // Stop any earlier running pg_doorman
     if let Some(ref mut child) = world.doorman_process {
         stop_doorman(child);
     }

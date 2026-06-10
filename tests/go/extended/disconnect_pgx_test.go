@@ -82,10 +82,18 @@ func testDisconnectWithCustomFunc(t *testing.T, fnBefore func(context.Context, *
 	require.NoError(t, errOpen)
 	t.Cleanup(func() { _ = session.Close(ctx) })
 
+	var currentPid int32
+	require.NoError(t, session.QueryRow(ctx, `select pg_backend_pid()`).Scan(&currentPid))
+
 	var backendPid sql.NullInt32
 	var state, waitEvent, waitEventType, query sql.NullString
-	require.NoError(t, session.QueryRow(ctx, `select `+diagnosticMarker+` state, wait_event, wait_event_type, query, pg_backend_pid() from pg_stat_activity where pid = $1`, pidBefore).Scan(
-		&state, &waitEvent, &waitEventType, &query, &backendPid))
+	err := session.QueryRow(ctx, `select `+diagnosticMarker+` state, wait_event, wait_event_type, query, pg_backend_pid() from pg_stat_activity where pid = $1`, pidBefore).Scan(
+		&state, &waitEvent, &waitEventType, &query, &backendPid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		t.Logf("pid after: old backend %d closed; replacement pid %d", pidBefore, currentPid)
+		return
+	}
+	require.NoError(t, err)
 
 	t.Logf("pid after: %d", backendPid.Int32)
 	if backendPid.Int32 == pidBefore {

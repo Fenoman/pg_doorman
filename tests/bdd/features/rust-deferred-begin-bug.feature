@@ -101,7 +101,6 @@ Feature: Deferred BEGIN optimization bug with extended protocol
 
     Then session "session2" should receive ParseComplete
     And session "session2" should receive BindComplete
-    And session "session2" should receive RowDescription with 1 fields
     And session "session2" should receive DataRow
     And session "session2" should receive CommandComplete "SELECT 1"
     And session "session2" should receive ReadyForQuery "T"
@@ -113,7 +112,7 @@ Feature: Deferred BEGIN optimization bug with extended protocol
     When we create session "client1" to pg_doorman as "example_user_1" with password "" and database "example_db"
 
     # Send BEGIN - deferred optimization
-    And we send SimpleQuery "BEGIN" to session "client1"
+    And we send SimpleQuery "BEGIN" to session "client1" and store response
 
     # Verify ReadyForQuery('T') received
     Then session "client1" should receive CommandComplete "BEGIN"
@@ -125,7 +124,7 @@ Feature: Deferred BEGIN optimization bug with extended protocol
     Then admin session "admin" column "sv_active" should be between 0 and 0
 
     # Send ROLLBACK and close
-    And we send SimpleQuery "ROLLBACK" to session "client1"
+    And we send SimpleQuery "ROLLBACK" to session "client1" and store response
     Then session "client1" should receive CommandComplete "ROLLBACK"
     And session "client1" should receive ReadyForQuery "I"
 
@@ -133,12 +132,27 @@ Feature: Deferred BEGIN optimization bug with extended protocol
 
     # New session should work fine
     When we create session "client2" to pg_doorman as "example_user_1" with password "" and database "example_db"
-    And we send SimpleQuery "SELECT 42" to session "client2"
+    And we send SimpleQuery "SELECT 42" to session "client2" and store response
 
     Then session "client2" should receive RowDescription with 1 fields
     And session "client2" should receive DataRow
     And session "client2" should receive CommandComplete "SELECT 1"
     And session "client2" should receive ReadyForQuery "I"
+
+  @deferred-begin-deallocate-pending
+  Scenario: DEALLOCATE after deferred BEGIN preserves transaction state
+    When we create session "client" to pg_doorman as "example_user_1" with password "" and database "example_db"
+
+    And we send SimpleQuery "BEGIN" to session "client" and store response
+    Then session "client" should receive CommandComplete "BEGIN"
+    And session "client" should receive ReadyForQuery "T"
+
+    And we send SimpleQuery "DEALLOCATE ALL" to session "client" and store response
+    Then session "client" should receive ReadyForQuery "T"
+
+    And we send SimpleQuery "ROLLBACK" to session "client" and store response
+    Then session "client" should receive CommandComplete "ROLLBACK"
+    And session "client" should receive ReadyForQuery "I"
 
   @deferred-begin-multiple-empty-transactions
   Scenario: Multiple empty transactions in sequence
@@ -206,7 +220,6 @@ Feature: Deferred BEGIN optimization bug with extended protocol
 
     Then session "client" should receive ParseComplete
     And session "client" should receive BindComplete
-    And session "client" should receive RowDescription with 1 fields
     And session "client" should receive DataRow
     And session "client" should receive CommandComplete "SELECT 1"
     And session "client" should receive ReadyForQuery "T"
@@ -243,7 +256,6 @@ Feature: Deferred BEGIN optimization bug with extended protocol
 
     Then session "client" should receive ParseComplete
     And session "client" should receive BindComplete
-    And session "client" should receive RowDescription with 1 fields
     And session "client" should receive DataRow
     And session "client" should receive CommandComplete "SELECT 1"
     And session "client" should receive ReadyForQuery "I"

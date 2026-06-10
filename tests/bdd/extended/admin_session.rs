@@ -12,7 +12,7 @@ pub async fn create_admin_session(
     password: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     // Connect to pg_doorman admin console (database = pgbouncer)
     let mut conn = PgConnection::connect(&doorman_addr)
@@ -43,10 +43,7 @@ pub async fn execute_admin_command(world: &mut DoormanWorld, query: String, sess
             'Z' => break,
             'E' => {
                 let err = String::from_utf8_lossy(&data);
-                panic!(
-                    "Error from admin session '{}' on '{}': {}",
-                    session_name, query, err
-                );
+                panic!("Error from admin session '{session_name}' on '{query}': {err}");
             }
             _ => {}
         }
@@ -86,10 +83,7 @@ pub async fn execute_admin_query_and_store_row_count(
                 break;
             }
             'E' => {
-                panic!(
-                    "Error received from admin session '{}': {:?}",
-                    session_name, _data
-                );
+                panic!("Error received from admin session '{session_name}': {_data:?}");
             }
             _ => {
                 // Other messages - skip
@@ -100,7 +94,7 @@ pub async fn execute_admin_query_and_store_row_count(
     // Store row count in session_backend_pids (reusing existing field for simplicity)
     world
         .session_backend_pids
-        .insert(format!("{}_row_count", session_name), row_count);
+        .insert(format!("{session_name}_row_count"), row_count);
 }
 
 #[when(regex = r#"^we execute "([^"]+)" on admin session "([^"]+)" expecting possible error$"#)]
@@ -154,11 +148,11 @@ pub async fn execute_admin_query_expecting_possible_error(
     // Store row count (will be 0 if error)
     world
         .session_backend_pids
-        .insert(format!("{}_row_count", session_name), row_count);
+        .insert(format!("{session_name}_row_count"), row_count);
 
     // Store error flag
     world.session_backend_pids.insert(
-        format!("{}_got_error", session_name),
+        format!("{session_name}_got_error"),
         if got_error { 1 } else { 0 },
     );
 }
@@ -263,16 +257,15 @@ pub async fn verify_admin_row_count(
     session_name: String,
     expected_count: i32,
 ) {
-    let key = format!("{}_row_count", session_name);
+    let key = format!("{session_name}_row_count");
     let actual_count = world
         .session_backend_pids
         .get(&key)
-        .unwrap_or_else(|| panic!("No row count stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No row count stored for session '{session_name}'"));
 
     assert_eq!(
         *actual_count, expected_count,
-        "Admin session '{}': expected {} rows, got {}",
-        session_name, expected_count, actual_count
+        "Admin session '{session_name}': expected {expected_count} rows, got {actual_count}"
     );
 }
 
@@ -282,18 +275,15 @@ pub async fn verify_admin_row_count_greater_than(
     session_name: String,
     min_count: i32,
 ) {
-    let key = format!("{}_row_count", session_name);
+    let key = format!("{session_name}_row_count");
     let actual_count = world
         .session_backend_pids
         .get(&key)
-        .unwrap_or_else(|| panic!("No row count stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No row count stored for session '{session_name}'"));
 
     assert!(
         *actual_count > min_count,
-        "Admin session '{}': expected more than {} rows, got {}",
-        session_name,
-        min_count,
-        actual_count
+        "Admin session '{session_name}': expected more than {min_count} rows, got {actual_count}"
     );
 }
 
@@ -303,18 +293,15 @@ pub async fn verify_admin_row_count_greater_or_equal(
     session_name: String,
     min_count: i32,
 ) {
-    let key = format!("{}_row_count", session_name);
+    let key = format!("{session_name}_row_count");
     let actual_count = world
         .session_backend_pids
         .get(&key)
-        .unwrap_or_else(|| panic!("No row count stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No row count stored for session '{session_name}'"));
 
     assert!(
         *actual_count >= min_count,
-        "Admin session '{}': expected at least {} rows, got {}",
-        session_name,
-        min_count,
-        actual_count
+        "Admin session '{session_name}': expected at least {min_count} rows, got {actual_count}"
     );
 }
 
@@ -330,10 +317,7 @@ pub async fn verify_admin_response_contains(
         response
             .to_uppercase()
             .contains(&expected_text.to_uppercase()),
-        "Admin session '{}': expected response to contain '{}', got '{}'",
-        session_name,
-        expected_text,
-        response
+        "Admin session '{session_name}': expected response to contain '{expected_text}', got '{response}'"
     );
 }
 
@@ -349,10 +333,7 @@ pub async fn verify_admin_response_not_contains(
         !response
             .to_uppercase()
             .contains(&unexpected_text.to_uppercase()),
-        "Admin session '{}': expected response NOT to contain '{}', but got '{}'",
-        session_name,
-        unexpected_text,
-        response
+        "Admin session '{session_name}': expected response NOT to contain '{unexpected_text}', but got '{response}'"
     );
 }
 
@@ -368,8 +349,7 @@ pub async fn verify_admin_column_in_range(
     let lines: Vec<&str> = response.lines().collect();
     assert!(
         lines.len() >= 2,
-        "Admin session '{}': need header + data row",
-        session_name
+        "Admin session '{session_name}': need header + data row"
     );
 
     let (col_idx, use_pipe) = super::helpers::find_column_index(lines[0], &column_name);
@@ -384,12 +364,37 @@ pub async fn verify_admin_column_in_range(
 
     assert!(
         value >= min_value && value <= max_value,
-        "Admin session '{}': column '{}' value {} is not between {} and {}",
-        session_name,
-        column_name,
-        value,
-        min_value,
-        max_value
+        "Admin session '{session_name}': column '{column_name}' value {value} is not between {min_value} and {max_value}"
+    );
+}
+
+#[then(regex = r#"^admin session "([^"]+)" column "([^"]+)" should be at least (\d+)$"#)]
+pub async fn verify_admin_column_at_least(
+    world: &mut DoormanWorld,
+    session_name: String,
+    column_name: String,
+    min_value: u64,
+) {
+    let response = super::helpers::get_admin_response(&world.session_messages, &session_name);
+    let lines: Vec<&str> = response.lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "Admin session '{session_name}': need header + data row"
+    );
+
+    let (col_idx, use_pipe) = super::helpers::find_column_index(lines[0], &column_name);
+    let values = super::helpers::split_row(lines[1], use_pipe);
+
+    let value: u64 = values[col_idx].parse().unwrap_or_else(|_| {
+        panic!(
+            "Admin session '{}': cannot parse '{}' as u64 for column '{}'",
+            session_name, values[col_idx], column_name
+        )
+    });
+
+    assert!(
+        value >= min_value,
+        "Admin session '{session_name}': column '{column_name}' value {value} is less than expected minimum {min_value}"
     );
 }
 
@@ -409,8 +414,7 @@ pub async fn verify_admin_column_in_range_for_row(
     let lines: Vec<&str> = response.lines().collect();
     assert!(
         !lines.is_empty(),
-        "Admin session '{}': empty response",
-        session_name
+        "Admin session '{session_name}': empty response"
     );
 
     let (col_idx, use_pipe) = super::helpers::find_column_index(lines[0], &column_name);
@@ -434,20 +438,10 @@ pub async fn verify_admin_column_in_range_for_row(
 
         assert!(
             value >= min_value && value <= max_value,
-            "Admin session '{}': column '{}' value {} (row {}={}) is not between {} and {}",
-            session_name,
-            column_name,
-            value,
-            filter_column,
-            filter_value,
-            min_value,
-            max_value
+            "Admin session '{session_name}': column '{column_name}' value {value} (row {filter_column}={filter_value}) is not between {min_value} and {max_value}"
         );
         return;
     }
 
-    panic!(
-        "Admin session '{}': no row found with {}='{}'",
-        session_name, filter_column, filter_value
-    );
+    panic!("Admin session '{session_name}': no row found with {filter_column}='{filter_value}'");
 }

@@ -12,6 +12,7 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -85,7 +86,7 @@ public class Main {
                     futures.add(executor.submit(() -> {
                         try (Connection conn = dataSource.getConnection()) {
                             for (int round = 0; round < 10; round++) {
-                                barrier.await();
+                                barrier.await(30, TimeUnit.SECONDS);
 
                                 try (PreparedStatement pstmt = conn.prepareStatement(
                                         "SELECT * FROM test_stress_describe WHERE id > ? ORDER BY id")) {

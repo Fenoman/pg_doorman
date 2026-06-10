@@ -97,8 +97,10 @@ Feature: Pool Coordinator — database-level connection limit
     # Fill both coordinator slots with active transactions
     When we create session "s1" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "s1"
+    And we send SimpleQuery "SELECT 1" to session "s1"
     When we create session "s2" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "s2"
+    And we send SimpleQuery "SELECT 1" to session "s2"
     # Third session: pool_size=3 allows the per-user semaphore, but coordinator
     # has 0 permits and reserve=0 → connection creation fails.
     When we create session "s3" to pg_doorman as "example_user_1" with password "" and database "example_db"
@@ -140,9 +142,11 @@ Feature: Pool Coordinator — database-level connection limit
     # user1 fills both main coordinator slots (holds transactions open)
     When we create session "u1_s1" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "u1_s1"
+    And we send SimpleQuery "SELECT 1" to session "u1_s1"
     When we create session "u1_s2" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "u1_s2"
-    # user2 arrives — main permits exhausted, eviction impossible (all active),
+    And we send SimpleQuery "SELECT 1" to session "u1_s2"
+    # user2 arrives - main permits exhausted, eviction impossible (all active),
     # but reserve_pool_size=1 so user2 gets a reserve connection
     When we create session "u2_s1" to pg_doorman as "postgres" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 1" to session "u2_s1" without waiting
@@ -178,10 +182,13 @@ Feature: Pool Coordinator — database-level connection limit
     # Fill main (2) + reserve (1) = 3 active transactions
     When we create session "s1" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "s1"
+    And we send SimpleQuery "SELECT 1" to session "s1"
     When we create session "s2" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "s2"
+    And we send SimpleQuery "SELECT 1" to session "s2"
     When we create session "s3" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "s3"
+    And we send SimpleQuery "SELECT 1" to session "s3"
     # Fourth: everything exhausted
     When we create session "s4" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 1" to session "s4" without waiting
@@ -214,6 +221,7 @@ Feature: Pool Coordinator — database-level connection limit
       """
     When we create session "s1" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "s1"
+    And we send SimpleQuery "SELECT 1" to session "s1"
     When we create session "s2" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 1" to session "s2" without waiting
     Then we read SimpleQuery response from session "s2" within 5000ms
@@ -506,6 +514,7 @@ Feature: Pool Coordinator — database-level connection limit
     # Fill it with an active transaction.
     When we create session "s1" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "s1"
+    And we send SimpleQuery "SELECT 1" to session "s1"
     # Second query should fail (limit=1, reserve=0)
     When we create session "s2" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 1" to session "s2" without waiting
@@ -633,8 +642,10 @@ Feature: Pool Coordinator — database-level connection limit
     # user1 fills 2 main coordinator slots
     When we create session "u1_s1" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "u1_s1"
+    And we send SimpleQuery "SELECT 1" to session "u1_s1"
     When we create session "u1_s2" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "u1_s2"
+    And we send SimpleQuery "SELECT 1" to session "u1_s2"
     # user2 gets a reserve connection
     When we create session "u2_s1" to pg_doorman as "postgres" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 1" to session "u2_s1"
@@ -810,20 +821,20 @@ Feature: Pool Coordinator — database-level connection limit
     Then admin session "admin" column "current" should be between 0 and 2
 
   @coordinator-phase-c-idle-return-wake
-  Scenario: Phase C waiter wakes on peer idle return and acquires via eviction
-    # Regression for the case where Phase C slept through peer idle-return events.
+  Scenario: the wait queue waiter wakes on peer idle return and acquires via eviction
+    # Regression for the case where the wait queue slept through peer idle-return events.
     #
     # Setup:
     #   - max_db_connections = 2, reserve_pool_size = 0 (no fallback).
     #   - min_connection_lifetime = 50 ms (so returned connections are evictable
     #     almost immediately).
-    #   - reserve_pool_timeout = 800 ms (Phase C wait budget). Short enough that
+    #   - reserve_pool_timeout = 800 ms (the wait queue wait budget). Short enough that
     #     this scenario fails fast if the fix regresses.
     #
     # Before the fix:
     #   1. user1 pins both coordinator slots with open transactions.
     #   2. user2 sends a query → Phase B finds nothing in user1's vec (both
-    #      connections are checked out, not in the idle queue) → Phase C waits
+    #      connections are checked out, not in the idle queue) -> the wait queue waits
     #      on connection_returned. That Notify only fires on permit drop.
     #   3. user1 commits one transaction → Pool::return_object pushes the
     #      backend into user1's slots.vec — no permit drop, no Notify.
@@ -834,7 +845,7 @@ Feature: Pool Coordinator — database-level connection limit
     # After the fix:
     #   1-2 as above.
     #   3. user1 commits one transaction → Pool::return_object calls
-    #      coordinator.notify_idle_returned() → Phase C wakes, re-runs
+    #      coordinator.notify_idle_returned() -> the wait queue wakes, re-runs
     #      try_evict_one against user1, finds the freshly returned idle in
     #      user1's vec (older than min_connection_lifetime), drops its permit.
     #   4. user2's try_acquire succeeds, the SELECT completes well within
@@ -894,13 +905,13 @@ Feature: Pool Coordinator — database-level connection limit
     # evictable as soon as they hit the idle queue.
     When we sleep for 80 milliseconds
     # user2 starts a query — Phase A fails (no idle in postgres user),
-    # Phase B finds nothing evictable in user1's vec, Phase C begins to wait.
+    # Phase B finds nothing evictable in user1's vec, the wait queue begins to wait.
     When we create session "u2_s1" to pg_doorman as "postgres" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 1" to session "u2_s1" without waiting
-    # Give user2 a head start so it is parked in Phase C before user1 commits.
+    # Give user2 a head start so it is parked in the wait queue before user1 commits.
     When we sleep for 100 milliseconds
     # user1 commits one transaction → Pool::return_object fires
-    # notify_idle_returned → Phase C wakes → eviction succeeds → user2 gets
+    # notify_idle_returned -> the wait queue wakes -> eviction succeeds -> user2 gets
     # the slot. Total wall time user2 → response should be well under the
     # 800 ms reserve_pool_timeout.
     When we send SimpleQuery "COMMIT" to session "u1_s1"
@@ -909,7 +920,7 @@ Feature: Pool Coordinator — database-level connection limit
     # Verify observability — exactly the expected counter changes.
     When we create admin session "admin" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW POOL_COORDINATOR" on admin session "admin" and store response
-    # At least one eviction happened (Phase C retry). Upper bound is loose
+    # At least one eviction happened (the wait queue retry). Upper bound is loose
     # because the BDD step only supports "between A and B".
     Then admin session "admin" column "evictions" should be between 1 and 999999
     # No reserve grants, no client exhaustion errors.

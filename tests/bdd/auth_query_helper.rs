@@ -74,7 +74,7 @@ async fn executor_creation_should_fail(world: &mut DoormanWorld, host: String, p
             // Expected: server unreachable
         }
         Err(e) => {
-            panic!("Expected AuthQueryConnectionError, got: {:?}", e);
+            panic!("Expected AuthQueryConnectionError, got: {e:?}");
         }
         Ok(_) => {
             panic!("Expected executor creation to fail, but it succeeded");
@@ -109,7 +109,7 @@ async fn result_should_contain_exact(
             assert_eq!(password, &expected_password, "Password mismatch");
         }
         Ok(None) => panic!("Expected password found, got None (not found)"),
-        Err(e) => panic!("Expected success, got error: {}", e),
+        Err(e) => panic!("Expected success, got error: {e}"),
     }
 }
 
@@ -130,13 +130,11 @@ async fn result_should_contain_password_prefix(
         Ok(Some(password)) => {
             assert!(
                 password.starts_with(&password_prefix),
-                "Password '{}' does not start with '{}'",
-                password,
-                password_prefix
+                "Password '{password}' does not start with '{password_prefix}'"
             );
         }
         Ok(None) => panic!("Expected password found, got None (not found)"),
-        Err(e) => panic!("Expected success, got error: {}", e),
+        Err(e) => panic!("Expected success, got error: {e}"),
     }
 }
 
@@ -152,7 +150,7 @@ async fn result_should_contain_user(world: &mut DoormanWorld, _expected_user: St
             // User found — password returned
         }
         Ok(None) => panic!("Expected user found, got None (not found)"),
-        Err(e) => panic!("Expected success, got error: {}", e),
+        Err(e) => panic!("Expected success, got error: {e}"),
     }
 }
 
@@ -170,7 +168,7 @@ async fn result_should_be_not_found(world: &mut DoormanWorld) {
         Ok(Some(_)) => {
             panic!("Expected not found, but password was returned");
         }
-        Err(e) => panic!("Expected not found (Ok(None)), got error: {}", e),
+        Err(e) => panic!("Expected not found (Ok(None)), got error: {e}"),
     }
 }
 
@@ -185,16 +183,11 @@ async fn result_should_be_config_error(world: &mut DoormanWorld, message_part: S
         Err(Error::AuthQueryConfigError(msg)) => {
             assert!(
                 msg.contains(&message_part),
-                "Error message '{}' does not contain '{}'",
-                msg,
-                message_part
+                "Error message '{msg}' does not contain '{message_part}'"
             );
         }
         Err(e) => {
-            panic!(
-                "Expected AuthQueryConfigError containing '{}', got: {}",
-                message_part, e
-            );
+            panic!("Expected AuthQueryConfigError containing '{message_part}', got: {e}");
         }
         Ok(val) => panic!("Expected AuthQueryConfigError, got Ok({:?})", val.is_some()),
     }

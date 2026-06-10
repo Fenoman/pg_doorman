@@ -13,7 +13,7 @@ pub async fn create_named_session_with_backend_key(
     database: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     // Connect to pg_doorman
     let mut conn = PgConnection::connect(&doorman_addr)
@@ -35,14 +35,10 @@ pub async fn create_named_session_with_backend_key(
             .session_secret_keys
             .insert(session_name.clone(), secret_key);
         eprintln!(
-            "Session '{}': stored backend_pid={}, secret_key={}",
-            session_name, process_id, secret_key
+            "Session '{session_name}': stored backend_pid={process_id}, secret_key={secret_key}"
         );
     } else {
-        panic!(
-            "Session '{}': BackendKeyData not received during authentication",
-            session_name
-        );
+        panic!("Session '{session_name}': BackendKeyData not received during authentication");
     }
 
     world.named_sessions.insert(session_name, conn);
@@ -51,21 +47,20 @@ pub async fn create_named_session_with_backend_key(
 #[when(regex = r#"^we send cancel request for session "([^"]+)"$"#)]
 pub async fn send_cancel_request_for_session(world: &mut DoormanWorld, session_name: String) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     let process_id = world
         .session_backend_pids
         .get(&session_name)
-        .unwrap_or_else(|| panic!("No backend_pid stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No backend_pid stored for session '{session_name}'"));
 
     let secret_key = world
         .session_secret_keys
         .get(&session_name)
-        .unwrap_or_else(|| panic!("No secret_key stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No secret_key stored for session '{session_name}'"));
 
     eprintln!(
-        "Sending cancel request for session '{}': process_id={}, secret_key={}",
-        session_name, process_id, secret_key
+        "Sending cancel request for session '{session_name}': process_id={process_id}, secret_key={secret_key}"
     );
 
     PgConnection::send_cancel_request(&doorman_addr, *process_id, *secret_key)
@@ -96,10 +91,7 @@ pub async fn session_should_receive_cancel_error(
                 // Error message - parse it
                 error_message = String::from_utf8_lossy(&data).to_string();
                 error_found = true;
-                eprintln!(
-                    "Session '{}': received error: {}",
-                    session_name, error_message
-                );
+                eprintln!("Session '{session_name}': received error: {error_message}");
             }
             'Z' => {
                 // ReadyForQuery - done
@@ -113,18 +105,14 @@ pub async fn session_should_receive_cancel_error(
 
     assert!(
         error_found,
-        "Session '{}': expected to receive an error, but none was received",
-        session_name
+        "Session '{session_name}': expected to receive an error, but none was received"
     );
 
     assert!(
         error_message
             .to_lowercase()
             .contains(&expected_text.to_lowercase()),
-        "Session '{}': expected error to contain '{}', got '{}'",
-        session_name,
-        expected_text,
-        error_message
+        "Session '{session_name}': expected error to contain '{expected_text}', got '{error_message}'"
     );
 }
 
@@ -135,7 +123,7 @@ pub async fn send_cancel_request_with_fabricated_credentials(
     secret_key: i32,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     PgConnection::send_cancel_request(&doorman_addr, process_id, secret_key)
         .await
@@ -151,12 +139,12 @@ pub async fn send_cancel_request_wrong_secret_key(
     wrong_secret_key: i32,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     let process_id = *world
         .session_backend_pids
         .get(&session_name)
-        .unwrap_or_else(|| panic!("No backend_pid stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No backend_pid stored for session '{session_name}'"));
 
     PgConnection::send_cancel_request(&doorman_addr, process_id, wrong_secret_key)
         .await
@@ -181,14 +169,11 @@ pub async fn session_should_complete_without_error(world: &mut DoormanWorld, ses
                 // Error message - this is unexpected
                 error_message = String::from_utf8_lossy(&data).to_string();
                 error_found = true;
-                eprintln!(
-                    "Session '{}': received unexpected error: {}",
-                    session_name, error_message
-                );
+                eprintln!("Session '{session_name}': received unexpected error: {error_message}");
             }
             'Z' => {
                 // ReadyForQuery - done
-                eprintln!("Session '{}': query completed successfully", session_name);
+                eprintln!("Session '{session_name}': query completed successfully");
                 break;
             }
             _ => {
@@ -199,7 +184,6 @@ pub async fn session_should_complete_without_error(world: &mut DoormanWorld, ses
 
     assert!(
         !error_found,
-        "Session '{}': expected query to complete without error, but got: {}",
-        session_name, error_message
+        "Session '{session_name}': expected query to complete without error, but got: {error_message}"
     );
 }

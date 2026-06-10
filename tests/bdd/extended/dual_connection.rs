@@ -35,8 +35,8 @@ pub async fn login_to_both(
     let pg_port = world.pg_port.expect("PostgreSQL not started");
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
 
-    let pg_addr = format!("127.0.0.1:{}", pg_port);
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let pg_addr = format!("127.0.0.1:{pg_port}");
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     let mut pg_conn = PgConnection::connect(&pg_addr)
         .await
@@ -97,8 +97,8 @@ pub async fn reconnect_to_both(world: &mut DoormanWorld) {
     let pg_port = world.pg_port.expect("PostgreSQL not started");
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
 
-    let pg_addr = format!("127.0.0.1:{}", pg_port);
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let pg_addr = format!("127.0.0.1:{pg_port}");
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     let mut pg_conn = PgConnection::connect(&pg_addr)
         .await
@@ -472,7 +472,7 @@ pub async fn verify_identical_messages(world: &mut DoormanWorld) {
         let (doorman_type, doorman_data) = doorman_msg;
 
         if pg_type != doorman_type {
-            eprintln!("\n=== MESSAGE TYPE MISMATCH at position {} ===", i);
+            eprintln!("\n=== MESSAGE TYPE MISMATCH at position {i} ===");
             eprintln!(
                 "PostgreSQL: {}",
                 helpers::format_message_details(*pg_type, pg_data)
@@ -481,14 +481,11 @@ pub async fn verify_identical_messages(world: &mut DoormanWorld) {
                 "pg_doorman: {}",
                 helpers::format_message_details(*doorman_type, doorman_data)
             );
-            panic!(
-                "Message {} type differs: PostgreSQL='{}', pg_doorman='{}'",
-                i, pg_type, doorman_type
-            );
+            panic!("Message {i} type differs: PostgreSQL='{pg_type}', pg_doorman='{doorman_type}'");
         }
 
         if pg_data.len() != doorman_data.len() {
-            eprintln!("\n=== MESSAGE LENGTH MISMATCH at position {} ===", i);
+            eprintln!("\n=== MESSAGE LENGTH MISMATCH at position {i} ===");
             eprintln!(
                 "PostgreSQL: {}",
                 helpers::format_message_details(*pg_type, pg_data)
@@ -499,13 +496,13 @@ pub async fn verify_identical_messages(world: &mut DoormanWorld) {
             );
 
             let max_len = pg_data.len().max(doorman_data.len()).min(64);
-            eprintln!("\n--- Hex comparison (first {} bytes) ---", max_len);
+            eprintln!("\n--- Hex comparison (first {max_len} bytes) ---");
             eprintln!(
                 "PostgreSQL: {}",
                 pg_data
                     .iter()
                     .take(max_len)
-                    .map(|b| format!("{:02x}", b))
+                    .map(|b| format!("{b:02x}"))
                     .collect::<Vec<_>>()
                     .join(" ")
             );
@@ -514,7 +511,7 @@ pub async fn verify_identical_messages(world: &mut DoormanWorld) {
                 doorman_data
                     .iter()
                     .take(max_len)
-                    .map(|b| format!("{:02x}", b))
+                    .map(|b| format!("{b:02x}"))
                     .collect::<Vec<_>>()
                     .join(" ")
             );
@@ -539,7 +536,7 @@ pub async fn verify_identical_messages(world: &mut DoormanWorld) {
         };
 
         if pg_data_normalized != doorman_data_normalized {
-            eprintln!("\n=== MESSAGE DATA MISMATCH at position {} ===", i);
+            eprintln!("\n=== MESSAGE DATA MISMATCH at position {i} ===");
             eprintln!(
                 "PostgreSQL: {}",
                 helpers::format_message_details(*pg_type, pg_data)
@@ -556,18 +553,17 @@ pub async fn verify_identical_messages(world: &mut DoormanWorld) {
             {
                 if pg_byte != doorman_byte {
                     eprintln!(
-                        "\nFirst difference at byte {}: PostgreSQL=0x{:02x} pg_doorman=0x{:02x}",
-                        pos, pg_byte, doorman_byte
+                        "\nFirst difference at byte {pos}: PostgreSQL=0x{pg_byte:02x} pg_doorman=0x{doorman_byte:02x}"
                     );
 
                     let start = pos.saturating_sub(8);
                     let end = (pos + 8).min(pg_data.len());
-                    eprintln!("Context (bytes {}-{}):", start, end);
+                    eprintln!("Context (bytes {start}-{end}):");
                     eprintln!(
                         "  PostgreSQL: {}",
                         pg_data[start..end]
                             .iter()
-                            .map(|b| format!("{:02x}", b))
+                            .map(|b| format!("{b:02x}"))
                             .collect::<Vec<_>>()
                             .join(" ")
                     );
@@ -575,7 +571,7 @@ pub async fn verify_identical_messages(world: &mut DoormanWorld) {
                         "  pg_doorman: {}",
                         doorman_data[start..end]
                             .iter()
-                            .map(|b| format!("{:02x}", b))
+                            .map(|b| format!("{b:02x}"))
                             .collect::<Vec<_>>()
                             .join(" ")
                     );
@@ -583,7 +579,7 @@ pub async fn verify_identical_messages(world: &mut DoormanWorld) {
                 }
             }
 
-            panic!("Message {} data differs", i);
+            panic!("Message {i} data differs");
         }
 
         println!(
