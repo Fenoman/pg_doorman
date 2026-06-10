@@ -12,15 +12,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
+use futures::TryStreamExt;
 use log::{debug, error, info, warn};
+use smallvec;
 
 use crate::utils::format_elapsed;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::{Client, NoTls};
 
-use crate::config::{AuthQueryConfig, Duration};
+use crate::config::{AuthQueryConfig, Duration, MAX_AUTH_QUERY_WORKERS};
 use crate::errors::Error;
 use crate::stats::auth_query::AuthQueryStats;
 
@@ -29,6 +30,9 @@ use crate::stats::auth_query::AuthQueryStats;
 /// Usernames exceeding this are rejected without caching to prevent
 /// memory exhaustion from very long usernames.
 const MAX_USERNAME_LEN: usize = 63;
+const MAX_AUTH_QUERY_VERIFIER_LEN: usize = 4096;
+const AUTH_QUERY_RECONNECT_INITIAL_BACKOFF_MS: u64 = 100;
+const AUTH_QUERY_RECONNECT_MAX_BACKOFF_MS: u64 = 5_000;
 
 /// Marker string the custom `LimitedJson` decoder embeds in its error
 /// message when a `json`/`jsonb` row exceeds `MAX_OPERATOR_BUDGET`. The
@@ -37,6 +41,7 @@ const MAX_USERNAME_LEN: usize = 63;
 /// `auth_query_oversize` (operator footgun) and `auth_query_bad_type`
 /// (decoder failure on unexpected wire bytes).
 const LIMITED_JSON_OVERSIZE_TAG: &str = "auth_query startup_parameters oversize";
+const LIMITED_TEXT_OVERSIZE_TAG: &str = "auth_query startup_parameters text oversize";
 
 /// Custom `FromSql` wrapper for `json`/`jsonb` columns that enforces
 /// `MAX_OPERATOR_BUDGET` on the raw wire bytes BEFORE `serde_json` walks
@@ -68,6 +73,79 @@ impl<'a> FromSql<'a> for LimitedJson {
     fn accepts(ty: &Type) -> bool {
         matches!(*ty, Type::JSON | Type::JSONB)
     }
+}
+
+/// Custom `FromSql` wrapper for text-like startup_parameters columns.
+/// It checks the raw column bytes before `tokio_postgres` allocates a
+/// `String`, matching the json/jsonb `LimitedJson` guard.
+#[derive(Debug)]
+struct LimitedText(String);
+
+impl<'a> FromSql<'a> for LimitedText {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let budget = crate::config::startup_parameters::MAX_OPERATOR_BUDGET;
+        if raw.len() > budget {
+            return Err(format!(
+                "{LIMITED_TEXT_OVERSIZE_TAG}: raw column is {} bytes, exceeding operator budget {budget}",
+                raw.len()
+            )
+            .into());
+        }
+        let value = <String as FromSql>::from_sql(ty, raw)?;
+        Ok(LimitedText(value))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <String as FromSql>::accepts(ty)
+    }
+}
+
+struct LimitedVerifier(String);
+
+impl<'a> FromSql<'a> for LimitedVerifier {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() > MAX_AUTH_QUERY_VERIFIER_LEN {
+            return Err(format!(
+                "auth_query password verifier is {} bytes, exceeds max {MAX_AUTH_QUERY_VERIFIER_LEN}",
+                raw.len()
+            )
+            .into());
+        }
+        let value = <String as FromSql>::from_sql(ty, raw)?;
+        Ok(LimitedVerifier(value))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <String as FromSql>::accepts(ty)
+    }
+}
+
+fn validate_auth_query_verifier_len(
+    password_hash: &str,
+    username: &str,
+    pool_name: &str,
+) -> Result<(), Error> {
+    if password_hash.len() > MAX_AUTH_QUERY_VERIFIER_LEN {
+        return Err(Error::AuthQueryConfigError(format!(
+            "[{username}@{pool_name}] auth_query password verifier is {} bytes, exceeds max {MAX_AUTH_QUERY_VERIFIER_LEN}",
+            password_hash.len()
+        )));
+    }
+    Ok(())
+}
+
+fn auth_query_reconnect_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    let millis = AUTH_QUERY_RECONNECT_INITIAL_BACKOFF_MS
+        .saturating_mul(1u64 << shift)
+        .min(AUTH_QUERY_RECONNECT_MAX_BACKOFF_MS);
+    std::time::Duration::from_millis(millis)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,18 +202,75 @@ impl PasswordFetcher for AuthQueryExecutor {
 // AuthQueryExecutor
 // ---------------------------------------------------------------------------
 
+/// snapshot of the data the reconnect task needs so the
+/// `ReturnGuard::Drop` path can launch recovery from a tokio task
+/// without re-borrowing `&AuthQueryExecutor`.
+#[derive(Clone)]
+struct ReconnectData {
+    config: AuthQueryConfig,
+    server_host: String,
+    server_port: u16,
+}
+
+/// RAII guard that keeps the auth_query worker slot replenished even
+/// if the surrounding task is cancelled mid-query. Without this the
+/// `fetch_credentials` cancel path was a connection leak - N cancellations
+/// emptied the executor pool and froze every subsequent login on the pool.
+///
+/// Normal flow: `fetch_credentials` takes ownership back via
+/// `guard.client.take()`, leaving `Option::None`, so Drop is a no-op.
+/// Cancel flow: `client.is_some()` -> discard the ambiguous Client and spawn a
+/// task that reconnects with a fresh executor connection.
+struct ReturnGuard {
+    client: Option<Client>,
+    tx: async_channel::Sender<Client>,
+    pool_name: String,
+    reconnect_data: ReconnectData,
+}
+
+impl Drop for ReturnGuard {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let pool_name = self.pool_name.clone();
+        let reconnect_data = self.reconnect_data.clone();
+        // Schedule the recovery off-Drop. A cancelled future may have been
+        // inside `query_raw` or a RowStream poll, so a non-closed Client can
+        // still be protocol-busy. Drop it and replenish with a fresh executor
+        // connection instead of returning ambiguous state to the pool.
+        drop(client);
+        AuthQueryExecutor::schedule_reconnect_with(
+            tx,
+            pool_name,
+            reconnect_data,
+            "cancelled fetch discarded executor connection",
+        );
+    }
+}
+
 /// Executor for running auth_query SELECT statements against PostgreSQL.
 ///
 /// Uses an mpsc channel as a simple connection pool: `fetch_password()` takes
 /// a Client from the channel, executes the query, and returns it back.
 /// If all connections are busy, callers wait on the channel.
+///
+/// used a `tokio::sync::Mutex<mpsc::Receiver<Client>>`. Tokio's
+/// `mpsc::Receiver` is single-consumer, so the mutex was needed to share
+/// access across the configured `workers` count - but it also serialised
+/// every `fetch_credentials` call through one global lock per executor,
+/// turning `workers > 1` into a no-op for parallelism. `async-channel` is
+/// MPMC so the receiver is `Send + Sync` and can be cloned to recv()
+/// concurrently from multiple callers; the channel's internal logic
+/// orders waiters fairly without an external mutex.
 pub struct AuthQueryExecutor {
     config: AuthQueryConfig,
     pool_name: String,
     server_host: String,
     server_port: u16,
-    tx: mpsc::Sender<Client>,
-    rx: tokio::sync::Mutex<mpsc::Receiver<Client>>,
+    tx: async_channel::Sender<Client>,
+    rx: async_channel::Receiver<Client>,
 }
 
 impl AuthQueryExecutor {
@@ -148,6 +283,17 @@ impl AuthQueryExecutor {
         server_host: &str,
         server_port: u16,
     ) -> Result<Self, Error> {
+        if config.workers == 0 {
+            return Err(Error::AuthQueryConfigError(
+                "auth_query.workers must be > 0".into(),
+            ));
+        }
+        if config.workers > MAX_AUTH_QUERY_WORKERS {
+            return Err(Error::AuthQueryConfigError(format!(
+                "auth_query.workers must be <= {MAX_AUTH_QUERY_WORKERS}"
+            )));
+        }
+
         let database = config
             .database
             .clone()
@@ -155,7 +301,11 @@ impl AuthQueryExecutor {
 
         let pg_config = Self::build_pg_config(config, server_host, server_port, &database);
 
-        let (tx, rx) = mpsc::channel(config.workers as usize);
+        // async-channel bounded MPMC. Capacity matches workers as
+        // before; semantics: producer side blocks when full (same as
+        // tokio mpsc), consumer side recv() may run concurrently from
+        // many callers (unlike tokio mpsc which required the Mutex).
+        let (tx, rx) = async_channel::bounded::<Client>(config.workers as usize);
 
         for i in 0..config.workers {
             info!(
@@ -176,7 +326,9 @@ impl AuthQueryExecutor {
             )
             .await?;
             tx.send(client).await.map_err(|_| {
-                Error::AuthQueryConnectionError("failed to initialize executor pool".into())
+                Error::AuthQueryConnectionError(
+                    "failed to initialize executor pool: channel closed".into(),
+                )
             })?;
         }
 
@@ -192,7 +344,7 @@ impl AuthQueryExecutor {
             server_host: server_host.to_string(),
             server_port,
             tx,
-            rx: tokio::sync::Mutex::new(rx),
+            rx,
         })
     }
 
@@ -212,6 +364,101 @@ impl AuthQueryExecutor {
         pg_config.dbname(database);
         pg_config.connect_timeout(std::time::Duration::from_secs(5));
         pg_config
+    }
+
+    fn reconnect_data(&self) -> ReconnectData {
+        ReconnectData {
+            config: self.config.clone(),
+            server_host: self.server_host.clone(),
+            server_port: self.server_port,
+        }
+    }
+
+    fn schedule_reconnect(&self, reason: &'static str) {
+        Self::schedule_reconnect_with(
+            self.tx.clone(),
+            self.pool_name.clone(),
+            self.reconnect_data(),
+            reason,
+        );
+    }
+
+    fn schedule_reconnect_with(
+        tx: async_channel::Sender<Client>,
+        pool_name: String,
+        reconnect_data: ReconnectData,
+        reason: &'static str,
+    ) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            error!(
+                "[pool: {pool_name}] auth_query: cannot schedule reconnect after {reason}: \
+                 no Tokio runtime"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            let database = reconnect_data
+                .config
+                .database
+                .clone()
+                .unwrap_or_else(|| pool_name.clone());
+            let pg_config = AuthQueryExecutor::build_pg_config(
+                &reconnect_data.config,
+                &reconnect_data.server_host,
+                reconnect_data.server_port,
+                &database,
+            );
+            let mut attempt = 1u32;
+            loop {
+                if tx.is_closed() {
+                    warn!(
+                        "[pool: {pool_name}] auth_query: reconnect stopped after {reason}: \
+                         executor channel closed"
+                    );
+                    return;
+                }
+
+                warn!("[pool: {pool_name}] auth_query: {reason}, reconnect attempt {attempt}");
+                match AuthQueryExecutor::connect(
+                    &pg_config,
+                    attempt,
+                    &pool_name,
+                    &reconnect_data.server_host,
+                    reconnect_data.server_port,
+                    &database,
+                    &reconnect_data.config.user,
+                )
+                .await
+                {
+                    Ok(new_client) => match tx.try_send(new_client) {
+                        Ok(()) => return,
+                        Err(async_channel::TrySendError::Full(_client)) => {
+                            warn!(
+                                "[pool: {pool_name}] auth_query: reconnect produced a Client \
+                                 but executor channel is already full; dropping duplicate"
+                            );
+                            return;
+                        }
+                        Err(async_channel::TrySendError::Closed(_client)) => {
+                            warn!(
+                                "[pool: {pool_name}] auth_query: reconnect produced a Client \
+                                 but executor channel closed"
+                            );
+                            return;
+                        }
+                    },
+                    Err(connect_err) => {
+                        let backoff = auth_query_reconnect_backoff(attempt);
+                        error!(
+                            "[pool: {pool_name}] auth_query: reconnect attempt {attempt} failed: \
+                             {connect_err}; retrying in {backoff:?}"
+                        );
+                        attempt = attempt.saturating_add(1);
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        });
     }
 
     async fn connect(
@@ -261,19 +508,45 @@ impl AuthQueryExecutor {
             self.pool_name
         );
 
-        let client = {
-            let mut rx = self.rx.lock().await;
-            rx.recv().await.ok_or_else(|| {
-                error!(
-                    "[{username}@{}] auth_query: executor pool closed, cannot fetch credentials",
-                    self.pool_name
-                );
-                Error::AuthQueryPoolClosed
-            })?
+        // shared async-channel receiver - multiple in-flight
+        // calls recv concurrently without an external mutex. The previous
+        // shape had a critical availability bug: if the caller's task was
+        // cancelled (client disconnect, login timeout, RELOAD drain) AFTER
+        // `rx.recv()` returned but BEFORE `tx.send()` ran, the Client was
+        // dropped instead of returned to the channel. After N such
+        // cancellations the executor pool was empty and every subsequent
+        // login on this pool hung forever on `rx.recv()`. RAII via
+        // `ReturnGuard` is the fix - `Drop` runs on cancellation too, and
+        // synchronously dispatches the Client back to the channel (or
+        // schedules a reconnect on a closed connection).
+        let client = self.rx.recv().await.map_err(|_| {
+            error!(
+                "[{username}@{}] auth_query: executor pool closed, cannot fetch credentials",
+                self.pool_name
+            );
+            Error::AuthQueryPoolClosed
+        })?;
+
+        // Move ownership into a guard. On normal completion we extract the
+        // Client back via `into_inner()`. On `await`-point cancellation the
+        // guard's Drop discards ambiguous protocol state and triggers reconnect.
+        let mut guard = ReturnGuard {
+            client: Some(client),
+            tx: self.tx.clone(),
+            pool_name: self.pool_name.clone(),
+            // Snapshot of config so reconnect can run from Drop without
+            // borrowing &self.
+            reconnect_data: ReconnectData {
+                config: self.config.clone(),
+                server_host: self.server_host.clone(),
+                server_port: self.server_port,
+            },
         };
 
         let start = std::time::Instant::now();
-        let result = self.execute_query(&client, username).await;
+        let result = self
+            .execute_query(guard.client.as_ref().unwrap(), username)
+            .await;
         let elapsed = format_elapsed(start.elapsed());
 
         match &result {
@@ -297,16 +570,51 @@ impl AuthQueryExecutor {
             }
         }
 
-        // Return connection to pool, or reconnect if dead
-        if result.is_ok() || !client.is_closed() {
-            let _ = self.tx.send(client).await;
+        // took client out of the guard BEFORE
+        // `tx.send().await` - but `send().await` is NOT cancel-safe in
+        // async-channel; a caller cancelled at that await point would
+        // drop the Client and leak the executor slot, reintroducing
+        // the exact bug F3 fixed at the recv-side. The fix: use the
+        // sync `try_send` while we still hold the guard. The channel
+        // capacity matches workers and the slot we recv'd from is
+        // immediately available, so `try_send` returns Ok in the happy
+        // path. If it returns Err (channel closed / full from races),
+        // the guard's Drop catches the cleanup.
+        if result.is_ok() {
+            let client = guard.client.take().expect("guard still holds Client");
+            if !client.is_closed() {
+                if let Err(send_err) = self.tx.try_send(client) {
+                    warn!(
+                        "[{username}@{}] auth_query: try_send back to channel failed: {send_err}",
+                        self.pool_name
+                    );
+                    // try_send took ownership of `client` on Err but
+                    // exposes it via `into_inner()`; the guard already
+                    // took() so we lose the slot here. Trigger reconnect
+                    // from an owned task to repopulate.
+                    drop(send_err);
+                    self.schedule_reconnect("try_send back to channel failed");
+                }
+            } else {
+                warn!(
+                    "[{username}@{}] auth_query: executor connection dead after successful query, \
+                     attempting reconnect",
+                    self.pool_name
+                );
+                drop(client);
+                self.schedule_reconnect("executor connection dead after successful query");
+            }
         } else {
+            // On query failure: discard the client and trigger reconnect.
+            // Guard.take() drops the client without sending; the guard's
+            // Drop is now a no-op for the `result is None` case.
+            let _ = guard.client.take();
             warn!(
                 "[{username}@{}] auth_query: executor connection dead after query failure, \
                  attempting reconnect",
                 self.pool_name
             );
-            self.try_reconnect().await;
+            self.schedule_reconnect("executor connection dead after query failure");
         }
 
         result
@@ -318,51 +626,15 @@ impl AuthQueryExecutor {
         Ok(self.fetch_credentials(username).await?.map(|(p, _)| p))
     }
 
-    async fn try_reconnect(&self) {
-        let database = self
-            .config
-            .database
-            .clone()
-            .unwrap_or_else(|| self.pool_name.clone());
-        let pg_config =
-            Self::build_pg_config(&self.config, &self.server_host, self.server_port, &database);
-        match Self::connect(
-            &pg_config,
-            0,
-            &self.pool_name,
-            &self.server_host,
-            self.server_port,
-            &database,
-            &self.config.user,
-        )
-        .await
-        {
-            Ok(new_client) => {
-                info!(
-                    "[pool: {}] auth_query: executor reconnection successful",
-                    self.pool_name
-                );
-                let _ = self.tx.send(new_client).await;
-            }
-            Err(e) => {
-                error!(
-                    "[pool: {}] auth_query: executor reconnection failed: {e} \
-                     (pool shrinks by 1, will retry on next request)",
-                    self.pool_name
-                );
-            }
-        }
-    }
-
     async fn execute_query(
         &self,
         client: &Client,
         username: &str,
     ) -> Result<Option<Credentials>, Error> {
         let rows = client
-            .query(
+            .query_raw(
                 &self.config.query,
-                &[&username as &(dyn tokio_postgres::types::ToSql + Sync)],
+                [&username as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
             .map_err(|e| {
@@ -370,22 +642,36 @@ impl AuthQueryExecutor {
                     "query execution failed for user '{username}': {e}"
                 ))
             })?;
+        futures::pin_mut!(rows);
 
-        match rows.len() {
-            0 => Ok(None),
-            1 => {
-                let row = &rows[0];
-                let pw_opt = Self::extract_password(row, username, &self.pool_name)?;
-                let Some(pw) = pw_opt else {
-                    return Ok(None);
-                };
-                let params = Self::extract_startup_parameters(row, username, &self.pool_name);
-                Ok(Some((pw, params)))
-            }
-            n => Err(Error::AuthQueryConfigError(format!(
-                "query returned {n} rows for user '{username}', expected 0 or 1"
-            ))),
+        let Some(row) = rows.try_next().await.map_err(|e| {
+            Error::AuthQueryQueryError(format!("query execution failed for user '{username}': {e}"))
+        })?
+        else {
+            return Ok(None);
+        };
+
+        if rows
+            .try_next()
+            .await
+            .map_err(|e| {
+                Error::AuthQueryQueryError(format!(
+                    "query execution failed for user '{username}': {e}"
+                ))
+            })?
+            .is_some()
+        {
+            return Err(Error::AuthQueryConfigError(format!(
+                "query returned more than 1 row for user '{username}', expected 0 or 1"
+            )));
         }
+
+        let pw_opt = Self::extract_password(&row, username, &self.pool_name)?;
+        let Some(pw) = pw_opt else {
+            return Ok(None);
+        };
+        let params = Self::extract_startup_parameters(&row, username, &self.pool_name);
+        Ok(Some((pw, params)))
     }
 
     /// Extract password hash from query result row.
@@ -400,16 +686,30 @@ impl AuthQueryExecutor {
         pool_name: &str,
     ) -> Result<Option<String>, Error> {
         let columns = row.columns();
-        let password: Option<String> = if let Ok(p) = row.try_get::<_, Option<String>>("passwd") {
-            p
-        } else if let Ok(p) = row.try_get::<_, Option<String>>("password") {
-            p
+        let password: Option<String> = if columns.iter().any(|c| c.name() == "passwd") {
+            row.try_get::<_, Option<LimitedVerifier>>("passwd")
+                .map_err(|e| {
+                    Error::AuthQueryConfigError(format!(
+                        "failed to read passwd from auth_query result: {e}"
+                    ))
+                })?
+                .map(|p| p.0)
+        } else if columns.iter().any(|c| c.name() == "password") {
+            row.try_get::<_, Option<LimitedVerifier>>("password")
+                .map_err(|e| {
+                    Error::AuthQueryConfigError(format!(
+                        "failed to read password from auth_query result: {e}"
+                    ))
+                })?
+                .map(|p| p.0)
         } else if columns.len() == 1 {
-            row.try_get::<_, Option<String>>(0).map_err(|e| {
-                Error::AuthQueryConfigError(format!(
-                    "failed to read password from single-column result: {e}"
-                ))
-            })?
+            row.try_get::<_, Option<LimitedVerifier>>(0)
+                .map_err(|e| {
+                    Error::AuthQueryConfigError(format!(
+                        "failed to read password from single-column result: {e}"
+                    ))
+                })?
+                .map(|p| p.0)
         } else {
             let col_names: Vec<&str> = columns.iter().map(|c| c.name()).collect();
             return Err(Error::AuthQueryConfigError(format!(
@@ -419,7 +719,10 @@ impl AuthQueryExecutor {
             )));
         };
         match password {
-            Some(p) if !p.is_empty() => Ok(Some(p)),
+            Some(p) if !p.is_empty() => {
+                validate_auth_query_verifier_len(&p, username, pool_name)?;
+                Ok(Some(p))
+            }
             _ => {
                 warn!("[{username}@{pool_name}] auth_query: password is NULL or empty");
                 Ok(None)
@@ -468,9 +771,10 @@ impl AuthQueryExecutor {
                             "[{username}@{pool_name}] auth_query startup_parameters: {json_err}; \
                              parameters ignored"
                         );
-                        crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                            .with_label_values(&[pool_name, "auth_query_oversize"])
-                            .inc();
+                        crate::web::metrics::observe_startup_parameters_dropped(
+                            pool_name,
+                            "auth_query_oversize",
+                        );
                     } else {
                         warn!(
                             "[{username}@{pool_name}] auth_query startup_parameters column has type \
@@ -478,26 +782,43 @@ impl AuthQueryExecutor {
                              Per-user parameters are ignored for this row.",
                             ty = col_type.name()
                         );
-                        crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                            .with_label_values(&[pool_name, "auth_query_bad_type"])
-                            .inc();
+                        crate::web::metrics::observe_startup_parameters_dropped(
+                            pool_name,
+                            "auth_query_bad_type",
+                        );
                     }
                     std::collections::HashMap::new()
                 }
             }
         } else {
-            match row.try_get::<_, Option<String>>("startup_parameters") {
-                Ok(raw) => Self::parse_startup_parameters_text(raw.as_deref(), username, pool_name),
+            match row.try_get::<_, Option<LimitedText>>("startup_parameters") {
+                Ok(raw) => Self::parse_startup_parameters_text(
+                    raw.as_ref().map(|text| text.0.as_str()),
+                    username,
+                    pool_name,
+                ),
                 Err(text_err) => {
-                    warn!(
-                        "[{username}@{pool_name}] auth_query startup_parameters column has type \
-                         `{ty}` but pg_doorman reads it as `text`, `json`, or `jsonb`: {text_err}. \
-                         Per-user parameters are ignored for this row.",
-                        ty = col_type.name()
-                    );
-                    crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                        .with_label_values(&[pool_name, "auth_query_bad_type"])
-                        .inc();
+                    if text_err.to_string().contains(LIMITED_TEXT_OVERSIZE_TAG) {
+                        warn!(
+                            "[{username}@{pool_name}] auth_query startup_parameters: {text_err}; \
+                             parameters ignored"
+                        );
+                        crate::web::metrics::observe_startup_parameters_dropped(
+                            pool_name,
+                            "auth_query_oversize",
+                        );
+                    } else {
+                        warn!(
+                            "[{username}@{pool_name}] auth_query startup_parameters column has type \
+                             `{ty}` but pg_doorman reads it as `text`, `json`, or `jsonb`: {text_err}. \
+                             Per-user parameters are ignored for this row.",
+                            ty = col_type.name()
+                        );
+                        crate::web::metrics::observe_startup_parameters_dropped(
+                            pool_name,
+                            "auth_query_bad_type",
+                        );
+                    }
                     std::collections::HashMap::new()
                 }
             }
@@ -528,9 +849,10 @@ impl AuthQueryExecutor {
                  exceeding operator budget {max_bytes}; parameters ignored",
                 text.len()
             );
-            crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                .with_label_values(&[pool_name, "auth_query_oversize"])
-                .inc();
+            crate::web::metrics::observe_startup_parameters_dropped(
+                pool_name,
+                "auth_query_oversize",
+            );
             return std::collections::HashMap::new();
         }
         let parsed: serde_json::Value = match serde_json::from_str(text) {
@@ -540,9 +862,10 @@ impl AuthQueryExecutor {
                     "[{username}@{pool_name}] auth_query startup_parameters: JSON parse failed: \
                      {e}; parameters ignored"
                 );
-                crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                    .with_label_values(&[pool_name, "auth_query_invalid_json"])
-                    .inc();
+                crate::web::metrics::observe_startup_parameters_dropped(
+                    pool_name,
+                    "auth_query_invalid_json",
+                );
                 return std::collections::HashMap::new();
             }
         };
@@ -563,9 +886,10 @@ impl AuthQueryExecutor {
                 "[{username}@{pool_name}] auth_query startup_parameters: top-level value is not a \
                  JSON object; ignored"
             );
-            crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                .with_label_values(&[pool_name, "auth_query_invalid_shape"])
-                .inc();
+            crate::web::metrics::observe_startup_parameters_dropped(
+                pool_name,
+                "auth_query_invalid_shape",
+            );
             return std::collections::HashMap::new();
         };
         let mut out = std::collections::HashMap::with_capacity(obj.len());
@@ -611,9 +935,10 @@ impl AuthQueryExecutor {
         // so `rate by(reason)` is dimensionally consistent. Per-entry
         // detail stays in the warn log.
         if had_invalid_entry {
-            crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                .with_label_values(&[pool_name, "auth_query_invalid_entry"])
-                .inc();
+            crate::web::metrics::observe_startup_parameters_dropped(
+                pool_name,
+                "auth_query_invalid_entry",
+            );
         }
         // The text decoder enforces `MAX_OPERATOR_BUDGET` on the raw
         // column before parsing. The json/jsonb decoder has no raw
@@ -632,9 +957,10 @@ impl AuthQueryExecutor {
                 "[{username}@{pool_name}] auth_query startup_parameters: decoded map is \
                  {serialized} bytes, exceeding operator budget {max_bytes}; parameters ignored"
             );
-            crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-                .with_label_values(&[pool_name, "auth_query_oversize"])
-                .inc();
+            crate::web::metrics::observe_startup_parameters_dropped(
+                pool_name,
+                "auth_query_oversize",
+            );
             return std::collections::HashMap::new();
         }
         out
@@ -772,7 +1098,13 @@ pub struct AuthQueryCache<F = AuthQueryExecutor> {
     /// Pool name for log context.
     pool_name: String,
     /// Cached credentials keyed by username.
-    entries: DashMap<String, CacheEntry>,
+    ///
+    /// values are `Arc<CacheEntry>` so a cache hit returns a
+    /// cheap pointer clone instead of deep-cloning `password_hash`
+    /// (String) and `client_key` (Vec<u8>) on every authentication. The
+    /// in-place `set_client_key` mutation uses `Arc::make_mut`, which only
+    /// copies when another reader is concurrently holding the Arc.
+    entries: DashMap<String, Arc<CacheEntry>>,
     /// Per-username locks for request coalescing.
     /// First request acquires lock + fetches; others wait + get cache hit.
     locks: DashMap<String, Arc<TokioMutex<()>>>,
@@ -794,6 +1126,56 @@ pub struct AuthQueryCache<F = AuthQueryExecutor> {
     /// in dedicated mode. Ensures the warning fires at most once per
     /// (pool, user) until the cache is cleared by a config reload.
     dedicated_warnings: DashMap<String, ()>,
+    /// counter for amortized sampled TTL eviction.
+    /// Every `SWEEP_INTERVAL` calls to `get_or_fetch` walk
+    /// `SWEEP_BATCH` cache entries and drop the expired ones (plus
+    /// their `locks` and `dedicated_warnings` peers). Without this,
+    /// `entries`/`locks`/`dedicated_warnings` grew unbounded by unique
+    /// username until the next config RELOAD - a brute-force username
+    /// probe or a multi-tenant SaaS with short-lived service accounts
+    /// could pin tens of megabytes of dead state inside the pooler.
+    sweep_counter: AtomicU64,
+}
+
+/// number of `get_or_fetch` calls between sweeps. 128 is large
+/// enough to keep the sweep amortized to <0.01% of authentication
+/// cost yet small enough that a 60s cache_failure_ttl entry never
+/// outlives more than ~128 negative-cache hits.
+const SWEEP_INTERVAL: u64 = 128;
+
+/// number of entries inspected per sweep. 8 keeps the per-call
+/// p99 latency overhead trivial (a few atomic reads + at most 8
+/// DashMap removes) while still draining the largest realistic
+/// caches (10k entries) in under 1 minute of normal traffic at
+/// 10 req/sec - well below typical `cache_ttl` (1 hour).
+const SWEEP_BATCH: usize = 8;
+
+/// Hard cap for one pool's auth_query credential cache. TTL sweeps remove
+/// expired entries, but an attacker can create fresh unique negative-cache
+/// entries faster than sampled sweeps age them out. Keep a bounded per-pool
+/// footprint even when every attempted username is different.
+const MAX_AUTH_QUERY_CACHE_ENTRIES: usize = 4096;
+
+/// Prune below the hard cap once it is crossed so every post-cap insert does
+/// not pay a full DashMap scan. The target remains high enough for normal
+/// multi-tenant caches while giving a 256-entry hysteresis window.
+const AUTH_QUERY_CACHE_TARGET_ENTRIES: usize = 3840;
+
+struct AuthQueryLockCleanupGuard<'a, F: PasswordFetcher> {
+    cache: &'a AuthQueryCache<F>,
+    username: &'a str,
+}
+
+impl<'a, F: PasswordFetcher> AuthQueryLockCleanupGuard<'a, F> {
+    fn new(cache: &'a AuthQueryCache<F>, username: &'a str) -> Self {
+        Self { cache, username }
+    }
+}
+
+impl<F: PasswordFetcher> Drop for AuthQueryLockCleanupGuard<'_, F> {
+    fn drop(&mut self) {
+        self.cache.remove_lock_without_live_entry(self.username);
+    }
 }
 
 impl<F: PasswordFetcher> AuthQueryCache<F> {
@@ -814,6 +1196,71 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
             stats,
             is_dedicated: config.is_dedicated_mode(),
             dedicated_warnings: DashMap::new(),
+            sweep_counter: AtomicU64::new(0),
+        }
+    }
+
+    fn remove_cached_username(&self, username: &str) {
+        self.entries.remove(username);
+        self.locks.remove(username);
+        self.dedicated_warnings.remove(username);
+    }
+
+    fn has_live_entry(&self, username: &str) -> bool {
+        self.entries
+            .get(username)
+            .is_some_and(|entry| !entry.is_expired(&self.cache_ttl, &self.cache_failure_ttl))
+    }
+
+    fn remove_lock_without_live_entry(&self, username: &str) {
+        if !self.has_live_entry(username) {
+            self.locks.remove(username);
+            self.dedicated_warnings.remove(username);
+        }
+    }
+
+    fn enforce_size_limit(&self) {
+        let len = self.entries.len();
+        if len <= MAX_AUTH_QUERY_CACHE_ENTRIES {
+            return;
+        }
+
+        let remove_goal = len.saturating_sub(AUTH_QUERY_CACHE_TARGET_ENTRIES);
+        let mut victims: Vec<(String, std::time::Duration)> = Vec::with_capacity(len);
+        for entry in self.entries.iter() {
+            victims.push((entry.key().clone(), entry.fetched_at.elapsed()));
+        }
+        victims.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (username, _) in victims.into_iter().take(remove_goal) {
+            self.remove_cached_username(&username);
+        }
+    }
+
+    /// drop up to `SWEEP_BATCH` expired entries plus
+    /// their `locks` and `dedicated_warnings` peers. Called from the
+    /// `get_or_fetch` slow path, amortized to one sweep per
+    /// `SWEEP_INTERVAL` calls. Sampled, not exhaustive - slow drift to
+    /// steady-state mirrors the prepared-statement cache eviction
+    /// policy (sampled K-stride, not full scan).
+    fn sweep_expired(&self) {
+        let mut to_drop: smallvec::SmallVec<[String; SWEEP_BATCH]> = smallvec::SmallVec::new();
+        for entry in self.entries.iter().take(SWEEP_BATCH * 2) {
+            if entry.is_expired(&self.cache_ttl, &self.cache_failure_ttl) {
+                to_drop.push(entry.key().clone());
+                if to_drop.len() >= SWEEP_BATCH {
+                    break;
+                }
+            }
+        }
+        for key in &to_drop {
+            // Dropping `locks[key]` is safe: any awaiter that held the
+            // Arc keeps the mutex alive; new requests for the same
+            // username re-create the entry under the DashMap shard
+            // lock. Doing this in lock-step with `entries.remove`
+            // prevents the lock-map from accumulating forever even when
+            // no two callers ever race on the same username.
+            self.remove_cached_username(key);
         }
     }
 
@@ -831,9 +1278,10 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
         // other reason on this counter so `rate by(reason)` is
         // dimensionally consistent. The warn log carries the same
         // once-per-(pool, user) shape.
-        crate::web::metrics::STARTUP_PARAMETERS_DROPPED_TOTAL
-            .with_label_values(&[self.pool_name.as_str(), "dedicated_mode"])
-            .inc();
+        crate::web::metrics::observe_startup_parameters_dropped(
+            self.pool_name.as_str(),
+            "dedicated_mode",
+        );
         if self
             .dedicated_warnings
             .insert(username.to_string(), ())
@@ -898,7 +1346,7 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
     /// - `Ok(Some(entry))` — user found (positive cache or fresh fetch)
     /// - `Ok(None)` — user not found (negative cache or fresh fetch returned 0 rows)
     /// - `Err` — executor error (PG down, SQL error, etc.)
-    pub async fn get_or_fetch(&self, username: &str) -> Result<Option<CacheEntry>, Error> {
+    pub async fn get_or_fetch(&self, username: &str) -> Result<Option<Arc<CacheEntry>>, Error> {
         if username.len() > MAX_USERNAME_LEN {
             warn!(
                 "[{username}@{}] auth_query cache: rejecting username (len={}, max={MAX_USERNAME_LEN})",
@@ -908,6 +1356,13 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
             return Ok(None);
         }
 
+        // amortized sampled TTL eviction. One sweep per
+        // SWEEP_INTERVAL calls keeps the cost <0.01% of auth latency
+        // while preventing unbounded growth on long-lived pools.
+        if self.sweep_counter.fetch_add(1, Ordering::Relaxed) % SWEEP_INTERVAL == 0 {
+            self.sweep_expired();
+        }
+
         // Fast path: check cache without lock
         if let Some(entry) = self.entries.get(username) {
             if !entry.is_expired(&self.cache_ttl, &self.cache_failure_ttl) {
@@ -915,7 +1370,8 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
                 return if entry.is_negative {
                     Ok(None)
                 } else {
-                    Ok(Some(entry.clone()))
+                    // cheap Arc pointer clone, not a deep copy.
+                    Ok(Some(Arc::clone(entry.value())))
                 };
             }
         }
@@ -927,7 +1383,12 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone();
 
+        let _lock_cleanup = AuthQueryLockCleanupGuard::new(self, username);
         let _guard = lock.lock().await;
+        // Keep the guard armed. Normal success publishes a live cache entry,
+        // so the guard keeps the coalescing lock. Cancellation or an error
+        // before publication drops the lock entry instead of growing the map
+        // outside the credential-cache cap.
 
         // Double-check after acquiring lock
         if let Some(entry) = self.entries.get(username) {
@@ -936,7 +1397,8 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
                 return if entry.is_negative {
                     Ok(None)
                 } else {
-                    Ok(Some(entry.clone()))
+                    // cheap Arc pointer clone, not a deep copy.
+                    Ok(Some(Arc::clone(entry.value())))
                 };
             }
         }
@@ -945,10 +1407,13 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
         self.inc(|s| &s.executor_queries);
         match self.executor.fetch_credentials(username).await {
             Ok(Some((password_hash, startup_params))) => {
+                validate_auth_query_verifier_len(&password_hash, username, &self.pool_name)?;
                 self.inc(|s| &s.cache_misses);
                 let mut entry = CacheEntry::positive(password_hash);
                 entry.set_startup_overlay(startup_params);
                 self.dedicated_mode_filter(&mut entry, username);
+                // wrap once, store and hand back the same Arc.
+                let entry = Arc::new(entry);
                 // Publish the fresh entry first so any concurrent
                 // create_dynamic_pool peeks the new overlay, then drop the
                 // pool whose snapshot drifted. Reversing the order would
@@ -956,18 +1421,22 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
                 // while the cache still holds the old map, and a racing
                 // create_dynamic_pool would rebuild against that stale
                 // map and immediately drift again.
-                self.entries.insert(username.to_string(), entry.clone());
+                self.entries
+                    .insert(username.to_string(), Arc::clone(&entry));
+                self.enforce_size_limit();
                 self.drop_dynamic_pool_if_overlay_drifted(username, entry.startup_overlay.map());
                 Ok(Some(entry))
             }
             Ok(None) => {
                 self.inc(|s| &s.cache_misses);
                 let entry = CacheEntry::negative();
-                self.entries.insert(username.to_string(), entry);
+                self.entries.insert(username.to_string(), Arc::new(entry));
+                self.enforce_size_limit();
                 Ok(None)
             }
             Err(err) => {
                 self.inc(|s| &s.executor_errors);
+                self.remove_lock_without_live_entry(username);
                 Err(err)
             }
         }
@@ -991,7 +1460,10 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
     ///
     /// Uses the same per-username lock as `get_or_fetch()` to prevent concurrent
     /// refetches for the same user.
-    pub async fn refetch_on_failure(&self, username: &str) -> Result<Option<CacheEntry>, Error> {
+    pub async fn refetch_on_failure(
+        &self,
+        username: &str,
+    ) -> Result<Option<Arc<CacheEntry>>, Error> {
         // Acquire per-username lock (same lock as get_or_fetch)
         let lock = self
             .locks
@@ -999,6 +1471,7 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone();
 
+        let _lock_cleanup = AuthQueryLockCleanupGuard::new(self, username);
         let _guard = lock.lock().await;
 
         // Check rate limit (under lock to avoid TOCTOU)
@@ -1021,23 +1494,30 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
         self.inc(|s| &s.cache_refetches);
         match self.executor.fetch_credentials(username).await {
             Ok(Some((password_hash, startup_params))) => {
+                validate_auth_query_verifier_len(&password_hash, username, &self.pool_name)?;
                 let mut entry = CacheEntry::positive(password_hash);
                 entry.set_startup_overlay(startup_params);
                 entry.last_refetch_at = Some(Instant::now());
                 self.dedicated_mode_filter(&mut entry, username);
-                // Insert before drop — see comment in get_or_fetch.
-                self.entries.insert(username.to_string(), entry.clone());
+                // wrap once, store and hand back the same Arc.
+                let entry = Arc::new(entry);
+                // Insert before drop - see comment in get_or_fetch.
+                self.entries
+                    .insert(username.to_string(), Arc::clone(&entry));
+                self.enforce_size_limit();
                 self.drop_dynamic_pool_if_overlay_drifted(username, entry.startup_overlay.map());
                 Ok(Some(entry))
             }
             Ok(None) => {
                 let mut entry = CacheEntry::negative();
                 entry.last_refetch_at = Some(Instant::now());
-                self.entries.insert(username.to_string(), entry);
+                self.entries.insert(username.to_string(), Arc::new(entry));
+                self.enforce_size_limit();
                 Ok(None)
             }
             Err(err) => {
                 self.inc(|s| &s.executor_errors);
+                self.remove_lock_without_live_entry(username);
                 Err(err)
             }
         }
@@ -1054,7 +1534,13 @@ impl<F: PasswordFetcher> AuthQueryCache<F> {
     /// Store ClientKey for a cached user (called after successful SCRAM auth).
     pub fn set_client_key(&self, username: &str, client_key: Vec<u8>) {
         if let Some(mut entry) = self.entries.get_mut(username) {
-            entry.client_key = Some(client_key);
+            // `Arc::make_mut` mutates in place when this is the
+            // sole owner (the common case under the shard write lock) and
+            // copy-on-writes only if a concurrent reader still holds a
+            // clone of the previous Arc - preserving the previous
+            // in-place mutation semantics without leaking the change to
+            // that reader's snapshot.
+            Arc::make_mut(&mut entry).client_key = Some(client_key);
         }
     }
 
@@ -1212,6 +1698,28 @@ mod tests {
         }
     }
 
+    struct ErrorFetcher {
+        fetch_count: AtomicUsize,
+    }
+
+    impl ErrorFetcher {
+        fn new() -> Self {
+            Self {
+                fetch_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PasswordFetcher for ErrorFetcher {
+        fn fetch<'a>(
+            &'a self,
+            _username: &'a str,
+        ) -> impl Future<Output = Result<Option<String>, Error>> + Send + 'a {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            async { Err(Error::AuthQueryConnectionError("executor down".into())) }
+        }
+    }
+
     fn test_config() -> AuthQueryConfig {
         AuthQueryConfig {
             query: String::new(),
@@ -1234,6 +1742,109 @@ mod tests {
         config: &AuthQueryConfig,
     ) -> AuthQueryCache<MockFetcher> {
         AuthQueryCache::new("test_pool".to_string(), fetcher, config, None)
+    }
+
+    #[test]
+    fn return_guard_cancel_path_discards_busy_executor_client() {
+        let src = include_str!("auth_query.rs");
+        let start = src
+            .find("impl Drop for ReturnGuard")
+            .expect("ReturnGuard Drop impl must exist");
+        let end = src[start..]
+            .find("/// Executor for running auth_query SELECT statements")
+            .map(|offset| start + offset)
+            .expect("ReturnGuard Drop impl should precede executor definition");
+        let drop_impl = &src[start..end];
+
+        assert!(
+            !drop_impl.contains("tx.send(client).await"),
+            "cancelled auth_query fetch must not return a possibly busy Client to the executor pool"
+        );
+        assert!(
+            !drop_impl.contains("if !client.is_closed()"),
+            "a non-closed Client can still have an in-flight query after task cancellation"
+        );
+        assert!(
+            drop_impl.find("drop(client);")
+                < drop_impl.find("AuthQueryExecutor::schedule_reconnect_with("),
+            "cancel path must discard the old Client before scheduling reconnect"
+        );
+    }
+
+    #[test]
+    fn fetch_credentials_reconnect_after_guard_disarm_is_detached() {
+        let src = include_str!("auth_query.rs");
+        let start = src
+            .find("pub async fn fetch_credentials")
+            .expect("fetch_credentials must exist");
+        let end = src[start..]
+            .find("/// Backwards-compatible password-only accessor")
+            .map(|offset| start + offset)
+            .expect("fetch_credentials should precede fetch_password");
+        let body = &src[start..end];
+
+        assert!(
+            !body.contains("self.try_reconnect().await"),
+            "after guard.client.take(), awaiting direct reconnect is cancellation-unsafe"
+        );
+        assert!(
+            body.contains("self.schedule_reconnect("),
+            "reconnect after guard disarm must be scheduled into an owned task"
+        );
+    }
+
+    #[test]
+    fn reconnect_task_retries_until_redeposit_or_channel_close() {
+        let src = include_str!("auth_query.rs");
+        let start = src
+            .find("fn schedule_reconnect_with")
+            .expect("schedule_reconnect_with must exist");
+        let end = src[start..]
+            .find("async fn connect")
+            .map(|offset| start + offset)
+            .expect("schedule_reconnect_with should precede connect");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("loop {"),
+            "a failed auth_query reconnect must retry instead of permanently shrinking the pool"
+        );
+        assert!(
+            body.contains("tokio::time::sleep"),
+            "retrying auth_query reconnects must use backoff, not a tight loop"
+        );
+        assert!(
+            body.contains("tx.is_closed()"),
+            "reconnect retry loop must stop when the executor channel closes"
+        );
+        assert!(
+            !body.contains("pool shrinks by 1"),
+            "a failed one-shot reconnect must not leave the worker slot permanently drained"
+        );
+    }
+
+    #[test]
+    fn executor_new_checks_worker_cap_before_channel_allocation() {
+        let src = include_str!("auth_query.rs");
+        let start = src
+            .find("pub async fn new")
+            .expect("AuthQueryExecutor::new must exist");
+        let end = src[start..]
+            .find("fn build_pg_config")
+            .map(|offset| start + offset)
+            .expect("new should precede build_pg_config");
+        let body = &src[start..end];
+        let guard = body
+            .find("MAX_AUTH_QUERY_WORKERS")
+            .expect("new must reject oversized workers directly");
+        let channel = body
+            .find("async_channel::bounded")
+            .expect("new must allocate worker channel");
+
+        assert!(
+            guard < channel,
+            "workers cap must be checked before channel allocation"
+        );
     }
 
     // -- test_cache_hit: second get_or_fetch returns cached, no extra fetch --
@@ -1291,6 +1902,65 @@ mod tests {
         assert_eq!(fetcher.fetch_count(), 2);
     }
 
+    // -- sweep_expired drops expired entries plus
+    //    their locks/dedicated_warnings peers, preventing unbounded
+    //    growth on long-lived caches under unique-username pressure
+    //    (brute-force probe, multi-tenant SaaS service accounts). --
+
+    #[tokio::test]
+    async fn sampled_ttl_sweep_drops_expired_entries() {
+        let fetcher = Arc::new(MockFetcher::new());
+        for i in 0..20 {
+            fetcher.add_user(&format!("user_{i}"), "md5deadbeef");
+        }
+        let mut config = test_config();
+        config.cache_ttl = Duration::from_millis(20);
+
+        let cache = make_cache(fetcher.clone(), &config);
+
+        // Seed all 20 entries.
+        for i in 0..20 {
+            cache.get_or_fetch(&format!("user_{i}")).await.unwrap();
+        }
+        assert_eq!(cache.entries.len(), 20);
+        assert_eq!(cache.locks.len(), 20);
+
+        // Let them all expire, then call get_or_fetch enough times to
+        // trigger several sweeps. Each sweep drains up to SWEEP_BATCH
+        // expired entries; 20 / 8 ≈ 3 sweeps; we do
+        // SWEEP_INTERVAL * 3 = 384 calls.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        for _ in 0..(super::SWEEP_INTERVAL as usize * 3) {
+            // Sweep happens on the sweep_counter % SWEEP_INTERVAL == 0
+            // branch in get_or_fetch; trigger by calling with a username
+            // that's not in cache (negative-cache path also exercises
+            // the sweep gate). Using a fresh name per call also feeds
+            // the cache new entries we don't want to keep - but that's
+            // fine, they too are subject to sweep when they expire.
+            let _ = cache.get_or_fetch("trigger_user").await;
+        }
+
+        // The seeded `user_*` entries should have been swept out.
+        // Allow some tolerance - sampled sweep walks SWEEP_BATCH*2
+        // entries per call so very large caches may need extra cycles.
+        let surviving_seeded = (0..20)
+            .filter(|i| cache.entries.contains_key(&format!("user_{i}")))
+            .count();
+        assert!(
+            surviving_seeded <= 4,
+            "expected sampled sweep to drain most expired entries, \
+             {surviving_seeded} of 20 survived"
+        );
+        // Locks for swept users dropped in lock-step.
+        let surviving_locks = (0..20)
+            .filter(|i| cache.locks.contains_key(&format!("user_{i}")))
+            .count();
+        assert_eq!(
+            surviving_seeded, surviving_locks,
+            "locks must be dropped in lock-step with entries"
+        );
+    }
+
     // -- test_negative_cache: user-not-found is cached with cache_failure_ttl --
 
     #[tokio::test]
@@ -1316,6 +1986,88 @@ mod tests {
         // Should re-fetch
         assert!(cache.get_or_fetch("unknown").await.unwrap().is_none());
         assert_eq!(fetcher.fetch_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn cache_size_is_hard_capped_under_unique_negative_users() {
+        let fetcher = Arc::new(MockFetcher::new());
+        let mut config = test_config();
+        config.cache_failure_ttl = Duration::from_hours(1);
+        let cache = make_cache(fetcher.clone(), &config);
+
+        for i in 0..(super::MAX_AUTH_QUERY_CACHE_ENTRIES + super::SWEEP_INTERVAL as usize) {
+            let username = format!("u{i}");
+            assert!(cache.get_or_fetch(&username).await.unwrap().is_none());
+        }
+
+        assert!(
+            cache.entries.len() <= super::MAX_AUTH_QUERY_CACHE_ENTRIES,
+            "credential cache must stay bounded under unique misses, len={}",
+            cache.entries.len()
+        );
+        assert!(
+            cache.locks.len() <= super::MAX_AUTH_QUERY_CACHE_ENTRIES,
+            "per-username lock map must be pruned with cache entries, len={}",
+            cache.locks.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_errors_do_not_grow_per_username_lock_map() {
+        let fetcher = Arc::new(ErrorFetcher::new());
+        let cache = AuthQueryCache::new("test_pool".to_string(), fetcher, &test_config(), None);
+
+        for i in 0..(super::MAX_AUTH_QUERY_CACHE_ENTRIES + super::SWEEP_INTERVAL as usize) {
+            let username = format!("err_user_{i}");
+            assert!(cache.get_or_fetch(&username).await.is_err());
+        }
+
+        assert_eq!(
+            cache.entries.len(),
+            0,
+            "executor errors must not cache entries"
+        );
+        assert_eq!(
+            cache.locks.len(),
+            0,
+            "executor errors without live cache entries must not retain per-user locks"
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_get_or_fetch_removes_lock_without_cache_entry() {
+        let fetcher = Arc::new(MockFetcher::with_delay(std::time::Duration::from_secs(30)));
+        fetcher.add_user("slow_user", "md5abc123");
+        let cache = Arc::new(make_cache(fetcher.clone(), &test_config()));
+
+        let task = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.get_or_fetch("slow_user").await })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if cache.locks.contains_key("slow_user") && fetcher.fetch_count() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow fetch must install a per-user lock before test cancellation");
+
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(
+            cache.entries.len(),
+            0,
+            "aborted fetch must not cache entries"
+        );
+        assert!(
+            !cache.locks.contains_key("slow_user"),
+            "aborted fetch without a live cache entry must not retain its per-user lock"
+        );
     }
 
     // -- test_invalidate: removes entry, next fetch goes to PG --
@@ -1397,6 +2149,25 @@ mod tests {
         assert!(result.is_none());
         assert_eq!(fetcher.fetch_count(), 0); // No fetch attempted
         assert_eq!(cache.len(), 0); // Not cached
+    }
+
+    #[tokio::test]
+    async fn oversized_password_hash_rejected_without_cache_entry() {
+        let fetcher = Arc::new(MockFetcher::new());
+        let oversized_hash = "x".repeat(4097);
+        fetcher.add_user("alice", &oversized_hash);
+        let cache = make_cache(fetcher.clone(), &test_config());
+
+        let err = cache.get_or_fetch("alice").await.unwrap_err();
+        match err {
+            Error::AuthQueryConfigError(msg) => {
+                assert!(msg.contains("password verifier"));
+                assert!(msg.contains("exceeds"));
+            }
+            other => panic!("expected AuthQueryConfigError, got {other:?}"),
+        }
+        assert_eq!(fetcher.fetch_count(), 1);
+        assert_eq!(cache.len(), 0);
     }
 
     // -- test_clear: removes all entries and locks --
@@ -1555,6 +2326,39 @@ mod tests {
         assert!(
             r.is_empty(),
             "oversize raw column must be rejected before serde_json walks it"
+        );
+    }
+
+    #[test]
+    fn limited_text_rejects_oversize_raw_before_string_decode() {
+        let cap = crate::config::startup_parameters::MAX_OPERATOR_BUDGET;
+        let raw = vec![b'a'; cap + 1];
+        let err = <LimitedText as FromSql>::from_sql(&Type::TEXT, &raw)
+            .expect_err("oversize raw text must fail before String allocation")
+            .to_string();
+        assert!(err.contains(LIMITED_TEXT_OVERSIZE_TAG));
+        assert!(err.contains("exceeding operator budget"));
+    }
+
+    #[test]
+    fn extract_startup_parameters_text_branch_uses_limited_decoder() {
+        let src = include_str!("auth_query.rs");
+        let start = src
+            .find("fn extract_startup_parameters(")
+            .expect("extract_startup_parameters must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n    /// Parse the optional `startup_parameters`")
+            .expect("parser docs should follow extractor");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("Option<LimitedText>"),
+            "text startup_parameters must use the bounded raw decoder"
+        );
+        assert!(
+            !body.contains("Option<String>"),
+            "text startup_parameters must not allocate String before the raw budget check"
         );
     }
 

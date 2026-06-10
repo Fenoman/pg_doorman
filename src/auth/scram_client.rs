@@ -14,6 +14,8 @@ use std::fmt::Write;
 use crate::errors::Error;
 use crate::messages::constants::*;
 
+const MAX_BACKEND_SCRAM_ITERATIONS: u32 = 1_000_000;
+
 /// Normalize a password string. Postgres
 /// passwords don't have to be UTF-8.
 fn normalize(pass: &[u8]) -> Vec<u8> {
@@ -87,7 +89,7 @@ impl ScramSha256 {
             })
             .collect::<String>();
 
-        let message = BytesMut::from(format!("n,,n=,r={}", nonce).as_bytes());
+        let message = BytesMut::from(format!("n,,n=,r={nonce}").as_bytes());
 
         ScramSha256 {
             password: String::new(),
@@ -278,6 +280,9 @@ impl Message {
             Ok(iterations) => iterations,
             Err(_) => return Err(Error::ProtocolSyncError("SCRAM".to_string())),
         };
+        if iterations == 0 || iterations > MAX_BACKEND_SCRAM_ITERATIONS {
+            return Err(Error::ProtocolSyncError("SCRAM".to_string()));
+        }
 
         Ok(Message {
             nonce,
@@ -318,6 +323,23 @@ mod test {
         assert_eq!(message.nonce, "fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j");
         assert_eq!(message.salt, "QSXCR+Q6sek8bf92");
         assert_eq!(message.iterations, 4096);
+    }
+
+    #[test]
+    fn parse_server_first_message_rejects_bad_iteration_counts() {
+        for iterations in [0, 1_000_001] {
+            let message = BytesMut::from(
+                format!(
+                    "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i={iterations}"
+                )
+                .as_bytes(),
+            );
+
+            assert!(
+                Message::parse(&message).is_err(),
+                "iterations={iterations} must be rejected before PBKDF2"
+            );
+        }
     }
 
     #[test]
