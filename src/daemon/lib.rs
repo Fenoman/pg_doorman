@@ -17,10 +17,23 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::error::{check_err, errno, ErrorKind};
 
 pub use super::error::Error;
+
+static CURRENT_PID_FILE_FD: AtomicI32 = AtomicI32::new(-1);
+
+pub fn current_pid_file_fd() -> Option<libc::c_int> {
+    let fd = CURRENT_PID_FILE_FD.load(Ordering::SeqCst);
+    (fd >= 0).then_some(fd)
+}
+
+pub fn rewrite_current_pid_file() -> Result<(), Error> {
+    let fd = current_pid_file_fd().ok_or(ErrorKind::OpenPidfile(libc::EBADF))?;
+    unsafe { write_pid_file(fd).map_err(Error::from) }
+}
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 enum UserImpl {
@@ -183,6 +196,7 @@ impl<T> Outcome<T> {
 pub struct Daemonize<T> {
     directory: PathBuf,
     pid_file: Option<PathBuf>,
+    inherited_pid_file_fd: Option<libc::c_int>,
     chown_pid_file: bool,
     user: Option<User>,
     group: Option<Group>,
@@ -199,6 +213,7 @@ impl<T> fmt::Debug for Daemonize<T> {
         fmt.debug_struct("Daemonize")
             .field("directory", &self.directory)
             .field("pid_file", &self.pid_file)
+            .field("inherited_pid_file_fd", &self.inherited_pid_file_fd)
             .field("chown_pid_file", &self.chown_pid_file)
             .field("user", &self.user)
             .field("group", &self.group)
@@ -222,6 +237,7 @@ impl Daemonize<()> {
         Daemonize {
             directory: Path::new("/").to_owned(),
             pid_file: None,
+            inherited_pid_file_fd: None,
             chown_pid_file: false,
             user: None,
             group: None,
@@ -239,6 +255,11 @@ impl<T> Daemonize<T> {
     /// Create pid-file at `path`, lock it exclusive and write daemon pid.
     pub fn pid_file<F: AsRef<Path>>(mut self, path: F) -> Self {
         self.pid_file = Some(path.as_ref().to_owned());
+        self
+    }
+
+    pub fn inherited_pid_file_fd(mut self, fd: libc::c_int) -> Self {
+        self.inherited_pid_file_fd = Some(fd);
         self
     }
 
@@ -352,9 +373,9 @@ impl<T> Daemonize<T> {
                     libc::close(pipe_write_fd);
                     let mut buf: [u8; 1] = [0];
                     // Block until daemon writes to pipe (or pipe is closed on error)
-                    libc::read(pipe_read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                    let exit_code = readiness_pipe_exit_code(pipe_read_fd, &mut buf);
                     libc::close(pipe_read_fd);
-                    exit(0)
+                    exit(exit_code)
                 }
                 None => {
                     // Daemon (second child): close read end, will write after PID file is ready
@@ -362,11 +383,15 @@ impl<T> Daemonize<T> {
                 }
             }
 
-            let pid_file_fd = self
-                .pid_file
-                .clone()
-                .map(|pid_file| create_pid_file(pid_file))
-                .transpose()?;
+            let pid_file_fd = match (self.pid_file.clone(), self.inherited_pid_file_fd) {
+                (Some(pid_file), Some(fd)) => Some(inherit_pid_file_fd(pid_file, fd)?),
+                (Some(pid_file), None) => Some(create_pid_file(pid_file)?),
+                (None, Some(fd)) => {
+                    libc::close(fd);
+                    return Err(ErrorKind::OpenPidfile(libc::EINVAL));
+                }
+                (None, None) => None,
+            };
 
             redirect_standard_streams(self.stdin, self.stdout, self.stderr)?;
 
@@ -408,6 +433,7 @@ impl<T> Daemonize<T> {
 
             if let Some(pid_file_fd) = pid_file_fd {
                 write_pid_file(pid_file_fd)?;
+                CURRENT_PID_FILE_FD.store(pid_file_fd, Ordering::SeqCst);
             }
 
             // Signal to first child that daemon is ready (PID file written)
@@ -436,7 +462,30 @@ unsafe fn perform_fork() -> Result<Option<libc::pid_t>, ErrorKind> {
 unsafe fn waitpid(pid: libc::pid_t) -> Result<libc::c_int, ErrorKind> {
     let mut child_ret = 0;
     check_err(libc::waitpid(pid, &mut child_ret, 0), ErrorKind::Wait)?;
-    Ok(child_ret)
+    Ok(wait_status_to_exit_code(child_ret))
+}
+
+fn wait_status_to_exit_code(status: libc::c_int) -> libc::c_int {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    }
+}
+
+unsafe fn readiness_pipe_exit_code(pipe_read_fd: libc::c_int, buf: &mut [u8; 1]) -> libc::c_int {
+    let read = libc::read(
+        pipe_read_fd,
+        buf.as_mut_ptr() as *mut libc::c_void,
+        buf.len(),
+    );
+    if read == 1 && buf[0] == 1 {
+        0
+    } else {
+        1
+    }
 }
 
 unsafe fn set_sid() -> Result<(), ErrorKind> {
@@ -517,15 +566,72 @@ unsafe fn create_pid_file(path: PathBuf) -> Result<libc::c_int, ErrorKind> {
     let path_c = pathbuf_into_cstring(path)?;
 
     let fd = check_err(
-        libc::open(path_c.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o666),
+        libc::open(
+            path_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW,
+            0o644,
+        ),
         ErrorKind::OpenPidfile,
     )?;
 
-    //check_err(
-    //    libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB),
-    //    ErrorKind::LockPidfile,
-    //)?;
+    if let Err(e) = secure_pid_file_fd(fd) {
+        libc::close(fd);
+        return Err(e);
+    }
     Ok(fd)
+}
+
+unsafe fn inherit_pid_file_fd(path: PathBuf, fd: libc::c_int) -> Result<libc::c_int, ErrorKind> {
+    if fd < 0 {
+        return Err(ErrorKind::OpenPidfile(libc::EBADF));
+    }
+
+    let path_c = pathbuf_into_cstring(path)?;
+    let mut path_stat: libc::stat = std::mem::zeroed();
+    check_err(
+        libc::lstat(path_c.as_ptr(), &mut path_stat),
+        ErrorKind::OpenPidfile,
+    )?;
+
+    let mut fd_stat: libc::stat = std::mem::zeroed();
+    check_err(libc::fstat(fd, &mut fd_stat), ErrorKind::OpenPidfile)?;
+    if path_stat.st_dev != fd_stat.st_dev || path_stat.st_ino != fd_stat.st_ino {
+        return Err(ErrorKind::OpenPidfile(libc::EINVAL));
+    }
+
+    secure_pid_file_fd(fd)?;
+    Ok(fd)
+}
+
+unsafe fn secure_pid_file_fd(fd: libc::c_int) -> Result<(), ErrorKind> {
+    let mut stat: libc::stat = std::mem::zeroed();
+    check_err(libc::fstat(fd, &mut stat), ErrorKind::OpenPidfile)?;
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(ErrorKind::OpenPidfile(libc::EINVAL));
+    }
+    if stat.st_nlink != 1 {
+        return Err(ErrorKind::OpenPidfile(libc::EMLINK));
+    }
+
+    let euid = libc::geteuid();
+    let egid = libc::getegid();
+    if stat.st_uid != euid {
+        if euid == 0 {
+            check_err(libc::fchown(fd, euid, egid), ErrorKind::ChownPidfile)?;
+            stat.st_uid = euid;
+        } else {
+            return Err(ErrorKind::OpenPidfile(libc::EACCES));
+        }
+    }
+    if stat.st_mode & 0o022 != 0 {
+        return Err(ErrorKind::OpenPidfile(libc::EACCES));
+    }
+
+    check_err(
+        libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB),
+        ErrorKind::LockPidfile,
+    )?;
+    Ok(())
 }
 
 unsafe fn chown_pid_file(
@@ -547,6 +653,7 @@ unsafe fn write_pid_file(fd: libc::c_int) -> Result<(), ErrorKind> {
     let pid_length = pid_buf.len();
     let pid_c = CString::new(pid_buf).unwrap();
     check_err(libc::ftruncate(fd, 0), ErrorKind::TruncatePidfile)?;
+    check_err(libc::lseek(fd, 0, libc::SEEK_SET), ErrorKind::WritePid)?;
 
     let written = check_err(
         libc::write(fd, pid_c.as_ptr() as *const libc::c_void, pid_length),
@@ -602,4 +709,166 @@ unsafe fn get_uid_by_name(name: &CString) -> Option<libc::uid_t> {
 
 fn pathbuf_into_cstring(path: PathBuf) -> Result<CString, ErrorKind> {
     CString::new(path.into_os_string().into_vec()).map_err(|_| ErrorKind::PathContainsNul)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        create_pid_file, inherit_pid_file_fd, readiness_pipe_exit_code, wait_status_to_exit_code,
+        write_pid_file,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn create_pid_file_rejects_world_writable_existing_file() {
+        let file = tempfile::NamedTempFile::new().expect("temp pid file");
+        let mut perms = std::fs::metadata(file.path())
+            .expect("pid metadata")
+            .permissions();
+        perms.set_mode(0o666);
+        std::fs::set_permissions(file.path(), perms).expect("make pid file world-writable");
+
+        let result = unsafe { create_pid_file(file.path().to_path_buf()) };
+        if let Ok(fd) = result {
+            unsafe {
+                libc::close(fd);
+            }
+            panic!("world-writable pid file must be rejected");
+        }
+    }
+
+    #[test]
+    fn write_pid_file_rewinds_before_rewriting_inherited_fd() {
+        let file = tempfile::NamedTempFile::new().expect("temp pid file");
+        let fd =
+            unsafe { create_pid_file(file.path().to_path_buf()) }.expect("create locked pid file");
+
+        unsafe {
+            write_pid_file(fd).expect("initial pid write");
+            write_pid_file(fd).expect("rewrite pid through inherited fd");
+        }
+
+        let body = std::fs::read(file.path()).expect("read pid file");
+        assert!(
+            !body.starts_with(&[0]),
+            "pid rewrite must not leave a sparse NUL prefix: {body:?}"
+        );
+        assert_eq!(
+            String::from_utf8(body).expect("pid file utf8"),
+            format!("{}\n", std::process::id())
+        );
+
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn inherited_pid_file_fd_reuses_locked_descriptor() {
+        let file = tempfile::NamedTempFile::new().expect("temp pid file");
+        let fd =
+            unsafe { create_pid_file(file.path().to_path_buf()) }.expect("create locked pid file");
+
+        let inherited = unsafe { inherit_pid_file_fd(file.path().to_path_buf(), fd) }
+            .expect("reuse inherited pid file fd");
+        assert_eq!(inherited, fd);
+
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn inherited_pid_file_fd_rejects_mismatched_path() {
+        let locked = tempfile::NamedTempFile::new().expect("locked pid file");
+        let other = tempfile::NamedTempFile::new().expect("other pid file");
+        let fd = unsafe { create_pid_file(locked.path().to_path_buf()) }
+            .expect("create locked pid file");
+
+        let result = unsafe { inherit_pid_file_fd(other.path().to_path_buf(), fd) };
+        assert!(
+            result.is_err(),
+            "inherited pid fd must match the configured pid file path"
+        );
+
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn waitpid_status_is_decoded_before_parent_exit() {
+        let src = include_str!("lib.rs");
+        let start = src.find("unsafe fn waitpid(").expect("waitpid helper");
+        let body = &src[start..];
+        let end = body
+            .find("\nunsafe fn set_sid")
+            .expect("set_sid should follow waitpid");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("wait_status_to_exit_code(child_ret)"),
+            "daemon parent must not pass the raw waitpid status to exit(2)"
+        );
+        assert!(
+            !body.contains("Ok(child_ret)"),
+            "raw wait status such as 256 would become process exit code 0"
+        );
+    }
+
+    #[test]
+    fn first_child_readiness_eof_exits_nonzero() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("First child: close write end and wait for daemon to signal readiness")
+            .expect("first child readiness branch");
+        let body = &src[start..];
+        let end = body
+            .find("Daemon (second child): close read end")
+            .expect("daemon branch should follow first child branch");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("readiness_pipe_exit_code(pipe_read_fd"),
+            "first child must convert readiness pipe EOF/read error into nonzero exit"
+        );
+        assert!(
+            body.contains("exit(exit_code)") && !body.contains("exit(0)"),
+            "first child must not report daemonization success unless a readiness byte was read"
+        );
+    }
+
+    #[test]
+    fn wait_status_decoder_preserves_real_child_exit_code() {
+        assert_eq!(wait_status_to_exit_code(7 << 8), 7);
+        assert_eq!(wait_status_to_exit_code(libc::SIGTERM), 128 + libc::SIGTERM);
+    }
+
+    #[test]
+    fn readiness_pipe_requires_success_byte() {
+        unsafe {
+            let mut fds = [0; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let byte = [1u8; 1];
+            assert_eq!(
+                libc::write(fds[1], byte.as_ptr() as *const libc::c_void, 1),
+                1
+            );
+            libc::close(fds[1]);
+            let mut buf = [0u8; 1];
+            assert_eq!(readiness_pipe_exit_code(fds[0], &mut buf), 0);
+            libc::close(fds[0]);
+
+            let mut fds = [0; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            libc::close(fds[1]);
+            let mut buf = [0u8; 1];
+            assert_eq!(
+                readiness_pipe_exit_code(fds[0], &mut buf),
+                1,
+                "EOF before readiness byte must make first child fail"
+            );
+            libc::close(fds[0]);
+        }
+    }
 }
