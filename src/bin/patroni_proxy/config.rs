@@ -101,29 +101,30 @@ pub enum ConfigError {
     EmptyRoles(String),
     EmptyPorts(String),
     InvalidListenAddress(String),
+    InvalidInterval(String),
+    UnsupportedHotReload(String),
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConfigError::IoError(e) => write!(f, "IO error: {}", e),
-            ConfigError::ParseError(e) => write!(f, "Parse error: {}", e),
+            ConfigError::IoError(e) => write!(f, "IO error: {e}"),
+            ConfigError::ParseError(e) => write!(f, "Parse error: {e}"),
             ConfigError::InvalidRole(r) => write!(
                 f,
-                "Invalid role '{}'. Allowed roles: leader, sync, async, any",
-                r
+                "Invalid role '{r}'. Allowed roles: leader, sync, async, any"
             ),
-            ConfigError::InvalidHost(h) => write!(
-                f,
-                "Invalid host '{}'. Only http:// and https:// schemes are allowed",
-                h
-            ),
-            ConfigError::DuplicateHost(h) => write!(f, "Duplicate host: {}", h),
-            ConfigError::DuplicateListen(l) => write!(f, "Duplicate listen address: {}", l),
-            ConfigError::EmptyHosts(c) => write!(f, "Cluster '{}' has no hosts defined", c),
-            ConfigError::EmptyRoles(p) => write!(f, "Port '{}' has no roles defined", p),
-            ConfigError::EmptyPorts(c) => write!(f, "Cluster '{}' has no ports defined", c),
-            ConfigError::InvalidListenAddress(a) => write!(f, "Invalid listen address: {}", a),
+            ConfigError::InvalidHost(reason) => write!(f, "Invalid host: {reason}"),
+            ConfigError::DuplicateHost(h) => write!(f, "Duplicate host: {h}"),
+            ConfigError::DuplicateListen(l) => write!(f, "Duplicate listen address: {l}"),
+            ConfigError::EmptyHosts(c) => write!(f, "Cluster '{c}' has no hosts defined"),
+            ConfigError::EmptyRoles(p) => write!(f, "Port '{p}' has no roles defined"),
+            ConfigError::EmptyPorts(c) => write!(f, "Cluster '{c}' has no ports defined"),
+            ConfigError::InvalidListenAddress(a) => write!(f, "Invalid listen address: {a}"),
+            ConfigError::InvalidInterval(reason) => write!(f, "Invalid interval: {reason}"),
+            ConfigError::UnsupportedHotReload(reason) => {
+                write!(f, "Unsupported hot reload: {reason}")
+            }
         }
     }
 }
@@ -146,22 +147,30 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut all_listen_addresses: HashSet<String> = HashSet::new();
 
+        if self.cluster_update_interval == 0 {
+            return Err(ConfigError::InvalidInterval(
+                "cluster_update_interval must be at least 1 second".to_string(),
+            ));
+        }
+
+        if self.listen_address.parse::<SocketAddr>().is_err() {
+            return Err(ConfigError::InvalidListenAddress(
+                self.listen_address.clone(),
+            ));
+        }
+
         for (cluster_name, cluster) in &self.clusters {
             // Validate hosts are not empty
             if cluster.hosts.is_empty() {
                 return Err(ConfigError::EmptyHosts(cluster_name.clone()));
             }
 
-            // Validate hosts: only http/https, no duplicates
+            // Validate hosts: only http/https, no secret-bearing components, no duplicates
             let mut seen_hosts: HashSet<String> = HashSet::new();
             for host in &cluster.hosts {
-                // Check scheme
-                if !host.starts_with("http://") && !host.starts_with("https://") {
-                    return Err(ConfigError::InvalidHost(host.clone()));
-                }
+                let normalized = validate_patroni_host_url(host)?;
 
                 // Check for duplicates within cluster
-                let normalized = host.to_lowercase();
                 if seen_hosts.contains(&normalized) {
                     return Err(ConfigError::DuplicateHost(host.clone()));
                 }
@@ -205,9 +214,45 @@ impl Config {
     }
 }
 
+fn validate_patroni_host_url(host: &str) -> Result<String, ConfigError> {
+    if host.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return Err(ConfigError::InvalidHost(
+            "URL must not contain whitespace or control characters".to_string(),
+        ));
+    }
+
+    let parsed = reqwest::Url::parse(host).map_err(|_| {
+        ConfigError::InvalidHost("URL must be a valid absolute http:// or https:// URL".to_string())
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ConfigError::InvalidHost(
+            "only http:// and https:// schemes are allowed".to_string(),
+        ));
+    }
+    if parsed.host_str().filter(|host| !host.is_empty()).is_none() {
+        return Err(ConfigError::InvalidHost(
+            "URL must include a non-empty host".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConfigError::InvalidHost(
+            "URL userinfo is not allowed; remove username/password".to_string(),
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(ConfigError::InvalidHost(
+            "URL query/fragment is not allowed; configure only scheme, host, port, and path"
+                .to_string(),
+        ));
+    }
+
+    Ok(parsed.as_str().to_ascii_lowercase())
+}
+
 // Diff types for detecting configuration changes
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClusterDiff {
+    TopLevelChanged(String, String, String), // field_name, old_value, new_value
     Added(String, ClusterConfig),
     Removed(String),
     HostsChanged(String, Vec<String>, Vec<String>), // cluster_name, old_hosts, new_hosts
@@ -227,6 +272,22 @@ pub struct ConfigDiff {
 impl ConfigDiff {
     pub fn compute(old: &Config, new: &Config) -> Self {
         let mut changes = Vec::new();
+
+        if old.cluster_update_interval != new.cluster_update_interval {
+            changes.push(ClusterDiff::TopLevelChanged(
+                "cluster_update_interval".to_string(),
+                old.cluster_update_interval.to_string(),
+                new.cluster_update_interval.to_string(),
+            ));
+        }
+
+        if old.listen_address != new.listen_address {
+            changes.push(ClusterDiff::TopLevelChanged(
+                "listen_address".to_string(),
+                old.listen_address.clone(),
+                new.listen_address.clone(),
+            ));
+        }
 
         // Find removed clusters
         for cluster_name in old.clusters.keys() {
@@ -324,6 +385,11 @@ pub struct ConfigRepository {
     config_path: String,
 }
 
+pub struct PreparedConfigReload {
+    pub diff: ConfigDiff,
+    config: Config,
+}
+
 impl ConfigRepository {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let path_str = path.as_ref().to_string_lossy().to_string();
@@ -338,16 +404,71 @@ impl ConfigRepository {
         self.config.load_full()
     }
 
+    #[allow(dead_code)]
     pub fn reload(&self) -> Result<ConfigDiff, ConfigError> {
+        let prepared = self.prepare_reload()?;
+        Ok(self.publish_reload(prepared))
+    }
+
+    pub fn prepare_reload(&self) -> Result<PreparedConfigReload, ConfigError> {
         let new_config = Config::from_file(&self.config_path)?;
         let old_config = self.config.load();
         let diff = ConfigDiff::compute(&old_config, &new_config);
 
         if diff.has_changes() {
-            self.config.store(Arc::new(new_config));
+            Self::ensure_supported_hot_reload(&diff)?;
         }
 
-        Ok(diff)
+        Ok(PreparedConfigReload {
+            diff,
+            config: new_config,
+        })
+    }
+
+    pub fn publish_reload(&self, prepared: PreparedConfigReload) -> ConfigDiff {
+        let diff = prepared.diff;
+        if diff.has_changes() {
+            self.config.store(Arc::new(prepared.config));
+        }
+        diff
+    }
+
+    fn ensure_supported_hot_reload(diff: &ConfigDiff) -> Result<(), ConfigError> {
+        if let Some((field, old, new)) = diff.changes.iter().find_map(|change| match change {
+            ClusterDiff::TopLevelChanged(field, old, new) => Some((field, old, new)),
+            _ => None,
+        }) {
+            return Err(ConfigError::UnsupportedHotReload(format!(
+                "{field} changed from '{old}' to '{new}'; restart patroni-proxy to apply top-level configuration changes"
+            )));
+        }
+        if let Some(cluster_name) = diff.changes.iter().find_map(|change| match change {
+            ClusterDiff::TlsChanged(name) => Some(name),
+            _ => None,
+        }) {
+            return Err(ConfigError::UnsupportedHotReload(format!(
+                "cluster '{cluster_name}' TLS configuration changed; restart patroni-proxy to apply TLS changes"
+            )));
+        }
+        if let Some((cluster_name, port_name, listen)) =
+            diff.changes.iter().find_map(|change| match change {
+                ClusterDiff::PortsChanged(cluster_name, old, new) => {
+                    old.iter().find_map(|(port_name, old_config)| {
+                        new.get(port_name).and_then(|new_config| {
+                            (old_config != new_config && old_config.listen == new_config.listen)
+                                .then_some((cluster_name, port_name, &old_config.listen))
+                        })
+                    })
+                }
+                _ => None,
+            })
+        {
+            return Err(ConfigError::UnsupportedHotReload(format!(
+                "cluster '{cluster_name}' port '{port_name}' changed while keeping listen '{listen}'; restart patroni-proxy to apply same-listen port changes"
+            )));
+        }
+
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -428,6 +549,24 @@ clusters:
     }
 
     #[test]
+    fn test_cluster_update_interval_rejects_zero() {
+        let yaml = r#"
+cluster_update_interval: 0
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:5432"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+        let config = Config::from_str(yaml);
+        assert!(matches!(config, Err(ConfigError::InvalidInterval(_))));
+    }
+
+    #[test]
     fn test_invalid_host_scheme() {
         let yaml = r#"
 clusters:
@@ -442,6 +581,37 @@ clusters:
 "#;
         let config = Config::from_str(yaml);
         assert!(matches!(config, Err(ConfigError::InvalidHost(_))));
+    }
+
+    #[test]
+    fn test_invalid_host_rejects_userinfo_query_fragment_without_echoing_secrets() {
+        for host in [
+            "https://user:secret@patroni.local:8008",
+            "https://patroni.local:8008?token=secret",
+            "https://patroni.local:8008#secret",
+        ] {
+            let yaml = format!(
+                r#"
+clusters:
+  one:
+    hosts:
+      - "{host}"
+    ports:
+      master:
+        listen: "127.0.0.1:5432"
+        roles: ["leader"]
+        host_port: 6432
+"#
+            );
+            let err = Config::from_str(&yaml)
+                .expect_err("Patroni proxy host URL must reject secret-bearing components");
+            let msg = err.to_string();
+            assert!(matches!(err, ConfigError::InvalidHost(_)), "{msg}");
+            assert!(
+                !msg.contains("secret") && !msg.contains("token"),
+                "invalid host error must not echo secret URL payload: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -551,6 +721,24 @@ clusters:
     ports:
       master:
         listen: "invalid_address"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+        let config = Config::from_str(yaml);
+        assert!(matches!(config, Err(ConfigError::InvalidListenAddress(_))));
+    }
+
+    #[test]
+    fn test_invalid_top_level_listen_address() {
+        let yaml = r#"
+listen_address: "not_a_socket"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:5432"
         roles: ["leader"]
         host_port: 6432
 "#;
@@ -694,6 +882,195 @@ clusters:
             .changes
             .iter()
             .any(|c| matches!(c, ClusterDiff::HostsChanged(name, _, _) if name == "one")));
+    }
+
+    #[test]
+    fn reload_rejects_tls_change_without_publishing() {
+        let initial = r#"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:15432"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+        let changed = r#"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    tls:
+      skip_verify: true
+    ports:
+      master:
+        listen: "127.0.0.1:15432"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), initial).unwrap();
+        let repo = ConfigRepository::new(file.path()).unwrap();
+
+        std::fs::write(file.path(), changed).unwrap();
+        let reload = repo.reload();
+
+        assert!(
+            reload.is_err(),
+            "Patroni TLS hot reload must be rejected because existing managers keep old TLS clients"
+        );
+        assert!(
+            repo.get().clusters.get("one").unwrap().tls.is_none(),
+            "rejected TLS reload must not publish the new config snapshot"
+        );
+    }
+
+    #[test]
+    fn reload_rejects_top_level_change_without_publishing() {
+        let initial = r#"
+cluster_update_interval: 3
+listen_address: "127.0.0.1:18009"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:15432"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+        let changed = r#"
+cluster_update_interval: 9
+listen_address: "127.0.0.1:18010"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:15432"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), initial).unwrap();
+        let repo = ConfigRepository::new(file.path()).unwrap();
+
+        std::fs::write(file.path(), changed).unwrap();
+        let reload = repo.reload();
+
+        assert!(
+            reload.is_err(),
+            "top-level patroni-proxy settings require restart because runtime tasks keep the old values"
+        );
+        let current = repo.get();
+        assert_eq!(current.cluster_update_interval, 3);
+        assert_eq!(current.listen_address, "127.0.0.1:18009");
+    }
+
+    #[test]
+    fn prepare_reload_defers_publication_until_publish() {
+        let initial = r#"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:15432"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+        let changed = r#"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+      - "http://192.168.0.2:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:15432"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), initial).unwrap();
+        let repo = ConfigRepository::new(file.path()).unwrap();
+
+        std::fs::write(file.path(), changed).unwrap();
+        let prepared = repo.prepare_reload().unwrap();
+
+        assert!(prepared.diff.has_changes());
+        assert_eq!(
+            repo.get().clusters.get("one").unwrap().hosts,
+            vec!["http://192.168.0.1:8008".to_string()],
+            "prepare_reload must not publish before runtime apply succeeds"
+        );
+
+        let diff = repo.publish_reload(prepared);
+
+        assert!(diff.has_changes());
+        assert_eq!(
+            repo.get().clusters.get("one").unwrap().hosts,
+            vec![
+                "http://192.168.0.1:8008".to_string(),
+                "http://192.168.0.2:8008".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn prepare_reload_rejects_same_listen_port_change_without_publishing() {
+        let initial = r#"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:15432"
+        roles: ["any"]
+        host_port: 5432
+"#;
+        let changed = r#"
+clusters:
+  one:
+    hosts:
+      - "http://192.168.0.1:8008"
+    ports:
+      master:
+        listen: "127.0.0.1:15432"
+        roles: ["leader"]
+        host_port: 6432
+"#;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), initial).unwrap();
+        let repo = ConfigRepository::new(file.path()).unwrap();
+
+        std::fs::write(file.path(), changed).unwrap();
+        let reload = repo.prepare_reload();
+
+        assert!(
+            reload.is_err(),
+            "same-listen port config changes cannot be applied without dropping the old listener first"
+        );
+        let current = repo.get();
+        let port = current
+            .clusters
+            .get("one")
+            .unwrap()
+            .ports
+            .get("master")
+            .unwrap();
+        assert_eq!(port.roles, vec!["any".to_string()]);
+        assert_eq!(port.host_port, 5432);
     }
 
     #[test]

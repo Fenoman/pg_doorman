@@ -10,6 +10,17 @@ use crate::config::{PortConfig, Role};
 use crate::patroni::Member;
 use crate::stream::{spawn_proxy, StopHandle};
 
+/// Backoff applied between accept attempts while there is no eligible backend
+/// (e.g. a leaderless Patroni election window). Without it, every client
+/// reconnect would be accepted and instantly dropped with zero throttle,
+/// producing a reconnect storm against this proxy.
+const NO_BACKEND_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Sleeps for [`NO_BACKEND_BACKOFF`]. Extracted so the throttle is unit-testable.
+async fn no_backend_backoff() {
+    tokio::time::sleep(NO_BACKEND_BACKOFF).await;
+}
+
 /// Backend member with connection counter for load balancing
 #[derive(Debug)]
 struct Backend {
@@ -262,12 +273,23 @@ impl Port {
     }
 
     /// Starts listening for incoming connections
+    #[cfg(test)]
     pub async fn run(&self) -> Result<(), PortError> {
-        let listener = TcpListener::bind(self.listen_addr)
-            .await
-            .map_err(|e| PortError::BindFailed(format!("{}: {}", self.listen_addr, e)))?;
+        let listener = self.bind_listener().await?;
+        self.run_with_listener(listener).await
+    }
 
-        info!("Port '{}': listening on {}", self.name, self.listen_addr);
+    /// Binds the listener for this port.
+    pub async fn bind_listener(&self) -> Result<TcpListener, PortError> {
+        TcpListener::bind(self.listen_addr)
+            .await
+            .map_err(|e| PortError::BindFailed(format!("{}: {}", self.listen_addr, e)))
+    }
+
+    /// Starts accepting incoming connections on an already-bound listener.
+    pub async fn run_with_listener(&self, listener: TcpListener) -> Result<(), PortError> {
+        let listen_addr = listener.local_addr().unwrap_or(self.listen_addr);
+        info!("Port '{}': listening on {}", self.name, listen_addr);
 
         loop {
             // Wait for either a new connection or stop signal
@@ -298,11 +320,17 @@ impl Port {
             let backend = match self.select_backend().await {
                 Some(b) => b,
                 None => {
+                    // No eligible backend (leaderless election window). Drop the
+                    // client and back off before accepting again so a flood of
+                    // reconnects during an election does not become a storm. The
+                    // backoff also throttles how often this warning is emitted.
                     warn!(
-                        "Port '{}': no backends available, closing connection from {}",
-                        self.name, client_addr
+                        "Port '{}': no backends available, closing connection from {} \
+                         (backing off {:?})",
+                        self.name, client_addr, NO_BACKEND_BACKOFF
                     );
                     drop(client_stream);
+                    no_backend_backoff().await;
                     continue;
                 }
             };
@@ -332,6 +360,7 @@ impl Port {
 
             // Spawn proxy and store stop handle
             let (stop_handle, join_handle) = spawn_proxy(backend_addr, client_stream);
+            let cleanup_handle = stop_handle.clone();
 
             // Store stop handle for later cleanup, grouped by backend host
             let backend_host = backend.host.clone();
@@ -376,10 +405,10 @@ impl Port {
                 // Decrement connection count
                 backend_clone.decrement_connections();
 
-                // Clean up completed connections (remove stopped handles)
+                // Clean up the handle for this completed connection.
                 let mut active = active_connections.lock().await;
                 if let Some(handles) = active.get_mut(&backend_host) {
-                    handles.retain(|h| !h.is_stopped());
+                    handles.retain(|h| !h.is_same_proxy(&cleanup_handle));
                     // Remove empty entries
                     if handles.is_empty() {
                         active.remove(&backend_host);
@@ -456,9 +485,9 @@ pub enum PortError {
 impl std::fmt::Display for PortError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PortError::InvalidListenAddress(e) => write!(f, "Invalid listen address: {}", e),
-            PortError::InvalidRole(r) => write!(f, "Invalid role: {}", r),
-            PortError::BindFailed(e) => write!(f, "Failed to bind: {}", e),
+            PortError::InvalidListenAddress(e) => write!(f, "Invalid listen address: {e}"),
+            PortError::InvalidRole(r) => write!(f, "Invalid role: {r}"),
+            PortError::BindFailed(e) => write!(f, "Failed to bind: {e}"),
         }
     }
 }
@@ -485,13 +514,22 @@ mod tests {
             name: name.to_string(),
             role: role.to_string(),
             state: state.to_string(),
-            api_url: format!("http://{}:8008/patroni", host),
+            api_url: format!("http://{host}:8008/patroni"),
             host: host.to_string(),
             port: 5432,
             timeline: json!(1),
             lag: lag.map(|l| json!(l)),
             tags: None,
         }
+    }
+
+    async fn active_connection_handle_count(port: &Port) -> usize {
+        port.active_connections
+            .lock()
+            .await
+            .values()
+            .map(Vec::len)
+            .sum()
     }
 
     #[test]
@@ -698,7 +736,7 @@ mod tests {
         drop(temp_listener); // Release the port
 
         let config = PortConfig {
-            listen: format!("127.0.0.1:{}", listen_port),
+            listen: format!("127.0.0.1:{listen_port}"),
             roles: vec!["any".to_string()],
             host_port: backend_addr.port(),
             max_lag_in_bytes: None,
@@ -759,6 +797,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_proxy_connection_removes_active_handle() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::oneshot;
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let (release_backend, wait_for_release) = oneshot::channel::<()>();
+
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            let _ = wait_for_release.await;
+            let _ = stream.shutdown().await;
+        });
+
+        let temp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = temp_listener.local_addr().unwrap().port();
+        drop(temp_listener);
+
+        let config = PortConfig {
+            listen: format!("127.0.0.1:{listen_port}"),
+            roles: vec!["any".to_string()],
+            host_port: backend_addr.port(),
+            max_lag_in_bytes: None,
+        };
+        let port = Arc::new(Port::new("test_completed_cleanup".to_string(), &config).unwrap());
+        port.update_members(vec![Member {
+            name: "node1".to_string(),
+            role: "leader".to_string(),
+            state: "running".to_string(),
+            api_url: format!("http://{}:8008/patroni", backend_addr.ip()),
+            host: backend_addr.ip().to_string(),
+            port: backend_addr.port(),
+            timeline: json!(1),
+            lag: None,
+            tags: None,
+        }])
+        .await;
+
+        let port_clone = Arc::clone(&port);
+        let run_handle = tokio::spawn(async move { port_clone.run().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(port.listen_addr()).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if active_connection_handle_count(&port).await > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("proxy handle should be tracked before completion");
+
+        let _ = release_backend.send(());
+        let _ = client.shutdown().await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if active_connection_handle_count(&port).await == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed proxy handle should be removed");
+
+        port.stop().await;
+        let result = tokio::time::timeout(Duration::from_secs(1), run_handle).await;
+        assert!(result.is_ok(), "Port should stop within timeout");
+        backend_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_update_members_disconnects_removed_backend_clients() {
         use std::sync::Arc;
         use std::time::Duration;
@@ -797,7 +917,7 @@ mod tests {
         drop(temp_listener);
 
         let config = PortConfig {
-            listen: format!("127.0.0.1:{}", listen_port),
+            listen: format!("127.0.0.1:{listen_port}"),
             roles: vec!["any".to_string()],
             host_port: backend1_addr.port(), // Will be overridden by member host
             max_lag_in_bytes: None,

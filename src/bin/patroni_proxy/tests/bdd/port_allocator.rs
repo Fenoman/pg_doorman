@@ -26,7 +26,7 @@ pub fn allocate_port() -> u16 {
         }
 
         // Try to bind to verify the port is actually free
-        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         if TcpListener::bind(addr).is_ok() {
             // Port is free and we successfully bound to it
             // The listener is dropped here, releasing the port

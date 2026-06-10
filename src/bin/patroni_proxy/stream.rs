@@ -29,8 +29,8 @@ pub enum ProxyError {
 impl std::fmt::Display for ProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProxyError::ConnectionFailed(e) => write!(f, "Connection failed: {}", e),
-            ProxyError::IoError(e) => write!(f, "IO error: {}", e),
+            ProxyError::ConnectionFailed(e) => write!(f, "Connection failed: {e}"),
+            ProxyError::IoError(e) => write!(f, "IO error: {e}"),
             ProxyError::Stopped => write!(f, "Proxy stopped"),
         }
     }
@@ -52,11 +52,18 @@ impl From<io::Error> for ProxyError {
 pub struct TcpProxy {
     /// Server address to connect to
     server_addr: SocketAddr,
+    /// Timeout for establishing the backend TCP connection. Bounds how long
+    /// a black-holed backend can stall the client before we give up.
+    connect_timeout: std::time::Duration,
     /// Stop flag
     stopped: Arc<AtomicBool>,
     /// Stop notification
     stop_notify: Arc<Notify>,
 }
+
+/// Default backend connect timeout. Without a bound, a black-holed backend
+/// would hang the client for the OS default connect timeout (60-120s).
+const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl TcpProxy {
     /// Creates a new TCP proxy for the specified server address.
@@ -71,9 +78,17 @@ impl TcpProxy {
     pub fn new(server_addr: SocketAddr) -> Self {
         Self {
             server_addr,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             stopped: Arc::new(AtomicBool::new(false)),
             stop_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Overrides the backend connect timeout (builder style).
+    #[cfg(test)]
+    pub fn with_connect_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
     }
 
     /// Returns a handle for stopping the proxy.
@@ -112,10 +127,24 @@ impl TcpProxy {
             return Err(ProxyError::Stopped);
         }
 
-        // Connect to server
-        let server_stream = TcpStream::connect(self.server_addr)
-            .await
-            .map_err(ProxyError::ConnectionFailed)?;
+        // Connect to server, bounded by connect_timeout so a black-holed
+        // backend cannot hang the client for the OS default (60-120s).
+        let server_stream =
+            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(self.server_addr))
+                .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(ProxyError::ConnectionFailed(e)),
+                Err(_) => {
+                    return Err(ProxyError::ConnectionFailed(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "connect to backend {} timed out after {:?}",
+                            self.server_addr, self.connect_timeout
+                        ),
+                    )))
+                }
+            };
 
         // Set TCP_NODELAY for minimal latency
         let _ = client_stream.set_nodelay(true);
@@ -181,8 +210,14 @@ impl StopHandle {
     }
 
     /// Checks if the proxy was stopped.
+    #[cfg(test)]
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Checks whether two handles refer to the same proxy task.
+    pub fn is_same_proxy(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.stopped, &other.stopped)
     }
 }
 
@@ -201,6 +236,10 @@ where
     let mut buf = vec![0u8; 64 * 1024]; // 64KB buffer for high performance
 
     loop {
+        let stop_notified = stop_notify.notified();
+        tokio::pin!(stop_notified);
+        stop_notified.as_mut().enable();
+
         // Check stop flag
         if stopped.load(Ordering::SeqCst) {
             return Err(ProxyError::Stopped);
@@ -208,7 +247,7 @@ where
 
         tokio::select! {
             // Wait for stop notification
-            _ = stop_notify.notified() => {
+            _ = &mut stop_notified => {
                 return Err(ProxyError::Stopped);
             }
             // Read data
@@ -216,13 +255,39 @@ where
                 match result {
                     Ok(0) => {
                         // EOF - connection closed
-                        let _ = writer.shutdown().await;
+                        let stop_notified = stop_notify.notified();
+                        tokio::pin!(stop_notified);
+                        stop_notified.as_mut().enable();
+                        if stopped.load(Ordering::SeqCst) {
+                            return Err(ProxyError::Stopped);
+                        }
+                        tokio::select! {
+                            _ = &mut stop_notified => {
+                                return Err(ProxyError::Stopped);
+                            }
+                            result = writer.shutdown() => {
+                                let _ = result;
+                            }
+                        }
                         return Ok(total_bytes);
                     }
                     Ok(n) => {
                         // Write data
-                        if let Err(e) = writer.write_all(&buf[..n]).await {
-                            return Err(ProxyError::IoError(e));
+                        let stop_notified = stop_notify.notified();
+                        tokio::pin!(stop_notified);
+                        stop_notified.as_mut().enable();
+                        if stopped.load(Ordering::SeqCst) {
+                            return Err(ProxyError::Stopped);
+                        }
+                        tokio::select! {
+                            _ = &mut stop_notified => {
+                                return Err(ProxyError::Stopped);
+                            }
+                            result = writer.write_all(&buf[..n]) => {
+                                if let Err(e) = result {
+                                    return Err(ProxyError::IoError(e));
+                                }
+                            }
                         }
                         total_bytes += n as u64;
                     }
@@ -387,6 +452,107 @@ mod tests {
         assert!(handle2.is_stopped());
     }
 
+    #[test]
+    fn copy_with_stop_enables_stop_notification_before_flag_check() {
+        let src = include_str!("stream.rs");
+        let start = src
+            .find("async fn copy_with_stop")
+            .expect("copy_with_stop must exist");
+        let end = src[start..]
+            .find("/// Creates a TCP proxy")
+            .map(|offset| start + offset)
+            .expect("copy_with_stop end marker must exist");
+        let body = &src[start..end];
+
+        let enable = body
+            .find(".enable()")
+            .expect("copy_with_stop must enable Notified before checking stopped");
+        let stopped_check = body
+            .find("stopped.load")
+            .expect("copy_with_stop must check the stopped flag");
+
+        assert!(
+            enable < stopped_check,
+            "stop notification must be registered before the stopped flag check \
+             to avoid losing stop() between the check and select registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_with_stop_interrupts_pending_write() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct OneRead {
+            sent: bool,
+        }
+
+        impl AsyncRead for OneRead {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if self.sent {
+                    return Poll::Pending;
+                }
+                self.sent = true;
+                buf.put_slice(b"ping");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        struct PendingWrite {
+            entered_write: Arc<Notify>,
+        }
+
+        impl AsyncWrite for PendingWrite {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.entered_write.notify_waiters();
+                Poll::Pending
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop_notify = Arc::new(Notify::new());
+        let entered_write = Arc::new(Notify::new());
+
+        let copy_task = tokio::spawn(copy_with_stop(
+            OneRead { sent: false },
+            PendingWrite {
+                entered_write: Arc::clone(&entered_write),
+            },
+            Arc::clone(&stopped),
+            Arc::clone(&stop_notify),
+        ));
+
+        tokio::time::timeout(Duration::from_millis(100), entered_write.notified())
+            .await
+            .expect("copy task must reach the pending write");
+
+        stopped.store(true, Ordering::SeqCst);
+        stop_notify.notify_waiters();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), copy_task)
+            .await
+            .expect("stop must interrupt a pending write")
+            .expect("copy task must not panic");
+
+        assert!(matches!(result, Err(ProxyError::Stopped)));
+    }
+
     #[tokio::test]
     async fn test_proxy_connection_failed() {
         // Try to connect to non-existent server
@@ -403,6 +569,43 @@ mod tests {
         let result = proxy.run(client_stream).await;
 
         assert!(matches!(result, Err(ProxyError::ConnectionFailed(_))));
+
+        client_task.abort();
+    }
+
+    // a black-holed backend must NOT hang the client for the OS
+    // default connect timeout (60-120s). TcpProxy::run must apply its
+    // connect_timeout and fail fast. 192.0.2.1 (TEST-NET-1, RFC 5737) is
+    // unrouted and silently drops SYNs, so without a timeout this would hang.
+    #[tokio::test]
+    async fn run_times_out_on_blackholed_backend() {
+        let server_addr: SocketAddr = "192.0.2.1:5432".parse().unwrap();
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let client_task =
+            tokio::spawn(async move { TcpStream::connect(client_addr).await.unwrap() });
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+
+        let proxy = TcpProxy::new(server_addr).with_connect_timeout(Duration::from_millis(200));
+
+        // Outer guard: if the inner timeout is missing this would block ~120s.
+        let outcome = tokio::time::timeout(Duration::from_secs(3), proxy.run(client_stream)).await;
+
+        assert!(
+            outcome.is_ok(),
+            "run() did not return within 3s -> connect timeout not applied"
+        );
+        match outcome.unwrap() {
+            Err(ProxyError::ConnectionFailed(e)) => {
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut,
+                    "blackhole connect must surface as a TimedOut ConnectionFailed"
+                );
+            }
+            other => panic!("expected ConnectionFailed(TimedOut), got {other:?}"),
+        }
 
         client_task.abort();
     }

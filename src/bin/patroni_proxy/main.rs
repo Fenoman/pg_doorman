@@ -30,6 +30,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
+    // install the same panic hook as pg_doorman main.
+    // Without it, panics in patroni_proxy worker tasks use the default
+    // Rust hook (stderr print only) and the process keeps running
+    // silently - no count, no operator signal. Matches pg_doorman's
+    // Semantics: log + WORKER_PANIC_COUNT inc + delegate to default
+    // (task aborts, process survives).
+    pg_doorman::app::install_panic_hook();
+
+    // install SIGTERM / SIGHUP handlers AS THE FIRST
+    // async action - BEFORE cluster init, HTTP bind, and any slow
+    // network work. A SIGTERM landing during a slow bring-up (DNS
+    // lag, port already in use, Patroni unreachable) earlier
+    // killed the process with the kernel default disposition,
+    // skipping `Port::stop()` cleanup and leaving listener sockets
+    // bound until kernel close. Tokio buffers the signal in the
+    // handler's internal channel until the consumer (the
+    // tokio::select! below) polls it, so an early-arriving SIGTERM
+    // still produces an orderly exit.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
     // Parse command line arguments (handles --version and --help automatically)
     let args = Args::parse();
     let config_path = args.config_file;
@@ -66,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cluster_name.clone(),
                 cluster_config.hosts.clone(),
                 update_interval,
+                cluster_config.tls.as_ref(),
             )?);
 
             // Start ports
@@ -84,25 +106,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         start_http_server(config.listen_address.clone(), Arc::clone(&cluster_managers)).await?;
     }
 
-    // Setup SIGHUP handler for configuration reload
+    // Setup SIGHUP handler for configuration reload. `sighup` is built at
+    // the top of main so a SIGHUP during slow cluster bring-up is still
+    // serviced.
     let config_repo_clone = Arc::clone(&config_repo);
     let cluster_managers_clone = Arc::clone(&cluster_managers);
     tokio::spawn(async move {
-        let mut sighup = signal(SignalKind::hangup()).expect("Failed to setup SIGHUP handler");
-
         loop {
             sighup.recv().await;
             info!("Received SIGHUP, reloading configuration...");
 
-            match config_repo_clone.reload() {
-                Ok(diff) => {
-                    if diff.has_changes() {
-                        log_config_changes(&diff);
+            match config_repo_clone.prepare_reload() {
+                Ok(prepared) => {
+                    if prepared.diff.has_changes() {
+                        log_config_changes(&prepared.diff);
                         let config = config_repo_clone.get();
                         let update_interval = Duration::from_secs(config.cluster_update_interval);
-                        handle_config_changes(&diff, &cluster_managers_clone, update_interval)
-                            .await;
-                        info!("Configuration reloaded successfully");
+                        match handle_config_changes(
+                            &prepared.diff,
+                            &cluster_managers_clone,
+                            update_interval,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                config_repo_clone.publish_reload(prepared);
+                                info!("Configuration reloaded successfully");
+                            }
+                            Err(e) => {
+                                error!("Failed to apply reloaded configuration: {}", e);
+                                warn!("Keeping previous configuration");
+                            }
+                        }
                     } else {
                         info!("Configuration unchanged");
                     }
@@ -115,17 +150,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    info!("patroni-proxy is running. Send SIGHUP to reload configuration, Ctrl+C to stop.");
+    info!(
+        "patroni-proxy is running. Send SIGHUP to reload configuration, SIGTERM or Ctrl+C to stop."
+    );
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down patroni-proxy...");
+    // `sigterm` was built at the top of main
+    // so SIGTERM during slow cluster bring-up is still serviced.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT, shutting down patroni-proxy...");
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down patroni-proxy...");
+        }
+    }
 
     // Stop all clusters
     {
         let managers = cluster_managers.read().await;
         for (cluster_name, manager) in managers.iter() {
             info!("Stopping cluster '{}'", cluster_name);
+            manager.stop_update_loop();
             manager.stop_ports().await;
         }
     }
@@ -136,6 +181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn log_config_changes(diff: &ConfigDiff) {
     for change in &diff.changes {
         match change {
+            ClusterDiff::TopLevelChanged(field, old, new) => {
+                info!("Top-level config '{}' changed: {} -> {}", field, old, new);
+            }
             ClusterDiff::Added(name, _) => {
                 info!("Cluster '{}' added", name);
             }
