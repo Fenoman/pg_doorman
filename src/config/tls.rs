@@ -247,8 +247,7 @@ impl ServerTlsConfig {
 
         if mode.requires_ca() && ca_cert.is_none() {
             return Err(Error::BadConfig(format!(
-                "server_tls_mode '{}' requires server_tls_ca_cert to be set",
-                mode
+                "server_tls_mode '{mode}' requires server_tls_ca_cert to be set"
             )));
         }
 
@@ -362,6 +361,24 @@ pub fn build_acceptor(
     builder.max_protocol_version(None);
 
     // Configure client certificate verification
+    //
+    // native-tls cannot wire client-certificate verification on
+    // macOS/Windows/iOS - the OS-provided TLS stacks don't expose the
+    // required hooks. Historically these `cfg` blocks were silently
+    // compiled out: an operator setting `tls_mode = "verify-full"` on a
+    // macOS build got a server that accepted any TLS connection without
+    // any indication. Reject loudly at startup so the misconfig surfaces
+    // before traffic flows.
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "ios"))]
+    if ca.is_some() || mode.is_some() {
+        return Err(Error::BadConfig(
+            "client certificate verification (tls_ca_cert / tls_mode) is not \
+             supported on macOS/Windows/iOS builds - remove these settings or \
+             run pg_doorman on Linux"
+                .to_string(),
+        ));
+    }
+
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "ios")))]
     if let Some(ca_cert) = ca {
         builder.client_cert_verification_ca_cert(Some(ca_cert));

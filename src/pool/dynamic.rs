@@ -5,6 +5,7 @@
 //! and garbage-collected when idle. On RELOAD, dynamic pools are dropped and recreated
 //! on the next client connection with fresh settings.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -12,15 +13,17 @@ use log::{debug, info, warn};
 
 use crate::config::{get_config, BackendAuthMethod, PoolMode, User};
 use crate::errors::Error;
-use crate::server::ServerParameters;
 use crate::stats::AddressStats;
 
-use super::types::{PoolConfig, QueueMode, Timeouts};
+use super::types::{PoolConfig, QueueMode};
 use super::{
     build_server_tls_for_pool, get_auth_query_state, get_coordinator, get_pool,
-    register_dynamic_pool, resolve_server_cache_size, Address, CheckQueryCache, ConnectionPool,
-    Pool, PoolIdentifier, PoolSettings, PreparedStatementCache, ServerPool, POOLS,
+    resolve_pool_connect_timeout, resolve_pool_timeouts, resolve_server_cache_size, Address,
+    CheckQueryCache, ConnectionPool, Pool, PoolIdentifier, PoolSettings, PreparedStatementCache,
+    ServerPool, POOLS,
 };
+
+const MAX_DYNAMIC_POOLS_PER_DATABASE: usize = 1024;
 
 /// Create a dynamic data pool for auth_query passthrough mode.
 /// Returns the new (or existing) pool. Race-safe: if another thread
@@ -34,10 +37,15 @@ use super::{
 pub fn create_dynamic_pool(
     pool_name: &str,
     username: &str,
+    expected_auth_query_state: &Arc<super::AuthQueryState>,
     backend_auth: Option<BackendAuthMethod>,
     fetched_overlay: Arc<std::collections::HashMap<String, String>>,
     fetched_overlay_hash: u64,
 ) -> Result<(ConnectionPool, super::PoolInitGuard), Error> {
+    if !auth_query_state_generation_is_current(pool_name, expected_auth_query_state) {
+        return Err(auth_query_state_changed_error(pool_name, username));
+    }
+
     // Fast path: pool already exists. The cache-side refetch path
     // already drops the live pool when an auth_query refetch changes
     // the overlay (see `drop_dynamic_pool_if_overlay_drifted`), but a
@@ -186,6 +194,12 @@ pub fn create_dynamic_pool(
         }
     };
 
+    // Dynamic (passthrough) pool: there is no static user config, so the
+    // per-user `prewarm_query` override is unavailable. Pool-level value
+    // applies to every dynamically-created passthrough backend.
+    let effective_prewarm = pool_config.prewarm_query.clone();
+    let connect_timeout = resolve_pool_connect_timeout(pool_config, &config.general);
+
     let manager = ServerPool::new(
         address.clone(),
         user.clone(),
@@ -203,13 +217,16 @@ pub fn create_dynamic_pool(
             .idle_timeout
             .unwrap_or(config.general.idle_timeout.as_millis()),
         config.general.server_idle_check_timeout.as_millis(),
-        config.general.connect_timeout.as_std(),
+        connect_timeout,
         config.general.query_wait_timeout.as_std(),
         pool_mode == PoolMode::Session,
         fallback_state,
         base_startup_parameters,
         per_user_startup_overlay.clone(),
-    );
+    )
+    .with_release_query(pool_config.release_query.clone())
+    .with_prewarm_query(effective_prewarm)
+    .with_intercept_discard_all(pool_config.intercept_discard_all);
 
     // The auth_query cache compares the new fetched per-user map against
     // this value after every refetch; a mismatch drops the dynamic pool
@@ -223,17 +240,25 @@ pub fn create_dynamic_pool(
         false => QueueMode::Lifo,
     };
 
+    // single coordinator read shared by both the inner
+    // builder and the outer `ConnectionPool::coordinator` field.
+    // Previously two separate `get_coordinator(pool_name)` calls
+    // could observe different `Arc<PoolCoordinator>` instances
+    // across a RELOAD that races `from_config` republishing
+    // `COORDINATORS`. The two fields would then track different
+    // coordinator generations: `retain.rs` reads
+    // `min_connection_lifetime_ms` from the outer one and walks
+    // reserves whose `coordinator_permit` was issued by the inner
+    // one - permit accounting drifts until the pool rotates.
+    let coordinator = get_coordinator(pool_name);
+
     let pool = Pool::builder(manager)
-        .coordinator(get_coordinator(pool_name))
+        .coordinator(coordinator.clone())
         .pool_name(pool_name.to_string())
         .username(username.to_string())
         .config(PoolConfig {
             max_size: user.pool_size as usize,
-            timeouts: Timeouts {
-                wait: Some(config.general.query_wait_timeout.as_std()),
-                create: Some(config.general.connect_timeout.as_std()),
-                recycle: None,
-            },
+            timeouts: resolve_pool_timeouts(pool_config, &config.general),
             queue_mode: queue_strategy,
             scaling: pool_config.resolve_scaling_config(&config.general),
         })
@@ -244,7 +269,7 @@ pub fn create_dynamic_pool(
         address,
         config_hash: 0, // dynamic pools don't participate in hash-based reload
         per_user_startup_overlay_hash: overlay_hash,
-        original_server_parameters: Arc::new(tokio::sync::Mutex::new(ServerParameters::new())),
+        original_server_parameters: Arc::new(tokio::sync::OnceCell::new()),
         settings: PoolSettings {
             pool_mode,
             user,
@@ -266,15 +291,32 @@ pub fn create_dynamic_pool(
             ))),
         },
         check_query_cache: Arc::new(CheckQueryCache::new()),
-        coordinator: get_coordinator(pool_name),
+        coordinator,
         replenish_failures: Arc::new(AtomicU32::new(0)),
         init_complete: Arc::new(AtomicBool::new(false)),
     };
 
-    // Atomic insert into POOLS
+    // Atomic insert into POOLS.
+    //
+    // take the write-serialisation lock so the POOLS.store +
+    // register_dynamic_pool below cannot interleave with another
+    // dynamic-pool insert (for a different user), a RELOAD that
+    // republishes POOLS, a drop_dynamic_pool, or a GC sweep. Without
+    // this, two concurrent inserts both `load()` the same snapshot and
+    // one's insert is silently dropped when the other stores its clone
+    // (last-write-wins). All POOLS mutations after this point are guarded.
+    // parking_lot::Mutex is not reentrant, so register_dynamic_pool below
+    // must observe the same hold - it has an internal fast-path that
+    // returns before re-locking. Instead, do the DYNAMIC_POOLS insert
+    // inline while we still hold the lock.
     let identifier = PoolIdentifier::new(pool_name, username);
+    let _commit_guard = super::pool_write_lock();
+    if !auth_query_state_generation_is_current(pool_name, expected_auth_query_state) {
+        return Err(auth_query_state_changed_error(pool_name, username));
+    }
     let current = POOLS.load();
     let mut new_pools = (**current).clone();
+    let mut removed_drifted_pool = None;
 
     // Re-check after clone (another thread may have created it). The
     // fast path at the top of this function already validates the
@@ -305,7 +347,22 @@ pub fn create_dynamic_pool(
         info!(
             "[{username}@{pool_name}] auth_query: per-user startup_parameters overlay drift on slow-path race — replacing concurrently-built pool"
         );
-        new_pools.remove(&identifier);
+        removed_drifted_pool = new_pools.remove(&identifier);
+        if let Some(pool) = &removed_drifted_pool {
+            pool.database.close_new_checkouts();
+        }
+    }
+
+    let current_dyn = super::DYNAMIC_POOLS.load();
+    if !dynamic_pool_insert_allowed(current_dyn.as_ref(), pool_name, &identifier) {
+        warn!(
+            "[{username}@{pool_name}] auth_query: dynamic pool limit reached \
+             ({MAX_DYNAMIC_POOLS_PER_DATABASE} per database)"
+        );
+        return Err(Error::AuthError(format!(
+            "auth_query: too many dynamic users for pool '{pool_name}' \
+             (limit {MAX_DYNAMIC_POOLS_PER_DATABASE})"
+        )));
     }
 
     let auth_method = match &conn_pool.address.backend_auth {
@@ -321,16 +378,50 @@ pub fn create_dynamic_pool(
     };
     info!("[{username}@{pool_name}] dynamic pool created (backend_auth={auth_method})");
     new_pools.insert(identifier.clone(), conn_pool.clone());
-    POOLS.store(Arc::new(new_pools));
-    register_dynamic_pool(&identifier);
 
-    // Prewarm: spawn background task to create min_pool_size connections
+    // Publish `DYNAMIC_POOLS` before `POOLS`. Hot readers in `auth/mod.rs`
+    // call `get_pool()` followed by `is_dynamic_pool()`; any reader that
+    // sees the pool via `get_pool()` must also see it as dynamic and route
+    // through `try_auth_query`. The write_lock serialises writers; the
+    // ordering above only matters for ArcSwap readers that bypass
+    // the lock.
+    {
+        let current_dyn = super::DYNAMIC_POOLS.load();
+        if !current_dyn.contains(&identifier) {
+            let mut new_dyn = (**current_dyn).clone();
+            new_dyn.insert(identifier.clone());
+            super::DYNAMIC_POOLS.store(Arc::new(new_dyn));
+        }
+    }
+    POOLS.store(Arc::new(new_pools));
+    drop(_commit_guard);
+    if let Some(pool) = &removed_drifted_pool {
+        pool.database.close();
+    }
+
+    // Prewarm: spawn background task to create min_pool_size connections.
+    //
+    // check `is_dynamic_pool` membership before replenishing.
+    // If RELOAD drops the dynamic pool between insert and prewarm
+    // (e.g. `general_startup_parameters_changed`), the spawned task
+    // would otherwise create orphan backends that never serve traffic
+    // and that accumulate against `max_concurrent_creates` until
+    // `lifetime_ms` ages them out.
     if aq_config.min_pool_size > 0 {
         let pool_clone = conn_pool.clone();
         let min = aq_config.min_pool_size as usize;
         let pn = pool_name.to_string();
         let un = username.to_string();
+        let identifier_for_check = identifier.clone();
+        let generation_for_check = Arc::clone(&conn_pool.init_complete);
         tokio::spawn(async move {
+            if !dynamic_pool_generation_is_current(&identifier_for_check, &generation_for_check) {
+                warn!(
+                    "[{un}@{pn}] dynamic prewarm aborted: pool was removed before \
+                     prewarm could start (RELOAD race)"
+                );
+                return;
+            }
             let created = pool_clone.database.replenish(min).await;
             if created > 0 {
                 info!("[{un}@{pn}] prewarmed {created} dynamic server(s) (min_pool_size={min})");
@@ -364,9 +455,83 @@ fn should_rebuild_for_overlay_drift(live_hash: u64, fetched_hash: u64, is_dynami
     live_hash != fetched_hash && is_dynamic
 }
 
+fn dynamic_pool_generation_is_current(
+    identifier: &PoolIdentifier,
+    init_complete: &Arc<AtomicBool>,
+) -> bool {
+    let pools = POOLS.load();
+    let Some(pool) = pools.get(identifier) else {
+        return false;
+    };
+    if !Arc::ptr_eq(&pool.init_complete, init_complete) {
+        return false;
+    }
+    super::DYNAMIC_POOLS.load().contains(identifier)
+}
+
+fn auth_query_state_generation_is_current(
+    pool_name: &str,
+    expected_auth_query_state: &Arc<super::AuthQueryState>,
+) -> bool {
+    super::get_auth_query_state(pool_name)
+        .as_ref()
+        .map(|current| Arc::ptr_eq(current, expected_auth_query_state))
+        .unwrap_or(false)
+}
+
+fn auth_query_state_changed_error(pool_name: &str, username: &str) -> Error {
+    warn!(
+        "[{username}@{pool_name}] auth_query state changed during dynamic pool creation; \
+         rejecting stale dynamic pool publish after reload"
+    );
+    Error::AuthError(format!(
+        "auth_query state changed during dynamic pool creation for pool '{pool_name}'"
+    ))
+}
+
+fn dynamic_pool_insert_allowed(
+    dynamic_ids: &HashSet<PoolIdentifier>,
+    pool_name: &str,
+    candidate: &PoolIdentifier,
+) -> bool {
+    if dynamic_ids.contains(candidate) {
+        return true;
+    }
+    dynamic_ids
+        .iter()
+        .filter(|id| id.db == pool_name)
+        .take(MAX_DYNAMIC_POOLS_PER_DATABASE)
+        .count()
+        < MAX_DYNAMIC_POOLS_PER_DATABASE
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_rebuild_for_overlay_drift;
+    use super::{
+        dynamic_pool_generation_is_current, dynamic_pool_insert_allowed,
+        should_rebuild_for_overlay_drift,
+    };
+    use crate::pool::{pool_write_lock, ConnectionPool, PoolIdentifier, DYNAMIC_POOLS, POOLS};
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    #[test]
+    fn dynamic_prewarm_checks_current_published_generation() {
+        let src = include_str!("dynamic.rs");
+        let prewarm_start = src.find("Prewarm: spawn background task").unwrap();
+        let prewarm_block = &src[prewarm_start..];
+        let prewarm_end = prewarm_block
+            .find("Increment dynamic_pools_created stat")
+            .expect("dynamic prewarm block end not found");
+        let prewarm_block = &prewarm_block[..prewarm_end];
+
+        assert!(
+            prewarm_block.contains("dynamic_pool_generation_is_current"),
+            "dynamic prewarm must verify the captured pool generation, not only \
+             DYNAMIC_POOLS membership for the same identifier"
+        );
+    }
 
     #[test]
     fn overlay_drift_reuses_on_hash_match() {
@@ -393,5 +558,150 @@ mod tests {
         assert!(!should_rebuild_for_overlay_drift(
             empty, fetched, /*is_dynamic=*/ false
         ));
+    }
+
+    #[test]
+    fn dynamic_pool_generation_rejects_stale_same_identifier_pool() {
+        let id = PoolIdentifier::new("dynamic_generation_db", "dynamic_user");
+        let stale_generation = Arc::new(AtomicBool::new(true));
+        let live_generation = Arc::new(AtomicBool::new(true));
+        let mut live_pool = ConnectionPool::test_for_protocol();
+        live_pool.init_complete = Arc::clone(&live_generation);
+
+        {
+            let _guard = pool_write_lock();
+            let mut pools = (**POOLS.load()).clone();
+            pools.insert(id.clone(), live_pool);
+            POOLS.store(Arc::new(pools));
+
+            let mut dynamics = (**DYNAMIC_POOLS.load()).clone();
+            dynamics.insert(id.clone());
+            DYNAMIC_POOLS.store(Arc::new(dynamics));
+        }
+
+        assert!(
+            dynamic_pool_generation_is_current(&id, &live_generation),
+            "the live dynamic pool generation must be accepted"
+        );
+        assert!(
+            !dynamic_pool_generation_is_current(&id, &stale_generation),
+            "a removed generation with the same identifier must not be accepted"
+        );
+
+        let _guard = pool_write_lock();
+        let mut pools = (**POOLS.load()).clone();
+        pools.remove(&id);
+        POOLS.store(Arc::new(pools));
+        let mut dynamics = (**DYNAMIC_POOLS.load()).clone();
+        dynamics.remove(&id);
+        DYNAMIC_POOLS.store(Arc::new(dynamics));
+    }
+
+    #[test]
+    fn slow_path_overlay_replacement_closes_removed_generation_before_publish() {
+        let src = include_str!("dynamic.rs");
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let slow_path_start = impl_src
+            .find("per-user startup_parameters overlay drift on slow-path race")
+            .expect("slow-path overlay drift replacement block not found");
+        let slow_path_block = &impl_src[slow_path_start..];
+        let publish_idx = slow_path_block
+            .find("POOLS.store")
+            .expect("dynamic slow path must publish POOLS");
+        let before_publish = &slow_path_block[..publish_idx];
+
+        assert!(
+            before_publish.contains("close_new_checkouts"),
+            "dynamic slow-path overlay replacement must close removed generations \
+             before publishing a POOLS map with the replacement"
+        );
+
+        let after_publish = &slow_path_block[publish_idx..];
+        let unlock_idx = after_publish
+            .find("drop(_commit_guard)")
+            .expect("dynamic slow path must release pool_write_lock explicitly");
+        let after_unlock = &after_publish[unlock_idx..];
+        assert!(
+            after_unlock.contains(".database.close()"),
+            "dynamic slow-path overlay replacement must close/drain removed generations \
+             after releasing pool_write_lock"
+        );
+    }
+
+    #[test]
+    fn dynamic_pool_create_rechecks_auth_query_generation_under_commit_lock() {
+        let src = include_str!("dynamic.rs");
+        let fn_start = src
+            .find("pub fn create_dynamic_pool(")
+            .expect("create_dynamic_pool must exist");
+        let body = &src[fn_start..];
+        let fn_end = body
+            .find("\n/// Decide whether `create_dynamic_pool`")
+            .expect("create_dynamic_pool helper marker must follow function");
+        let body = &body[..fn_end];
+
+        assert!(
+            body.contains("expected_auth_query_state: &Arc<super::AuthQueryState>"),
+            "dynamic pool creation must carry the AuthQueryState that supplied \
+             the authenticated cache row"
+        );
+
+        let lock_idx = body
+            .find("let _commit_guard = super::pool_write_lock()")
+            .expect("dynamic pool create must hold pool_write_lock before publish");
+        let recheck_idx = body[lock_idx..]
+            .find("auth_query_state_generation_is_current(pool_name, expected_auth_query_state)")
+            .map(|offset| lock_idx + offset)
+            .expect("dynamic pool create must recheck auth_query generation under the commit lock");
+        let dynamic_publish_idx = body[recheck_idx..]
+            .find("DYNAMIC_POOLS.store")
+            .map(|offset| recheck_idx + offset)
+            .expect("dynamic pool create must publish DYNAMIC_POOLS");
+        let pools_publish_idx = body[recheck_idx..]
+            .find("POOLS.store")
+            .map(|offset| recheck_idx + offset)
+            .expect("dynamic pool create must publish POOLS");
+
+        assert!(
+            lock_idx < recheck_idx
+                && recheck_idx < dynamic_publish_idx
+                && recheck_idx < pools_publish_idx,
+            "dynamic pool create must reject stale auth_query generations before publishing either map"
+        );
+        assert!(
+            body[recheck_idx..].contains("auth_query_state_changed_error(pool_name, username)"),
+            "stale auth_query generation rejection must use the dedicated reload-race error"
+        );
+        assert!(
+            src.contains("auth_query state changed during dynamic pool creation"),
+            "stale auth_query generation rejection must explain the reload race"
+        );
+    }
+
+    #[test]
+    fn dynamic_pool_limit_rejects_new_user_but_allows_existing_id() {
+        let pool_name = "limited_db";
+        let mut dynamic_ids = HashSet::new();
+        for i in 0..super::MAX_DYNAMIC_POOLS_PER_DATABASE {
+            dynamic_ids.insert(PoolIdentifier::new(pool_name, &format!("u_{i}")));
+        }
+
+        let new_user = PoolIdentifier::new(pool_name, "new_user");
+        assert!(
+            !dynamic_pool_insert_allowed(&dynamic_ids, pool_name, &new_user),
+            "new dynamic users must be rejected once the per-db cap is reached"
+        );
+
+        let existing_user = PoolIdentifier::new(pool_name, "u_0");
+        assert!(
+            dynamic_pool_insert_allowed(&dynamic_ids, pool_name, &existing_user),
+            "existing dynamic pool rebuild/reuse must not be blocked by the cap"
+        );
+
+        let other_db_user = PoolIdentifier::new("other_db", "new_user");
+        assert!(
+            dynamic_pool_insert_allowed(&dynamic_ids, "other_db", &other_db_user),
+            "dynamic pools in other databases must not count against this database"
+        );
     }
 }

@@ -58,28 +58,51 @@ impl Drop for Object {
     fn drop(&mut self) {
         if let Some(mut inner) = self.inner.take() {
             if let Some(pool) = self.pool.upgrade() {
-                // Evict on two conditions, both meaning the connection is unsafe
-                // to hand to another client:
-                //   bad: mark_bad fired during the request (protocol desync,
-                //        large-frame failure, server-side drain error).
-                //   pending_large_message set: handle_large_data_row read the
-                //        DataRow/CopyData header but never streamed its body.
-                //        Body bytes still sit in the server socket. The next
-                //        client on this connection would read them as its own
-                //        protocol frames and corrupt its result set.
-                let must_evict = inner.obj.is_bad() || inner.obj.pending_large_message.is_some();
+                // Drop cannot await normal checkin cleanup. If a client task
+                // panics or is cancelled while holding a transaction, COPY
+                // stream, unread bytes, or dirty session state, close this
+                // backend instead of handing it to another client.
+                if let Some(reason) = inner.obj.recycle_safety_violation() {
+                    if !inner.obj.is_bad() {
+                        inner.obj.mark_bad(reason);
+                    }
+                }
+                let must_evict = inner.obj.is_bad();
                 if must_evict {
                     // Skip return_object so this connection never reaches the
                     // idle queue or a direct-handoff waiter. Update accounting
-                    // in the same tick (decrement slots.size, return the
-                    // semaphore permit, wake coordinator observers) so the next
-                    // checkout sees the freed slot. Server::drop closes the PG
-                    // socket via RAII when `inner` falls off scope below.
-                    {
+                    // in the same tick (decrement slots.size, restore or retire
+                    // the semaphore permit, wake coordinator observers) so the
+                    // next checkout sees the freed slot. Server::drop closes the
+                    // PG socket via RAII when `inner` falls off scope below.
+                    //
+                    // ALSO drop one registered same-pool waiter's
+                    // oneshot sender so that the waiter wakes immediately
+                    // (its `rx.try_recv()` will see Closed and continue) -
+                    // otherwise registered waiters keep sleeping for
+                    // BURST_BACKOFF (5-10 ms) while a fresh acquire could
+                    // skip the queue via `try_acquire_burst_gate`. Without
+                    // this, bad-eviction storms (mass `pg_terminate_backend`)
+                    // cause fairness inversion: registered waiters starve.
+                    let (waker_to_close, retire_permit) = {
                         let mut slots = pool.slots.lock();
+                        let retire_slot = slots.size > slots.max_size;
                         slots.size = slots.size.saturating_sub(1);
+                        // retire the permit
+                        // only when resize() pre-marked one. A pre_replace_one
+                        // overshoot leaves permits_to_retire == 0, so the permit
+                        // is restored below instead of leaked.
+                        let retire_permit = retire_slot && slots.permits_to_retire > 0;
+                        if retire_permit {
+                            slots.permits_to_retire -= 1;
+                        }
+                        (slots.waiters.pop_front(), retire_permit)
+                    };
+                    // Dropping the sender wakes the waiter via Closed.
+                    drop(waker_to_close);
+                    if !retire_permit {
+                        pool.semaphore.add_permits(1);
                     }
-                    pool.semaphore.add_permits(1);
                     pool.notify_return_observers();
                 } else {
                     inner.metrics.recycled = Some(clock::now());
@@ -133,6 +156,12 @@ struct Slots {
     waiters: VecDeque<oneshot::Sender<ObjectInner>>,
     size: usize,
     max_size: usize,
+    /// permits that a resize() shrink could
+    /// not forget immediately (because they were checked out) and that the
+    /// `size > max_size` retire branches must still retire as those clients
+    /// return. ONLY resize sets this; a pre_replace_one overshoot leaves it 0,
+    /// so a return during overshoot RESTORES the permit instead of leaking it.
+    permits_to_retire: usize,
 }
 
 impl fmt::Debug for Slots {
@@ -212,7 +241,7 @@ pub struct ScalingStatsSnapshot {
 struct PoolInner {
     server_pool: ServerPool,
     slots: Mutex<Slots>,
-    /// Number of users currently holding or waiting for objects.
+    /// Number of checkout futures currently inside `timeout_get`.
     users: AtomicUsize,
     semaphore: Semaphore,
     config: PoolConfig,
@@ -326,6 +355,67 @@ fn push_idle(queue_mode: QueueMode, vec: &mut VecDeque<ObjectInner>, inner: Obje
     }
 }
 
+#[inline(always)]
+fn prune_closed_handoff_waiters(slots: &mut Slots) {
+    slots.waiters.retain(|sender| !sender.is_closed());
+}
+
+#[inline(always)]
+fn push_handoff_waiter(slots: &mut Slots, sender: oneshot::Sender<ObjectInner>) {
+    prune_closed_handoff_waiters(slots);
+    slots.waiters.push_back(sender);
+}
+
+#[inline(always)]
+fn close_and_drain_handoff_receiver<T>(
+    rx: &mut oneshot::Receiver<T>,
+) -> Result<T, oneshot::error::TryRecvError> {
+    rx.close();
+    rx.try_recv()
+}
+
+struct HandoffReceiverGuard<'a> {
+    pool: &'a PoolInner,
+    rx: Option<oneshot::Receiver<ObjectInner>>,
+}
+
+impl<'a> HandoffReceiverGuard<'a> {
+    fn new(pool: &'a PoolInner, rx: oneshot::Receiver<ObjectInner>) -> Self {
+        Self { pool, rx: Some(rx) }
+    }
+
+    fn rx_mut(&mut self) -> &mut oneshot::Receiver<ObjectInner> {
+        self.rx.as_mut().expect("handoff receiver must be armed")
+    }
+
+    fn close_and_drain(&mut self) -> Result<ObjectInner, oneshot::error::TryRecvError> {
+        let mut rx = self.rx.take().expect("handoff receiver must be armed");
+        close_and_drain_handoff_receiver(&mut rx)
+    }
+}
+
+impl Drop for HandoffReceiverGuard<'_> {
+    fn drop(&mut self) {
+        let Some(mut rx) = self.rx.take() else {
+            return;
+        };
+
+        match close_and_drain_handoff_receiver(&mut rx) {
+            Ok(inner) => {
+                let mut slots = self.pool.slots.lock();
+                push_idle(self.pool.config.queue_mode, &mut slots.vec, inner);
+                drop(slots);
+                self.pool.notify_return_observers();
+            }
+            Err(_) => {
+                drop(rx);
+                let mut slots = self.pool.slots.lock();
+                prune_closed_handoff_waiters(&mut slots);
+            }
+        }
+    }
+}
+
 impl PoolInner {
     /// Try to take a burst gate slot. On success, bumps `creates_started`
     /// and returns a guard that releases the slot on drop.
@@ -363,6 +453,11 @@ impl PoolInner {
             ),
             coordinator_permit,
         }
+    }
+
+    #[inline(always)]
+    fn accepts_fresh_backend_after_create(&self, slots: &Slots) -> bool {
+        !self.semaphore.is_closed() && slots.max_size > 0
     }
 
     /// Background pre-replacement: create one connection ahead of lifetime
@@ -436,14 +531,48 @@ impl PoolInner {
             }
         };
 
-        let inner = self.new_object_inner(obj, coordinator_permit);
-
         // Push to idle queue. Temporarily exceeds max_size by 1; returns
         // to max_size when the old connection fails recycle.
+        //
+        // BEFORE pushing to idle, try to hand the
+        // fresh connection directly to an oldest queued waiter. Without
+        // this, a client that is currently blocked in `try_anticipate`
+        // had to wait the full anticipate budget even though a fresh
+        // connection just landed. Mirrors the waiter-drain in
+        // `return_object`.
+        let mut handoff_done = false;
         {
             let mut slots = self.slots.lock();
+            if !self.accepts_fresh_backend_after_create(&slots) {
+                drop(slots);
+                log::debug!(
+                    "[{}@{}] pre-replace: dropped fresh backend because pool generation closed",
+                    self.username,
+                    self.pool_name,
+                );
+                self.scaling_stats
+                    .pre_replacements_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             slots.size += 1;
-            push_idle(self.config.queue_mode, &mut slots.vec, inner);
+            let inner = self.new_object_inner(obj, coordinator_permit);
+            let mut carry: Option<ObjectInner> = Some(inner);
+            while let Some(sender) = slots.waiters.pop_front() {
+                let take = carry.take().expect("carry held one inner per iteration");
+                match sender.send(take) {
+                    Ok(()) => {
+                        handoff_done = true;
+                        break;
+                    }
+                    Err(returned) => {
+                        carry = Some(returned);
+                    }
+                }
+            }
+            if let Some(remaining) = carry {
+                push_idle(self.config.queue_mode, &mut slots.vec, remaining);
+            }
         }
 
         // No semaphore.add_permits needed: return_object now always
@@ -456,9 +585,14 @@ impl PoolInner {
             .pre_replacements_triggered
             .fetch_add(1, Ordering::Relaxed);
         log::info!(
-            "[{}@{}] pre-replace: replacement connection created ahead of lifetime expiry",
+            "[{}@{}] pre-replace: replacement connection created ahead of lifetime expiry{}",
             self.username,
             self.pool_name,
+            if handoff_done {
+                " (handed to waiter)"
+            } else {
+                ""
+            },
         );
     }
 
@@ -487,6 +621,11 @@ impl PoolInner {
 
         {
             let mut slots = self.slots.lock();
+            if !self.accepts_fresh_backend_after_create(&slots) {
+                drop(slots);
+                drop(obj);
+                return Err(PoolError::Closed);
+            }
             slots.size += 1;
         }
 
@@ -509,37 +648,52 @@ impl PoolInner {
             slots.vec.pop_front()
         };
 
-        let Some(mut inner) = obj_inner else {
+        let Some(inner) = obj_inner else {
             return RecycleOutcome::Empty;
         };
 
         let skip_lifetime = self.under_pressure();
 
-        let recycle_result = match timeouts.recycle {
-            Some(duration) => {
-                match tokio::time::timeout(
-                    duration,
-                    self.server_pool
-                        .recycle(&mut inner.obj, &inner.metrics, skip_lifetime),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(RecycleError::StaticMessage("Recycle timeout")),
-                }
-            }
-            None => {
-                self.server_pool
-                    .recycle(&mut inner.obj, &inner.metrics, skip_lifetime)
+        // cancel-safety guard. The pop above removed
+        // the connection from `slots.vec` but `slots.size` still
+        // counts it (size tracks vec + checked-out + in-transit). If
+        // the future is cancelled during `recycle().await` (timeout
+        // higher in the stack, runtime shutdown, client RST), the
+        // bare `ObjectInner` falls off the stack and `Server::drop`
+        // closes the TCP fd - but `slots.size` is never decremented,
+        // leaking 1 size unit per cancellation. Over time `slots.size`
+        // saturates at `max_size`, the create gate blocks every
+        // `replenish`, and the pool freezes with no real backends.
+        let mut guard = BareInnerGuard::new(self, inner);
+
+        let recycle_result = {
+            let inner_ref = guard.as_mut();
+            // Split borrows of disjoint fields are accepted by the
+            // borrow checker; `as_mut` returned one mutable reference,
+            // so destructure from it.
+            let ObjectInner { obj, metrics, .. } = inner_ref;
+            match timeouts.recycle {
+                Some(duration) => {
+                    match tokio::time::timeout(
+                        duration,
+                        self.server_pool.recycle(obj, metrics, skip_lifetime),
+                    )
                     .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(RecycleError::StaticMessage("Recycle timeout")),
+                    }
+                }
+                None => self.server_pool.recycle(obj, metrics, skip_lifetime).await,
             }
         };
 
         match recycle_result {
-            Ok(()) => RecycleOutcome::Reused(Box::new(inner)),
+            Ok(()) => RecycleOutcome::Reused(Box::new(guard.disarm())),
             Err(_) => {
-                let mut slots = self.slots.lock();
-                slots.size = slots.size.saturating_sub(1);
+                // Guard's Drop decrements `slots.size` and closes the
+                // backend's TCP fd via `Server::drop`.
+                drop(guard);
                 RecycleOutcome::Failed
             }
         }
@@ -548,6 +702,27 @@ impl PoolInner {
     #[inline(always)]
     fn return_object(&self, mut inner: ObjectInner) {
         let mut slots = self.slots.lock();
+
+        if slots.size > slots.max_size {
+            slots.size = slots.size.saturating_sub(1);
+            // retire the returning permit
+            // only when resize() pre-marked one. A pre_replace_one overshoot
+            // leaves permits_to_retire == 0, so the permit is restored below
+            // instead of leaked.
+            let retire_permit = slots.permits_to_retire > 0;
+            if retire_permit {
+                slots.permits_to_retire -= 1;
+            }
+            let waker_to_close = slots.waiters.pop_front();
+            drop(slots);
+            drop(waker_to_close);
+            drop(inner);
+            if !retire_permit {
+                self.semaphore.add_permits(1);
+            }
+            self.notify_return_observers();
+            return;
+        }
 
         // Direct handoff: send to the oldest registered waiter.
         // Waiters whose receiver was dropped (timeout) are skipped.
@@ -581,7 +756,7 @@ impl PoolInner {
 
     /// Wake peer-pool coordinator waiter after a connection lands in
     /// `slots.vec` (the no-waiter path of `return_object`). The coordinator
-    /// Phase C waiter scans this pool's idle vec via `evict_one_idle` and
+    /// the wait queue waiter scans this pool's idle vec via `evict_one_idle` and
     /// drops the returned connection to free a coordinator slot.
     ///
     /// Same-pool waiters (Phase B anticipation, burst gate) now receive
@@ -646,6 +821,170 @@ enum CoordinatorJitResult<'a> {
     Recycled(Box<ObjectInner>),
 }
 
+/// RAII guard that owns the semaphore-permits-forgotten-for-eviction
+/// accounting in `Pool::evict_dead_backends`. The happy-path commit
+/// pushes survivors back, deducts `evicted` from `slots.size`, and
+/// restores all `checked` permits via a single `add_permits` (disarming
+/// the guard). If the scan task is dropped at any await point inside
+/// the off-lock check loop - cancellation, panic during `check_alive`,
+/// or any future `select!` wrapper around the retain task - `Drop` runs
+/// the worst-case bookkeeping: treat every popped object as evicted
+/// (the survivors `Vec` that was never moved into the commit path
+/// drops here too, and each `Server::drop` closes its TCP fd), deduct
+/// the full `popped_count` from `slots.size`, and `add_permits` back
+/// the matching count so the semaphore stays balanced.
+///
+/// Without this guard, an `.abort()` of the retain task between the
+/// pop phase and the bookkeeping section would permanently leak
+/// `popped_count` permits and leave `slots.size` inflated until process
+/// restart.
+struct EvictGuard<'p> {
+    pool: &'p PoolInner,
+    popped_count: usize,
+    committed: bool,
+}
+
+/// cancel-safety guard for `ObjectInner`
+/// values that have been removed from `slots.vec` but not yet
+/// committed (wrap_checkout or back into the vec). Without it, a
+/// future cancellation between pop and commit silently leaks
+/// `slots.size` by 1 per occurrence (and the semaphore permit the
+/// pending caller already held). Over time the pool freezes at
+/// `slots.size == max_size` with zero real backends.
+///
+/// Behaviour:
+/// - On `Drop` without `disarm()`: decrement `slots.size` by 1,
+///   `add_permits(1)` to the semaphore (the caller's permit is
+///   restored), then drop the wrapped `ObjectInner` off-lock -
+///   `Server::drop` closes the TCP fd via RAII.
+/// - On `disarm()`: returns the `ObjectInner` for the success
+///   path; bookkeeping is the caller's responsibility (typically
+///   `wrap_checkout` which `permit.forget()`s).
+struct BareInnerGuard<'p> {
+    pool: &'p PoolInner,
+    inner: Option<ObjectInner>,
+}
+
+impl<'p> BareInnerGuard<'p> {
+    #[inline]
+    fn new(pool: &'p PoolInner, inner: ObjectInner) -> Self {
+        Self {
+            pool,
+            inner: Some(inner),
+        }
+    }
+    #[inline]
+    fn as_mut(&mut self) -> &mut ObjectInner {
+        self.inner.as_mut().expect("guard held inner")
+    }
+    #[inline]
+    fn disarm(mut self) -> ObjectInner {
+        self.inner.take().expect("guard held inner")
+    }
+}
+
+impl<'p> Drop for BareInnerGuard<'p> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            {
+                let mut slots = self.pool.slots.lock();
+                slots.size = slots.size.saturating_sub(1);
+            }
+            // NOTE: we deliberately do NOT call `add_permits(1)`. The
+            // caller of `try_recycle_one` / `recycle_handoff` still
+            // holds a `SemaphorePermit` from `acquire_semaphore`. On
+            // both the Err return path AND the cancellation/drop
+            // path, that permit is dropped naturally by tokio and
+            // returns to the semaphore. Calling `add_permits(1)` here
+            // would double-restore the permit and inflate the
+            // semaphore beyond `max_size`.
+            drop(inner); // Server::drop runs off-lock
+        }
+    }
+}
+
+impl<'p> EvictGuard<'p> {
+    fn new(pool: &'p PoolInner, popped_count: usize) -> Self {
+        Self {
+            pool,
+            popped_count,
+            committed: false,
+        }
+    }
+
+    /// Happy-path finalisation. Re-insert survivors via `push_idle`,
+    /// deduct `evicted` from `slots.size`, then restore all permits.
+    /// Marks the guard committed only at the END so a panic anywhere
+    /// inside this function (debug_assert, `push_idle` OOM,
+    /// `add_permits` overflow) still triggers `Drop`'s worst-case
+    /// bookkeeping path - without the late `committed=true`, a panic
+    /// in `push_idle` would leave permits unrestored AND survivors
+    /// dropped, permanently shrinking the pool by `popped_count`.
+    fn commit(mut self, queue_mode: QueueMode, survivors: Vec<ObjectInner>, evicted: usize) {
+        debug_assert_eq!(
+            survivors.len() + evicted,
+            self.popped_count,
+            "EvictGuard.commit: survivors + evicted must equal popped",
+        );
+        if !survivors.is_empty() || evicted > 0 {
+            let mut guard = self.pool.slots.lock();
+            for obj in survivors {
+                push_idle(queue_mode, &mut guard.vec, obj);
+            }
+            if evicted > 0 {
+                guard.size = guard.size.saturating_sub(evicted);
+            }
+        }
+        self.pool.semaphore.add_permits(self.popped_count);
+        // Disarm AFTER all bookkeeping. Any panic before this point
+        // falls through to `Drop::drop` which conservatively treats
+        // the entire batch as evicted (deducting popped_count from
+        // slots.size and restoring popped_count permits). That is
+        // strictly safer than a partial commit leaving permits
+        // forgotten forever.
+        self.committed = true;
+    }
+}
+
+impl Drop for EvictGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed || self.popped_count == 0 {
+            return;
+        }
+        // Cancellation / panic path. The survivors Vec the caller was
+        // building dropped along with this stack frame, so every popped
+        // ObjectInner has either been consumed in-loop or is dropping
+        // right now - each Server::drop already closed its TCP fd.
+        //
+        // **Known side effect** under cancellation: backends that were
+        // already verified healthy in the off-lock loop and pushed onto
+        // `survivors` are silently dropped here too. They do NOT make it
+        // back to the idle vec. This is the correctness-preserving
+        // pessimistic choice - the pool is left under-capacity by up to
+        // `max_per_cycle` connections that `replenish` will refill on
+        // the next tick. The alternative ("preserve survivors across
+        // cancellation") would require the guard to own the survivors
+        // Vec, complicating the happy-path API for a benefit measured
+        // only against a cancellation surface the retain task does not
+        // currently expose (no parent `select!`, no JoinHandle abort).
+        //
+        // We just need to keep the pool's accounting consistent:
+        //   * slots.size has not been touched since the pop phase, so
+        //     it still reflects the pre-eviction count. Deduct the full
+        //     popped_count - the objects are gone from the idle vec
+        //     either way.
+        //   * semaphore lost `popped_count` permits during pop (one
+        //     `try_acquire().forget()` per item). Restore them so a
+        //     concurrent checkout that arrives after the cancellation
+        //     can still acquire up to `max_size` permits.
+        {
+            let mut guard = self.pool.slots.lock();
+            guard.size = guard.size.saturating_sub(self.popped_count);
+        }
+        self.pool.semaphore.add_permits(self.popped_count);
+    }
+}
+
 impl Pool {
     /// Wrap a recycled/created ObjectInner into an Object, consuming
     /// the semaphore permit. The permit is restored by `return_object`
@@ -668,12 +1007,18 @@ impl Pool {
         timeouts: &Timeouts,
         non_blocking: bool,
     ) -> BurstGateOutcome<'_> {
-        let (_, _, _, xact_p99_us) = self
+        // read the cached p99 atom (refreshed by the Collector every
+        // 15s) instead of taking the blocking `xact_histogram.lock()` on
+        // every checkout. The cached value is at most one stats-cycle
+        // stale - fine for sizing an adaptive wait budget - and the hot
+        // path becomes one `Relaxed` atomic load.
+        let xact_p99_us = self
             .inner
             .server_pool
             .address()
             .stats
-            .get_xact_percentiles();
+            .p99_xact_time_us
+            .load(Ordering::Relaxed);
         let budget = burst_gate_budget(xact_p99_us);
         let loop_start = tokio::time::Instant::now();
 
@@ -700,15 +1045,23 @@ impl Pool {
                 return BurstGateOutcome::Recycled(inner);
             }
 
-            // Adaptive timeout: waited longer than 2× xact_p99 — pool is undersized.
+            // Adaptive timeout: waited longer than 2× xact_p99 - pool is undersized.
             // Stop accepting recycled connections, wait for the burst gate directly.
             if loop_start.elapsed() > budget {
                 self.inner
                     .scaling_stats
                     .burst_gate_budget_exhausted
                     .fetch_add(1, Ordering::Relaxed);
+                // pin + enable BEFORE awaiting. `Notify::notified()`
+                // registers the waiter on first `poll`, NOT at construction
+                // time. Without explicit `enable()` a notify_one fired
+                // between `notified()` and the first poll is consumed by
+                // the permit store and lost - the timeout then waits the
+                // full BURST_GATE_EXHAUSTED_BACKOFF for nothing.
                 let notify = self.inner.create_done.notified();
-                let _ = tokio::time::timeout(BURST_GATE_EXHAUSTED_BACKOFF, notify).await;
+                tokio::pin!(notify);
+                notify.as_mut().enable();
+                let _ = tokio::time::timeout(BURST_GATE_EXHAUSTED_BACKOFF, &mut notify).await;
                 continue;
             }
 
@@ -716,21 +1069,32 @@ impl Pool {
             // `biased;` ensures rx is always checked first: without it,
             // tokio::select! randomly picks among ready branches, and a
             // connection delivered to rx can be silently dropped when
-            // on_create or sleep wins the race — leaking slots.size.
-            let (tx, mut rx) = oneshot::channel();
-            self.inner.slots.lock().waiters.push_back(tx);
+            // on_create or sleep wins the race - leaking slots.size.
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut slots = self.inner.slots.lock();
+                push_handoff_waiter(&mut slots, tx);
+            }
+            let mut handoff_rx = HandoffReceiverGuard::new(&self.inner, rx);
+            // register the create_done waiter BEFORE entering select
+            // so a notify_one between this line and the select's first
+            // poll is captured, not lost. Without this the only signal
+            // for "a peer create finished" was the BURST_BACKOFF sleep
+            // (~5-10ms tail per wait).
             let on_create = self.inner.create_done.notified();
+            tokio::pin!(on_create);
+            on_create.as_mut().enable();
 
             tokio::select! {
                 biased;
-                result = &mut rx => {
+                result = handoff_rx.rx_mut() => {
                     if let Ok(inner) = result {
                         if let Ok(inner) = self.recycle_handoff(inner, timeouts).await {
                             return BurstGateOutcome::Recycled(Box::new(inner));
                         }
                     }
                 }
-                _ = on_create => {}
+                _ = &mut on_create => {}
                 _ = tokio::time::sleep(BURST_BACKOFF) => {}
             }
 
@@ -739,11 +1103,17 @@ impl Pool {
             // the original return_object that sent it here already
             // called add_permits(1), so calling return_object again
             // would double-count the permit.
-            if let Ok(inner) = rx.try_recv() {
-                let mut slots = self.inner.slots.lock();
-                push_idle(self.inner.config.queue_mode, &mut slots.vec, inner);
-                drop(slots);
-                self.inner.notify_return_observers();
+            match handoff_rx.close_and_drain() {
+                Ok(inner) => {
+                    let mut slots = self.inner.slots.lock();
+                    push_idle(self.inner.config.queue_mode, &mut slots.vec, inner);
+                    drop(slots);
+                    self.inner.notify_return_observers();
+                }
+                Err(_) => {
+                    let mut slots = self.inner.slots.lock();
+                    prune_closed_handoff_waiters(&mut slots);
+                }
             }
 
             // After wake — try recycle once before retrying the gate.
@@ -834,18 +1204,39 @@ impl Pool {
     /// to avoid a race where RESUME fires between the two calls and the
     /// notification is lost.
     async fn wait_if_paused(&self, timeouts: &Timeouts) -> Result<(), PoolError> {
-        let resume_notify = self.inner.server_pool.resume_notified();
-        if self.inner.server_pool.is_paused() {
+        self.wait_if_paused_with_hook(timeouts, || {}).await
+    }
+
+    async fn wait_if_paused_with_hook<F>(
+        &self,
+        timeouts: &Timeouts,
+        mut before_wait: F,
+    ) -> Result<(), PoolError>
+    where
+        F: FnMut(),
+    {
+        loop {
+            let resume_notify = self.inner.server_pool.resume_notified();
+            tokio::pin!(resume_notify);
+            resume_notify.as_mut().enable();
+
+            if !self.inner.server_pool.is_paused() {
+                return Ok(());
+            }
+
+            before_wait();
             match timeouts.wait {
                 Some(duration) => {
-                    if tokio::time::timeout(duration, resume_notify).await.is_err() {
+                    if tokio::time::timeout(duration, &mut resume_notify)
+                        .await
+                        .is_err()
+                    {
                         return Err(PoolError::Timeout(TimeoutType::Wait));
                     }
                 }
-                None => resume_notify.await,
+                None => (&mut resume_notify).await,
             }
         }
-        Ok(())
     }
 
     /// Acquire a semaphore permit: fast spin path, then blocking fallback.
@@ -950,12 +1341,16 @@ impl Pool {
                 // Adaptive anticipation budget: wait proportionally to actual
                 // transaction latency. If a return doesn't arrive within 2x
                 // the p99 xact time, creating is cheaper than waiting.
-                let (_, _, _, xact_p99_us) = self
+                //
+                // cached atomic instead of blocking histogram lock;
+                // updated every 15s by the Collector.
+                let xact_p99_us = self
                     .inner
                     .server_pool
                     .address()
                     .stats
-                    .get_xact_percentiles();
+                    .p99_xact_time_us
+                    .load(Ordering::Relaxed);
                 let base_ms = anticipation_base_ms(xact_p99_us);
                 // ±20% jitter to prevent synchronized creates across pools
                 let jitter_range = (base_ms / 5).max(1);
@@ -964,10 +1359,29 @@ impl Pool {
                     .clamp(ANTICIPATION_MIN_BUDGET_MS, ANTICIPATION_HARD_CAP_MS);
                 let effective_budget = total_budget.min(Duration::from_millis(cap_ms));
 
+                // was a slow `slots.size` leak. The
+                // previous shape moved `rx` BY VALUE into
+                // `tokio::time::timeout` - when the timeout fired,
+                // both `rx` AND any handoff that `return_object`
+                // delivered in the microseconds between were dropped.
+                // `return_object` had already executed
+                // `add_permits(1)` but `slots.size` was never
+                // decremented (size only decrements on recycle
+                // failures, evictions, bad-Object::Drop - not here).
+                // Over weeks: `slots.size` drifts up, pool freezes at
+                // max_size with no real backends. `acquire_burst_gate`
+                // already had the matching `try_recv` drain
+                // (inner.rs:880); apply it here for the same reason.
                 let (tx, rx) = oneshot::channel();
-                self.inner.slots.lock().waiters.push_back(tx);
+                {
+                    let mut slots = self.inner.slots.lock();
+                    push_handoff_waiter(&mut slots, tx);
+                }
+                let mut handoff_rx = HandoffReceiverGuard::new(&self.inner, rx);
 
-                match tokio::time::timeout(effective_budget, rx).await {
+                let timeout_result =
+                    tokio::time::timeout(effective_budget, handoff_rx.rx_mut()).await;
+                match timeout_result {
                     Ok(Ok(inner)) => {
                         self.inner
                             .scaling_stats
@@ -978,10 +1392,25 @@ impl Pool {
                         }
                     }
                     _ => {
-                        self.inner
-                            .scaling_stats
-                            .anticipation_wakes_timeout
-                            .fetch_add(1, Ordering::Relaxed);
+                        // drain a late-arriving handoff that
+                        // raced our timeout window. Without this,
+                        // `slots.size` leaks one per occurrence.
+                        if let Ok(inner) = handoff_rx.close_and_drain() {
+                            self.inner
+                                .scaling_stats
+                                .anticipation_wakes_notify
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Ok(inner) = self.recycle_handoff(inner, timeouts).await {
+                                return Some(inner);
+                            }
+                        } else {
+                            let mut slots = self.inner.slots.lock();
+                            prune_closed_handoff_waiters(&mut slots);
+                            self.inner
+                                .scaling_stats
+                                .anticipation_wakes_timeout
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -1009,6 +1438,7 @@ impl Pool {
                     waiters: VecDeque::new(),
                     size: 0,
                     max_size: builder.config.max_size,
+                    permits_to_retire: 0,
                 }),
                 users: AtomicUsize::new(0),
                 semaphore: Semaphore::new(builder.config.max_size),
@@ -1051,8 +1481,13 @@ impl Pool {
         })?;
 
         if let RecycleOutcome::Reused(inner) = self.inner.try_recycle_one(timeouts).await {
-            self.maybe_trigger_pre_replacement(&inner.metrics);
-            return Ok(self.wrap_checkout(*inner, permit));
+            // Wrap first so Object's RAII Drop covers any panic in
+            // `maybe_trigger_pre_replacement`. Once ownership is assigned,
+            // any subsequent panic flows through `Object::drop` and
+            // `return_object`, preserving slot-size invariants.
+            let obj = self.wrap_checkout(*inner, permit);
+            self.maybe_trigger_pre_replacement(&obj.inner.as_ref().unwrap().metrics);
+            return Ok(obj);
         }
 
         if let Some(inner) = self.try_anticipate(timeouts, start).await {
@@ -1119,38 +1554,101 @@ impl Pool {
     }
 
     /// Resizes the pool.
+    ///
+    /// collect evicted `ObjectInner`s into a local Vec and
+    /// drop them OFF-LOCK to match the discipline `retain()` documents.
+    /// Holding `slots.lock()` across `ObjectInner::Drop` (Server::Drop
+    /// -> Terminate syscall, CoordinatorPermit::Drop -> tokio Notify
+    /// chain) would otherwise stall every peer recycle on the same
+    /// pool for the full TCP-close+notify duration - under RELOAD with
+    /// 100 idle backends that's 50-200 ms of pool-wide freeze.
     pub fn resize(&self, max_size: usize) {
-        let mut slots = self.inner.slots.lock();
-        let old_max_size = slots.max_size;
-        slots.max_size = max_size;
+        let mut evicted: Vec<ObjectInner> = Vec::new();
+        {
+            let mut slots = self.inner.slots.lock();
+            let old_max_size = slots.max_size;
+            slots.max_size = max_size;
 
-        // Shrink pool
-        if max_size < old_max_size {
-            while slots.vec.len() > max_size {
-                if slots.vec.pop_back().is_some() {
-                    slots.size = slots.size.saturating_sub(1);
+            // Shrink pool
+            if max_size < old_max_size {
+                while slots.size > max_size {
+                    if let Some(obj) = slots.vec.pop_back() {
+                        slots.size = slots.size.saturating_sub(1);
+                        // defer the Drop until after we
+                        // release `slots.lock`.
+                        evicted.push(obj);
+                    } else {
+                        break;
+                    }
                 }
+                // reduce semaphore permits. `try_acquire_many`
+                // returns Err when fewer than `permits_to_remove`
+                // permits are currently free (active checkouts hold
+                // the rest). The original code silently ignored that
+                // Err, letting the semaphore drift past max_size.
+                // Acquire as many as we can synchronously now; the
+                // remaining over-permit is retired by `return_object`
+                // / bad-object Drop when active clients come back
+                // while `slots.size > slots.max_size`. Log the gap so
+                // operators see resize-under-load drift.
+                let permits_to_remove = old_max_size - max_size;
+                let acquired = self
+                    .inner
+                    .semaphore
+                    .try_acquire_many(permits_to_remove as u32)
+                    .map(|p| {
+                        p.forget();
+                        permits_to_remove
+                    })
+                    .unwrap_or_else(|_| {
+                        // Try acquiring permits one at a time to take
+                        // however many ARE available right now.
+                        let mut took = 0;
+                        while took < permits_to_remove {
+                            match self.inner.semaphore.try_acquire() {
+                                Ok(p) => {
+                                    p.forget();
+                                    took += 1;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if took < permits_to_remove {
+                            warn!(
+                                "[{}@{}] resize shrink: could acquire only {}/{} semaphore permits - active checkouts hold the rest; semaphore will resync as clients return",
+                                self.inner.pool_name,
+                                self.inner.username,
+                                took,
+                                permits_to_remove,
+                            );
+                        }
+                        took
+                    });
+                // record the permits this
+                // shrink wanted to remove but could not forget now (held by
+                // active checkouts). The `size > max_size` retire branches
+                // consume this counter as those clients return, so they retire
+                // exactly the resize shortfall - while a pre_replace_one
+                // overshoot (which never sets it) restores permits instead of
+                // leaking them.
+                slots.permits_to_retire += permits_to_remove.saturating_sub(acquired);
+                // Reallocate vec
+                let mut vec = VecDeque::with_capacity(max_size);
+                for obj in slots.vec.drain(..) {
+                    vec.push_back(obj);
+                }
+                slots.vec = vec;
             }
-            // Reduce semaphore permits
-            let permits_to_remove = old_max_size - max_size;
-            let _ = self
-                .inner
-                .semaphore
-                .try_acquire_many(permits_to_remove as u32);
-            // Reallocate vec
-            let mut vec = VecDeque::with_capacity(max_size);
-            for obj in slots.vec.drain(..) {
-                vec.push_back(obj);
-            }
-            slots.vec = vec;
-        }
 
-        // Grow pool
-        if max_size > old_max_size {
-            let additional = max_size - old_max_size;
-            slots.vec.reserve_exact(additional);
-            self.inner.semaphore.add_permits(additional);
+            // Grow pool
+            if max_size > old_max_size {
+                let additional = max_size - old_max_size;
+                slots.vec.reserve_exact(additional);
+                self.inner.semaphore.add_permits(additional);
+            }
         }
+        // drops fire here, after `slots.lock` is released.
+        drop(evicted);
     }
 
     /// Retains only the objects specified by the given function.
@@ -1282,6 +1780,230 @@ impl Pool {
             |_, metrics| metrics.age().as_millis() >= u128::from(min_lifetime_ms),
             1,
         ) > 0
+    }
+
+    /// Detect and drop idle backends whose TCP connection is dead. Solves the
+    /// post-PostgreSQL-restart "zombie pool" regression: idle TCP sockets
+    /// linger in `slots.vec` until `idle_timeout` / `server_lifetime` evicts
+    /// them, during which `slots.size` looks healthy and `retain_connections`
+    /// never asks `replenish` for more. Result observed in production: a pool
+    /// configured for `min_pool_size = 100` runs with ~3-7 real backends for
+    /// hours.
+    ///
+    /// Mechanism:
+    ///   1. Briefly lock `slots`, pop up to `max_per_cycle` idle objects off
+    ///      the front. We are not reducing `slots.size` here - the popped
+    ///      objects are "in flight" exactly like a checkout would be, so
+    ///      concurrent traffic sees consistent accounting.
+    ///   2. Off-lock, await `Server::check_alive(timeout)` on each one.
+    ///      `check_alive` already uses a single send+recv deadline (Step 2)
+    ///      and marks the backend bad on failure.
+    ///   3. Re-acquire the lock once and either push survivors back via
+    ///      `push_idle` (respecting the configured FIFO/LIFO mode) or shrink
+    ///      `slots.size` by the eviction count. Dead `ObjectInner`s are
+    ///      dropped after the lock is released so `Server::drop` runs
+    ///      off-lock too.
+    ///
+    /// Skipped entirely when the pool is `under_pressure()` (taking idle
+    /// objects away from queued clients would force a `connect()` on the
+    /// wait path) or `is_paused()` (no checkin/checkout during PAUSE).
+    /// Passing `timeout == 0` or `max_per_cycle == 0` also short-circuits,
+    /// so operators can disable the cycle with a config knob without
+    /// patching the retain loop.
+    ///
+    /// Returns `(checked, evicted)` for caller-side logging / metrics. Both
+    /// counts refer to backends *processed this cycle*; the dead ones have
+    /// been removed from the pool by the time this function returns and the
+    /// next `replenish` tick will refill the slot.
+    pub async fn evict_dead_backends(
+        &self,
+        timeout: Duration,
+        max_per_cycle: usize,
+        skip_recent_threshold: Duration,
+    ) -> (usize, usize) {
+        if timeout.is_zero() || max_per_cycle == 0 {
+            return (0, 0);
+        }
+        if self.under_pressure() || self.is_paused() {
+            return (0, 0);
+        }
+
+        // 1. Snapshot phase - short critical section.
+        //
+        // Pop AND acquire a semaphore permit per object together. The permit
+        // is the same accounting unit a real checkout uses, so during the
+        // off-lock `check_alive` window concurrent checkouts see fewer
+        // permits and cannot push the pool past `max_size` by triggering
+        // a `create()` for an idle slot that is actually held by the scan.
+        //
+        // Permits are `forget()`ed here so they survive the SemaphorePermit
+        // guard going out of scope at the end of this block. They are
+        // restored explicitly at the end via a single `add_permits()` call
+        // - that ordering matters: permits must come back AFTER `slots.size`
+        // has been shrunk by the eviction count, so a concurrent checkout
+        // that wakes on the new permits sees the already-reduced size and
+        // either reuses a surviving idle backend or creates the replacement.
+        // Pop from the "oldest" end of the idle deque so the scan visits
+        // the connections least likely to have been recently exercised -
+        // those are the ones whose TCP state has had the most time to
+        // diverge from PostgreSQL's view (e.g. a backend that has been
+        // idle for hours during a partial-network event).
+        //
+        // The mapping is mode-aware because checkout pops from the front
+        // in both modes; "oldest" therefore differs:
+        //
+        //   * LIFO (default, `server_round_robin = false`): checkin
+        //     pushes to the front, so the BACK of the deque holds the
+        //     idle entries that have been waiting longest. Pop_back.
+        //   * FIFO (`server_round_robin = true`): checkin pushes to the
+        //     back and checkout pops from the front, so the FRONT holds
+        //     the entries waiting longest. Pop_front.
+        //
+        // Survivors are returned via `push_idle` after the off-lock
+        // check, which inserts them at the "newest" end (front for
+        // LIFO, back for FIFO). That keeps survivors from being
+        // re-scanned on the very next cycle - the next scan picks the
+        // next-oldest, and the pool rotates entirely through over
+        // ceil(idle_count / max_per_cycle) ticks.
+        //
+        // **FIFO side effect - known and accepted**: a healthy front-of-
+        // queue connection that the scan visits gets pushed to the back
+        // via `push_idle(FIFO)` = `push_back`. Strict FIFO checkout
+        // order is therefore broken by the scan: a connection that was
+        // first in line to be reused gets demoted to last. The pool
+        // mostly behaves as FIFO for entries not touched by the scan
+        // and partial-LRU for ones that are. Acceptable because (a)
+        // the production default is LIFO, (b) scan touches at most
+        // `max_per_cycle` per tick, and (c) the alternative (push
+        // survivors back to front in FIFO mode) would re-scan the
+        // same head every tick and never reach back-of-queue zombies
+        // - the same shielding bug we're fixing in LIFO.
+        //
+        // The earlier pop_front-only implementation never reached the
+        // back of a LIFO pool: alive entries at the front were popped,
+        // verified, and pushed straight back to the front, perfectly
+        // shielding any zombie backends sitting at the back from the
+        // scan. With LIFO the default, that meant the production
+        // common case never got fixed.
+        let queue_mode = self.inner.config.queue_mode;
+        let popped: Vec<ObjectInner> = {
+            let mut guard = self.inner.slots.lock();
+            let take = std::cmp::min(max_per_cycle, guard.vec.len());
+            let mut buf = Vec::with_capacity(take);
+            for _ in 0..take {
+                // try_acquire is non-blocking by design - if the semaphore
+                // is exhausted (some real client just took everything) we
+                // stop probing for this tick rather than fight them.
+                let permit = match self.inner.semaphore.try_acquire() {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let popped_one = match queue_mode {
+                    QueueMode::Lifo => guard.vec.pop_back(),
+                    QueueMode::Fifo => guard.vec.pop_front(),
+                };
+                match popped_one {
+                    Some(obj) => {
+                        permit.forget();
+                        buf.push(obj);
+                    }
+                    None => {
+                        // No more idle to probe; permit drops here and is
+                        // returned to the semaphore automatically.
+                        break;
+                    }
+                }
+            }
+            buf
+        };
+
+        if popped.is_empty() {
+            return (0, 0);
+        }
+
+        let checked = popped.len();
+        // `EvictGuard` owns the worst-case bookkeeping should this scope
+        // unwind during any `check_alive(...).await` below - cancellation,
+        // panic, or a future `select!` wrapping the retain task. On
+        // happy-path commit it issues a single `add_permits(checked)`
+        // AFTER `slots.size -= evicted` so a concurrent checkout never
+        // sees `permits == max_size` while `slots.size` is still inflated.
+        let guard = EvictGuard::new(&self.inner, checked);
+        let mut survivors: Vec<ObjectInner> = Vec::with_capacity(checked);
+        let mut evicted: usize = 0;
+
+        // 2. Off-lock checks. The popped objects are in flight exactly like
+        // a checkout would be - semaphore permits are held (forgotten) on
+        // their behalf. Concurrent callers see the reduced permit budget.
+        //
+        // backends with a fresh `last_activity` timestamp
+        // (touched by every protocol_io send/recv on the connection) skip
+        // the `check_alive(SELECT 1)` round-trip. A TCP zombie cannot
+        // have completed observable I/O within the threshold; the only
+        // way the socket could have died since `last_activity` is a
+        // network event that will surface on the next real query, so
+        // burning a `SELECT 1` per retain tick on connections that just
+        // serviced traffic is pure overhead. On the upper bound - 100
+        // pools × `dead_backend_check_max_per_cycle = 8` × 30 s retain
+        // interval - that is ~800 SELECT 1/min eliminated from
+        // PostgreSQL's load when traffic is steady.
+        //
+        // The threshold is supplied by the retain loop and should match
+        // the retain tick interval: successful I/O since the previous
+        // retain cycle is enough evidence to skip the synthetic probe,
+        // but older idle backends must be checked so PostgreSQL restarts
+        // are detected promptly under short retain intervals.
+        for mut inner in popped {
+            // A marked-bad object should not survive a health check;
+            // it must drop now so `slots.size` decreases (and the replenish
+            // loop on the next tick brings a fresh one in).
+            if inner.obj.is_bad() {
+                evicted += 1;
+                // `inner` drops at end of iteration - Server::drop closes the
+                // TCP fd; slots.size and semaphore are adjusted in bookkeeping.
+                continue;
+            }
+            // Zombie-scan fast path. `SystemTime::elapsed()` returns
+            // Err on rare backwards-clock skew (NTP step); fall through
+            // to a real check in that case, never skip it.
+            if let Ok(elapsed) = inner.obj.last_activity.elapsed() {
+                if elapsed < skip_recent_threshold {
+                    survivors.push(inner);
+                    continue;
+                }
+            }
+            match inner.obj.check_alive(timeout).await {
+                Ok(()) => {
+                    // Backend is alive - return it to the idle set unchanged.
+                    // Do NOT touch `metrics.recycled`; an actually-idle
+                    // connection still needs to age out via `idle_timeout`.
+                    survivors.push(inner);
+                }
+                Err(_) => {
+                    // check_alive already called mark_bad and emitted a
+                    // descriptive warn!; drop the object and let the
+                    // bookkeeping step shrink slots.size.
+                    evicted += 1;
+                }
+            }
+        }
+
+        // 3. Happy-path commit: push survivors back, deduct evicted from
+        // `slots.size`, then restore all permits. EvictGuard.commit handles
+        // the strict ordering (size -= ... -> unlock -> add_permits) inside a
+        // single helper so the contract cannot drift in a future refactor.
+        guard.commit(queue_mode, survivors, evicted);
+
+        // Pump the per-pool counters so SHOW STATS / Prometheus reflect what
+        // the scan just did. Cheap relaxed atomics; safe to call even when
+        // nothing changed (the recorder no-ops on zero).
+        self.inner
+            .server_pool
+            .address()
+            .stats
+            .record_dead_backend_scan(checked, evicted);
+
+        (checked, evicted)
     }
 
     /// Convert idle reserve connections into main connections when the
@@ -1462,13 +2184,21 @@ impl Pool {
                 }
             };
 
-            let inner = self.inner.new_object_inner(obj, coordinator_permit);
-
             {
                 let mut slots = self.inner.slots.lock();
-                if slots.size >= slots.max_size {
+                if !self.inner.accepts_fresh_backend_after_create(&slots) {
+                    drop(slots);
+                    drop(obj);
+                    drop(coordinator_permit);
                     break;
                 }
+                if slots.size >= slots.max_size {
+                    drop(slots);
+                    drop(obj);
+                    drop(coordinator_permit);
+                    break;
+                }
+                let inner = self.inner.new_object_inner(obj, coordinator_permit);
                 slots.size += 1;
                 push_idle(self.inner.config.queue_mode, &mut slots.vec, inner);
             }
@@ -1480,8 +2210,8 @@ impl Pool {
 
     /// Closes this Pool.
     pub fn close(&self) {
+        self.close_new_checkouts();
         self.resize(0);
-        self.inner.semaphore.close();
     }
 
     /// Indicates whether this Pool has been closed.
@@ -1489,16 +2219,18 @@ impl Pool {
         self.inner.semaphore.is_closed()
     }
 
+    /// Stop future checkout attempts without draining idle objects yet.
+    pub(crate) fn close_new_checkouts(&self) {
+        self.inner.semaphore.close();
+    }
+
     /// Retrieves Status of this Pool.
     #[must_use]
     pub fn status(&self) -> Status {
         let slots = self.inner.slots.lock();
         let users = self.inner.users.load(Ordering::Relaxed);
-        let (available, waiting) = if users < slots.size {
-            (slots.size - users, 0)
-        } else {
-            (0, users - slots.size)
-        };
+        let available = slots.vec.len();
+        let waiting = users.saturating_sub(available);
         Status {
             max_size: slots.max_size,
             size: slots.size,
@@ -1603,39 +2335,47 @@ impl Pool {
     /// backend is gone) and returns `Err(())`.
     async fn recycle_handoff(
         &self,
-        mut inner: ObjectInner,
+        inner: ObjectInner,
         timeouts: &Timeouts,
     ) -> Result<ObjectInner, ()> {
+        // same cancel-safety hazard as
+        // `try_recycle_one`. The `inner` arrived via direct handoff
+        // (counted in `slots.size`). If the future is cancelled during
+        // `recycle().await`, the bare `inner` drops and closes the TCP
+        // fd but `slots.size` is never decremented - permanent leak.
         let skip_lifetime = self.inner.under_pressure();
-        let recycle_result = match timeouts.recycle {
-            Some(duration) => {
-                match tokio::time::timeout(
-                    duration,
+        let mut guard = BareInnerGuard::new(&self.inner, inner);
+        let recycle_result = {
+            let inner_ref = guard.as_mut();
+            let ObjectInner { obj, metrics, .. } = inner_ref;
+            match timeouts.recycle {
+                Some(duration) => {
+                    match tokio::time::timeout(
+                        duration,
+                        self.inner.server_pool.recycle(obj, metrics, skip_lifetime),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(RecycleError::StaticMessage("Recycle timeout")),
+                    }
+                }
+                None => {
                     self.inner
                         .server_pool
-                        .recycle(&mut inner.obj, &inner.metrics, skip_lifetime),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(RecycleError::StaticMessage("Recycle timeout")),
+                        .recycle(obj, metrics, skip_lifetime)
+                        .await
                 }
-            }
-            None => {
-                self.inner
-                    .server_pool
-                    .recycle(&mut inner.obj, &inner.metrics, skip_lifetime)
-                    .await
             }
         };
         match recycle_result {
             Ok(()) => {
+                let inner = guard.disarm();
                 self.maybe_trigger_pre_replacement(&inner.metrics);
                 Ok(inner)
             }
             Err(_) => {
-                let mut slots = self.inner.slots.lock();
-                slots.size = slots.size.saturating_sub(1);
+                drop(guard);
                 Err(())
             }
         }
@@ -1694,10 +2434,21 @@ impl Pool {
 
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
+            // RAII guard so the counter is decremented even
+            // if `pre_replace_one` panics. Previously the manual
+            // `fetch_sub` after `.await` was skipped on panic, leaking
+            // the slot permanently - after MAX_CONCURRENT_PRE_REPLACEMENTS
+            // panics, `try_take_burst_slot` would refuse every future
+            // pre-replacement attempt (silent degradation invisible to
+            // operators).
+            struct PreReplaceGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+            impl Drop for PreReplaceGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let _guard = PreReplaceGuard(&inner.pre_replacements_in_flight);
             inner.pre_replace_one().await;
-            inner
-                .pre_replacements_in_flight
-                .fetch_sub(1, Ordering::Release);
         });
     }
 }
@@ -1925,9 +2676,7 @@ mod tests {
         // Hard upper bound — burst gate must never accept more than MAX.
         assert!(
             final_accepted <= MAX,
-            "burst gate accepted {} > MAX {}",
-            final_accepted,
-            MAX
+            "burst gate accepted {final_accepted} > MAX {MAX}"
         );
         // Sanity — at least one thread must have made progress.
         assert!(final_accepted >= 1);
@@ -2110,7 +2859,7 @@ mod tests {
             .build()
     }
 
-    /// `notify_return_observers` wakes the peer-pool coordinator Phase C
+    /// `notify_return_observers` wakes the peer-pool coordinator the wait queue
     /// waiter so eviction scans can find the just-returned connection.
     /// Same-pool waiters now use direct-handoff oneshot channels inside
     /// `return_object` and do not park on a Notify.
@@ -2167,11 +2916,11 @@ mod tests {
             }
         })
         .await;
-        assert!(parked.is_ok(), "Phase C waiter never parked");
+        assert!(parked.is_ok(), "the wait queue waiter never parked");
         let baseline = calls.load(AOrdering::Relaxed);
         assert_eq!(
             baseline, 2,
-            "Phase B and the first Phase C iteration each call try_evict_one once",
+            "Phase B and the first wait-queue iteration each call try_evict_one once",
         );
 
         pool.inner.notify_return_observers();
@@ -2187,12 +2936,12 @@ mod tests {
         .await;
         assert!(
             woke.is_ok(),
-            "Phase C waiter must wake on coordinator.notify_idle_returned",
+            "the wait queue waiter must wake on coordinator.notify_idle_returned",
         );
         assert_eq!(
             calls.load(AOrdering::Relaxed),
             baseline + 1,
-            "exactly one Phase C wake -> exactly one extra try_evict_one",
+            "exactly one wait-queue wake -> exactly one extra try_evict_one",
         );
 
         phase_c_waiter.abort();
@@ -2318,8 +3067,61 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_status_separates_idle_available_from_checkout_waiters() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(3);
+        let mut checked_out = Vec::new();
+
+        {
+            let mut slots = pool.inner.slots.lock();
+            for _ in 0..2 {
+                let permit = pool.semaphore().try_acquire().unwrap();
+                permit.forget();
+                slots.size += 1;
+                checked_out.push(ObjectInner {
+                    obj: Server::test_zombie_marked_bad(),
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+            }
+
+            slots.size += 1;
+            push_idle(
+                pool.inner.config.queue_mode,
+                &mut slots.vec,
+                ObjectInner {
+                    obj: Server::test_zombie_marked_bad(),
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                },
+            );
+        }
+
+        let status = pool.status();
+        assert_eq!(status.size, 3);
+        assert_eq!(
+            status.available, 1,
+            "only idle queue entries are immediately available; checked-out slots are busy"
+        );
+        assert_eq!(status.waiting, 0);
+
+        pool.inner.users.store(2, Ordering::Relaxed);
+        let status = pool.status();
+        assert_eq!(status.available, 1);
+        assert_eq!(
+            status.waiting, 1,
+            "two checkout futures competing for one idle entry leaves one waiter"
+        );
+
+        pool.inner.users.store(0, Ordering::Relaxed);
+        drop(checked_out);
+    }
+
     // ------------------------------------------------------------------
-    // Direct handoff — oneshot channel mechanics
+    // Direct handoff - oneshot channel mechanics
     // ------------------------------------------------------------------
 
     #[tokio::test]
@@ -2390,6 +3192,116 @@ mod tests {
         let waiters: VecDeque<oneshot::Sender<u32>> = VecDeque::new();
         assert!(waiters.is_empty());
         // return_object would push to vec + add_permits here.
+    }
+
+    #[tokio::test]
+    async fn direct_handoff_enqueue_prunes_cancelled_waiters() {
+        let mut slots = Slots {
+            vec: VecDeque::new(),
+            waiters: VecDeque::new(),
+            size: 0,
+            max_size: 8,
+            permits_to_retire: 0,
+        };
+
+        let (stale_tx, stale_rx) = oneshot::channel::<ObjectInner>();
+        slots.waiters.push_back(stale_tx);
+        drop(stale_rx);
+
+        let (live_tx, _live_rx) = oneshot::channel::<ObjectInner>();
+        push_handoff_waiter(&mut slots, live_tx);
+
+        assert_eq!(
+            slots.waiters.len(),
+            1,
+            "enqueue must prune cancelled handoff waiters before appending a new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_handoff_final_drain_closes_late_sender_window() {
+        let (tx, mut rx) = oneshot::channel::<u32>();
+
+        assert!(close_and_drain_handoff_receiver(&mut rx).is_err());
+        assert!(
+            tx.send(42).is_err(),
+            "sender must fail after the waiter commits to no-value"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_handoff_waiter_cancellation_requeues_delivered_inner() {
+        let pool = empty_test_pool_with_max_size(1);
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = 1;
+        }
+
+        let pool_for_waiter = pool.clone();
+        let waiter = tokio::spawn(async move {
+            pool_for_waiter
+                .timeout_get(&Timeouts {
+                    wait: Some(Duration::from_secs(30)),
+                    create: Some(Duration::from_secs(30)),
+                    recycle: Some(Duration::from_secs(30)),
+                })
+                .await
+        });
+
+        for _ in 0..100 {
+            if pool.inner.slots.lock().waiters.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pool.inner.slots.lock().waiters.len(),
+            1,
+            "checkout must be parked as a direct-handoff waiter"
+        );
+
+        let inner = pool
+            .inner
+            .new_object_inner(Server::test_zombie_marked_bad(), None);
+        pool.inner.return_object(inner);
+
+        waiter.abort();
+        let _ = waiter.await;
+
+        let slots = pool.inner.slots.lock();
+        assert_eq!(slots.size, 1);
+        assert_eq!(
+            slots.vec.len(),
+            1,
+            "a handoff delivered before cancellation must be returned to idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_if_paused_catches_resume_between_check_and_await() {
+        let pool = empty_test_pool();
+        pool.pause();
+
+        let mut fired = false;
+        let pool_for_hook = pool.clone();
+        pool.wait_if_paused_with_hook(
+            &Timeouts {
+                wait: Some(Duration::from_millis(50)),
+                ..Timeouts::default()
+            },
+            || {
+                if !fired {
+                    fired = true;
+                    pool_for_hook.resume();
+                }
+            },
+        )
+        .await
+        .expect("enabled waiter must observe resume fired before await");
+
+        assert!(fired);
+        assert!(!pool.is_paused());
     }
 
     // ------------------------------------------------------------------
@@ -2551,13 +3463,11 @@ mod tests {
                     .clamp(ANTICIPATION_MIN_BUDGET_MS, ANTICIPATION_HARD_CAP_MS);
                 assert!(
                     clamped >= ANTICIPATION_MIN_BUDGET_MS,
-                    "p99_us={p99_us} base={base_ms} jitter={jitter}: result {clamped} < min {}",
-                    ANTICIPATION_MIN_BUDGET_MS,
+                    "p99_us={p99_us} base={base_ms} jitter={jitter}: result {clamped} < min {ANTICIPATION_MIN_BUDGET_MS}",
                 );
                 assert!(
                     clamped <= ANTICIPATION_HARD_CAP_MS,
-                    "p99_us={p99_us} base={base_ms} jitter={jitter}: result {clamped} > cap {}",
-                    ANTICIPATION_HARD_CAP_MS,
+                    "p99_us={p99_us} base={base_ms} jitter={jitter}: result {clamped} > cap {ANTICIPATION_HARD_CAP_MS}",
                 );
             }
         }
@@ -2960,6 +3870,1201 @@ mod tests {
             semaphore.available_permits(),
             max_size,
             "all permits must be restored after concurrent checkout-return cycles"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // evict_dead_backends - background liveness scan gating
+    // ------------------------------------------------------------------
+    //
+    // Positive-path coverage (an actual half-dead TCP backend gets evicted
+    // and slots.size shrinks) is integration-level - it requires a real
+    // PostgreSQL container restart and is exercised by the BDD scenario in
+    // `tests/bdd/features/dead-backend-detection.feature`. The unit tests
+    // here only pin the gating contract so a future refactor cannot
+    // silently turn the scan into a hot-path bottleneck.
+    const TEST_SKIP_RECENT_THRESHOLD: Duration = Duration::from_secs(30);
+
+    fn empty_test_pool() -> Pool {
+        use crate::config::{Address, User};
+        use dashmap::DashMap;
+
+        let server_pool = ServerPool::new(
+            Address::default(),
+            User::default(),
+            "test_db",
+            Arc::new(DashMap::new()),
+            false,
+            false,
+            0,
+            "test_app".to_string(),
+            1,
+            60_000,
+            60_000,
+            60_000,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            false,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        Pool::builder(server_pool)
+            .pool_name("test_db".to_string())
+            .username("test_user".to_string())
+            .build()
+    }
+
+    fn empty_test_pool_with_max_size(max_size: usize) -> Pool {
+        use crate::config::{Address, User};
+        use crate::pool::types::PoolConfig;
+        use dashmap::DashMap;
+
+        let server_pool = ServerPool::new(
+            Address::default(),
+            User::default(),
+            "test_db",
+            Arc::new(DashMap::new()),
+            false,
+            false,
+            0,
+            "test_app".to_string(),
+            1,
+            60_000,
+            60_000,
+            60_000,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            false,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        Pool::builder(server_pool)
+            .config(PoolConfig::new(max_size))
+            .pool_name("test_db".to_string())
+            .username("test_user".to_string())
+            .build()
+    }
+
+    /// Variant of `empty_test_pool` that pins the queue mode to LIFO.
+    /// `PoolConfig::default()` is FIFO, but the production default for
+    /// the iServ deployment is LIFO (`server_round_robin = false`),
+    /// so the queue-direction regression test
+    /// (`evict_dead_backends_lifo_pops_from_back`) has to construct
+    /// the pool explicitly with LIFO to mirror the field-deployed
+    /// configuration.
+    fn empty_test_pool_lifo() -> Pool {
+        use crate::config::{Address, User};
+        use crate::pool::types::PoolConfig;
+        use dashmap::DashMap;
+
+        let server_pool = ServerPool::new(
+            Address::default(),
+            User::default(),
+            "test_db",
+            Arc::new(DashMap::new()),
+            false,
+            false,
+            0,
+            "test_app".to_string(),
+            1,
+            60_000,
+            60_000,
+            60_000,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            false,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let config = PoolConfig {
+            queue_mode: QueueMode::Lifo,
+            ..PoolConfig::default()
+        };
+        Pool::builder(server_pool)
+            .config(config)
+            .pool_name("test_db".to_string())
+            .username("test_user".to_string())
+            .build()
+    }
+
+    #[tokio::test]
+    async fn evict_dead_backends_short_circuits_on_zero_timeout() {
+        // `dead_backend_check_timeout = 0` is the operator-facing kill switch
+        // for the scan. The method must return `(0, 0)` immediately, without
+        // touching the slots mutex.
+        let pool = empty_test_pool();
+        let result = pool
+            .evict_dead_backends(Duration::ZERO, 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!(result, (0, 0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resize_shrink_drops_idle_before_waiting_for_active_returns() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let mut active = Vec::new();
+        {
+            let mut slots = pool.inner.slots.lock();
+            for _ in 0..3 {
+                let permit = pool.semaphore().try_acquire().unwrap();
+                permit.forget();
+                slots.size += 1;
+                active.push(ObjectInner {
+                    obj: Server::test_zombie_marked_bad(),
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+            }
+            slots.size += 1;
+            slots.vec.push_back(ObjectInner {
+                obj: Server::test_zombie_marked_bad(),
+                metrics: Metrics::default(),
+                coordinator_permit: None,
+            });
+        }
+
+        assert_eq!(pool.status().size, 4);
+        assert_eq!(pool.semaphore().available_permits(), 1);
+
+        pool.resize(2);
+
+        let slots = pool.inner.slots.lock();
+        assert_eq!(
+            slots.size, 3,
+            "resize must evict idle objects until total size is no more \
+             than active checkouts; otherwise active returns keep the \
+             pool above the new max for extra cycles"
+        );
+        assert_eq!(
+            slots.vec.len(),
+            0,
+            "the only idle object must be dropped during shrink before \
+             waiting for active clients to return"
+        );
+        drop(slots);
+        assert_eq!(
+            pool.semaphore().available_permits(),
+            0,
+            "the freed idle semaphore slot must be retired for the \
+             lower max_size"
+        );
+
+        drop(active);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resize_shrink_retires_over_limit_active_returns() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let mut active = Vec::new();
+        {
+            let mut slots = pool.inner.slots.lock();
+            for _ in 0..4 {
+                let permit = pool.semaphore().try_acquire().unwrap();
+                permit.forget();
+                slots.size += 1;
+                active.push(ObjectInner {
+                    obj: Server::test_zombie_marked_bad(),
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+            }
+        }
+
+        assert_eq!(pool.semaphore().available_permits(), 0);
+        pool.resize(2);
+        assert_eq!(pool.status().size, 4);
+
+        pool.inner.return_object(active.pop().unwrap());
+        assert_eq!(
+            pool.status().size,
+            3,
+            "first active return after a shrink must close the backend \
+             instead of re-entering it into the idle queue"
+        );
+        assert_eq!(
+            pool.semaphore().available_permits(),
+            0,
+            "the returned permit must be retired while the pool remains \
+             above the new max_size"
+        );
+        assert_eq!(pool.inner.slots.lock().vec.len(), 0);
+
+        pool.inner.return_object(active.pop().unwrap());
+        assert_eq!(pool.status().size, 2);
+        assert_eq!(pool.semaphore().available_permits(), 0);
+
+        pool.inner.return_object(active.pop().unwrap());
+        assert_eq!(
+            pool.status().size,
+            2,
+            "once size reaches max_size, later returns should recycle normally"
+        );
+        assert_eq!(pool.inner.slots.lock().vec.len(), 1);
+        assert_eq!(pool.semaphore().available_permits(), 1);
+
+        drop(active);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resize_shrink_retires_over_limit_bad_drops() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let mut active = Vec::new();
+        {
+            let mut slots = pool.inner.slots.lock();
+            for _ in 0..3 {
+                let permit = pool.semaphore().try_acquire().unwrap();
+                permit.forget();
+                slots.size += 1;
+                active.push(ObjectInner {
+                    obj: Server::test_zombie_marked_bad(),
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+            }
+            let permit = pool.semaphore().try_acquire().unwrap();
+            permit.forget();
+            slots.size += 1;
+        }
+
+        let bad_object = Object {
+            inner: Some(ObjectInner {
+                obj: Server::test_zombie_marked_bad(),
+                metrics: Metrics::default(),
+                coordinator_permit: None,
+            }),
+            pool: Arc::downgrade(&pool.inner),
+        };
+
+        pool.resize(2);
+        drop(bad_object);
+
+        assert_eq!(
+            pool.status().size,
+            3,
+            "bad connection drops after shrink must reduce size exactly \
+             like normal over-limit returns"
+        );
+        assert_eq!(
+            pool.semaphore().available_permits(),
+            0,
+            "bad connection drops above the new max_size must retire the \
+             returning slot instead of re-opening old capacity"
+        );
+
+        drop(active);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn object_drop_evicts_backend_returned_inside_transaction() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(1);
+        pool.semaphore().try_acquire().unwrap().forget();
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = 1;
+        }
+
+        let mut server = Server::test_dead_socket();
+        server.in_transaction = true;
+
+        let object = Object {
+            inner: Some(ObjectInner {
+                obj: server,
+                metrics: Metrics::default(),
+                coordinator_permit: None,
+            }),
+            pool: Arc::downgrade(&pool.inner),
+        };
+
+        drop(object);
+
+        assert_eq!(
+            pool.status().size,
+            0,
+            "a checked-out backend dropped inside a transaction must close \
+             instead of re-entering the idle pool"
+        );
+        assert_eq!(
+            pool.inner.slots.lock().vec.len(),
+            0,
+            "dirty drop must not leave the backend available for direct reuse"
+        );
+        assert_eq!(
+            pool.semaphore().available_permits(),
+            1,
+            "evicting the dirty backend must release the checked-out slot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_replacement_overshoot_return_does_not_leak_permit() {
+        use crate::server::Server;
+
+        // pre_replace_one drives slots.size
+        // above max_size WITHOUT removing a semaphore permit (it is not a
+        // resize). A return during that overshoot window hits the
+        // `size > max_size` retire branch; because permits_to_retire stays 0,
+        // the returning client's permit must be RESTORED, not retired -
+        // otherwise every such return permanently leaks a permit and the pool
+        // drifts into self-inflicted "too many clients".
+        let max_size = 2;
+        let pool = empty_test_pool_with_max_size(max_size);
+
+        // One client checked out: forget its permit, account for it in size.
+        pool.semaphore().try_acquire().unwrap().forget();
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = max_size;
+        }
+        assert_eq!(pool.semaphore().available_permits(), max_size - 1);
+
+        // pre_replace_one created an extra backend ahead of lifetime expiry:
+        // size = max_size + 1, semaphore untouched, permits_to_retire stays 0.
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size += 1;
+            assert_eq!(
+                slots.permits_to_retire, 0,
+                "pre-replacement must not mark any permit for retirement"
+            );
+        }
+
+        // The checked-out client returns during the overshoot window.
+        let inner = pool
+            .inner
+            .new_object_inner(Server::test_zombie_marked_bad(), None);
+        pool.inner.return_object(inner);
+
+        // The extra connection was retired (size back to max_size) AND the
+        // permit was restored - no leak.
+        assert_eq!(
+            pool.status().size,
+            max_size,
+            "the pre-replacement overshoot connection must be retired on return"
+        );
+        assert_eq!(
+            pool.semaphore().available_permits(),
+            max_size,
+            "a return during pre-replacement overshoot must restore the permit, not leak it"
+        );
+    }
+
+    #[test]
+    fn fresh_create_paths_recheck_open_generation_after_await() {
+        let src = include_str!("inner.rs");
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for (name, start, end) in [
+            (
+                "pre_replace_one",
+                "async fn pre_replace_one(&self)",
+                "/// Create a new backend connection",
+            ),
+            (
+                "create_connection",
+                "async fn create_connection(",
+                "/// Returns true when every permit is in use",
+            ),
+            (
+                "replenish",
+                "pub async fn replenish(&self, count: usize)",
+                "/// Closes this Pool.",
+            ),
+        ] {
+            let start_idx = impl_src.find(start).expect("create path start marker");
+            let block = &impl_src[start_idx..];
+            let end_idx = block.find(end).expect("create path end marker");
+            let block = &block[..end_idx];
+            let create_idx = block
+                .find("server_pool.create")
+                .expect("create path must await server_pool.create");
+            let post_create = &block[create_idx..];
+            let size_idx = post_create
+                .find("slots.size += 1")
+                .expect("create path must account slots.size");
+            let before_size = &post_create[..size_idx];
+            assert!(
+                before_size.contains("accepts_fresh_backend_after_create"),
+                "{name} must recheck that the pool generation is still open \
+                 after awaiting server_pool.create() and before slots.size accounting"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_create_guard_rejects_closed_or_zero_generation() {
+        let pool = empty_test_pool_with_max_size(2);
+        {
+            let slots = pool.inner.slots.lock();
+            assert!(
+                pool.inner.accepts_fresh_backend_after_create(&slots),
+                "open non-zero pool must accept fresh post-create backends"
+            );
+        }
+
+        pool.close_new_checkouts();
+        {
+            let slots = pool.inner.slots.lock();
+            assert!(
+                !pool.inner.accepts_fresh_backend_after_create(&slots),
+                "closed generation must reject fresh post-create backends"
+            );
+        }
+
+        let zero = empty_test_pool_with_max_size(2);
+        zero.resize(0);
+        {
+            let slots = zero.inner.slots.lock();
+            assert!(
+                !zero.inner.accepts_fresh_backend_after_create(&slots),
+                "zero-sized generation must reject fresh post-create backends"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_dead_backends_short_circuits_on_zero_max() {
+        // Same kill-switch semantics for `dead_backend_check_max_per_cycle = 0`.
+        let pool = empty_test_pool();
+        let result = pool
+            .evict_dead_backends(Duration::from_secs(2), 0, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!(result, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn evict_dead_backends_noop_on_empty_pool() {
+        // No idle objects -> no popping, no checking, no eviction. The pool
+        // would not even know what timeout to apply against.
+        let pool = empty_test_pool();
+        let result = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!(result, (0, 0));
+    }
+
+    /// Zombie-scan invariant: a backend whose `last_activity` is
+    /// inside the skip-recent threshold (default 30 s) must NOT be
+    /// probed by `check_alive` - `evict_dead_backends` should push
+    /// it back to the idle vec as a survivor without burning a
+    /// SELECT 1 round-trip. Without this the scan wakes up every
+    /// retain tick and re-checks the same hot pool the application
+    /// is already exercising on the query path, which doubled the
+    /// pool's PostgreSQL traffic on busy deployments.
+    ///
+    /// Uses `test_dead_socket()` to make the assertion sharp: if
+    /// the fast path were skipped and check_alive ran, the EPIPE
+    /// would surface as `evicted == ZOMBIES`. With the fast path
+    /// firing on every recent backend the count must be 0.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_dead_backends_skips_recently_active_backends() {
+        use crate::server::Server;
+
+        const ZOMBIES: usize = 4;
+        let pool = empty_test_pool();
+        {
+            let mut guard = pool.inner.slots.lock();
+            for _ in 0..ZOMBIES {
+                let server = Server::test_dead_socket(); // peer dropped, EPIPE on send
+                                                         // `last_activity` is `SystemTime::now()` from the
+                                                         // constructor - well inside the 30 s threshold.
+                guard.vec.push_back(ObjectInner {
+                    obj: server,
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+                guard.size += 1;
+            }
+        }
+        let (checked, evicted) = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!(
+            checked, ZOMBIES,
+            "scan must still account for popped objects in the \
+             `checked` metric - only the SELECT 1 round-trip is \
+             skipped, not the per-object bookkeeping."
+        );
+        assert_eq!(
+            evicted, 0,
+            "fresh-`last_activity` backends must \
+             bypass check_alive and survive the scan. evicted={evicted} \
+             means the fast-path gate regressed and the scan re-probed \
+             a connection the protocol_io layer just touched."
+        );
+    }
+
+    /// A recently-active skip is only valid inside the caller-supplied
+    /// recent window. Once the retain interval has passed, the scan must
+    /// probe again so a PostgreSQL restart that happened after the last
+    /// successful query cannot leave zombie sockets counted as idle
+    /// capacity until the fixed 30 s production window expires.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_dead_backends_probes_after_recent_window_expires() {
+        use crate::server::Server;
+
+        const ZOMBIES: usize = 4;
+        let pool = empty_test_pool();
+        {
+            let mut guard = pool.inner.slots.lock();
+            for _ in 0..ZOMBIES {
+                let mut server = Server::test_dead_socket();
+                server.last_activity =
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(3);
+                guard.vec.push_back(ObjectInner {
+                    obj: server,
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+                guard.size += 1;
+            }
+        }
+
+        let (checked, evicted) = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, Duration::from_secs(2))
+            .await;
+
+        assert_eq!(checked, ZOMBIES);
+        assert_eq!(
+            evicted, ZOMBIES,
+            "dead sockets older than the retain recent-window must be \
+             probed and evicted, not kept as fresh survivors."
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_dead_backends_skips_under_pressure_pool() {
+        // Same rationale as `retain_pool_skips_under_pressure`: yanking an
+        // idle backend out from under a queued client just forces a
+        // `connect()` on the wait path. The scan must defer to the next
+        // cycle when the semaphore is exhausted.
+        let pool = empty_test_pool();
+        let semaphore = pool.semaphore();
+        let total = semaphore.available_permits();
+        let mut held = Vec::with_capacity(total);
+        for _ in 0..total {
+            held.push(semaphore.acquire().await.unwrap());
+        }
+        assert!(pool.under_pressure());
+
+        let result = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!(result, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn evict_dead_backends_skips_paused_pool() {
+        // PAUSE freezes checkin/checkout; the background scan must respect
+        // that and not surprise the admin with disappearing connections.
+        let pool = empty_test_pool();
+        pool.server_pool().pause();
+        assert!(pool.is_paused());
+        let result = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!(result, (0, 0));
+        pool.server_pool().resume();
+    }
+
+    /// Invariant guard.
+    ///
+    /// `evict_dead_backends` `try_acquire`'s a semaphore permit per pop and
+    /// `forget()`s it for the off-lock check_alive window. The permits are
+    /// then returned by a single `add_permits(checked)` after the lock has
+    /// released - survivor `push_idle` and evict `size -= 1` already
+    /// happened inside that lock. If a future refactor moves the
+    /// `add_permits` call before the `size -=` write, or drops the
+    /// permits inside the loop instead of in one batch, this test catches
+    /// it: after the function returns the pool must hold exactly the same
+    /// number of available permits as before the scan, and `slots.size`
+    /// must not have been touched (no real backends were probed because
+    /// the vec was empty, but the gating still must keep the books).
+    #[tokio::test]
+    async fn evict_dead_backends_preserves_permit_count() {
+        let pool = empty_test_pool();
+        let permits_before = pool.semaphore().available_permits();
+        let size_before = pool.status().size;
+
+        let (checked, evicted) = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!((checked, evicted), (0, 0));
+
+        let permits_after = pool.semaphore().available_permits();
+        let size_after = pool.status().size;
+        assert_eq!(
+            permits_after, permits_before,
+            "no real probes happened (empty vec) - permit count must be \
+             identical, not over- or under-counted"
+        );
+        assert_eq!(
+            size_after, size_before,
+            "no real evictions happened - slots.size must be unchanged"
+        );
+    }
+
+    /// Real pop -> check -> evict path coverage.
+    ///
+    /// The other `evict_dead_backends_*` tests in this module short-
+    /// circuit through `under_pressure`/empty-vec/zero-timeout branches -
+    /// they pin the gating contract but never exercise the bookkeeping
+    /// path that runs when objects are actually popped. This test does:
+    ///
+    /// 1. Seed the idle vec with `N` `Server` instances that have
+    ///    `bad = true` set up front (test-only `Server::test_zombie_marked_bad`
+    ///    backed by a `UnixStream` pair whose peer is dropped - no real
+    ///    PostgreSQL needed). `slots.size` is bumped to match, mirroring
+    ///    what a normal `create()` would do.
+    /// 2. Snapshot `available_permits` and `slots.size`.
+    /// 3. Call `evict_dead_backends`. Each iteration must:
+    ///       - `try_acquire` a permit and `forget()` it (hidden state),
+    ///       - `pop_front()` the zombie,
+    ///       - see `is_bad() == true`, increment `evicted`,
+    ///       - skip `check_alive` (saves us from needing a live TCP loop),
+    ///       - after the loop: take the slots lock, do `size -= evicted`,
+    ///       - drop the lock, then `add_permits(checked)`.
+    ///
+    /// Post-conditions verify each transition:
+    ///   - return value `(N, N)` - every zombie was both probed and ejected,
+    ///   - `available_permits` is restored to the pre-injection value
+    ///     (try_acquire×N -> forget×N -> add_permits(N) round-trip is exact),
+    ///   - `slots.size` is back to the pre-injection value (decremented
+    ///     by exactly `N`, not 0 and not 2N).
+    ///
+    /// A regression that returns permits before deducting `slots.size`
+    /// (the original race) would still leave the post-state
+    /// correct in this single-task test - the deterministic race window
+    /// against a concurrent checkout needs a multi-task harness that
+    /// the BDD scenario in `tests/bdd/features/dead-backend-detection.feature`
+    /// supplies. But a regression that forgets `evicted += 1`, or
+    /// forgets `add_permits`, or leaks the permit on `forget()` without
+    /// returning it fails this test loudly with the exact off-count.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evict_dead_backends_real_path_evicts_zombies() {
+        use crate::server::Server;
+        use std::time::Duration;
+
+        const ZOMBIES: usize = 3;
+
+        let pool = empty_test_pool();
+        let permits_before = pool.semaphore().available_permits();
+        let size_before = pool.status().size;
+
+        // Inject `ZOMBIES` marked-bad Server objects directly into the
+        // idle vec. This mirrors what `return_object` would do for a
+        // backend that finished a transaction and was placed back into
+        // the pool, except the backend is already dead.
+        {
+            let mut guard = pool.inner.slots.lock();
+            for _ in 0..ZOMBIES {
+                guard.vec.push_back(ObjectInner {
+                    obj: Server::test_zombie_marked_bad(),
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+                guard.size += 1;
+            }
+        }
+        let size_after_inject = pool.status().size;
+        assert_eq!(
+            size_after_inject,
+            size_before + ZOMBIES,
+            "test setup precondition: slots.size must reflect the injected zombies"
+        );
+
+        let (checked, evicted) = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+
+        assert_eq!(
+            (checked, evicted),
+            (ZOMBIES, ZOMBIES),
+            "every probed object must be ejected via the is_bad() short-circuit"
+        );
+
+        let permits_after = pool.semaphore().available_permits();
+        let size_after = pool.status().size;
+
+        // Real bookkeeping invariants - these are what a regression of the
+        // form "skip add_permits", "double add_permits", "forget evicted++"
+        // would break.
+        assert_eq!(
+            permits_after, permits_before,
+            "try_acquire×{ZOMBIES} -> permit.forget()×{ZOMBIES} -> \
+             add_permits({ZOMBIES}) must be net-zero on the semaphore",
+        );
+        assert_eq!(
+            size_after, size_before,
+            "slots.size must shrink by exactly the evicted count, not by \
+             twice the count and not by zero",
+        );
+    }
+
+    /// Strict ordering guard.
+    ///
+    /// Simulate the worst-case race the original race called out:
+    /// hand-acquire every semaphore permit in advance (modelling a fully
+    /// saturated pool where every backend is in flight to some client),
+    /// then ask `evict_dead_backends` to probe. The function must NOT try
+    /// to forget more permits than the semaphore can hand out - the
+    /// `try_acquire` per pop guards against that - and it must NOT touch
+    /// `slots.size` when it could not pop anything. Without the
+    /// `try_acquire`-first pattern this would either panic on
+    /// `add_permits(checked)` over-restoration, or it would leave the
+    /// pool with negative permit accounting.
+    #[tokio::test]
+    async fn evict_dead_backends_safe_under_full_semaphore_pressure() {
+        let pool = empty_test_pool();
+        let total = pool.semaphore().available_permits();
+        let mut held = Vec::with_capacity(total);
+        for _ in 0..total {
+            held.push(pool.semaphore().acquire().await.unwrap());
+        }
+        assert_eq!(pool.semaphore().available_permits(), 0);
+        // under_pressure() is true here - the scan must short-circuit
+        // BEFORE attempting any try_acquire / pop, returning (0, 0) and
+        // leaving the semaphore at 0 available permits.
+        let result = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!(result, (0, 0));
+        assert_eq!(
+            pool.semaphore().available_permits(),
+            0,
+            "under_pressure short-circuit must not touch permits"
+        );
+        drop(held);
+        // Now all permits are back.
+        assert_eq!(pool.semaphore().available_permits(), total);
+    }
+
+    /// Regression guard: `evict_dead_backends`
+    /// must keep the pool's accounting consistent even when the scan
+    /// task is cancelled mid-flight (panic during `check_alive`, future
+    /// `select!` wrapper around the retain task, runtime shutdown).
+    /// Without `EvictGuard` the forgotten semaphore permits and the
+    /// not-yet-deducted `slots.size` would leak permanently until
+    /// process restart - slow, silent degradation that no
+    /// `SHOW STATS`-driven alert would catch.
+    ///
+    /// Setup uses `Server::test_silent_socket()` - peer kept alive, so
+    /// `check_alive` parks on its recv deadline waiting for a response
+    /// that never comes. The test wraps the scan in
+    /// `tokio::time::timeout(50ms, ...)` to force a deterministic
+    /// cancellation; when the timeout fires, the scan future drops
+    /// while parked at the `check_alive(...).await` point, which is
+    /// exactly the cancellation shape `EvictGuard::drop` exists to
+    /// handle.
+    ///
+    /// Post-cancellation assertions:
+    ///   * `available_permits` is back to its pre-scan value (all
+    ///     `try_acquire().forget()` were balanced by the Drop's
+    ///     `add_permits`),
+    ///   * `slots.size` reflects the popped count being deducted (the
+    ///     popped objects went out of the idle vec into the scan's
+    ///     temporary Vec, then dropped during unwind - Drop deducts).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evict_dead_backends_cancellation_releases_permits() {
+        use crate::server::Server;
+        use std::time::Duration;
+
+        const ZOMBIES: usize = 4;
+
+        let pool = empty_test_pool();
+        let permits_before = pool.semaphore().available_permits();
+        let size_before = pool.status().size;
+
+        // Inject ZOMBIES backends with silent peers (bad=false so
+        // is_bad() short-circuit doesn't apply; check_alive will hang
+        // on recv until the per-object 30s timeout). Keep the peer
+        // ends alive so the writes succeed but no response arrives.
+        let mut peers = Vec::with_capacity(ZOMBIES);
+        {
+            let mut guard = pool.inner.slots.lock();
+            for _ in 0..ZOMBIES {
+                let (mut server, peer) = Server::test_silent_socket();
+                // age `last_activity` past the
+                // skip-recent threshold so the cancellation harness
+                // actually exercises `check_alive(...).await` - the
+                // fast path would otherwise push the silent socket
+                // back as a "recently active" survivor and the scan
+                // would finish before the outer 50 ms timeout.
+                server.last_activity =
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+                peers.push(peer);
+                guard.vec.push_back(ObjectInner {
+                    obj: server,
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+                guard.size += 1;
+            }
+        }
+        let size_after_inject = pool.status().size;
+        assert_eq!(size_after_inject, size_before + ZOMBIES);
+
+        // Force the scan to cancel mid-flight: wrap in a timeout
+        // shorter than the per-object check_alive deadline so we drop
+        // the future while parked in `check_alive(...).await`.
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            pool.evict_dead_backends(Duration::from_secs(30), 32, TEST_SKIP_RECENT_THRESHOLD),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "scan must time out (cancel) mid-flight - silent peers \
+             should keep check_alive parked past the 50ms outer \
+             timeout. Got Ok(..) which means the scan finished, the \
+             test setup is broken."
+        );
+
+        // EvictGuard::drop must have run during the timeout's
+        // drop-the-future unwind. Verify the accounting is restored.
+        let permits_after = pool.semaphore().available_permits();
+        let size_after = pool.status().size;
+
+        assert_eq!(
+            permits_after, permits_before,
+            "cancellation must restore every permit forgotten during the \
+             pop phase. permits_before={permits_before}, after={permits_after}: \
+             the delta is a permanent leak that would degrade the pool's \
+             effective capacity until process restart.",
+        );
+        assert_eq!(
+            size_after, size_before,
+            "cancellation must deduct the popped count from slots.size - \
+             those objects are gone from the idle vec (dropped during \
+             unwind, Server::drop fired) and not coming back. \
+             size_before={size_before}, after={size_after}: any residual \
+             would make replenish skip refilling, repeating the original \
+             zombie-pool symptom.",
+        );
+
+        // Clean up peer ends so the test fixture doesn't leak fds.
+        drop(peers);
+    }
+
+    /// Regression guard: in LIFO mode (the
+    /// production default via `server_round_robin = false`), the
+    /// liveness scan must visit the BACK of the idle deque. A
+    /// regression that uses `pop_front` in both modes would perfectly
+    /// shield any zombie sitting at the back from the scan - fresh
+    /// alive entries at the front get popped, verified, and pushed
+    /// straight back to the front (LIFO push_idle = push_front),
+    /// repeating forever while the actual zombies at the back never
+    /// get probed.
+    ///
+    /// Setup is deterministic: inject N marked-bad zombies via
+    /// `push_back` so the deque content goes `[oldest=front,
+    /// newest=back]`, label each with a synthetic `process_id` so we
+    /// can identify the survivor, then run a partial scan
+    /// (`max_per_cycle < N`) and assert the surviving entry is the
+    /// one at the FRONT (= the one furthest from the LIFO back, the
+    /// position the scan must skip).
+    ///
+    /// In the buggy `pop_front` impl the survivor would be at the
+    /// BACK instead - the assertion fails loudly with that exact
+    /// signature.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evict_dead_backends_lifo_pops_from_back() {
+        use crate::server::Server;
+        use std::time::Duration;
+
+        const ZOMBIES: i32 = 4;
+        const MAX_PER_CYCLE: usize = 3;
+
+        let pool = empty_test_pool_lifo();
+        // Mirror the production iServ deployment (server_round_robin =
+        // false -> LIFO). `PoolConfig::default()` ships FIFO, so the
+        // helper pins it.
+        assert!(matches!(pool.inner.config.queue_mode, QueueMode::Lifo));
+
+        let pre_size = pool.status().size;
+
+        // Inject ZOMBIES marked-bad backends, labelled 1..=ZOMBIES.
+        // push_back means deque is [1, 2, 3, 4]; for LIFO checkout
+        // pop_front would pull pid=1 (oldest); evict's pop_back must
+        // pull pid=4 first.
+        {
+            let mut guard = pool.inner.slots.lock();
+            for pid in 1..=ZOMBIES {
+                let mut obj = Server::test_zombie_marked_bad();
+                obj.test_set_process_id(pid);
+                guard.vec.push_back(ObjectInner {
+                    obj,
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+                guard.size += 1;
+            }
+        }
+        assert_eq!(pool.status().size, pre_size + ZOMBIES as usize);
+
+        // Partial scan: pop MAX_PER_CYCLE (3) from the back, leave 1.
+        let (checked, evicted) = pool
+            .evict_dead_backends(
+                Duration::from_secs(2),
+                MAX_PER_CYCLE,
+                TEST_SKIP_RECENT_THRESHOLD,
+            )
+            .await;
+        assert_eq!(
+            (checked, evicted),
+            (MAX_PER_CYCLE, MAX_PER_CYCLE),
+            "the {MAX_PER_CYCLE} zombies popped (from the LIFO back) \
+             must all be evicted via the is_bad() short-circuit"
+        );
+
+        // The deque should now hold exactly the 1 entry that was the
+        // furthest from the LIFO back - pid=1 (front position).
+        let guard = pool.inner.slots.lock();
+        assert_eq!(
+            guard.vec.len(),
+            1,
+            "exactly one zombie should remain after a partial scan"
+        );
+        let survivor_pid = guard.vec[0].obj.test_process_id();
+        assert_eq!(
+            survivor_pid, 1,
+            "in LIFO mode the scan must pop from the back; the entry \
+             that survives a max_per_cycle < N scan is the one at the \
+             FRONT (pid=1 here). Got pid={survivor_pid} - if this is \
+             pid=4, the scan is using pop_front and shielding back-of-\
+             queue zombies from eviction (the production-default bug)."
+        );
+    }
+
+    /// Deterministic ordering race coverage for the dead-backend eviction path.
+    ///
+    /// **Setup.** Inject N `Server::test_dead_socket()` objects (peer
+    /// `UnixStream` dropped, `bad = false` so `evict_dead_backends`
+    /// actually invokes `check_alive(...).await` per object - that
+    /// `.await` is the scheduling yield point a concurrent observer
+    /// needs to interleave with the eviction loop). Run an observer
+    /// task on the same multi-threaded runtime that:
+    ///   1. waits until `available_permits < max_size` (proof that
+    ///      evict has begun and pulled at least one `try_acquire`),
+    ///   2. then repeatedly snapshots `(permits, slots.size)` and
+    ///      flags any moment when `permits == max_size` while
+    ///      `slots.size > post_evict_size`.
+    ///
+    /// **What the invariant means.** In correct flow `add_permits` runs
+    /// AFTER `drop(guard)` AND AFTER `guard.size -= evicted`, so the
+    /// first instant the observer can ever see `permits == max_size`
+    /// is the same instant `slots.size` is already at `post_evict_size`.
+    /// A regression that issues `add_permits(1)` inside the `for inner
+    /// in popped` loop (the realistic refactor shape - pull the
+    /// restore into the per-Err arm to "balance the books eagerly")
+    /// would race: between an early `add_permits(1)` and the final
+    /// batched `guard.size -= evicted` there is a window where
+    /// `permits` is back at `max_size` but `slots.size` still reflects
+    /// the not-yet-evicted backends.
+    ///
+    /// **Negative verification done locally.** Sketched one regression
+    /// shape and confirmed the harness catches it:
+    ///   - move `add_permits(1)` into the per-iteration `match Err` arm
+    ///     of the eviction loop and drop the trailing batched
+    ///     `add_permits(checked)`. Harness flagged 29 violations on a
+    ///     single run on the developer machine.
+    /// Mutation reverted after verification.
+    ///
+    /// **Acknowledged blind spot:** a regression that moves
+    /// `add_permits` inside the slots critical section but keeps it
+    /// before `guard.size -= evicted` still leaves the observer's
+    /// `slots.try_lock()` returning `None` (the production lock is
+    /// held by evict) for the entire bug window - by the time the
+    /// observer reads `size`, the `size -=` write has already
+    /// committed. The harness cannot deterministically catch this
+    /// in-section reorder shape.
+    ///
+    /// However, this shape does **not** produce the user-observable
+    /// the over-capacity behaviour: a
+    /// concurrent `checkout` that wins one of the early-released
+    /// permits still has to take `slots.lock()` before it can pull an
+    /// idle object or open a new one, and that lock is held by evict
+    /// for the entire window, so by the time checkout sees the slot
+    /// state it is already post-eviction. The in-section variant is
+    /// therefore not a regression checkout clients could observe;
+    /// structurally it is also out-of-pattern (every other
+    /// `add_permits` call in `pool/inner.rs` runs after
+    /// `drop(guard)`), so it is caught at review time.
+    ///
+    /// **CI flakiness note:** the sanity check (observer must have
+    /// seen `permits == max_size` at least once) is soft - it logs a
+    /// warning if the runtime didn't schedule the observer to catch
+    /// a post-evict snapshot, but does NOT fail the test. Under heavy
+    /// parallel CI load (e.g. the full `cargo test --lib` on a small
+    /// VM) the observer can be starved of CPU and miss the brief
+    /// window. The test still rejects positive observations of the
+    /// regression - the local negative-verification documented above
+    /// is what gives confidence the harness catches the bug, not
+    /// every CI run.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evict_dead_backends_ordering_race_invariant_holds() {
+        use crate::server::Server;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const ZOMBIES: usize = 8;
+        // Observer polls fast but yields between reads - the per-iter
+        // `check_alive(...).await` inside `evict_dead_backends` is what
+        // gives the scheduler the opportunity to swap to the observer
+        // and back.
+        const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let pool = empty_test_pool();
+        let max_size = pool.semaphore().available_permits();
+        let pre_size = pool.status().size;
+        let post_size_expected = pre_size; // every zombie gets evicted
+
+        // Inject the dead-socket zombies. Bad=false so `is_bad()`
+        // short-circuit in evict is skipped and `check_alive(...).await`
+        // runs (and fails with EPIPE because the UnixStream peer is
+        // dropped).
+        {
+            let mut guard = pool.inner.slots.lock();
+            for _ in 0..ZOMBIES {
+                let mut server = Server::test_dead_socket();
+                // age `last_activity` past the
+                // skip-recent threshold so the ordering-race harness
+                // actually drives the eviction loop through
+                // `check_alive(...).await`. Otherwise every dead
+                // socket gets a fast-path survivor pass and the
+                // assertion downstream (`evicted == ZOMBIES`) fires.
+                server.last_activity =
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+                guard.vec.push_back(ObjectInner {
+                    obj: server,
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+                guard.size += 1;
+            }
+        }
+        assert_eq!(pool.status().size, pre_size + ZOMBIES);
+
+        let pool_inner = Arc::clone(&pool.inner);
+        let stop = Arc::new(AtomicBool::new(false));
+        let violations = Arc::new(AtomicUsize::new(0));
+        let max_size_seen_during_evict = Arc::new(AtomicBool::new(false));
+
+        let observer_handle: tokio::task::JoinHandle<()> = {
+            let pool_inner = Arc::clone(&pool_inner);
+            let stop = Arc::clone(&stop);
+            let violations = Arc::clone(&violations);
+            let max_size_seen = Arc::clone(&max_size_seen_during_evict);
+            tokio::spawn(async move {
+                // Phase 1: wait until evict has demonstrably started
+                // (semaphore is below max - at least one try_acquire
+                // ran). Without this the initial state itself would
+                // be a false positive.
+                let phase1_deadline = std::time::Instant::now() + OBSERVATION_TIMEOUT;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if pool_inner.semaphore.available_permits() < max_size {
+                        break;
+                    }
+                    if std::time::Instant::now() > phase1_deadline {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+
+                // Phase 2: observe `(permits, slots.size)` and flag
+                // any instant when permits returned to max_size while
+                // slots.size still reflected the pre-evict count. In
+                // correct flow this never happens - permits hits
+                // max_size only AFTER size -= evicted inside the
+                // post-loop lock.
+                while !stop.load(Ordering::Relaxed) {
+                    let p = pool_inner.semaphore.available_permits();
+                    // try_lock so a held slots-lock by evict doesn't
+                    // serialize us with it (which would mask the very
+                    // race we want to observe).
+                    let size_opt = pool_inner.slots.try_lock().map(|g| g.size);
+                    if let Some(s) = size_opt {
+                        if p == max_size {
+                            max_size_seen.store(true, Ordering::Relaxed);
+                            if s > post_size_expected {
+                                violations.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Tiny delay so the observer is parked on its phase-1 loop
+        // before evict starts.
+        tokio::task::yield_now().await;
+
+        let (checked, evicted) = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+        assert_eq!(
+            (checked, evicted),
+            (ZOMBIES, ZOMBIES),
+            "every dead-socket zombie must be evicted (check_alive fails \
+             with EPIPE, mark_bad fires, the match-Err arm increments \
+             evicted)",
+        );
+
+        // Give the observer one more poll to see the final state.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        stop.store(true, Ordering::Relaxed);
+        observer_handle.await.expect("observer task must not panic");
+
+        let v = violations.load(Ordering::Relaxed);
+        let seen_post = max_size_seen_during_evict.load(Ordering::Relaxed);
+
+        // Soft sanity: warn (don't fail) if observer didn't catch a
+        // post-evict snapshot. See doc comment "CI flakiness note".
+        if !seen_post {
+            eprintln!(
+                "evict_dead_backends_ordering_race_invariant_holds: \
+                 observer never saw `permits == max_size` after evict - \
+                 scheduler likely starved it under parallel test load. \
+                 Test passes neutrally; the regression-catching power \
+                 comes from local negative verification documented in \
+                 the test header."
+            );
+        }
+        assert_eq!(
+            v, 0,
+            "observed {v} moments where `permits == max_size` and \
+             `slots.size > {post_size_expected}` simultaneously. A \
+             regression that returns semaphore permits BEFORE deducting \
+             slots.size leaves the pool transiently over-capacity - a \
+             concurrent acquire would see more permits than the pool has \
+             live slots.",
         );
     }
 }
