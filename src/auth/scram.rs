@@ -9,6 +9,7 @@ use sha2::Sha256;
 use std::borrow::Cow;
 
 type HmacSha = Hmac<Sha256>;
+const MAX_SCRAM_ITERATIONS: i32 = 1_000_000;
 
 pub struct ServerSecret {
     pub iteration: i32,
@@ -59,7 +60,13 @@ macro_rules! parse_part {
     };
 }
 
-pub fn parse_client_first_message(password: Cow<str>) -> Result<ClientFirstMessage, Error> {
+pub fn parse_client_first_message(
+    password: Cow<str>,
+    // Retained (intentionally unused for now) so a future SCRAM-SHA-256-PLUS
+    // implementation can branch on TLS without re-threading the flag from the
+    // caller - see the gs2_flag='y' note below (SCRAM channel-binding handling).
+    _use_tls: bool,
+) -> Result<ClientFirstMessage, Error> {
     let data: &str;
     if let Some(sub_password) = password.get(constants::SCRAM_SHA_256.len() + 4 + 1..password.len())
     {
@@ -87,6 +94,20 @@ pub fn parse_client_first_message(password: Cow<str>) -> Result<ClientFirstMessa
                     "unsupported channel binding".to_string(),
                 ));
             }
+            // accept gs2_flag='y' even
+            // over TLS. RFC 5802 §6 requires rejecting 'y' ONLY when the
+            // server actually advertises a channel-binding (-PLUS) mechanism.
+            // pg_doorman's scram_start_challenge offers SCRAM-SHA-256 only (no
+            // SCRAM-SHA-256-PLUS) and implements no tls-server-end-point
+            // binding, so at the protocol level it does NOT support channel
+            // binding and MUST accept 'y'. Default libpq (channel_binding=
+            // prefer), psycopg3 and pgjdbc send 'y' over TLS against a
+            // SCRAM-SHA-256-only server; the previous use_tls-conditioned
+            // rejection broke their authentication. The earlier
+            // downgrade-protection rationale is moot here: there is no -PLUS
+            // offer for a MITM to strip at this SCRAM layer. (The `_use_tls`
+            // parameter is retained for a future -PLUS implementation, where
+            // advertising -PLUS WOULD require rejecting 'y'.)
             gs2_flag = cb;
         } else {
             return Err(Error::ScramServerError(
@@ -116,8 +137,17 @@ pub fn parse_client_first_message(password: Cow<str>) -> Result<ClientFirstMessa
     let authcid = parse_part!(parts, Authcid, b"n=");
 
     // Nonce
+    //
+    // pre-auth panic. The previous shape sliced
+    // `part.as_bytes()[..2]` BEFORE checking `part.len() >= 2`. A
+    // SASLInitialResponse whose SCRAM body ends with a 1-byte field
+    // (e.g. `n,,n=u,r`) used to panic during the guard evaluation,
+    // aborting the auth task. Per-connection DoS that any
+    // unauthenticated client could repeatedly trigger, draining
+    // `WORKER_PANIC_COUNT` and flooding stderr/syslog. Mirrors the
+    // length check in the authzid branch above.
     let nonce = match parts.next() {
-        Some(part) if &part.as_bytes()[..2] == b"r=" => &part[2..],
+        Some(part) if part.len() >= 2 && &part.as_bytes()[..2] == b"r=" => &part[2..],
         _ => {
             return Err(Error::ScramClientError("unexpected nonce".to_string()));
         }
@@ -179,6 +209,11 @@ pub fn parse_server_secret(data: &str) -> Result<ServerSecret, Error> {
             salt_keys = value;
             match key.parse::<i32>() {
                 Ok(n) => {
+                    if !(1..=MAX_SCRAM_ITERATIONS).contains(&n) {
+                        return Err(Error::ScramServerError(
+                            "password secret is not scram".to_string(),
+                        ));
+                    }
                     iterations = n;
                 }
                 _ => {
@@ -463,12 +498,77 @@ mod tests {
     }
 
     #[test]
+    fn parse_server_secret_rejects_bad_iteration_counts() {
+        for iterations in ["0", "-1", "1000001"] {
+            let secret = format!(
+                "SCRAM-SHA-256${iterations}:L6Nhfyy6pos5mpvTRXQOTQ==$RMoA1BGLjB/LmVJ2iP5N91E0ri/9siV5E3D5DEvfqXU=:/aRx7mRpU0txwFSzZ5lcj/u/FHCc503fUfGrF12nGx0="
+            );
+            assert!(
+                parse_server_secret(&secret).is_err(),
+                "iterations={iterations} must be rejected"
+            );
+        }
+    }
+
+    /// `parse_client_first_message`
+    /// used to panic on a SCRAM body whose last field was a
+    /// single byte (e.g. just `"r"` instead of `"r=…"`).
+    /// `&part.as_bytes()[..2]` on a 1-byte slice was an
+    /// out-of-bounds index that aborted the pre-auth task - an
+    /// unauthenticated DoS reachable from any client willing to
+    /// keep TCP-reconnecting.
+    #[test]
+    fn parse_client_first_message_short_nonce_field_returns_err_not_panic() {
+        // Header "SCRAM-SHA-256\0\0\0\0 " + body whose nonce
+        // field is the single byte "r" - no `=value`.
+        let payload = "SCRAM-SHA-256\0\0\0\0 n,,n=u,r";
+        let result = parse_client_first_message(Cow::from(payload), false);
+        assert!(
+            matches!(result, Err(Error::ScramClientError(_))),
+            "expected ScramClientError, got {result:?}"
+        );
+
+        // Same for the authzid branch already guarded -
+        // include it so the gate is locked in.
+        let payload = "SCRAM-SHA-256\0\0\0\0 n,a,n=u,r=abc";
+        let _ = parse_client_first_message(Cow::from(payload), false);
+        // Should NOT panic; either Ok(_) or typed Err.
+    }
+
+    #[test]
     fn good_parse_client_first_message() {
-        let result = parse_client_first_message(Cow::from(
-            "SCRAM-SHA-256\0\0\0\0 n,,n=,r=5DAkMQDUZpG/3GcwewTYJZbD",
-        ))
+        let result = parse_client_first_message(
+            Cow::from("SCRAM-SHA-256\0\0\0\0 n,,n=,r=5DAkMQDUZpG/3GcwewTYJZbD"),
+            false,
+        )
         .unwrap();
         assert_eq!("n=,r=5DAkMQDUZpG/3GcwewTYJZbD", result.client_first_bare);
+    }
+
+    /// RFC 5802 §6 - a server that does
+    /// NOT advertise a channel-binding (-PLUS) mechanism MUST accept the
+    /// `gs2_flag='y'` signal. pg_doorman's scram_start_challenge offers
+    /// SCRAM-SHA-256 only, so 'y' must be accepted even over TLS; default
+    /// libpq/psycopg3/pgjdbc (channel_binding=prefer) send exactly this over
+    /// TLS against a SCRAM-SHA-256-only server.
+    #[test]
+    fn cbind_y_accepted_when_tls_active() {
+        // Valid SCRAM first message body with gs2_flag='y' over TLS.
+        let payload = "SCRAM-SHA-256\0\0\0\0 y,,n=u,r=abc";
+        let result = parse_client_first_message(Cow::from(payload), true);
+        assert!(
+            result.is_ok(),
+            "gs2_flag='y' must be accepted over TLS (no -PLUS advertised), got {result:?}"
+        );
+    }
+
+    /// Sanity check: without TLS the `'y'` signal is structurally honest
+    /// (no cbind material exists either side) and must still be accepted.
+    #[test]
+    fn cbind_y_accepted_when_tls_inactive() {
+        let payload = "SCRAM-SHA-256\0\0\0\0 y,,n=u,r=abc";
+        let result = parse_client_first_message(Cow::from(payload), false);
+        assert!(result.is_ok(), "expected Ok over plain TCP, got {result:?}");
     }
 
     #[test]

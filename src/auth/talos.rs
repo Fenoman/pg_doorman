@@ -1,3 +1,4 @@
+use crate::auth::jwt::validate_supported_jwt_public_key;
 use crate::errors::Error;
 use base64::prelude::*;
 use jwt::{Header, PKeyWithDigest, RegisteredClaims, SignWithKey, Token, VerifyWithKey};
@@ -12,20 +13,37 @@ use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 
 pub async fn extract_talos_token(
     access_token: String,
+    requested_database: &str,
     databases: Vec<String>,
+    resource_prefixes: Vec<String>,
 ) -> Result<TalosParsedToken, Error> {
     let key = get_key_from_token(&access_token)?;
-    extract_talos_token_with_key(databases, key, access_token).await
+    extract_talos_token_with_key_and_resources(
+        requested_database,
+        databases,
+        resource_prefixes,
+        key,
+        access_token,
+    )
+    .await
 }
 pub static TALOS_KEYS: Lazy<RwLock<HashMap<String, PKeyWithDigest<Public>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-pub async fn load_talos_pub_key(key_filename: String) -> Result<(), Error> {
-    let key = Path::new(&key_filename)
+pub(crate) struct StagedTalosPubKeys {
+    keys: HashMap<String, PKeyWithDigest<Public>>,
+}
+
+pub(crate) struct TalosPubKeysWriteGuard {
+    guard: RwLockWriteGuard<'static, HashMap<String, PKeyWithDigest<Public>>>,
+}
+
+fn load_talos_pub_key_entry(key_filename: &str) -> Result<(String, PKeyWithDigest<Public>), Error> {
+    let key = Path::new(key_filename)
         .file_stem()
         .ok_or_else(|| Error::AuthError(format!("can't create filepath: {key_filename}")))?;
 
@@ -34,14 +52,61 @@ pub async fn load_talos_pub_key(key_filename: String) -> Result<(), Error> {
     })?;
 
     let pub_key_data =
-        fs::read_to_string(&key_filename).map_err(|err| Error::JWTPubKey(err.to_string()))?;
+        fs::read_to_string(key_filename).map_err(|err| Error::JWTPubKey(err.to_string()))?;
 
     let pub_key = PKey::public_key_from_pem(pub_key_data.as_ref())
         .map_err(|err| Error::JWTPubKey(err.to_string()))?;
+    validate_supported_jwt_public_key(&pub_key, key_filename)?;
     let rs256_public_key = PKeyWithDigest {
         digest: MessageDigest::sha256(),
         key: pub_key,
     };
+    Ok((key.to_string(), rs256_public_key))
+}
+
+pub fn validate_talos_pub_keys(key_filenames: &[String]) -> Result<(), Error> {
+    stage_talos_pub_keys(key_filenames).map(|_| ())
+}
+
+pub(crate) fn stage_talos_pub_keys(key_filenames: &[String]) -> Result<StagedTalosPubKeys, Error> {
+    let mut new_keys = HashMap::new();
+    for key_filename in key_filenames {
+        let (kid, key) = load_talos_pub_key_entry(key_filename)?;
+        if new_keys.insert(kid.clone(), key).is_some() {
+            return Err(Error::BadConfig(format!(
+                "duplicate Talos public key id '{kid}' from file '{key_filename}'"
+            )));
+        }
+    }
+    Ok(StagedTalosPubKeys { keys: new_keys })
+}
+
+pub async fn publish_talos_pub_keys(key_filenames: &[String]) -> Result<(), Error> {
+    let staged = stage_talos_pub_keys(key_filenames)?;
+    publish_staged_talos_pub_keys(staged).await;
+    Ok(())
+}
+
+pub(crate) async fn talos_pub_keys_write_guard() -> TalosPubKeysWriteGuard {
+    TalosPubKeysWriteGuard {
+        guard: TALOS_KEYS.write().await,
+    }
+}
+
+pub(crate) fn publish_staged_talos_pub_keys_locked(
+    staged: StagedTalosPubKeys,
+    guard: &mut TalosPubKeysWriteGuard,
+) {
+    *guard.guard = staged.keys;
+}
+
+pub(crate) async fn publish_staged_talos_pub_keys(staged: StagedTalosPubKeys) {
+    let mut guard = talos_pub_keys_write_guard().await;
+    publish_staged_talos_pub_keys_locked(staged, &mut guard);
+}
+
+pub async fn load_talos_pub_key(key_filename: String) -> Result<(), Error> {
+    let (key, rs256_public_key) = load_talos_pub_key_entry(&key_filename)?;
     let mut guard_write = TALOS_KEYS.write().await;
     guard_write.insert(key.to_string(), rs256_public_key);
     Ok(())
@@ -275,11 +340,19 @@ fn get_key_from_token(access_token: &str) -> Result<String, Error> {
     Ok(kid_data.kid)
 }
 
-async fn extract_talos_token_with_key(
+async fn extract_talos_token_with_key_and_resources(
+    requested_database: &str,
     databases: Vec<String>,
+    resource_prefixes: Vec<String>,
     key: String,
     access_token: String,
 ) -> Result<TalosParsedToken, Error> {
+    if !databases.iter().any(|db| db == requested_database) {
+        return Err(Error::AuthError(format!(
+            "Talos is not enabled for requested database {requested_database:?}"
+        )));
+    }
+
     let read_guard = TALOS_KEYS.read().await;
 
     let pub_key = read_guard.get(&key).ok_or_else(|| Error::JWTPubKey(format!(
@@ -296,20 +369,28 @@ async fn extract_talos_token_with_key(
     let (_, claim) = token.into();
     claim.validate()?;
 
+    if resource_prefixes.is_empty() {
+        return Err(Error::AuthError(
+            "Talos resource_prefixes is empty; refusing suffix-only resource_access matching"
+                .to_string(),
+        ));
+    }
+
+    let resource_keys: Vec<String> = resource_prefixes
+        .iter()
+        .map(|prefix| format!("{prefix}:{requested_database}"))
+        .collect();
+
     let mut string_roles = vec![];
     for (k, v) in claim.resource_access {
-        // k = postgres.stg:pgstats
-        if let Some((_, resource_database)) = k.split_once(':') {
-            if databases.iter().any(|db| resource_database == db) {
-                string_roles.extend(v.roles);
-                // No need to continue checking other databases once we've found a match
-            }
+        if resource_keys.iter().any(|resource_key| resource_key == &k) {
+            string_roles.extend(v.roles);
         }
     }
 
     let max_role = get_max_role(string_roles)
         .map_err(|err| Error::AuthError(format!(
-                "Failed to determine user role for databases {databases:?}: {err}. Token may not contain valid roles for the requested databases."
+                "Failed to determine user role for requested database {requested_database:?}: {err}. Token may not contain valid roles for the requested database."
             ))
         )?;
 
@@ -347,8 +428,10 @@ async fn sign_with_jwt_priv_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openssl::dsa::Dsa;
+    use std::fs;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
 
     // Helper function to generate temporary RSA key pair
     fn generate_temp_rsa_keys() -> (NamedTempFile, NamedTempFile) {
@@ -368,6 +451,51 @@ mod tests {
         public_file.flush().unwrap();
 
         (private_file, public_file)
+    }
+
+    fn generate_temp_dsa_public_key() -> NamedTempFile {
+        let dsa = Dsa::generate(2048).unwrap();
+        let public_pem = dsa.public_key_to_pem().unwrap();
+        let mut public_file = NamedTempFile::new().unwrap();
+        public_file.write_all(&public_pem).unwrap();
+        public_file.flush().unwrap();
+        public_file
+    }
+
+    #[test]
+    fn validate_talos_pub_keys_rejects_unsupported_key_type() {
+        let public_file = generate_temp_dsa_public_key();
+        let public_path = public_file.path().to_str().unwrap().to_string();
+
+        let err = validate_talos_pub_keys(&[public_path]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("unsupported JWT public key type"),
+            "unexpected unsupported-key validation error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_talos_pub_keys_rejects_duplicate_key_ids() {
+        let rsa_a = Rsa::generate(2048).unwrap();
+        let rsa_b = Rsa::generate(2048).unwrap();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let path_a = dir_a.path().join("same-kid.pem");
+        let path_b = dir_b.path().join("same-kid.pem");
+        fs::write(&path_a, rsa_a.public_key_to_pem().unwrap()).unwrap();
+        fs::write(&path_b, rsa_b.public_key_to_pem().unwrap()).unwrap();
+
+        let err = validate_talos_pub_keys(&[
+            path_a.to_str().unwrap().to_string(),
+            path_b.to_str().unwrap().to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("duplicate Talos public key id"),
+            "unexpected duplicate kid validation error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -552,8 +680,10 @@ mod tests {
             Err(err) => panic!("{err:?}"),
         };
         load_talos_pub_key(public_path).await.unwrap();
-        let result = extract_talos_token_with_key(
+        let result = extract_talos_token_with_key_and_resources(
+            "database",
             vec!["database".to_string(), "database-1".to_string()],
+            vec!["postgres.stg".to_string()],
             key_name,
             token,
         )
@@ -565,26 +695,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn talos_token_without_requested_database_is_rejected() {
+        let (private_file, public_file) = generate_temp_rsa_keys();
+        let private_path = private_file.path().to_str().unwrap().to_string();
+        let public_path = public_file.path().to_str().unwrap().to_string();
+        let key_name = public_file
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut claims = TalosClaims {
+            default_claims: RegisteredClaims {
+                expiration: Some(now + 3600),
+                ..Default::default()
+            },
+            client_id: "billing-client".to_string(),
+            resource_access: HashMap::new(),
+        };
+        claims.resource_access.insert(
+            "postgres.stg:billing".to_string(),
+            TalosClaimsRoles {
+                roles: vec!["owner".to_string()],
+            },
+        );
+
+        let token = sign_with_jwt_priv_key(claims, private_path).await.unwrap();
+        load_talos_pub_key(public_path).await.unwrap();
+
+        let result = extract_talos_token_with_key_and_resources(
+            "inventory",
+            vec!["billing".to_string(), "inventory".to_string()],
+            vec!["postgres.stg".to_string()],
+            key_name,
+            token,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "token without inventory resource_access must not authenticate to inventory"
+        );
+    }
+
+    #[tokio::test]
+    async fn talos_token_with_unconfigured_resource_prefix_is_rejected() {
+        let (private_file, public_file) = generate_temp_rsa_keys();
+        let private_path = private_file.path().to_str().unwrap().to_string();
+        let public_path = public_file.path().to_str().unwrap().to_string();
+        let key_name = public_file
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut claims = TalosClaims {
+            default_claims: RegisteredClaims {
+                expiration: Some(now + 3600),
+                ..Default::default()
+            },
+            client_id: "billing-client".to_string(),
+            resource_access: HashMap::new(),
+        };
+        claims.resource_access.insert(
+            "postgres.dev:billing".to_string(),
+            TalosClaimsRoles {
+                roles: vec!["owner".to_string()],
+            },
+        );
+
+        let token = sign_with_jwt_priv_key(claims, private_path).await.unwrap();
+        load_talos_pub_key(public_path).await.unwrap();
+
+        let result = extract_talos_token_with_key_and_resources(
+            "billing",
+            vec!["billing".to_string()],
+            vec!["postgres.prod".to_string()],
+            key_name,
+            token,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Talos must reject resource_access keys outside configured resource_prefixes"
+        );
+    }
+
+    #[tokio::test]
     async fn test_extract_talos_token() {
         // Instead of generating a token, we'll use a pre-formatted token with a known kid
         // This is the same token used in test_key which we know has a valid kid
         let token = "eyJhbGciOiJSUzI1NiIsImtpZCI6IkJBb3JkTTktOXhIeERKZ1V5NUtMY2pCNWJMa3hpN1hNIiwidHlwIjoiSldUIn0.eyJhY3IiOjEs";
 
         // Test with invalid token format
-        let result = extract_talos_token(token.to_string(), vec!["db1".to_string()]).await;
+        let result = extract_talos_token(
+            token.to_string(),
+            "db1",
+            vec!["db1".to_string()],
+            vec!["postgres.stg".to_string()],
+        )
+        .await;
         assert!(result.is_err(), "Expected error with incomplete token");
 
         // Test with completely invalid token
-        let result =
-            extract_talos_token("invalid_token".to_string(), vec!["db1".to_string()]).await;
+        let result = extract_talos_token(
+            "invalid_token".to_string(),
+            "db1",
+            vec!["db1".to_string()],
+            vec!["postgres.stg".to_string()],
+        )
+        .await;
         assert!(result.is_err(), "Expected error with invalid token");
     }
 
     #[tokio::test]
     async fn test_extract_talos_token_with_key_invalid() {
         // Test with invalid key
-        let result = extract_talos_token_with_key(
+        let result = extract_talos_token_with_key_and_resources(
+            "database",
             vec!["database".to_string()],
+            vec!["postgres.stg".to_string()],
             "non_existent_key".to_string(),
             "valid_token_format".to_string(),
         )

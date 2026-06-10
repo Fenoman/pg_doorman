@@ -14,9 +14,12 @@ use std::sync::Arc;
 
 use crate::auth::hba::CheckResult;
 use log::{error, info, warn};
+use once_cell::sync::Lazy;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 
-use crate::auth::jwt::get_user_name_from_jwt;
+use crate::auth::jwt::{get_user_name_from_jwt, parse_jwt_pub_key_password};
 use crate::auth::pam::pam_auth;
 use crate::auth::scram::{
     parse_client_final_message, parse_client_first_message, parse_server_secret,
@@ -37,7 +40,13 @@ use crate::pool::{
     create_dynamic_pool, get_auth_query_state, get_pool, get_pool_config, is_dynamic_pool,
     ConnectionPool, PoolIdentifier,
 };
+
+const PAM_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const MAX_CONCURRENT_PAM_AUTH: usize = 16;
+static PAM_AUTH_SEMAPHORE: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PAM_AUTH)));
 use crate::server::ServerParameters;
+use crate::stats::auth_query::AuthQueryStats;
 
 /// Canonicalised set of GUC names the operator put under
 /// `general.startup_parameters` / `pool.startup_parameters` /
@@ -58,7 +67,12 @@ pub struct AuthOutcome {
     pub transaction_mode: bool,
     pub server_parameters: ServerParameters,
     pub prepared_statements_enabled: bool,
+    /// Pool user used for backend routing. Usually equal to the authenticated
+    /// client username; in auth_query dedicated mode it is auth_query.server_user.
+    pub pool_user: String,
     pub operator_managed_keys: Option<OperatorManagedKeys>,
+    pub pool_generation: Option<ConnectionPool>,
+    pub pool_generation_is_dynamic: bool,
 }
 
 /// Authenticate a user based on the provided parameters
@@ -77,7 +91,22 @@ where
     let mut prepared_statements_enabled = false;
 
     // Authenticate admin user.
-    let (transaction_mode, server_parameters, operator_managed_keys) = if admin {
+    let (
+        transaction_mode,
+        server_parameters,
+        pool_user,
+        operator_managed_keys,
+        pool_generation,
+        pool_generation_is_dynamic,
+    ) = if admin {
+        let config = get_config();
+        if username_from_parameters != config.general.admin_username {
+            let error = Error::AuthError(format!("Invalid admin user: {username_from_parameters}"));
+            warn!("{error}");
+            wrong_password(write, username_from_parameters).await?;
+            return Err(error);
+        }
+
         if client_identifier.hba_md5 == CheckResult::Trust
             || client_identifier.hba_scram == CheckResult::Trust
         {
@@ -89,7 +118,10 @@ where
                 transaction_mode: false,
                 server_parameters: ServerParameters::admin(),
                 prepared_statements_enabled: false,
+                pool_user: client_identifier.username.clone(),
                 operator_managed_keys: None,
+                pool_generation: None,
+                pool_generation_is_dynamic: false,
             });
         }
         if client_identifier.hba_md5 == CheckResult::Deny
@@ -102,8 +134,22 @@ where
             wrong_password(write, username_from_parameters).await?;
             return Err(error);
         }
-        let (tx, sp) = authenticate_admin(read, write, username_from_parameters).await?;
-        (tx, sp, None)
+        let (tx, sp) = authenticate_admin(
+            read,
+            write,
+            username_from_parameters,
+            &config.general.admin_username,
+            &config.general.admin_password,
+        )
+        .await?;
+        (
+            tx,
+            sp,
+            client_identifier.username.clone(),
+            None,
+            None,
+            false,
+        )
     }
     // Authenticate normal user.
     else {
@@ -122,7 +168,10 @@ where
         transaction_mode,
         server_parameters,
         prepared_statements_enabled,
+        pool_user,
         operator_managed_keys,
+        pool_generation,
+        pool_generation_is_dynamic,
     })
 }
 
@@ -131,6 +180,8 @@ async fn authenticate_admin<S, T>(
     read: &mut S,
     write: &mut T,
     username_from_parameters: &str,
+    admin_username: &str,
+    admin_password: &str,
 ) -> Result<(bool, ServerParameters), Error>
 where
     S: AsyncReadExt + Unpin,
@@ -139,16 +190,15 @@ where
     // Authenticate admin user with md5.
     let salt = md5_challenge(write).await?;
     let password_response = read_password(read).await?;
-    let config = get_config();
 
     // Compare server and client hashes.
-    let password_hash = md5_hash_password(
-        &config.general.admin_username,
-        &config.general.admin_password,
-        &salt,
-    );
+    let password_hash = md5_hash_password(admin_username, admin_password, &salt);
 
-    if password_hash != password_response {
+    // constant-time compare. `Vec::eq` short-circuits on first mismatching
+    // byte and leaks the matched prefix length through response timing, enabling
+    // a byte-by-byte brute-force of the admin MD5 hash. Especially load-bearing
+    // because old generated configs may still carry published admin credentials.
+    if !bool::from(password_hash.ct_eq(&password_response)) {
         let error = Error::AuthError(format!(
             "Invalid password for admin user: {username_from_parameters}"
         ));
@@ -160,6 +210,93 @@ where
     }
 
     Ok((false, ServerParameters::admin()))
+}
+
+fn md5_verifier_hash(password: &str) -> Option<&str> {
+    let hash = password.strip_prefix(MD5_PASSWORD_PREFIX)?;
+    if hash.len() == 32 && hash.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        Some(hash)
+    } else {
+        None
+    }
+}
+
+fn md5_verifier_label(password: &str) -> &'static str {
+    if password.starts_with(MD5_PASSWORD_PREFIX) {
+        "md5"
+    } else {
+        "scram"
+    }
+}
+
+async fn unsupported_auth_query_verifier_error<T>(
+    write: &mut T,
+    stats: &AuthQueryStats,
+    username: &str,
+    pool_name: &str,
+    password_hash: &str,
+) -> Result<Error, Error>
+where
+    T: AsyncWriteExt + Unpin,
+{
+    stats.auth_failure.fetch_add(1, Ordering::Relaxed);
+    error!(
+        "[{username}@{pool_name}] auth_query: unsupported password verifier returned by auth_query (len={})",
+        password_hash.len()
+    );
+    error_response_terminal(
+        write,
+        "Unsupported authentication method for auth_query user.",
+        "28P01",
+    )
+    .await?;
+    Ok(Error::AuthError(format!(
+        "Unsupported password type for auth_query user: {username}"
+    )))
+}
+
+async fn auth_query_dynamic_pool_admission_error<T>(
+    write: &mut T,
+    stats: &AuthQueryStats,
+    username: &str,
+    pool_name: &str,
+    err: Error,
+) -> Result<Error, Error>
+where
+    T: AsyncWriteExt + Unpin,
+{
+    stats.auth_failure.fetch_add(1, Ordering::Relaxed);
+    error!("[{username}@{pool_name}] auth_query: failed to create dynamic pool: {err}");
+    error_response(
+        write,
+        "Unable to create authenticated dynamic pool.",
+        "58000",
+    )
+    .await?;
+    Ok(err)
+}
+
+async fn reject_scram_passthrough_hba_trust<T>(
+    write: &mut T,
+    username: &str,
+    pool_name: &str,
+) -> Result<Error, Error>
+where
+    T: AsyncWriteExt + Unpin,
+{
+    error!(
+        "[{username}@{pool_name}] HBA trust cannot be used with SCRAM passthrough \
+         because backend SCRAM authentication requires a client proof"
+    );
+    error_response_terminal(
+        write,
+        "HBA trust cannot be used with SCRAM passthrough authentication.",
+        "28000",
+    )
+    .await?;
+    Ok(Error::HbaForbiddenError(format!(
+        "HBA trust cannot be used with SCRAM passthrough for {username}@{pool_name}"
+    )))
 }
 
 /// Authenticate a normal user with various methods
@@ -197,7 +334,12 @@ fn eval_hba_for_pool_password(pool_password: &str, ci: &ClientIdentifier) -> Che
         return CheckResult::Allow;
     }
 
-    if pool_password.starts_with(MD5_PASSWORD_PREFIX) {
+    if pool_password.starts_with(MD5_PASSWORD_PREFIX) && md5_verifier_hash(pool_password).is_none()
+    {
+        return CheckResult::Deny;
+    }
+
+    if md5_verifier_hash(pool_password).is_some() {
         if ci.hba_md5 == CheckResult::Trust {
             return CheckResult::Trust;
         }
@@ -207,8 +349,33 @@ fn eval_hba_for_pool_password(pool_password: &str, ci: &ClientIdentifier) -> Che
         return CheckResult::Allow;
     }
 
-    // For other auth kinds (JWT/PAM/unknown), the HBA rules here are not applicable.
+    // For other auth kinds (JWT/PAM/unknown), the stored verifier shape
+    // does not pick a password mechanism, but a matching `reject` HBA
+    // line still applies. `reject` sets both hba_md5 and hba_scram to
+    // Deny (see HbaLine::check_hba); honor that explicit Deny before the
+    // default Allow so a JWT/PAM client cannot bypass a pg_hba reject.
+    // Only an explicit Deny blocks here - NotMatched stays Allow so these
+    // verifier kinds are not turned into default-deny.
+    if ci.hba_md5 == CheckResult::Deny || ci.hba_scram == CheckResult::Deny {
+        return CheckResult::Deny;
+    }
     CheckResult::Allow
+}
+
+fn hba_trust_skips_required_scram_passthrough(
+    hba_decision: CheckResult,
+    verifier: &str,
+    passthrough_requires_client_key: bool,
+) -> bool {
+    hba_decision == CheckResult::Trust
+        && verifier.starts_with(SCRAM_SHA_256)
+        && passthrough_requires_client_key
+}
+
+fn is_auth_query_shared_pool(pool_id: &PoolIdentifier) -> bool {
+    get_auth_query_state(&pool_id.db)
+        .and_then(|state| state.shared_pool_id.as_ref().cloned())
+        .is_some_and(|shared_pool_id| shared_pool_id == *pool_id)
 }
 
 async fn authenticate_normal_user<S, T>(
@@ -218,7 +385,17 @@ async fn authenticate_normal_user<S, T>(
     pool_name: &str,
     username_from_parameters: &str,
     prepared_statements_enabled: &mut bool,
-) -> Result<(bool, ServerParameters, Option<OperatorManagedKeys>), Error>
+) -> Result<
+    (
+        bool,
+        ServerParameters,
+        String,
+        Option<OperatorManagedKeys>,
+        Option<ConnectionPool>,
+        bool,
+    ),
+    Error,
+>
 where
     S: AsyncReadExt + Unpin,
     T: AsyncWriteExt + Unpin,
@@ -228,7 +405,7 @@ where
             // Dynamic pools (created by auth_query passthrough) have empty passwords.
             // Re-authenticate via auth_query to verify credentials on every connection.
             let pool_id = PoolIdentifier::new(pool_name, client_identifier.username.as_str());
-            if is_dynamic_pool(&pool_id) {
+            if is_dynamic_pool(&pool_id) || is_auth_query_shared_pool(&pool_id) {
                 return try_auth_query(
                     read,
                     write,
@@ -259,6 +436,14 @@ where
 
     // Evaluate HBA once for this connection
     let hba_decision = eval_hba_for_pool_password(&pool_password, client_identifier);
+    let backend_auth_snapshot = pool
+        .address
+        .backend_auth
+        .as_ref()
+        .map(|ba| ba.read().clone());
+    let scram_passthrough_requires_client_key =
+        matches!(backend_auth_snapshot, Some(BackendAuthMethod::ScramPending))
+            && pool.settings.user.server_password.is_none();
     if hba_decision == CheckResult::Deny {
         error_response_terminal(
         write,
@@ -273,7 +458,17 @@ where
         return Err(Error::HbaForbiddenError(format!(
         "Connection with scram not permitted by HBA configuration for client: {} from address: {:?}",
         client_identifier, client_identifier.addr,
-    )));
+        )));
+    }
+
+    if hba_trust_skips_required_scram_passthrough(
+        hba_decision,
+        pool_password.as_str(),
+        scram_passthrough_requires_client_key,
+    ) {
+        return Err(
+            reject_scram_passthrough_hba_trust(write, username_from_parameters, pool_name).await?,
+        );
     }
 
     if client_identifier.is_talos || hba_decision == CheckResult::Trust {
@@ -296,6 +491,7 @@ where
             username_from_parameters,
             pool_name,
             &client_identifier.addr,
+            client_identifier.use_tls,
         )
         .await?;
 
@@ -311,7 +507,7 @@ where
                 }
             }
         }
-    } else if pool_password.starts_with(MD5_PASSWORD_PREFIX) {
+    } else if md5_verifier_hash(&pool_password).is_some() {
         authenticate_with_md5(
             read,
             write,
@@ -321,14 +517,25 @@ where
             &client_identifier.addr,
         )
         .await?;
+    } else if pool_password.starts_with(MD5_PASSWORD_PREFIX) {
+        error!(
+            "[{username_from_parameters}@{pool_name}] invalid MD5 verifier configured for static user"
+        );
+        error_response_terminal(
+            write,
+            "Server authentication configuration error. Please contact your database administrator.",
+            "28P01",
+        )
+        .await?;
+        return Err(Error::AuthError(format!(
+            "Invalid MD5 verifier configured for static user: {username_from_parameters}"
+        )));
     } else if pool_password.starts_with(JWT_PUB_KEY_PASSWORD_PREFIX) {
+        let jwt_config = parse_jwt_pub_key_password(&pool_password)?.expect("prefix checked above");
         authenticate_with_jwt(
             read,
             write,
-            pool_password
-                .strip_prefix(JWT_PUB_KEY_PASSWORD_PREFIX)
-                .unwrap()
-                .to_string(),
+            jwt_config,
             username_from_parameters,
             pool_name,
             &client_identifier.addr,
@@ -392,7 +599,14 @@ where
     // two views stay in step.
     let operator_managed_keys = Some(pool.database.server_pool().operator_managed_startup_keys());
 
-    Ok((transaction_mode, server_parameters, operator_managed_keys))
+    Ok((
+        transaction_mode,
+        server_parameters,
+        client_identifier.username.clone(),
+        operator_managed_keys,
+        Some(pool),
+        false,
+    ))
 }
 
 /// Authenticate a user with PAM
@@ -425,11 +639,13 @@ where
         }
     };
     let service = pool.settings.user.auth_pam_service.clone().unwrap();
-    match pam_auth(
-        service.as_str(),
-        username_from_parameters,
-        password_response.as_str(),
-    ) {
+    match run_pam_auth_blocking(
+        service.clone(),
+        username_from_parameters.to_string(),
+        password_response,
+    )
+    .await
+    {
         Ok(_) => (),
         Err(err) => {
             error!(
@@ -450,6 +666,30 @@ where
     Ok(())
 }
 
+async fn run_pam_auth_blocking(
+    service: String,
+    username: String,
+    password: String,
+) -> Result<(), Error> {
+    let fut = async move {
+        let permit = PAM_AUTH_SEMAPHORE
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::AuthError("PAM authentication limiter is closed".to_string()))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            pam_auth(&service, &username, &password)
+        })
+        .await
+        .map_err(|err| Error::AuthError(format!("PAM authentication task failed: {err}")))?
+    };
+
+    tokio::time::timeout(PAM_AUTH_TIMEOUT, fut)
+        .await
+        .map_err(|_| Error::AuthError("PAM authentication timed out".to_string()))?
+}
+
 /// Authenticate a user with SCRAM-SHA-256.
 /// Returns the ClientKey extracted from the client's SCRAM proof on success.
 async fn authenticate_with_scram<S, T>(
@@ -459,6 +699,10 @@ async fn authenticate_with_scram<S, T>(
     username_from_parameters: &str,
     pool_name: &str,
     client_addr: &str,
+    // RFC 5802 §6 cbind downgrade guard. When TLS is
+    // active pg_doorman MUST reject `gs2_flag='y'`; see
+    // `parse_client_first_message` for the rationale.
+    use_tls: bool,
 ) -> Result<Option<Vec<u8>>, Error>
 where
     S: AsyncReadExt + Unpin,
@@ -481,9 +725,10 @@ where
     // scram auth.
     scram_start_challenge(write).await?;
     let first_message = read_password(read).await?;
-    let client_first_message = match parse_client_first_message(String::from_utf8_lossy(
-        &first_message,
-    )) {
+    let client_first_message = match parse_client_first_message(
+        String::from_utf8_lossy(&first_message),
+        use_tls,
+    ) {
         Ok(client_first_message) => client_first_message,
         Err(err) => {
             warn!("[{username_from_parameters}@{pool_name}] SCRAM: client first message parse error from {client_addr}: {err}");
@@ -570,11 +815,28 @@ where
     S: AsyncReadExt + Unpin,
     T: AsyncWriteExt + Unpin,
 {
+    let Some(md5_hash) = md5_verifier_hash(pool_password) else {
+        error!(
+            "[{username_from_parameters}@{}] invalid MD5 verifier configured for static user",
+            pool.address.pool_name
+        );
+        error_response_terminal(
+            write,
+            "Server authentication configuration error. Please contact your database administrator.",
+            "28P01",
+        )
+        .await?;
+        return Err(Error::AuthError(format!(
+            "Invalid MD5 verifier configured for static user: {username_from_parameters}"
+        )));
+    };
     // md5 auth.
     let salt = md5_challenge(write).await?;
     let password_response = read_password(read).await?;
-    let except_md5_hash = md5_hash_second_pass(pool_password.strip_prefix("md5").unwrap(), &salt);
-    if except_md5_hash != password_response {
+    let except_md5_hash = md5_hash_second_pass(md5_hash, &salt);
+    // constant-time compare prevents timing side-channel byte-by-byte
+    // brute force of the user's MD5 hash.
+    if !bool::from(except_md5_hash.ct_eq(&password_response)) {
         error!(
             "[{username_from_parameters}@{}] MD5 authentication failed from {client_addr}",
             pool.address.pool_name
@@ -597,7 +859,7 @@ where
 async fn authenticate_with_jwt<S, T>(
     read: &mut S,
     write: &mut T,
-    jwt_pub_key: String,
+    jwt_config: crate::auth::jwt::JwtVerifierConfig,
     username_from_parameters: &str,
     pool_name: &str,
     client_addr: &str,
@@ -624,7 +886,14 @@ where
             )));
         }
     };
-    let jwt_user_name = match get_user_name_from_jwt(jwt_pub_key, jwt_token).await {
+    let jwt_user_name = match get_user_name_from_jwt(
+        jwt_config.key_filename,
+        jwt_token,
+        &jwt_config.issuer,
+        &jwt_config.audience,
+    )
+    .await
+    {
         Ok(u) => u,
         Err(err) => {
             error!("[{username_from_parameters}@{pool_name}] JWT: validation failed from {client_addr}: {err}");
@@ -661,8 +930,8 @@ where
 /// Authenticate a user via auth_query: fetch password hash from cache/PG,
 /// run MD5 challenge-response, then return the shared pool + server params.
 ///
-/// On success, mutates `client_identifier.username` to the server_user
-/// so that subsequent `get_pool()` calls find the shared data pool.
+/// On success, keeps `client_identifier.username` as the authenticated client
+/// user and returns the backend pool user separately for routing.
 async fn try_auth_query<S, T>(
     read: &mut S,
     write: &mut T,
@@ -670,7 +939,17 @@ async fn try_auth_query<S, T>(
     pool_name: &str,
     username: &str,
     prepared_statements_enabled: &mut bool,
-) -> Result<(bool, ServerParameters, Option<OperatorManagedKeys>), Error>
+) -> Result<
+    (
+        bool,
+        ServerParameters,
+        String,
+        Option<OperatorManagedKeys>,
+        Option<ConnectionPool>,
+        bool,
+    ),
+    Error,
+>
 where
     S: AsyncReadExt + Unpin,
     T: AsyncWriteExt + Unpin,
@@ -765,30 +1044,33 @@ where
 
     // 5. Authenticate based on password type
     let mut auth_client_key: Option<Vec<u8>> = None;
+    if hba_trust_skips_required_scram_passthrough(
+        hba_decision,
+        &cache_entry.password_hash,
+        aq_state.shared_pool_id.is_none(),
+    ) {
+        auth_fail!(aq_state);
+        return Err(reject_scram_passthrough_hba_trust(write, username, pool_name).await?);
+    }
 
     if hba_decision == CheckResult::Trust {
         // HBA trust — skip password check
-    } else if cache_entry.password_hash.starts_with(MD5_PASSWORD_PREFIX) {
+    } else if let Some(md5_hash) = md5_verifier_hash(&cache_entry.password_hash) {
         // MD5 challenge-response
         let salt = md5_challenge(write).await?;
         let password_response = read_password(read).await?;
-        let expected = md5_hash_second_pass(
-            cache_entry.password_hash.strip_prefix("md5").unwrap(),
-            &salt,
-        );
+        let expected = md5_hash_second_pass(md5_hash, &salt);
 
-        if expected != password_response {
-            // Password mismatch — try re-fetch (password may have changed in PG)
+        // constant-time compare on auth_query-cached MD5 hash.
+        if !bool::from(expected.ct_eq(&password_response)) {
+            // Password mismatch - try re-fetch (password may have changed in PG)
             let mut auth_ok = false;
-            let mut refreshed: Option<crate::auth::auth_query::CacheEntry> = None;
+            let mut refreshed: Option<std::sync::Arc<crate::auth::auth_query::CacheEntry>> = None;
             if let Ok(Some(new_entry)) = cache.refetch_on_failure(username).await {
                 if new_entry.password_hash != cache_entry.password_hash {
-                    if new_entry.password_hash.starts_with(MD5_PASSWORD_PREFIX) {
-                        let new_expected = md5_hash_second_pass(
-                            new_entry.password_hash.strip_prefix("md5").unwrap(),
-                            &salt,
-                        );
-                        if new_expected == password_response {
+                    if let Some(new_md5_hash) = md5_verifier_hash(&new_entry.password_hash) {
+                        let new_expected = md5_hash_second_pass(new_md5_hash, &salt);
+                        if bool::from(new_expected.ct_eq(&password_response)) {
                             auth_ok = true;
                             info!(
                                 "[{username}@{pool_name}] auth_query: re-fetched password matched"
@@ -806,8 +1088,8 @@ where
                         // `cache_ttl`.
                         warn!(
                             "[{username}@{pool_name}] auth_query: refetched verifier changed type ({stored} → {fresh}); cache invalidated, client must reconnect with the new mechanism",
-                            stored = if cache_entry.password_hash.starts_with(MD5_PASSWORD_PREFIX) { "md5" } else { "scram" },
-                            fresh = if new_entry.password_hash.starts_with(MD5_PASSWORD_PREFIX) { "md5" } else { "scram" }
+                            stored = md5_verifier_label(&cache_entry.password_hash),
+                            fresh = md5_verifier_label(&new_entry.password_hash)
                         );
                         cache.invalidate(username);
                     }
@@ -831,6 +1113,18 @@ where
                 cache_entry = new_entry;
             }
         }
+    } else if cache_entry.password_hash.starts_with(MD5_PASSWORD_PREFIX) {
+        auth_fail!(aq_state);
+        error!("[{username}@{pool_name}] auth_query: invalid MD5 verifier returned by auth_query");
+        error_response_terminal(
+            write,
+            "Server authentication configuration error. Please contact your database administrator.",
+            "28P01",
+        )
+        .await?;
+        return Err(Error::AuthError(format!(
+            "Invalid MD5 verifier for auth_query user: {username}"
+        )));
     } else if cache_entry.password_hash.starts_with(SCRAM_SHA_256) {
         // SCRAM-SHA-256 challenge-response
         let server_secret = match parse_server_secret(&cache_entry.password_hash) {
@@ -853,7 +1147,10 @@ where
 
         scram_start_challenge(write).await?;
         let first_msg = read_password(read).await?;
-        let client_first = match parse_client_first_message(String::from_utf8_lossy(&first_msg)) {
+        let client_first = match parse_client_first_message(
+            String::from_utf8_lossy(&first_msg),
+            client_identifier.use_tls,
+        ) {
             Ok(msg) => msg,
             Err(err) => {
                 warn!("[{username}@{pool_name}] auth_query: SCRAM client first message parse error: {err}");
@@ -924,22 +1221,21 @@ where
             }
         }
     } else {
-        error_response_terminal(
+        return Err(unsupported_auth_query_verifier_error(
             write,
-            "Unsupported authentication method for auth_query user.",
-            "28P01",
+            &aq_state.stats,
+            username,
+            pool_name,
+            &cache_entry.password_hash,
         )
-        .await?;
-        return Err(Error::AuthError(format!(
-            "Unsupported password type for auth_query user: {username}"
-        )));
+        .await?);
     }
 
     // 6. Route to shared pool (dedicated) or dynamic pool (passthrough)
     match aq_state.shared_pool_id {
         Some(ref shared_pool_id) => {
             // === Dedicated mode: all dynamic users share the server_user pool ===
-            client_identifier.username = shared_pool_id.user.clone();
+            let pool_user = shared_pool_id.user.clone();
 
             let mut pool = match get_pool(&shared_pool_id.db, &shared_pool_id.user) {
                 Some(pool) => pool,
@@ -950,8 +1246,7 @@ where
                     );
                     error_response(write, "Internal pool configuration error.", "58000").await?;
                     return Err(Error::AuthError(format!(
-                        "auth_query shared pool not found: {}",
-                        shared_pool_id
+                        "auth_query shared pool not found: {shared_pool_id}"
                     )));
                 }
             };
@@ -990,13 +1285,19 @@ where
 
             aq_state.stats.auth_success.fetch_add(1, Ordering::Relaxed);
             info!(
-                "[{username}@{pool_name}] auth_query: authenticated, using shared pool '{}'",
-                shared_pool_id
+                "[{username}@{pool_name}] auth_query: authenticated, using shared pool '{shared_pool_id}'"
             );
 
             let operator_managed_keys =
                 Some(pool.database.server_pool().operator_managed_startup_keys());
-            Ok((transaction_mode, server_parameters, operator_managed_keys))
+            Ok((
+                transaction_mode,
+                server_parameters,
+                pool_user,
+                operator_managed_keys,
+                Some(pool),
+                false,
+            ))
         }
         None => {
             // === Passthrough mode: each dynamic user gets their own pool ===
@@ -1004,7 +1305,7 @@ where
             // `cache_entry` already points at the new snapshot, so
             // `password_hash` and `startup_parameters` below reflect the
             // credentials PG will accept on the backend side.
-            let backend_auth = if cache_entry.password_hash.starts_with(MD5_PASSWORD_PREFIX) {
+            let backend_auth = if md5_verifier_hash(&cache_entry.password_hash).is_some() {
                 Some(BackendAuthMethod::Md5PassTheHash(
                     cache_entry.password_hash.clone(),
                 ))
@@ -1018,17 +1319,26 @@ where
             // again while TTL expiry or a concurrent refetch is changing it.
             let fetched_overlay = Arc::clone(cache_entry.startup_overlay.map());
             let fetched_overlay_hash = cache_entry.startup_overlay.hash();
-            let (mut pool, init_guard) = create_dynamic_pool(
+            let (mut pool, init_guard) = match create_dynamic_pool(
                 pool_name,
                 username,
+                &aq_state,
                 backend_auth,
                 fetched_overlay,
                 fetched_overlay_hash,
-            )
-            .map_err(|err| {
-                error!("[{username}@{pool_name}] auth_query: failed to create dynamic pool: {err}");
-                err
-            })?;
+            ) {
+                Ok(created) => created,
+                Err(err) => {
+                    return Err(auth_query_dynamic_pool_admission_error(
+                        write,
+                        &aq_state.stats,
+                        username,
+                        pool_name,
+                        err,
+                    )
+                    .await?);
+                }
+            };
 
             // Do NOT change client_identifier.username — stay as the dynamic user
             // so that Client.username matches the pool's user for get_pool() lookups.
@@ -1077,7 +1387,14 @@ where
 
             let operator_managed_keys =
                 Some(pool.database.server_pool().operator_managed_startup_keys());
-            Ok((transaction_mode, server_parameters, operator_managed_keys))
+            Ok((
+                transaction_mode,
+                server_parameters,
+                username.to_string(),
+                operator_managed_keys,
+                Some(pool),
+                true,
+            ))
         }
     }
 }

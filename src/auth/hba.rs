@@ -27,27 +27,120 @@ impl AuthMethod {
     }
 }
 
-/// Matcher for database/user fields (supports keyword `all`).
+/// Matcher for database/user fields (supports keyword `all` and comma lists).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameMatcher {
     All,
     Name(String),
+    List(Vec<String>),
 }
 
 impl NameMatcher {
     fn from_token(tok: &str) -> Self {
-        if tok.eq_ignore_ascii_case("all") {
+        if tok.contains(',') {
+            NameMatcher::List(
+                tok.split(',')
+                    .filter_map(|part| {
+                        let part = part.trim();
+                        (!part.is_empty()).then(|| part.to_string())
+                    })
+                    .collect(),
+            )
+        } else if tok.eq_ignore_ascii_case("all") {
             NameMatcher::All
         } else {
             NameMatcher::Name(tok.to_string())
         }
     }
-    fn matches(&self, value: &str) -> bool {
+
+    fn from_hba_token(tok: &HbaToken) -> Result<Self, String> {
+        reject_mixed_quoted_comma_token(tok)?;
+        if tok.quoted {
+            Ok(NameMatcher::Name(tok.value.clone()))
+        } else {
+            Ok(Self::from_token(&tok.value))
+        }
+    }
+
+    fn try_from_token(tok: &str) -> Result<Self, String> {
+        validate_name_token(tok)?;
+        Ok(Self::from_token(tok))
+    }
+
+    fn try_from_hba_token(tok: &HbaToken) -> Result<Self, String> {
+        reject_mixed_quoted_comma_token(tok)?;
+        if tok.quoted {
+            Ok(NameMatcher::Name(tok.value.clone()))
+        } else {
+            Self::try_from_token(&tok.value)
+        }
+    }
+
+    pub(crate) fn matches(&self, value: &str) -> bool {
         match self {
             NameMatcher::All => true,
             NameMatcher::Name(ref n) => n == value,
+            NameMatcher::List(names) => names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("all") || n == value),
         }
     }
+}
+
+fn database_matcher_from_hba_token(tok: &HbaToken) -> Result<NameMatcher, String> {
+    reject_mixed_quoted_comma_token(tok)?;
+    if tok.quoted {
+        return Ok(NameMatcher::Name(tok.value.clone()));
+    }
+
+    validate_database_token(&tok.value)?;
+    Ok(NameMatcher::from_token(&tok.value))
+}
+
+fn reject_mixed_quoted_comma_token(tok: &HbaToken) -> Result<(), String> {
+    if tok.quoted && tok.has_unquoted_comma {
+        return Err(format!(
+            "mixed quoted comma-list pg_hba name token '{}'",
+            tok.value
+        ));
+    }
+    Ok(())
+}
+
+fn validate_name_token(tok: &str) -> Result<(), String> {
+    let parts = tok.split(',');
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!("empty item in pg_hba name list '{tok}'"));
+        }
+        let lower = part.to_ascii_lowercase();
+        if lower == "sameuser"
+            || lower == "samerole"
+            || lower == "samegroup"
+            || part.starts_with('+')
+            || part.starts_with('/')
+            || part.starts_with('@')
+        {
+            return Err(format!(
+                "unsupported pg_hba database/user token '{part}' in '{tok}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_database_token(tok: &str) -> Result<(), String> {
+    validate_name_token(tok)?;
+    for part in tok.split(',') {
+        let part = part.trim();
+        if part.eq_ignore_ascii_case("replication") {
+            return Err(format!(
+                "unsupported pg_hba database token '{part}' in '{tok}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A single pg_hba.conf rule reduced to what we need.
@@ -114,6 +207,7 @@ impl std::fmt::Display for NameMatcher {
         match self {
             NameMatcher::All => f.write_str("all"),
             NameMatcher::Name(s) => f.write_str(s),
+            NameMatcher::List(names) => f.write_str(&names.join(",")),
         }
     }
 }
@@ -214,14 +308,14 @@ impl<'de> serde::Deserialize<'de> for PgHba {
             where
                 E: DeError,
             {
-                Ok(PgHba::from_content(v))
+                PgHba::try_from_content(v).map_err(DeError::custom)
             }
 
             fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
             where
                 E: DeError,
             {
-                Ok(PgHba::from_content(&v))
+                PgHba::try_from_content(&v).map_err(DeError::custom)
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
@@ -253,13 +347,13 @@ impl<'de> serde::Deserialize<'de> for PgHba {
                 }
 
                 if let Some(c) = content {
-                    return Ok(PgHba::from_content(&c));
+                    return PgHba::try_from_content(&c).map_err(DeError::custom);
                 }
                 if let Some(p) = path {
                     let data = fs::read_to_string(&p).map_err(|e| {
                         DeError::custom(format!("failed to read hba file {p}: {e}"))
                     })?;
-                    return Ok(PgHba::from_content(&data));
+                    return PgHba::try_from_content(&data).map_err(DeError::custom);
                 }
                 Err(DeError::custom(
                     "expected either 'path' or 'content' field for PgHba",
@@ -275,46 +369,117 @@ impl PgHba {
     /// Parse from file path (utf-8 text expected)
     pub fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let content = fs::read_to_string(path)?;
-        Ok(Self::from_content(&content))
+        Self::try_from_content(&content)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
     }
 
     /// Parse from string content of a pg_hba.conf
     pub fn from_content(content: &str) -> Self {
+        Self::parse_content(content, false).expect("non-strict pg_hba parse must not fail")
+    }
+
+    /// Parse from string content and reject pg_hba name constructs that this
+    /// reduced checker cannot evaluate safely.
+    pub fn try_from_content(content: &str) -> Result<Self, String> {
+        Self::parse_content(content, true)
+    }
+
+    fn parse_content(content: &str, strict_names: bool) -> Result<Self, String> {
         let mut rules = Vec::new();
-        for raw_line in content.lines() {
+        for (line_no, raw_line) in content.lines().enumerate() {
             let line = strip_comments(raw_line).trim();
             if line.is_empty() {
                 continue;
             }
 
-            let tokens = shell_like_split(line);
+            let tokens = match shell_like_split(line) {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    if strict_names {
+                        return Err(format!("pg_hba line {}: {err}", line_no + 1));
+                    }
+                    log::warn!(
+                        "[pg_hba] dropping malformed rule on line {}: {err}",
+                        line_no + 1
+                    );
+                    continue;
+                }
+            };
             if tokens.is_empty() {
                 continue;
             }
 
             // connection type
-            let Some(ht) = HostType::from_token(&tokens[0]) else {
+            let Some(ht) = HostType::from_token(&tokens[0].value) else {
+                if strict_names {
+                    return Err(format!(
+                        "pg_hba line {}: unsupported pg_hba record type '{}'",
+                        line_no + 1,
+                        tokens[0].value
+                    ));
+                }
                 continue;
             };
 
             // Minimal pg_hba format:
-            // type  database  user  address  method  [options]
-            // For local, address is omitted.
-            // We ignore database/user/options in this component.
+            // type  database  user  address  method
+            // For local, address is omitted. Strict config parsing rejects
+            // PostgreSQL auth-options (`clientcert=...`, `map=...`, etc.)
+            // because this reduced evaluator cannot enforce them safely.
 
             // Ensure we have enough tokens to read method and optional address.
             // We'll map positions based on host type.
             // Parse database and user (common positions)
             if tokens.len() < 3 {
+                if strict_names {
+                    return Err(format!(
+                        "pg_hba line {}: too few fields for pg_hba record",
+                        line_no + 1
+                    ));
+                }
                 continue;
             }
-            let database = NameMatcher::from_token(&tokens[1]);
-            let user = NameMatcher::from_token(&tokens[2]);
+            let database = match database_matcher_from_hba_token(&tokens[1]) {
+                Ok(database) => database,
+                Err(err) => {
+                    if strict_names {
+                        return Err(format!("pg_hba line {}: {err}", line_no + 1));
+                    }
+                    log::warn!(
+                        "[pg_hba] dropping rule with unsupported database token on line {}: {err}",
+                        line_no + 1
+                    );
+                    continue;
+                }
+            };
+            let user = match if strict_names {
+                NameMatcher::try_from_hba_token(&tokens[2])
+            } else {
+                NameMatcher::from_hba_token(&tokens[2])
+            } {
+                Ok(user) => user,
+                Err(err) => {
+                    if strict_names {
+                        return Err(format!("pg_hba line {}: {err}", line_no + 1));
+                    }
+                    log::warn!(
+                        "[pg_hba] dropping rule with ambiguous user token on line {}: {err}",
+                        line_no + 1
+                    );
+                    continue;
+                }
+            };
 
             let (method_idx, address_opt) = match ht {
                 HostType::Local => {
                     // type database user method [options]
                     if tokens.len() < 4 {
+                        if strict_names {
+                            return Err(format!(
+                                "pg_hba line {}: too few fields for local pg_hba record",
+                                line_no + 1
+                            ));
+                        }
                         continue;
                     }
                     let method_idx = 3;
@@ -323,16 +488,65 @@ impl PgHba {
                 _ => {
                     // type database user address method [options]
                     if tokens.len() < 5 {
+                        if strict_names {
+                            return Err(format!(
+                                "pg_hba line {}: too few fields for host pg_hba record",
+                                line_no + 1
+                            ));
+                        }
                         continue;
                     }
-                    let addr_token = &tokens[3];
-                    let address = parse_address(addr_token);
+                    let addr_token = &tokens[3].value;
+                    // parse_address returning None used
+                    // to fall through as "no address restriction" - the
+                    // resulting rule matched every TCP peer. PG semantics:
+                    // a malformed address makes the rule invalid; we drop
+                    // it and log a warning so operators notice.
+                    let address = match parse_address(addr_token) {
+                        Some(net) => net,
+                        None => {
+                            if strict_names {
+                                return Err(format!(
+                                    "pg_hba line {}: unsupported pg_hba address token \
+                                     '{addr_token}' (only CIDR forms like \
+                                     192.168.0.0/24 or 2001:db8::/32 are supported)",
+                                    line_no + 1
+                                ));
+                            }
+                            log::warn!(
+                                "[pg_hba] dropping rule with unsupported \
+                                 address token '{addr_token}' (only CIDR \
+                                 forms like 192.168.0.0/24 or \
+                                 2001:db8::/32 are supported)"
+                            );
+                            continue;
+                        }
+                    };
                     let method_idx = 4;
-                    (method_idx, address)
+                    (method_idx, Some(address))
                 }
             };
 
-            let method = AuthMethod::from_token(tokens[method_idx].as_str());
+            let method_token = tokens[method_idx].value.as_str();
+            let method = AuthMethod::from_token(method_token);
+            if let AuthMethod::Other(method_name) = &method {
+                if strict_names {
+                    return Err(format!(
+                        "pg_hba line {}: unsupported pg_hba auth method '{}'",
+                        line_no + 1,
+                        method_name
+                    ));
+                }
+                log::warn!("[pg_hba] dropping rule with unsupported auth method '{method_name}'");
+                continue;
+            }
+            if strict_names && tokens.len() > method_idx + 1 {
+                return Err(format!(
+                    "pg_hba line {}: unsupported pg_hba auth-options after method '{}'",
+                    line_no + 1,
+                    tokens[method_idx].value
+                ));
+            }
 
             rules.push(HbaRule {
                 host_type: ht,
@@ -342,7 +556,7 @@ impl PgHba {
                 method,
             });
         }
-        PgHba { rules }
+        Ok(PgHba { rules })
     }
 
     /// Evaluate given connection parameters against parsed HBA rules.
@@ -353,10 +567,9 @@ impl PgHba {
     /// - `username`: database user name
     /// - `database`: target database name
     ///
-    /// Returns `CheckResult::Trust` when a matching `trust` rule is found,
-    /// `CheckResult::Allow` when a matching rule with method equal to `type_auth` is found,
-    /// `CheckResult::Deny` only when a matching `reject` rule is encountered,
-    /// otherwise `CheckResult::NotMatched`.
+    /// Returns the decision from the first rule whose transport, database,
+    /// user, and address fields match. This mirrors PostgreSQL pg_hba rule
+    /// ordering: a later rule must not override an earlier method mismatch.
     pub fn check_hba(
         &self,
         transport: &ClientTransport,
@@ -364,10 +577,19 @@ impl PgHba {
         username: &str,
         database: &str,
     ) -> CheckResult {
-        let want = match type_auth.to_ascii_lowercase().as_str() {
-            "md5" => AuthMethod::Md5,
-            "scram-sha-256" | "scram_sha_256" | "scramsha256" => AuthMethod::ScramSha256,
-            _ => AuthMethod::Other(type_auth.to_string()),
+        // match case-insensitively without allocating a
+        // lowercased String per connection. Production callers pass the
+        // literal "md5" / "scram-sha-256", so the common path now does
+        // zero allocation.
+        let want = if type_auth.eq_ignore_ascii_case("md5") {
+            AuthMethod::Md5
+        } else if type_auth.eq_ignore_ascii_case("scram-sha-256")
+            || type_auth.eq_ignore_ascii_case("scram_sha_256")
+            || type_auth.eq_ignore_ascii_case("scramsha256")
+        {
+            AuthMethod::ScramSha256
+        } else {
+            AuthMethod::Other(type_auth.to_string())
         };
 
         for rule in &self.rules {
@@ -386,10 +608,17 @@ impl PgHba {
                     if !rule.host_type.matches_ssl(transport.is_tls()) {
                         continue;
                     }
-                    if let Some(net) = &rule.address {
-                        if !net.contains(&transport.hba_ip()) {
-                            continue;
+                    // defense-in-depth - even if
+                    // a future change ever lets `host*` rule reach here
+                    // with `address: None`, refuse to match instead of
+                    // falling through as "any address".
+                    match &rule.address {
+                        Some(net) => {
+                            if !net.contains(&transport.hba_ip()) {
+                                continue;
+                            }
                         }
+                        None => continue,
                     }
                 }
             }
@@ -398,12 +627,20 @@ impl PgHba {
                 continue;
             }
 
-            // First matching rule that applies decides.
+            // First matching rule that applies decides. PostgreSQL's `md5`
+            // method can still use SCRAM when the stored verifier is SCRAM, so
+            // treat it as compatible with both verifier families here.
             match rule.method {
                 AuthMethod::Trust => return CheckResult::Trust,
-                ref m if *m == want => return CheckResult::Allow,
                 AuthMethod::Reject => return CheckResult::Deny,
-                _ => continue, // different method: not a decision, keep searching
+                AuthMethod::Md5 if matches!(want, AuthMethod::Md5 | AuthMethod::ScramSha256) => {
+                    return CheckResult::Allow
+                }
+                AuthMethod::ScramSha256 if want == AuthMethod::ScramSha256 => {
+                    return CheckResult::Allow
+                }
+                ref m if *m == want => return CheckResult::Allow,
+                _ => return CheckResult::Deny,
             }
         }
         CheckResult::NotMatched
@@ -411,36 +648,68 @@ impl PgHba {
 }
 
 fn strip_comments(s: &str) -> &str {
-    match s.find('#') {
-        Some(idx) => &s[..idx],
-        None => s,
+    let mut in_quotes = false;
+    for (idx, c) in s.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes => return &s[..idx],
+            _ => {}
+        }
     }
+    s
 }
 
 /// Very small splitter that treats consecutive whitespace as separators and supports
 /// double-quoted tokens with spaces (like "db name"). It does not support escapes inside quotes.
-fn shell_like_split(line: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HbaToken {
+    value: String,
+    quoted: bool,
+    has_unquoted_comma: bool,
+}
+
+fn shell_like_split(line: &str) -> Result<Vec<HbaToken>, String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
+    let mut quoted = false;
+    let mut has_unquoted_comma = false;
 
     for c in line.chars() {
         match c {
             '"' => {
                 in_quotes = !in_quotes;
+                quoted = true;
+            }
+            ',' if !in_quotes => {
+                has_unquoted_comma = true;
+                cur.push(c);
             }
             c if c.is_whitespace() && !in_quotes => {
                 if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
+                    out.push(HbaToken {
+                        value: std::mem::take(&mut cur),
+                        quoted,
+                        has_unquoted_comma,
+                    });
+                    quoted = false;
+                    has_unquoted_comma = false;
                 }
             }
             _ => cur.push(c),
         }
     }
-    if !cur.is_empty() {
-        out.push(cur);
+    if in_quotes {
+        return Err("unterminated quoted token".to_string());
     }
-    out
+    if !cur.is_empty() {
+        out.push(HbaToken {
+            value: cur,
+            quoted,
+            has_unquoted_comma,
+        });
+    }
+    Ok(out)
 }
 
 fn parse_address(token: &str) -> Option<IpNet> {
@@ -506,6 +775,62 @@ hostnossl all all 127.0.0.1/32 trust
         assert_eq!(
             hba.check_hba(&tcp(ip3, false), "md5", "alice", "app"),
             CheckResult::Trust
+        );
+    }
+
+    /// `host` rule with IPv6 CIDR is supported by
+    /// `IpNet::from_str` and `parse_address`, but no test exercised
+    /// the v6 match path. Lock it in: an IPv6 peer inside the CIDR
+    /// matches; outside the CIDR rejects; an IPv4 peer never matches
+    /// a v6 rule (ipnet returns false for cross-family contains).
+    #[test]
+    fn host_rule_ipv6_cidr_matches_ipv6_peer_and_rejects_ipv4() {
+        let hba = PgHba::from_content("host all all 2001:db8::/32 md5\n");
+        let v6_inside: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6_outside: IpAddr = "fe80::1".parse().unwrap();
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(
+            hba.check_hba(&tcp(v6_inside, false), "md5", "u", "d"),
+            CheckResult::Allow
+        );
+        assert_eq!(
+            hba.check_hba(&tcp(v6_outside, false), "md5", "u", "d"),
+            CheckResult::NotMatched
+        );
+        assert_eq!(
+            hba.check_hba(&tcp(v4, false), "md5", "u", "d"),
+            CheckResult::NotMatched
+        );
+    }
+
+    /// a malformed address token (bare
+    /// IP without /N, `samenet`, hostname, IP+mask) used to parse to
+    /// `address: None` and silently match every TCP peer. Now we drop
+    /// the rule entirely so the next rule (or default deny) wins.
+    #[test]
+    fn bare_ip_and_unsupported_address_tokens_do_not_become_wildcards() {
+        // None of these tokens is a valid CIDR, so all four rules
+        // must be dropped at parse - nothing should match.
+        let hba = PgHba::from_content(
+            "\
+host all all 192.168.0.1 md5\n\
+host all all 10.0.0.0 255.0.0.0 md5\n\
+host all all db.example.com md5\n\
+host all all samenet md5\n\
+",
+        );
+        assert_eq!(
+            hba.rules.len(),
+            0,
+            "all rules with non-CIDR address tokens must be rejected"
+        );
+
+        // Sanity: a peer that would have matched the wildcard
+        // bypass now resolves NotMatched.
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "alice", "app"),
+            CheckResult::NotMatched
         );
     }
 
@@ -700,15 +1025,405 @@ hostnossl all all 127.0.0.1/32 trust
     }
 
     #[test]
-    fn local_scram_rule_returns_not_matched_for_md5_request() {
+    fn local_scram_rule_denies_md5_request() {
         // A local rule with a stricter auth method must not grant access to a
-        // weaker requested method — we return NotMatched so the caller can
-        // fall through to the next rule or deny.
+        // weaker requested method or fall through to a later rule.
         let hba = PgHba::from_content("local all all scram-sha-256");
         assert_eq!(
             hba.check_hba(&unix_transport(), "md5", "alice", "app"),
-            CheckResult::NotMatched
+            CheckResult::Deny
         );
+    }
+
+    #[test]
+    fn first_matching_scram_rule_blocks_later_trust_for_md5_request() {
+        let hba = PgHba::from_content(
+            "host all all 127.0.0.1/32 scram-sha-256\nhost all all 127.0.0.1/32 trust",
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "alice", "app"),
+            CheckResult::Deny
+        );
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "scram-sha-256", "alice", "app"),
+            CheckResult::Allow
+        );
+    }
+
+    #[test]
+    fn first_matching_md5_rule_does_not_fall_through_to_later_trust_for_scram_request() {
+        let hba =
+            PgHba::from_content("host all all 127.0.0.1/32 md5\nhost all all 127.0.0.1/32 trust");
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "scram-sha-256", "alice", "app"),
+            CheckResult::Allow
+        );
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "alice", "app"),
+            CheckResult::Allow
+        );
+    }
+
+    #[test]
+    fn comma_separated_user_list_is_first_match_decisive() {
+        let hba = PgHba::from_content(
+            "host all alice,bob 127.0.0.1/32 reject\nhost all all 127.0.0.1/32 trust",
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "alice", "app"),
+            CheckResult::Deny
+        );
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "bob", "app"),
+            CheckResult::Deny
+        );
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "carol", "app"),
+            CheckResult::Trust
+        );
+    }
+
+    #[test]
+    fn comma_separated_database_list_is_first_match_decisive() {
+        let hba = PgHba::from_content(
+            "host app,admin all 127.0.0.1/32 reject\nhost all all 127.0.0.1/32 trust",
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "alice", "app"),
+            CheckResult::Deny
+        );
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "alice", "admin"),
+            CheckResult::Deny
+        );
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "alice", "other"),
+            CheckResult::Trust
+        );
+    }
+
+    #[test]
+    fn serde_rejects_unsupported_database_user_tokens() {
+        let toml_in = r#"
+            hba = """
+            host all +admins 127.0.0.1/32 reject
+            """
+        "#;
+
+        let err = toml::from_str::<Wrapper>(toml_in)
+            .expect_err("unsupported pg_hba role tokens must reject config");
+
+        assert!(
+            err.to_string().contains("unsupported pg_hba"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serde_rejects_regex_database_user_tokens() {
+        for toml_in in [
+            r#"
+            hba = """
+            host /^tenant_/ all 127.0.0.1/32 reject
+            host all all 127.0.0.1/32 trust
+            """
+            "#,
+            r#"
+            hba = """
+            host all /^tenant_/ 127.0.0.1/32 reject
+            host all all 127.0.0.1/32 trust
+            """
+            "#,
+        ] {
+            let err = toml::from_str::<Wrapper>(toml_in)
+                .expect_err("unsupported pg_hba regex tokens must reject config");
+
+            assert!(
+                err.to_string().contains("unsupported pg_hba"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn serde_rejects_unsupported_address_tokens() {
+        let toml_in = r#"
+            hba = """
+            host all all samehost reject
+            host all all 0.0.0.0/0 trust
+            """
+        "#;
+
+        let err = toml::from_str::<Wrapper>(toml_in)
+            .expect_err("unsupported pg_hba address tokens must reject config");
+
+        assert!(
+            err.to_string().contains("unsupported pg_hba address token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serde_rejects_unsupported_record_types() {
+        let toml_in = r#"
+            hba = """
+            hostgssenc all all 127.0.0.1/32 reject
+            host all all 127.0.0.1/32 trust
+            """
+        "#;
+
+        let err = toml::from_str::<Wrapper>(toml_in)
+            .expect_err("unsupported pg_hba record types must reject config");
+
+        assert!(
+            err.to_string().contains("unsupported pg_hba record type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serde_rejects_too_short_records() {
+        let toml_in = r#"
+            hba = """
+            host all all
+            host all all 127.0.0.1/32 trust
+            """
+        "#;
+
+        let err = toml::from_str::<Wrapper>(toml_in)
+            .expect_err("truncated pg_hba records must reject config");
+
+        assert!(
+            err.to_string().contains("too few fields"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serde_rejects_unsupported_auth_options() {
+        let toml_in = r#"
+            hba = """
+            hostssl all all 0.0.0.0/0 trust clientcert=verify-full
+            """
+        "#;
+
+        let err = toml::from_str::<Wrapper>(toml_in)
+            .expect_err("unsupported pg_hba auth-options must reject config");
+
+        assert!(
+            err.to_string().contains("unsupported pg_hba auth-options"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serde_rejects_unsupported_auth_methods() {
+        let toml_in = r#"
+            hba = """
+            host all all 127.0.0.1/32 password
+            """
+        "#;
+
+        let err = toml::from_str::<Wrapper>(toml_in)
+            .expect_err("unsupported pg_hba auth methods must reject config");
+
+        assert!(
+            err.to_string().contains("unsupported pg_hba auth method"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serde_rejects_unquoted_replication_database_token() {
+        let toml_in = r#"
+            hba = """
+            host replication repl 127.0.0.1/32 trust
+            """
+        "#;
+
+        let err = toml::from_str::<Wrapper>(toml_in)
+            .expect_err("unquoted pg_hba replication database token must reject config");
+
+        assert!(
+            err.to_string().contains("replication"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serde_rejects_unterminated_quoted_tokens() {
+        for (field, line) in [
+            ("method", r#"host app alice 127.0.0.1/32 "trust"#),
+            ("database", r#"host "app all 127.0.0.1/32 trust"#),
+            ("user", r#"host app "alice 127.0.0.1/32 trust"#),
+            ("address", r#"host app alice "127.0.0.1/32 trust"#),
+        ] {
+            let toml_in = format!(
+                r#"
+                hba = """
+                {line}
+                """
+                "#
+            );
+
+            let err = match toml::from_str::<Wrapper>(&toml_in) {
+                Ok(_) => panic!("unterminated quoted {field} token must reject config"),
+                Err(err) => err,
+            };
+
+            assert!(
+                err.to_string().contains("unterminated quoted token"),
+                "unexpected error for {field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_hash_in_name_is_not_treated_as_comment() {
+        let toml_in = r##"
+            hba = """
+            host app "bob#prod" 127.0.0.1/32 reject
+            host all all 127.0.0.1/32 trust
+            """
+        "##;
+
+        let cfg: Wrapper =
+            toml::from_str(toml_in).expect("quoted # inside pg_hba name must parse as token data");
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            cfg.hba.check_hba(&tcp(ip, false), "md5", "bob#prod", "app"),
+            CheckResult::Deny,
+            "quoted # user rule must remain decisive before later trust"
+        );
+    }
+
+    #[test]
+    fn unquoted_replication_database_rule_does_not_match_normal_database() {
+        let hba = PgHba::from_content(
+            "host replication repl 127.0.0.1/32 trust\n\
+             host all all 127.0.0.1/32 reject",
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            hba.check_hba(&tcp(ip, false), "md5", "repl", "replication"),
+            CheckResult::Deny,
+            "unquoted replication is a PostgreSQL replication pseudo-database, \
+             not a normal database named replication"
+        );
+    }
+
+    #[test]
+    fn quoted_replication_database_is_literal_name() {
+        let toml_in = r#"
+            hba = """
+            host "replication" repl 127.0.0.1/32 trust
+            host all all 127.0.0.1/32 reject
+            """
+        "#;
+
+        let cfg: Wrapper = toml::from_str(toml_in)
+            .expect("quoted replication must parse as a literal database name");
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            cfg.hba
+                .check_hba(&tcp(ip, false), "md5", "repl", "replication"),
+            CheckResult::Trust
+        );
+        assert_eq!(
+            cfg.hba.check_hba(&tcp(ip, false), "md5", "repl", "app"),
+            CheckResult::Deny
+        );
+    }
+
+    #[test]
+    fn quoted_all_database_and_user_are_literals_not_wildcards() {
+        let toml_in = r#"
+            hba = """
+            host "all" "all" 127.0.0.1/32 trust
+            host all all 127.0.0.1/32 reject
+            """
+        "#;
+
+        let cfg: Wrapper = toml::from_str(toml_in)
+            .expect("quoted all in pg_hba names must parse as literal token data");
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            cfg.hba.check_hba(&tcp(ip, false), "md5", "alice", "app"),
+            CheckResult::Deny,
+            "quoted all must not wildcard arbitrary users/databases before a later reject"
+        );
+        assert_eq!(
+            cfg.hba.check_hba(&tcp(ip, false), "md5", "all", "all"),
+            CheckResult::Trust,
+            "quoted all still matches the literal database and user names"
+        );
+    }
+
+    #[test]
+    fn quoted_comma_user_is_literal_not_a_name_list() {
+        let toml_in = r#"
+            hba = """
+            host all "alice,bob" 127.0.0.1/32 trust
+            host all all 127.0.0.1/32 reject
+            """
+        "#;
+
+        let cfg: Wrapper = toml::from_str(toml_in)
+            .expect("quoted comma in pg_hba name must parse as literal token data");
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        assert_eq!(
+            cfg.hba.check_hba(&tcp(ip, false), "md5", "alice", "app"),
+            CheckResult::Deny,
+            "quoted comma names must not expand into a list before a later reject"
+        );
+        assert_eq!(
+            cfg.hba
+                .check_hba(&tcp(ip, false), "md5", "alice,bob", "app"),
+            CheckResult::Trust,
+            "quoted comma names still match the literal user name"
+        );
+    }
+
+    #[test]
+    fn serde_rejects_mixed_quoted_comma_list_name_tokens() {
+        for (field, line) in [
+            (
+                "database",
+                r#"host "app,admin",other all 127.0.0.1/32 trust"#,
+            ),
+            ("user", r#"host all "alice,bob",carol 127.0.0.1/32 trust"#),
+        ] {
+            let toml_in = format!(
+                r#"
+                hba = """
+                {line}
+                """
+                "#
+            );
+
+            let err = match toml::from_str::<Wrapper>(&toml_in) {
+                Ok(_) => panic!("mixed quoted comma-list {field} token must reject config"),
+                Err(err) => err,
+            };
+
+            assert!(
+                err.to_string().contains("mixed quoted comma-list"),
+                "unexpected error for {field}: {err}"
+            );
+        }
     }
 
     #[test]
