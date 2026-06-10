@@ -77,6 +77,13 @@ pub struct ClientIdentifier {
     pub is_talos: bool,
     pub hba_scram: CheckResult,
     pub hba_md5: CheckResult,
+    /// does this client speak to pg_doorman over TLS?
+    /// SCRAM channel-binding negotiation needs to know - per RFC 5802 §6 a
+    /// server that supports channel binding MUST reject the `gs2_flag='y'`
+    /// downgrade signal. pg_doorman terminates TLS, has a server cert, and
+    /// can therefore implement `tls-server-end-point` channel binding, so
+    /// accepting `'y'` over TLS is a MITM-friendly silent downgrade.
+    pub use_tls: bool,
 }
 
 impl ClientIdentifier {
@@ -94,6 +101,7 @@ impl ClientIdentifier {
             is_talos: false,
             hba_scram: CheckResult::NotMatched,
             hba_md5: CheckResult::NotMatched,
+            use_tls: false,
         }
     }
 }

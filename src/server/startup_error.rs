@@ -53,7 +53,7 @@ pub fn extract_parameter_name(message: &str) -> Option<String> {
 ///    message, server_identifier }`. Lets the checkout site forward the
 ///    PG sqlstate verbatim to the client, instead of the generic 53300
 ///    pool-exhausted fallback.
-/// 3. Otherwise → `ServerStartupError(<sqlstate>: <message>, …)`.
+/// 3. Otherwise -> `ServerStartupError(<sqlstate>: <message>, …)`.
 pub fn classify_pg_startup_error<'a, I>(
     sqlstate: String,
     message: String,
@@ -114,6 +114,28 @@ where
         }
     }
     None
+}
+
+/// Bound Prometheus label cardinality for startup-parameter backend
+/// rejections. The full PG SQLSTATE still travels in the forwarded
+/// `ErrorResponse` and logs; metrics only keep classes that are useful
+/// for operator triage.
+pub(crate) fn startup_parameter_sqlstate_metric_label(sqlstate: &str) -> &'static str {
+    let canonical = sqlstate.len() == 5
+        && sqlstate
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    if !canonical {
+        return "other";
+    }
+
+    match sqlstate {
+        c if c.starts_with("22") => "22",
+        c if c.starts_with("42") => "42",
+        c if c.starts_with("53") => "53",
+        c if c.starts_with("55") => "55",
+        _ => "other",
+    }
 }
 
 /// Handles error response during server startup. Surfaces the PG sqlstate
@@ -263,5 +285,17 @@ mod parameter_extractor_tests {
             match_sent_key_in_message(msg, &sent),
             Some("second_key".into())
         );
+    }
+
+    #[test]
+    fn startup_parameter_sqlstate_metric_label_is_bounded() {
+        assert_eq!(startup_parameter_sqlstate_metric_label("22023"), "22");
+        assert_eq!(startup_parameter_sqlstate_metric_label("42704"), "42");
+        assert_eq!(startup_parameter_sqlstate_metric_label("42501"), "42");
+        assert_eq!(startup_parameter_sqlstate_metric_label("53400"), "53");
+        assert_eq!(startup_parameter_sqlstate_metric_label("55P02"), "55");
+        assert_eq!(startup_parameter_sqlstate_metric_label("ZZ999"), "other");
+        assert_eq!(startup_parameter_sqlstate_metric_label("abc12"), "other");
+        assert_eq!(startup_parameter_sqlstate_metric_label("toolong"), "other");
     }
 }

@@ -4,12 +4,14 @@ use log::{debug, error, log_enabled, Level};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpStream, UnixStream};
 
-use crate::config::{get_config, Config};
+use crate::config::{config_arc, Config};
 
 /// Configure Unix socket parameters.
 pub fn configure_unix_socket(stream: &UnixStream) {
     let sock_ref = SockRef::from(stream);
-    let conf = get_config();
+    // Per-connection: borrow the live Arc<Config> instead of deep-cloning
+    // the whole Config just to read a few scalar `general` fields.
+    let conf = config_arc();
 
     match sock_ref.set_linger(Some(Duration::from_secs(conf.general.tcp_so_linger))) {
         Ok(_) => {}
@@ -40,7 +42,9 @@ pub fn configure_tcp_socket_for_cancel(stream: &TcpStream) {
 /// Configure TCP socket parameters.
 pub fn configure_tcp_socket(stream: &TcpStream) {
     let sock_ref = SockRef::from(stream);
-    let conf = get_config();
+    // Per-connection: borrow the live Arc<Config> instead of deep-cloning
+    // the whole Config just to read a few scalar `general` fields.
+    let conf = config_arc();
 
     match sock_ref.set_linger(Some(Duration::from_secs(conf.general.tcp_so_linger))) {
         Ok(_) => {}
@@ -61,7 +65,9 @@ pub fn configure_tcp_socket(stream: &TcpStream) {
 /// `tcp_so_linger = 0` can turn a normal HTTP close into a reset.
 pub fn configure_web_tcp_socket(stream: &TcpStream) {
     let sock_ref = SockRef::from(stream);
-    let conf = get_config();
+    // Borrow the live Arc<Config> instead of deep-cloning the whole Config
+    // just to read a few scalar `general` fields.
+    let conf = config_arc();
 
     match sock_ref.set_tcp_nodelay(conf.general.tcp_no_delay) {
         Ok(_) => {}

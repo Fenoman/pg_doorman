@@ -48,6 +48,10 @@ pub struct PreparedCacheSnapshot {
     pub anonymous_count: u64,
     /// Monotonic counter of Anonymous LRU evictions for this client.
     pub anonymous_evictions: u64,
+    /// monotonic counter of Named cap evictions.
+    /// Surfaced via SHOW POOLS_MEMORY so operators have admin-side
+    /// visibility into per-client cap pressure.
+    pub named_evictions: u64,
 }
 
 impl PreparedCacheSnapshot {
@@ -58,6 +62,7 @@ impl PreparedCacheSnapshot {
         named_count: u64,
         anonymous_count: u64,
         anonymous_evictions: u64,
+        named_evictions: u64,
     ) -> Self {
         Self {
             total_count: named_count + anonymous_count,
@@ -65,6 +70,7 @@ impl PreparedCacheSnapshot {
             named_count,
             anonymous_count,
             anonymous_evictions,
+            named_evictions,
         }
     }
 }
@@ -85,6 +91,9 @@ pub struct ClientStats {
     application_name: String,
     /// PostgreSQL username used for the connection
     username: String,
+    /// PostgreSQL username used for backend pool routing. Normally equal to
+    /// `username`; auth_query dedicated mode routes through server_user.
+    pool_user: String,
     /// Name of the connection pool this client is using
     pool_name: String,
     /// IP address of the client
@@ -114,7 +123,16 @@ pub struct ClientStats {
     pub transaction_count: AtomicU64,
     /// Number of queries executed by this client
     pub query_count: AtomicU64,
-    /// Number of errors encountered by this client
+    /// Number of pooler-side errors encountered by this client. Only counts
+    /// pooler / protocol / checkout failures (`53000` resource exhausted,
+    /// `53300` no available servers, `ServerStartupParameterRejection`,
+    /// etc.). Does NOT count PG-side SQL errors (`23xxx`, `40xxx`,
+    /// `42xxx`) - those are application-level and counted at the
+    /// per-pool address level via `pg_doorman_pools_errors_total{sqlstate}`.
+    ///
+    /// documented to distinguish from per-server SQL errors
+    /// so alerts on `error_count > 0` don't fire on routine application
+    /// errors (e.g. `INSERT ... ON CONFLICT` unique-violation traffic).
     pub error_count: AtomicU64,
 
     /// Nanoseconds elapsed since `connect_time` at the moment of the latest
@@ -135,6 +153,12 @@ pub struct ClientStats {
     pub prepared_anonymous_count: AtomicU64,
     /// Cumulative count of Anonymous LRU evictions in client's prepared statement cache
     pub prepared_anonymous_evictions: AtomicU64,
+    /// cumulative Named LRU evictions from cap pressure.
+    /// Mirrored from `PreparedStatementState.named_evictions` via
+    /// `update_prepared_cache_stats` so SHOW POOLS_MEMORY / SHOW CLIENTS
+    /// can attribute per-client cap pressure (Prometheus alone showed it
+    /// before; admin queries had no visibility).
+    pub prepared_named_evictions: AtomicU64,
     /// Whether this client is async (uses Flush instead of Sync)
     pub is_async_client: AtomicBool,
 }
@@ -156,6 +180,7 @@ impl Default for ClientStats {
             connect_time: clock::now(),
             application_name: String::new(),
             username: String::new(),
+            pool_user: String::new(),
             pool_name: String::new(),
             ipaddr: String::new(),
             total_wait_time: AtomicU64::new(0),
@@ -170,6 +195,7 @@ impl Default for ClientStats {
             prepared_named_count: AtomicU64::new(0),
             prepared_anonymous_count: AtomicU64::new(0),
             prepared_anonymous_evictions: AtomicU64::new(0),
+            prepared_named_evictions: AtomicU64::new(0),
             is_async_client: AtomicBool::new(false),
             reporter: get_reporter(),
             use_tls: false,
@@ -205,7 +231,7 @@ impl ClientStats {
     ///
     /// Groups: 1 = active, 2 = idle, 3 = waiting, 0 = other.
     /// The timestamp is written only on cross-group transitions so that
-    /// intra-group flips (e.g. ACTIVE_READ ↔ ACTIVE_WRITE) don't pay the
+    /// intra-group flips (e.g. ACTIVE_READ <-> ACTIVE_WRITE) don't pay the
     /// clock cost per query.
     #[inline(always)]
     fn state_group(state: u8) -> u8 {
@@ -274,11 +300,37 @@ impl ClientStats {
         connect_time: quanta::Instant,
         use_tls: bool,
     ) -> Self {
+        Self::new_with_pool_user(
+            connection_id,
+            application_name,
+            username,
+            pool_name,
+            username,
+            ipaddr,
+            connect_time,
+            use_tls,
+        )
+    }
+
+    /// Creates a new ClientStats instance with a route user that can differ
+    /// from the authenticated client username.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_pool_user(
+        connection_id: u64,
+        application_name: &str,
+        username: &str,
+        pool_name: &str,
+        pool_user: &str,
+        ipaddr: &str,
+        connect_time: quanta::Instant,
+        use_tls: bool,
+    ) -> Self {
         Self {
             connection_id,
             connect_time,
             application_name: application_name.to_string(),
             username: username.to_string(),
+            pool_user: pool_user.to_string(),
             pool_name: pool_name.to_string(),
             ipaddr: ipaddr.to_string(),
             use_tls,
@@ -413,6 +465,19 @@ impl ClientStats {
         self.transaction_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the error counter.
+    ///
+    /// this field used to be populated only in unit-test setups. Every
+    /// SHOW CLIENTS / `/api/clients` / `/api/top/clients?by=errors` row
+    /// therefore reported zero errors in production, even when
+    /// `pools_errors_total` Prometheus counter was climbing. Wire this
+    /// alongside the existing per-pool `error_with_sqlstate` calls so the
+    /// per-client view reflects reality.
+    #[inline(always)]
+    pub fn error(&self) {
+        self.error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     //
     // Accessor methods for SHOW CLIENTS command
     // ------------------------------------------------------------------------------------------
@@ -445,6 +510,12 @@ impl ClientStats {
     #[inline(always)]
     pub fn username(&self) -> &str {
         &self.username
+    }
+
+    /// Returns the backend pool user this client is routed through.
+    #[inline(always)]
+    pub fn pool_user(&self) -> &str {
+        &self.pool_user
     }
 
     /// Returns the name of the connection pool this client is using.
@@ -489,6 +560,9 @@ impl ClientStats {
             .store(snap.anonymous_count, Ordering::Relaxed);
         self.prepared_anonymous_evictions
             .store(snap.anonymous_evictions, Ordering::Relaxed);
+        // mirror named_evictions for SHOW POOLS_MEMORY.
+        self.prepared_named_evictions
+            .store(snap.named_evictions, Ordering::Relaxed);
     }
 
     /// Returns the number of entries in the client's prepared statement cache.
@@ -577,6 +651,7 @@ mod tests {
         assert_eq!(stats.connection_id(), 0);
         assert_eq!(stats.application_name(), "");
         assert_eq!(stats.username(), "");
+        assert_eq!(stats.pool_user(), "");
         assert_eq!(stats.pool_name(), "");
         assert_eq!(stats.ipaddr(), "");
         assert!(!stats.tls());
@@ -613,6 +688,7 @@ mod tests {
         assert_eq!(stats.connection_id(), 42);
         assert_eq!(stats.application_name(), "test_app");
         assert_eq!(stats.username(), "test_user");
+        assert_eq!(stats.pool_user(), "test_user");
         assert_eq!(stats.pool_name(), "test_pool");
         assert_eq!(stats.ipaddr(), "127.0.0.1");
         assert_eq!(stats.connect_time(), now);
@@ -706,6 +782,24 @@ mod tests {
     }
 
     #[test]
+    fn test_client_stats_new_with_pool_user_keeps_identity_and_route_separate() {
+        let stats = ClientStats::new_with_pool_user(
+            7,
+            "test_app",
+            "authenticated_user",
+            "test_pool",
+            "shared_backend_user",
+            "127.0.0.1",
+            clock::now(),
+            false,
+        );
+
+        assert_eq!(stats.username(), "authenticated_user");
+        assert_eq!(stats.pool_user(), "shared_backend_user");
+        assert_eq!(stats.pool_name(), "test_pool");
+    }
+
+    #[test]
     fn test_state_conversion_methods() {
         let stats = ClientStats::default();
 
@@ -783,12 +877,13 @@ mod tests {
     fn prepared_cache_snapshot_total_count_is_sum() {
         // PreparedCacheSnapshot::new must compute total_count as named + anonymous;
         // this is the structural guarantee the setter relies on.
-        let snap = PreparedCacheSnapshot::new(1024, 5, 7, 0);
+        let snap = PreparedCacheSnapshot::new(1024, 5, 7, 0, 0);
         assert_eq!(snap.total_count, 12);
         assert_eq!(snap.total_bytes, 1024);
         assert_eq!(snap.named_count, 5);
         assert_eq!(snap.anonymous_count, 7);
         assert_eq!(snap.anonymous_evictions, 0);
+        assert_eq!(snap.named_evictions, 0);
     }
 
     // Hand-built snapshots that violate total_count == named + anonymous must
@@ -806,6 +901,7 @@ mod tests {
             named_count: 5,
             anonymous_count: 7,
             anonymous_evictions: 0,
+            named_evictions: 0,
         };
         stats.set_prepared_cache_stats(bogus);
     }
