@@ -153,7 +153,8 @@ fn parse_filter(s: &str) -> Result<(LevelFilter, Vec<(String, LevelFilter)>), St
             let module = module.trim();
             let level = parse_level(level_str.trim())?;
             if module.len() > 256 {
-                return Err(format!("Module path too long: {}", &module[..64]));
+                let preview: String = module.chars().take(64).collect();
+                return Err(format!("Module path too long: {preview}"));
             }
             modules.push((module.to_string(), level));
         } else {
@@ -181,8 +182,7 @@ fn parse_level(s: &str) -> Result<LevelFilter, String> {
         "trace" => Ok(LevelFilter::Trace),
         "off" => Ok(LevelFilter::Off),
         _ => Err(format!(
-            "Invalid log level '{}'. Valid: error, warn, info, debug, trace, off",
-            s
+            "Invalid log level '{s}'. Valid: error, warn, info, debug, trace, off"
         )),
     }
 }
@@ -241,6 +241,22 @@ mod tests {
     #[test]
     fn test_parse_filter_multiple_base_levels() {
         assert!(parse_filter("info,debug").is_err());
+    }
+
+    #[test]
+    fn test_parse_filter_overlong_utf8_module_returns_error() {
+        let module = format!("{}é{}", "a".repeat(63), "b".repeat(194));
+        let input = format!("{module}=debug");
+
+        let result = std::panic::catch_unwind(|| parse_filter(&input));
+        assert!(
+            result.is_ok(),
+            "overlong UTF-8 module path must return Err, not panic"
+        );
+        let err = result
+            .unwrap()
+            .expect_err("overlong module path must be rejected");
+        assert!(err.contains("Module path too long"));
     }
 
     #[test]

@@ -42,6 +42,13 @@ pub struct Args {
     pub inherit_fd: Option<i32>,
 
     #[arg(
+        long,
+        env,
+        help = "inherit Unix listener file descriptor from parent process (for binary upgrade)"
+    )]
+    pub inherit_unix_fd: Option<i32>,
+
+    #[arg(
         short = 't',
         long = "test-config",
         default_value_t = false,

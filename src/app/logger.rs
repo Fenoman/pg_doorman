@@ -179,12 +179,7 @@ impl Log for JsonLogger {
 
         let _ = writeln!(
             std::io::stderr(),
-            r#"{{"timestamp":"{}","level":"{}","file":"{}","line":{},"message":"{}"}}"#,
-            timestamp,
-            level,
-            file,
-            line,
-            escaped,
+            r#"{{"timestamp":"{timestamp}","level":"{level}","file":"{file}","line":{line},"message":"{escaped}"}}"#,
         );
     }
 

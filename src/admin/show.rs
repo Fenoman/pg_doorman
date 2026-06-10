@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
+use log::warn;
 
 use crate::app::log_level;
 use crate::config::{get_config, VERSION};
@@ -22,6 +23,49 @@ use crate::stats::{
     get_client_stats, get_server_stats, CANCEL_CONNECTION_COUNTER, PLAIN_CONNECTION_COUNTER,
     TLS_CONNECTION_COUNTER, TOTAL_CONNECTION_COUNTER,
 };
+
+const SHOW_PREPARED_STATEMENTS_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const SHOW_PREPARED_STATEMENTS_TRAILER_BYTES: usize = 1024;
+
+fn put_prepared_statement_row_with_budget(
+    res: &mut BytesMut,
+    row: [String; 6],
+    max_response_bytes: usize,
+) -> bool {
+    let row = data_row(&row);
+    if res
+        .len()
+        .saturating_add(row.len())
+        .saturating_add(SHOW_PREPARED_STATEMENTS_TRAILER_BYTES)
+        > max_response_bytes
+    {
+        return false;
+    }
+    res.put(row);
+    true
+}
+
+fn prepared_statement_query_preview(query: &str) -> String {
+    crate::utils::strings::preview_query(query)
+}
+
+fn prepared_statement_row(
+    pool: String,
+    hash: u64,
+    name: String,
+    query: &str,
+    count_used: u64,
+    kind: &'static str,
+) -> [String; 6] {
+    [
+        pool,
+        hash.to_string(),
+        name,
+        prepared_statement_query_preview(query),
+        count_used.to_string(),
+        kind.to_string(),
+    ]
+}
 
 /// Column-oriented statistics.
 pub async fn show_lists<T>(stream: &mut T) -> Result<(), Error>
@@ -93,7 +137,7 @@ where
 {
     let mut res = BytesMut::new();
     res.put(row_description(&vec![("version", DataType::Text)]));
-    res.put(data_row(&[format!("PgDoorman {}", VERSION)]));
+    res.put(data_row(&[format!("PgDoorman {VERSION}")]));
     res.put(command_complete("SHOW"));
     res.put_u8(b'Z');
     res.put_i32(5);
@@ -172,20 +216,51 @@ where
     let mut res = BytesMut::new();
     res.put(row_description(&columns));
 
-    for (identifier, pool) in get_all_pools().iter() {
+    let mut truncated = false;
+    'pools: for (identifier, pool) in get_all_pools().iter() {
         if let Some(cache) = pool.prepared_statement_cache.as_ref() {
-            let entries = cache.get_entries();
-            for (hash, parse, last_used, kind, _hits, _misses) in entries {
-                res.put(data_row(&[
+            let completed = cache.for_each_entry_until(|hash, parse, last_used, kind, _, _| {
+                let row = prepared_statement_row(
                     identifier.to_string(),
-                    hash.to_string(),
+                    hash,
                     parse.name.clone(),
-                    parse.query().to_string(),
-                    last_used.to_string(),
-                    kind.as_str().to_string(),
-                ]));
+                    parse.query(),
+                    last_used,
+                    kind.as_str(),
+                );
+                if !put_prepared_statement_row_with_budget(
+                    &mut res,
+                    row,
+                    SHOW_PREPARED_STATEMENTS_MAX_RESPONSE_BYTES,
+                ) {
+                    truncated = true;
+                    return false;
+                }
+                true
+            });
+            if !completed {
+                break 'pools;
             }
         }
+    }
+    if truncated {
+        warn!(
+            "SHOW PREPARED_STATEMENTS response truncated at {SHOW_PREPARED_STATEMENTS_MAX_RESPONSE_BYTES} bytes"
+        );
+        let _ = put_prepared_statement_row_with_budget(
+            &mut res,
+            [
+                "__truncated__".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                format!(
+                    "output truncated at {SHOW_PREPARED_STATEMENTS_MAX_RESPONSE_BYTES} bytes; use /api/prepared/text/<hash> for full SQL"
+                ),
+                "0".to_string(),
+                "truncated".to_string(),
+            ],
+            SHOW_PREPARED_STATEMENTS_MAX_RESPONSE_BYTES,
+        );
     }
 
     res.put(command_complete("SHOW"));
@@ -202,7 +277,7 @@ pub async fn show_interner<T>(stream: &mut T) -> Result<(), Error>
 where
     T: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    use crate::server::{anon_snapshot, named_snapshot};
+    use crate::server::{anon_stats, named_stats};
 
     let columns = vec![
         ("kind", DataType::Text),
@@ -212,20 +287,18 @@ where
     let mut res = BytesMut::new();
     res.put(row_description(&columns));
 
-    let named = named_snapshot();
-    let anon = anon_snapshot();
-    let named_bytes: u64 = named.iter().map(|(_, e)| e.text().len() as u64).sum();
-    let anon_bytes: u64 = anon.iter().map(|(_, e)| e.text().len() as u64).sum();
+    let named = named_stats();
+    let anon = anon_stats();
 
     res.put(data_row(&[
         "named".to_string(),
-        named.len().to_string(),
-        named_bytes.to_string(),
+        named.entries.to_string(),
+        named.bytes.to_string(),
     ]));
     res.put(data_row(&[
         "anonymous".to_string(),
-        anon.len().to_string(),
-        anon_bytes.to_string(),
+        anon.entries.to_string(),
+        anon.bytes.to_string(),
     ]));
 
     res.put(command_complete("SHOW"));
@@ -323,7 +396,7 @@ pub async fn show_pools_extended<T>(stream: &mut T) -> Result<(), Error>
 where
     T: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    let pool_lookup = PoolStats::construct_pool_lookup();
+    let pool_lookup = PoolStats::construct_pool_lookup_fresh_percentiles();
     let mut res = BytesMut::new();
     res.put(row_description(
         &PoolStats::generate_show_pools_extended_header(),
@@ -550,7 +623,7 @@ where
     let tls = TLS_CONNECTION_COUNTER.load(Ordering::Relaxed);
     let plain = PLAIN_CONNECTION_COUNTER.load(Ordering::Relaxed);
     let cancel = CANCEL_CONNECTION_COUNTER.load(Ordering::Relaxed);
-    let error = total - tls - plain - cancel;
+    let error = show_connections_error_count(total, tls, plain, cancel);
     let row = vec![
         total.to_string(),
         error.to_string(),
@@ -565,6 +638,13 @@ where
     res.put_i32(5);
     res.put_u8(b'I');
     write_all_half(stream, &res).await
+}
+
+fn show_connections_error_count(total: usize, tls: usize, plain: usize, cancel: usize) -> usize {
+    total
+        .saturating_sub(tls)
+        .saturating_sub(plain)
+        .saturating_sub(cancel)
 }
 
 /// Show currently connected servers
@@ -594,13 +674,16 @@ where
     let mut res = BytesMut::new();
     res.put(row_description(&columns));
     for (_, server) in new_map {
-        let application_name = server.application_name.lock();
+        // ServerStats.application_name is now `ArcSwap<String>`;
+        // `application_name()` returns an owned String for the admin
+        // row builder which needs `String` ownership downstream.
+        let application_name = server.application_name();
         let row = vec![
             format!("{:#010X}", server.server_id()),
             server.process_id().to_string(),
             server.pool_name().to_string(),
             server.username().to_string(),
-            application_name.clone(),
+            application_name,
             server.tls().to_string(),
             server.state_str().to_string(),
             server.wait_str().to_string(),
@@ -924,4 +1007,86 @@ where
     res.put_i32(5);
     res.put_u8(b'I');
     write_all_half(stream, &res).await
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+
+    #[test]
+    fn show_prepared_statement_row_renders_query_preview_not_full_sql() {
+        let long_tail = "x".repeat(4096);
+        let query = format!("SELECT '{long_tail}'");
+        let row = super::prepared_statement_row(
+            "test_user@test_db".to_string(),
+            0xfeed,
+            "stmt_long".to_string(),
+            &query,
+            0,
+            "named",
+        );
+
+        assert!(
+            !row[3].contains(&"x".repeat(256)),
+            "admin output must not include the full long SQL body"
+        );
+        assert!(
+            row[3].contains(&"x".repeat(64)),
+            "admin output should still include a useful query preview"
+        );
+    }
+
+    #[test]
+    fn show_prepared_statement_rows_stop_at_response_budget() {
+        let mut response = BytesMut::from(&b"header"[..]);
+        let before = response.clone();
+        let row = [
+            "test_user@test_db".to_string(),
+            "1".to_string(),
+            "stmt".to_string(),
+            "SELECT 1".to_string(),
+            "0".to_string(),
+            "named".to_string(),
+        ];
+
+        assert!(
+            !super::put_prepared_statement_row_with_budget(&mut response, row, before.len() + 8),
+            "row renderer must refuse rows that would exceed the response budget"
+        );
+        assert_eq!(response, before, "rejected row must not partially append");
+    }
+
+    #[test]
+    fn show_connections_errors_saturate_when_categories_exceed_total() {
+        assert_eq!(
+            super::show_connections_error_count(10, 8, 5, 0),
+            0,
+            "derived error count must not wrap when category counters race ahead of total"
+        );
+    }
+
+    #[test]
+    fn show_interner_aggregate_does_not_materialize_snapshots() {
+        let src = include_str!("show.rs");
+        let start = src
+            .find("pub async fn show_interner<T>")
+            .expect("SHOW INTERNER aggregate handler must exist");
+        let end = src
+            .find("pub async fn show_interner_top<T>")
+            .expect("SHOW INTERNER TOP handler should follow aggregate handler");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("named_stats()"),
+            "SHOW INTERNER aggregate must use O(1) named interner stats"
+        );
+        assert!(
+            body.contains("anon_stats()"),
+            "SHOW INTERNER aggregate must use O(1) anonymous interner stats"
+        );
+        assert!(
+            !body.contains("named_snapshot()") && !body.contains("anon_snapshot()"),
+            "SHOW INTERNER aggregate must not clone full interner snapshots"
+        );
+    }
 }

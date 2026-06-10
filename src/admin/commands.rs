@@ -26,9 +26,17 @@ where
     // immediately, but the operator watching the UI is the one who
     // usually needs the visual breadcrumb when the deploy step quietly
     // fails.
+    // differentiate "changed" vs
+    // "unchanged" like the SIGHUP path (server.rs) does. Pre-fix
+    // both arms collapsed to "config reloaded" - operators reading
+    // the events ring could not tell a no-op apart from an actual
+    // diff application.
     match reload_config(client_server_map).await {
-        Ok(_) => {
+        Ok(true) => {
             crate::admin::events::push_event("RELOAD", "config reloaded".to_string());
+        }
+        Ok(false) => {
+            crate::admin::events::push_event("RELOAD", "config unchanged".to_string());
         }
         Err(e) => {
             crate::admin::events::push_event_rate_limited(

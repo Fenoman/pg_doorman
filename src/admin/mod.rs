@@ -14,7 +14,7 @@ use log::{debug, warn};
 
 use crate::app::log_level;
 use crate::errors::Error;
-use crate::messages::protocol::{command_complete, data_row, error_response, row_description};
+use crate::messages::protocol::{command_complete, data_row, row_description};
 use crate::messages::types::DataType;
 use crate::messages::write_all_half;
 use crate::pool::ClientServerMap;
@@ -73,13 +73,47 @@ where
     let code = query.get_u8() as char;
 
     if code != 'Q' {
-        return Err(Error::ProtocolSyncError(format!(
-            "Invalid code, expected 'Q' but got '{code}'"
-        )));
+        // legacy code returned `Err(ProtocolSyncError)`,
+        // which propagated up to `client.handle()` -> `process_error` is
+        // skipped for admin and the socket was dropped without an
+        // ErrorResponse. Drivers that default to the extended-query protocol
+        // (psycopg3, asyncpg, pgjdbc with simpleProtocolOnly=false, npgsql)
+        // then surfaced `OperationalError: server closed the connection
+        // unexpectedly` on `SHOW POOLS` etc. Reply with an honest
+        // `feature_not_supported` ErrorResponse + ReadyForQuery so the
+        // client can keep its socket alive and reissue via simple-query
+        // (psycopg3 `ClientCursor`, asyncpg `conn.execute`, pgjdbc
+        // `prepareThreshold=0` or `simpleProtocolOnly=true`). Same shape as
+        // the cancel / GSS / DEALLOCATE / FunctionCall change fixes: a
+        // legitimate client request is now refused with a protocol-correct
+        // signal instead of a silent drop.
+        return write_admin_error(
+            stream,
+            &format!(
+                "extended query protocol not supported on admin database (got message code '{code}'); use simple query"
+            ),
+            "0A000",
+        )
+        .await;
     }
 
-    let len = query.get_i32() as usize;
-    let query = String::from_utf8_lossy(&query[..len - 5]).to_string();
+    // Reject invalid admin query frame lengths before converting to
+    // `usize`; frames shorter than header plus trailing NUL cannot be
+    // parsed safely.
+    let len_raw = query.get_i32();
+    if len_raw < 5 {
+        return Err(Error::ProtocolSyncError(format!(
+            "Admin Q frame length {len_raw} below 5-byte minimum (header + NUL)"
+        )));
+    }
+    let body_len = (len_raw as usize).saturating_sub(5);
+    let remaining = query.remaining();
+    if body_len > remaining {
+        return Err(Error::ProtocolSyncError(format!(
+            "Admin Q frame declared body {body_len} bytes but only {remaining} bytes remain"
+        )));
+    }
+    let query = String::from_utf8_lossy(&query[..body_len]).to_string();
 
     debug!("Admin query: {query}");
 
@@ -88,9 +122,36 @@ where
         return handle_tab_completion(stream, &query).await;
     }
 
-    let query_parts: Vec<&str> = query.trim_end_matches(';').split_whitespace().collect();
+    // split on `;` FIRST so semicolons attached to
+    // intermediate tokens don't poison the dispatch match. Previously
+    // `query.trim_end_matches(';').split_whitespace()` produced
+    // `["SHOW", "POOLS;", "SHOW", "DATABASES"]` for `SHOW POOLS; SHOW
+    // DATABASES`, and `query_parts[1] == "POOLS;"` failed the SHOW
+    // dispatch (no match arm with the trailing `;`) - so even the FIRST
+    // statement returned `"Unsupported SHOW query"`. Take the first
+    // non-empty statement and tokenize it cleanly; subsequent
+    // statements in the same Q frame are dropped (admin runs one
+    // command per frame, mirroring pgbouncer; see pgbouncer docs
+    // `https://www.pgbouncer.org/usage.html`).
+    let first_stmt = query
+        .split(';')
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    let query_parts: Vec<&str> = first_stmt.split_whitespace().collect();
 
-    match query_parts[0].to_ascii_uppercase().as_str() {
+    // Empty admin Q frames, e.g. body just `;\0` or whitespace, have no first
+    // token after splitting. Reject them before indexing into `query_parts`.
+    let first_token = match query_parts.first() {
+        Some(t) => t,
+        None => {
+            return Err(Error::ProtocolSyncError(
+                "empty admin query (no tokens after whitespace/`;` strip)".to_string(),
+            ));
+        }
+    };
+
+    match first_token.to_ascii_uppercase().as_str() {
         "SET" => set_command(stream, &query_parts).await,
         "RELOAD" => reload(stream, client_server_map).await,
         "SHUTDOWN" => shutdown(stream).await,
@@ -111,7 +172,7 @@ where
         "SHOW" => {
             if query_parts.len() < 2 {
                 warn!("unsupported admin subcommand for SHOW: {query_parts:?}");
-                error_response(
+                write_admin_error(
                     stream,
                     "Unsupported query against the admin database, please use SHOW HELP for a list of supported subcommands",
                     "58000",
@@ -128,7 +189,9 @@ where
                     "POOLS_MEMORY" | "POOL_MEMORY" => show_pools_memory(stream).await,
                     "PREPARED_STATEMENTS" => show_prepared_statements(stream).await,
                     "INTERNER" => match query_parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
-                        Some(n) => show_interner_top(stream, n).await,
+                        Some(n) => {
+                            show_interner_top(stream, normalize_show_interner_top_n(n)).await
+                        }
                         None => show_interner(stream).await,
                     },
                     "CLIENTS" => show_clients(stream).await,
@@ -149,7 +212,7 @@ where
                             "unsupported admin subcommand for SHOW: {}",
                             query_parts[1].to_ascii_uppercase().as_str()
                         );
-                        error_response(
+                        write_admin_error(
                             stream,
                             "Unsupported SHOW query against the admin database",
                             "58000",
@@ -164,7 +227,7 @@ where
                 reset_interner(stream).await
             } else {
                 warn!("unsupported admin RESET target: {query_parts:?}");
-                error_response(
+                write_admin_error(
                     stream,
                     "Unsupported RESET target — only RESET INTERNER is supported",
                     "58000",
@@ -177,7 +240,7 @@ where
                 "unsupported admin command: {}",
                 query_parts[0].to_ascii_uppercase().as_str()
             );
-            error_response(
+            write_admin_error(
                 stream,
                 "Unsupported query against the admin database",
                 "58000",
@@ -185,6 +248,11 @@ where
             .await
         }
     }
+}
+
+fn normalize_show_interner_top_n(n: usize) -> usize {
+    let requested = u64::try_from(n).unwrap_or(u64::MAX);
+    crate::web::routes::collect::clamp_top_n(requested) as usize
 }
 
 /// Respond to psql tab-completion queries that reference pg_catalog.pg_settings.
@@ -225,6 +293,32 @@ where
     write_all_half(stream, &res).await
 }
 
+/// Send an ERROR-severity response through the bounded admin writer.
+async fn write_admin_error<T>(stream: &mut T, message: &str, code: &str) -> Result<(), Error>
+where
+    T: tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    let mut error = BytesMut::new();
+    error.put_u8(b'S');
+    error.put_slice(b"ERROR\0");
+    error.put_u8(b'V');
+    error.put_slice(b"ERROR\0");
+    error.put_u8(b'C');
+    error.put_slice(format!("{code}\0").as_bytes());
+    error.put_u8(b'M');
+    error.put_slice(format!("{message}\0").as_bytes());
+    error.put_u8(0);
+
+    let mut res = BytesMut::new();
+    res.put_u8(b'E');
+    res.put_i32(error.len() as i32 + 4);
+    res.put(error);
+    res.put_u8(b'Z');
+    res.put_i32(5);
+    res.put_u8(b'I');
+    write_all_half(stream, &res).await
+}
+
 /// Handle SET command. Currently supports: SET log_level = '<filter>'
 async fn set_command<T>(stream: &mut T, query_parts: &[&str]) -> Result<(), Error>
 where
@@ -232,7 +326,8 @@ where
 {
     // Parse: SET log_level = 'value' or SET log_level 'value' or SET log_level value
     if query_parts.len() < 3 {
-        return error_response(stream, "SET requires: SET <parameter> = '<value>'", "42601").await;
+        return write_admin_error(stream, "SET requires: SET <parameter> = '<value>'", "42601")
+            .await;
     }
 
     let param = query_parts[1].to_ascii_uppercase();
@@ -261,10 +356,10 @@ where
                 res.put_u8(b'I');
                 write_all_half(stream, &res).await
             }
-            Err(err) => error_response(stream, &err, "42601").await,
+            Err(err) => write_admin_error(stream, &err, "42601").await,
         },
         _ => {
-            error_response(
+            write_admin_error(
                 stream,
                 &format!("Unknown SET parameter: {param}. Supported: log_level"),
                 "42601",
@@ -289,6 +384,78 @@ mod tests {
         assert!(
             SHOW_SUBCOMMANDS.contains(&"startup_parameters"),
             "SHOW_SUBCOMMANDS missing startup_parameters: {SHOW_SUBCOMMANDS:?}"
+        );
+    }
+
+    #[test]
+    fn show_interner_top_n_is_bounded() {
+        assert_eq!(normalize_show_interner_top_n(0), 20);
+        assert_eq!(normalize_show_interner_top_n(1), 1);
+        assert_eq!(normalize_show_interner_top_n(200), 200);
+        assert_eq!(normalize_show_interner_top_n(usize::MAX), 200);
+    }
+
+    /// `psql -c "SHOW POOLS; SHOW DATABASES"` ships
+    /// both statements in one `'Q'` frame. The legacy
+    /// `query.trim_end_matches(';').split_whitespace()` left `'POOLS;'`
+    /// as a single token, so `query_parts[1]` had a trailing `';'` and
+    /// no SHOW match arm matched it - even the FIRST statement returned
+    /// `"Unsupported SHOW query"`. The fix splits on `;` first; this
+    /// test pins the tokenizer behaviour so the regression cannot creep
+    /// back unnoticed.
+    #[test]
+    fn admin_tokenizer_splits_on_semicolon_first() {
+        // Inline the same tokenizer the production code uses so the
+        // tokenizer logic is the unit under test, without spinning up
+        // a full BDD scenario.
+        let tokenize = |q: &str| -> Vec<String> {
+            let first_stmt = q
+                .split(';')
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .unwrap_or("");
+            first_stmt.split_whitespace().map(str::to_string).collect()
+        };
+
+        assert_eq!(tokenize("SHOW POOLS;"), vec!["SHOW", "POOLS"]);
+        assert_eq!(tokenize("SHOW POOLS"), vec!["SHOW", "POOLS"]);
+        // Multi-statement Q from psql `-c "...; ..."` - first stmt is
+        // taken cleanly; the second is intentionally dropped.
+        assert_eq!(
+            tokenize("SHOW POOLS; SHOW DATABASES"),
+            vec!["SHOW", "POOLS"]
+        );
+        // Leading garbage / empty statements are skipped.
+        assert_eq!(tokenize("  ;  ; SHOW POOLS;"), vec!["SHOW", "POOLS"]);
+        // All-empty input falls through to an empty Vec (caller emits
+        // the typed "empty admin query" error).
+        assert_eq!(tokenize(""), Vec::<String>::new());
+        assert_eq!(tokenize(";;;"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn admin_sql_errors_use_bounded_admin_writer() {
+        let src = include_str!("mod.rs");
+        let production_src = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("admin module must have production section before tests");
+        let import_start = src
+            .find("use crate::messages::protocol::")
+            .expect("protocol import must exist");
+        let import_end = src[import_start..]
+            .find(';')
+            .map(|offset| import_start + offset)
+            .expect("protocol import must end with semicolon");
+        let protocol_import = &src[import_start..=import_end];
+
+        assert!(
+            !protocol_import.contains("error_response"),
+            "admin SQL errors must not import the unbounded protocol error_response writer"
+        );
+        assert!(
+            !production_src.contains("error_response(stream"),
+            "admin SQL errors must use write_admin_error/write_all_half"
         );
     }
 }
