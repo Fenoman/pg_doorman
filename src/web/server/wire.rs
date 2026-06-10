@@ -3,8 +3,17 @@
 //! headers — it just turns bytes into [`ParsedRequest`] and a
 //! [`Response`] back into bytes.
 
+use std::io;
+use std::time::Duration;
+
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::tcp::OwnedWriteHalf;
+
+use crate::web::metrics::WEB_RESPONSE_WRITE_ERRORS_TOTAL;
+
+/// Deadline for each socket write step in regular web/admin responses.
+const WEB_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const WEB_RESPONSE_WRITE_FAILURE_STATUS: u16 = 499;
 
 #[derive(Debug)]
 pub(super) enum ReadError {
@@ -67,6 +76,17 @@ pub(super) struct ParsedRequest<'a> {
     /// uses it to decide whether to drop the connection after the
     /// response or wait for another request on the same socket.
     pub(super) connection_close: bool,
+    /// Raw value of the `Origin:` header, if present. Used by the CSRF
+    /// gate on POST /api/admin/* - the mutation is rejected when an
+    /// authenticated request originates from a different origin than the
+    /// configured listener Host.
+    pub(super) origin: Option<&'a str>,
+    /// Raw value of the `Referer:` header, if present. Fallback when the
+    /// browser stripped the Origin header (legacy navigation flows).
+    pub(super) referer: Option<&'a str>,
+    /// Raw value of the `Host:` header, if present. Compared against
+    /// Origin/Referer on POST /api/admin/* to enforce same-origin.
+    pub(super) host: Option<&'a str>,
 }
 
 impl<'a> ParsedRequest<'a> {
@@ -90,6 +110,9 @@ impl<'a> ParsedRequest<'a> {
         let mut accepts_gzip = false;
         let mut accepts_json = false;
         let mut connection_close = !http_version.eq_ignore_ascii_case("HTTP/1.1");
+        let mut origin = None;
+        let mut referer = None;
+        let mut host = None;
         for line in lines {
             if line.is_empty() {
                 break;
@@ -119,6 +142,12 @@ impl<'a> ParsedRequest<'a> {
                 if contains_ascii_ci(value, "close") {
                     connection_close = true;
                 }
+            } else if let Some(value) = strip_header_prefix(line, "Origin") {
+                origin = Some(value);
+            } else if let Some(value) = strip_header_prefix(line, "Referer") {
+                referer = Some(value);
+            } else if let Some(value) = strip_header_prefix(line, "Host") {
+                host = Some(value);
             }
         }
         Some(ParsedRequest {
@@ -133,6 +162,9 @@ impl<'a> ParsedRequest<'a> {
             accepts_gzip,
             accepts_json,
             connection_close,
+            origin,
+            referer,
+            host,
         })
     }
 }
@@ -143,6 +175,33 @@ pub(crate) struct Response {
     pub(crate) reason: &'static str,
     pub(crate) extra_headers: Vec<(&'static str, String)>,
     pub(crate) body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResponseWriteOutcome {
+    status: u16,
+    bytes: usize,
+}
+
+impl ResponseWriteOutcome {
+    fn success(status: u16, bytes: usize) -> Self {
+        Self { status, bytes }
+    }
+
+    fn write_failure() -> Self {
+        Self {
+            status: WEB_RESPONSE_WRITE_FAILURE_STATUS,
+            bytes: 0,
+        }
+    }
+
+    pub(super) fn status(self) -> u16 {
+        self.status
+    }
+
+    pub(super) fn bytes(self) -> usize {
+        self.bytes
+    }
 }
 
 impl Response {
@@ -181,6 +240,30 @@ impl Response {
     /// our React modal.
     pub(crate) fn unauthorized_silent() -> Self {
         Response::status(401, "Unauthorized")
+    }
+
+    /// minimal 200 OK with a plaintext body. Used for k8s
+    /// liveness/readiness probes - no JSON envelope so probe failures
+    /// remain visible in `kubectl describe pod` without parsing.
+    pub(crate) fn ok_text(body: &'static str) -> Self {
+        Response {
+            status: 200,
+            reason: "OK",
+            extra_headers: vec![("Content-Type", "text/plain; charset=utf-8".into())],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// 503 for k8s readiness during shutdown drain. k8s removes
+    /// the pod from the Service endpoint list on 503 even though the
+    /// pod itself stays alive long enough to drain in-flight clients.
+    pub(crate) fn service_unavailable(body: &'static str) -> Self {
+        Response {
+            status: 503,
+            reason: "Service Unavailable",
+            extra_headers: vec![("Content-Type", "text/plain; charset=utf-8".into())],
+            body: body.as_bytes().to_vec(),
+        }
     }
 
     /// 403 with a small JSON envelope the SPA can render as a "needs
@@ -275,12 +358,39 @@ impl Response {
         }
     }
 
-    pub(super) async fn write(self, writer: &mut BufWriter<OwnedWriteHalf>) -> std::io::Result<()> {
+    pub(super) async fn write(
+        self,
+        writer: &mut BufWriter<OwnedWriteHalf>,
+    ) -> ResponseWriteOutcome {
+        let status = self.status;
+        let bytes = self.body.len();
         let mut head = format!(
             "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n",
             self.status,
             self.reason,
             self.body.len()
+        );
+        // defence-in-depth HTTP security headers on every
+        // admin / metrics / SPA response. Without them an XSS in the
+        // SPA render path (logs page, /api/top/prepared statement
+        // names, etc.) becomes a full admin-account takeover via the
+        // same-origin /api/admin/* mutations (no CSP). Frame-jacking
+        // an authenticated tab works against the admin POST endpoints
+        // because nothing forbids being framed. Minimal set:
+        //   X-Frame-Options: DENY        - kill clickjacking
+        //   X-Content-Type-Options: nosniff - kill /api/logs sniffing
+        //   Referrer-Policy: no-referrer   - kill SSO token URL leakage
+        //   Content-Security-Policy: strict default-src - kill XSS pivots
+        head.push_str("X-Frame-Options: DENY\r\n");
+        head.push_str("X-Content-Type-Options: nosniff\r\n");
+        head.push_str("Referrer-Policy: no-referrer\r\n");
+        head.push_str(
+            "Content-Security-Policy: default-src 'self'; \
+             script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; \
+             object-src 'none'; \
+             frame-ancestors 'none'\r\n",
         );
         for (k, v) in &self.extra_headers {
             head.push_str(k);
@@ -289,19 +399,81 @@ impl Response {
             head.push_str("\r\n");
         }
         head.push_str("\r\n");
-        writer.write_all(head.as_bytes()).await?;
-        if !self.body.is_empty() {
-            writer.write_all(&self.body).await?;
+        if write_all_with_timeout(writer, head.as_bytes(), "header")
+            .await
+            .is_err()
+        {
+            return ResponseWriteOutcome::write_failure();
         }
-        writer.flush().await
+        if !self.body.is_empty()
+            && write_all_with_timeout(writer, &self.body, "body")
+                .await
+                .is_err()
+        {
+            return ResponseWriteOutcome::write_failure();
+        }
+        if flush_with_timeout(writer).await.is_err() {
+            return ResponseWriteOutcome::write_failure();
+        }
+        ResponseWriteOutcome::success(status, bytes)
     }
+}
+
+async fn write_all_with_timeout(
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    bytes: &[u8],
+    segment: &'static str,
+) -> io::Result<()> {
+    match tokio::time::timeout(WEB_RESPONSE_WRITE_TIMEOUT, writer.write_all(bytes)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            record_web_response_write_error(segment, "io");
+            log::error!("Failed to write web response {segment}: {e}");
+            Err(e)
+        }
+        Err(_) => {
+            record_web_response_write_error(segment, "timeout");
+            log::warn!(
+                "Timed out writing web response {segment} after {WEB_RESPONSE_WRITE_TIMEOUT:?}"
+            );
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "web response write timed out",
+            ))
+        }
+    }
+}
+
+async fn flush_with_timeout(writer: &mut BufWriter<OwnedWriteHalf>) -> io::Result<()> {
+    match tokio::time::timeout(WEB_RESPONSE_WRITE_TIMEOUT, writer.flush()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            record_web_response_write_error("flush", "io");
+            log::error!("Failed to flush web response: {e}");
+            Err(e)
+        }
+        Err(_) => {
+            record_web_response_write_error("flush", "timeout");
+            log::warn!("Timed out flushing web response after {WEB_RESPONSE_WRITE_TIMEOUT:?}");
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "web response flush timed out",
+            ))
+        }
+    }
+}
+
+fn record_web_response_write_error(stage: &'static str, reason: &'static str) {
+    WEB_RESPONSE_WRITE_ERRORS_TOTAL
+        .with_label_values(&[stage, reason])
+        .inc();
 }
 
 pub(super) async fn write_simple(
     writer: &mut BufWriter<OwnedWriteHalf>,
     status: u16,
     reason: &'static str,
-) -> std::io::Result<()> {
+) -> ResponseWriteOutcome {
     Response::status(status, reason).write(writer).await
 }
 
@@ -350,4 +522,63 @@ fn decompress_gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(bytes.len() * 4);
     decoder.read_to_end(&mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn web_response_socket_writes_are_deadline_bound() {
+        let src = include_str!("wire.rs");
+        let start = src
+            .find("    pub(super) async fn write(\n        self,\n        writer:")
+            .expect("Response::write should exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n\nasync fn write_all_with_timeout")
+            .expect("bounded write helper should follow Response::write");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("write_all_with_timeout(writer, head.as_bytes(), \"header\")"),
+            "web response header write must use a bounded write helper"
+        );
+        assert!(
+            body.contains("write_all_with_timeout(writer, &self.body, \"body\")"),
+            "web response body write must use a bounded write helper"
+        );
+        assert!(
+            body.contains("flush_with_timeout(writer)"),
+            "web response flush must use a bounded flush helper"
+        );
+    }
+
+    #[test]
+    fn web_response_write_errors_are_logged_and_counted() {
+        let src = include_str!("wire.rs");
+
+        assert!(
+            src.contains("record_web_response_write_error(segment, \"io\")"),
+            "web response write I/O errors must increment a bounded counter"
+        );
+        assert!(
+            src.contains("record_web_response_write_error(segment, \"timeout\")"),
+            "web response write timeouts must increment a bounded counter"
+        );
+        assert!(
+            src.contains("record_web_response_write_error(\"flush\", \"io\")"),
+            "web response flush I/O errors must increment a bounded counter"
+        );
+        assert!(
+            src.contains("record_web_response_write_error(\"flush\", \"timeout\")"),
+            "web response flush timeouts must increment a bounded counter"
+        );
+        assert!(
+            src.contains("Failed to write web response {segment}: {e}"),
+            "web response write I/O errors must be logged"
+        );
+        assert!(
+            src.contains("Failed to flush web response: {e}"),
+            "web response flush I/O errors must be logged"
+        );
+    }
 }

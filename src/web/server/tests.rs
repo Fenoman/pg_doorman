@@ -16,6 +16,7 @@ fn opts(ui_active: bool, ui_anonymous: bool) -> WebServerOptions {
         trusted_proxies: Vec::new(),
         sso_admin_groups_configured: false,
         sso_require_https: false,
+        allowed_admin_origins: Vec::new(),
     }
 }
 
@@ -47,6 +48,9 @@ fn req<'a>(method: &'a str, raw_path: &'a str) -> ParsedRequest<'a> {
         accepts_gzip: false,
         accepts_json: false,
         connection_close: false,
+        origin: None,
+        referer: None,
+        host: None,
     }
 }
 
@@ -64,6 +68,9 @@ fn req_json<'a>(method: &'a str, raw_path: &'a str) -> ParsedRequest<'a> {
         accepts_gzip: false,
         accepts_json: true,
         connection_close: false,
+        origin: None,
+        referer: None,
+        host: None,
     }
 }
 
@@ -86,6 +93,16 @@ fn from_config_demotes_ui_when_admin_password_empty() {
 fn from_config_demotes_ui_when_admin_password_is_default_admin() {
     let opts = WebServerOptions::from_config(&config_with(true, false, "admin"));
     assert!(!opts.ui_active, "literal 'admin' must disable UI");
+}
+
+#[test]
+fn from_config_demotes_ui_when_admin_password_is_generated_placeholder() {
+    let opts = WebServerOptions::from_config(&config_with(
+        true,
+        false,
+        "change_me_to_a_long_random_secret",
+    ));
+    assert!(!opts.ui_active, "generated placeholder must disable UI");
 }
 
 #[test]
@@ -392,7 +409,10 @@ fn required_role_admin_for_management() {
 #[test]
 fn required_role_sso_for_personal_data() {
     assert_eq!(required_role("/api/logs", true), Role::Sso);
+    assert_eq!(required_role("/api/prepared", true), Role::Sso);
     assert_eq!(required_role("/api/prepared/text/abc", true), Role::Sso);
+    assert_eq!(required_role("/api/events", true), Role::Sso);
+    assert_eq!(required_role("/api/top/prepared", true), Role::Sso);
     assert_eq!(required_role("/api/top/queries", true), Role::Sso);
     assert_eq!(required_role("/api/interner/top", true), Role::Sso);
 }
@@ -402,7 +422,6 @@ fn required_role_public_when_anonymous_allowed() {
     assert_eq!(required_role("/api/version", true), Role::Anonymous);
     assert_eq!(required_role("/api/overview", true), Role::Anonymous);
     assert_eq!(required_role("/api/pools", true), Role::Anonymous);
-    assert_eq!(required_role("/api/prepared", true), Role::Anonymous);
 }
 
 #[test]
@@ -674,11 +693,21 @@ fn dispatch_sockets_returns_503_on_non_linux() {
 }
 
 #[test]
-fn dispatch_prepared_returns_200() {
+fn dispatch_prepared_anonymous_returns_401() {
     let r = dispatch(
         &req("GET", "/api/prepared"),
         &opts(true, true),
         &AuthOutcome::Anonymous,
+    );
+    assert_eq!(r.status, 401);
+}
+
+#[test]
+fn dispatch_prepared_admin_returns_200() {
+    let r = dispatch(
+        &req("GET", "/api/prepared"),
+        &opts(true, true),
+        &admin_outcome(),
     );
     assert_eq!(r.status, 200);
 }
@@ -766,11 +795,21 @@ fn dispatch_top_queries_admin_returns_200() {
 }
 
 #[test]
-fn dispatch_top_prepared_returns_200() {
+fn dispatch_top_prepared_anonymous_returns_401() {
     let r = dispatch(
         &req("GET", "/api/top/prepared"),
         &opts(true, true),
         &AuthOutcome::Anonymous,
+    );
+    assert_eq!(r.status, 401);
+}
+
+#[test]
+fn dispatch_top_prepared_admin_returns_200() {
+    let r = dispatch(
+        &req("GET", "/api/top/prepared"),
+        &opts(true, true),
+        &admin_outcome(),
     );
     assert_eq!(r.status, 200);
 }
@@ -786,11 +825,21 @@ fn dispatch_apps_returns_200() {
 }
 
 #[test]
-fn dispatch_events_returns_200() {
+fn dispatch_events_anonymous_returns_401() {
     let r = dispatch(
         &req("GET", "/api/events"),
         &opts(true, true),
         &AuthOutcome::Anonymous,
+    );
+    assert_eq!(r.status, 401);
+}
+
+#[test]
+fn dispatch_events_sso_returns_200() {
+    let r = dispatch(
+        &req("GET", "/api/events"),
+        &opts(true, true),
+        &sso_outcome(),
     );
     assert_eq!(r.status, 200);
 }

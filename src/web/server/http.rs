@@ -4,7 +4,6 @@
 //! response cannot be produced synchronously), and stops when the client
 //! signals close or the per-connection request cap is hit.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, BufReader, BufWriter};
@@ -15,7 +14,7 @@ use crate::web::auth::{classify, AuthOutcome, Role, SsoTransportPolicy};
 use crate::web::metrics::write_metrics_response;
 
 use super::router::{dispatch, unauthorized_for};
-use super::state::WebServerOptions;
+use super::state::current_options;
 use super::wire::{find_double_crlf, write_simple, ParsedRequest, ReadError, Response};
 
 /// Soft cap on requests per keep-alive connection. After this many
@@ -28,7 +27,12 @@ const KEEPALIVE_MAX_REQUESTS: u32 = 1000;
 /// because each idle connection still costs an FD and a tokio task.
 const KEEPALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(super) async fn handle_connection(stream: TcpStream, opts: Arc<WebServerOptions>) {
+/// Absolute deadline to finish a request header after the peer has sent
+/// at least one byte. This bounds slowloris-style clients that drip bytes
+/// without ever completing `\r\n\r\n`.
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(super) async fn handle_connection(stream: TcpStream) {
     let peer_addr = stream.peer_addr().ok();
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -71,6 +75,7 @@ pub(super) async fn handle_connection(stream: TcpStream, opts: Arc<WebServerOpti
         let log_method = parsed.method.to_string();
         let log_path = parsed.path.to_string();
         let log_query_present = parsed.query.is_some();
+        let opts = current_options();
 
         let peer_string = crate::web::peer::render_peer(
             peer_addr,
@@ -79,17 +84,75 @@ pub(super) async fn handle_connection(stream: TcpStream, opts: Arc<WebServerOpti
             &opts.trusted_proxies,
         );
 
-        // /metrics is always served, regardless of ui_active or auth.
-        // It writes its body directly through the gzip-aware response
-        // writer, so we don't build a Response struct here.
-        if parsed.method == "GET" && parsed.path == "/metrics" {
-            write_metrics_response(&mut writer, parsed.accepts_gzip).await;
+        // kubernetes liveness/readiness probes - unauthenticated,
+        // cheap, no SHOW POOLS walk. Returns 200 immediately on /health
+        // (liveness - process is alive and HTTP listener responds) and
+        // 200/503 on /ready (readiness - shutdown drain state).
+        if parsed.method == "GET" && parsed.path == "/health" {
+            let response = Response::ok_text("ok");
+            let write_outcome = response.write(&mut writer).await;
             crate::web::access_log::write(
                 &log_method,
                 &log_path,
                 log_query_present,
-                200,
-                0,
+                write_outcome.status(),
+                write_outcome.bytes(),
+                started.elapsed().as_millis() as u64,
+                &peer_string,
+                &AuthOutcome::Anonymous,
+            );
+            req_buf.drain(..head_end);
+            handled += 1;
+            if close_after {
+                return;
+            }
+            continue;
+        }
+        if parsed.method == "GET" && parsed.path == "/ready" {
+            // 503 also during STARTUP (READY=false) until pools
+            // are loaded AND the main PG listener is accepting. Prevents
+            // k8s from routing client traffic to a pod that's still
+            // spawning pools.
+            let shutting_down =
+                crate::app::server::SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+            let ready = crate::app::server::READY.load(std::sync::atomic::Ordering::Acquire);
+            let response = if shutting_down {
+                Response::service_unavailable("shutting down")
+            } else if !ready {
+                Response::service_unavailable("starting up")
+            } else {
+                Response::ok_text("ready")
+            };
+            let write_outcome = response.write(&mut writer).await;
+            crate::web::access_log::write(
+                &log_method,
+                &log_path,
+                log_query_present,
+                write_outcome.status(),
+                write_outcome.bytes(),
+                started.elapsed().as_millis() as u64,
+                &peer_string,
+                &AuthOutcome::Anonymous,
+            );
+            req_buf.drain(..head_end);
+            handled += 1;
+            if close_after {
+                return;
+            }
+            continue;
+        }
+
+        // /metrics is always served, regardless of ui_active or auth.
+        // It writes its body directly through the gzip-aware response
+        // writer, so we don't build a Response struct here.
+        if parsed.method == "GET" && parsed.path == "/metrics" {
+            let metrics_outcome = write_metrics_response(&mut writer, parsed.accepts_gzip).await;
+            crate::web::access_log::write(
+                &log_method,
+                &log_path,
+                log_query_present,
+                metrics_outcome.status(),
+                metrics_outcome.bytes(),
                 started.elapsed().as_millis() as u64,
                 &peer_string,
                 &AuthOutcome::Anonymous,
@@ -148,22 +211,42 @@ pub(super) async fn handle_connection(stream: TcpStream, opts: Arc<WebServerOpti
                 } else {
                     unauthorized_for(&parsed)
                 }
+            } else if !crate::web::server::csrf::is_same_origin(
+                parsed.origin,
+                parsed.referer,
+                parsed.host,
+                &opts.allowed_admin_origins,
+            ) {
+                // SSO admin cookies are auto-attached by the browser
+                // to cross-origin POSTs. Without a same-origin check an
+                // attacker page can fire /api/admin/shutdown while the
+                // operator is signed in. Origin/Referer must match Host.
+                crate::web::metrics::WEB_ADMIN_CSRF_REJECTED
+                    .with_label_values::<&str>(&[])
+                    .inc();
+                Response::forbidden("cross-origin admin POST rejected")
             } else {
-                crate::web::routes::admin::handle_admin_action(parsed.path).await
+                let raw_admin_path;
+                let admin_path = match parsed.query {
+                    Some(query) => {
+                        raw_admin_path = format!("{}?{}", parsed.path, query);
+                        raw_admin_path.as_str()
+                    }
+                    None => parsed.path,
+                };
+                crate::web::routes::admin::handle_admin_action(admin_path).await
             }
         } else {
             dispatch(&parsed, &opts, &auth)
         };
 
-        let status = response.status;
-        let bytes = response.body.len();
-        let _ = response.write(&mut writer).await;
+        let write_outcome = response.write(&mut writer).await;
         crate::web::access_log::write(
             &log_method,
             &log_path,
             log_query_present,
-            status,
-            bytes,
+            write_outcome.status(),
+            write_outcome.bytes(),
             started.elapsed().as_millis() as u64,
             &peer_string,
             &auth,
@@ -202,14 +285,23 @@ async fn read_request_head(
     reader: &mut BufReader<OwnedReadHalf>,
     buf: &mut Vec<u8>,
 ) -> Result<usize, ReadError> {
+    read_request_head_with_timeouts(reader, buf, KEEPALIVE_IDLE_TIMEOUT, REQUEST_HEADER_TIMEOUT)
+        .await
+}
+
+async fn read_request_head_with_timeouts(
+    reader: &mut BufReader<OwnedReadHalf>,
+    buf: &mut Vec<u8>,
+    idle_timeout: Duration,
+    header_timeout: Duration,
+) -> Result<usize, ReadError> {
     const MAX_HEADER_BYTES: usize = 32 * 1024;
     if buf.is_empty() {
         // Wait up to KEEPALIVE_IDLE_TIMEOUT for the first byte; once
-        // bytes arrive, the read loop below drives without an outer
-        // timeout because the headers are bounded by MAX_HEADER_BYTES.
+        // bytes arrive, header_timeout bounds the rest of the header.
         let mut chunk = [0u8; 1024];
         let read_fut = reader.read(&mut chunk);
-        let n = match tokio::time::timeout(KEEPALIVE_IDLE_TIMEOUT, read_fut).await {
+        let n = match tokio::time::timeout(idle_timeout, read_fut).await {
             Ok(r) => r?,
             Err(_elapsed) => return Err(ReadError::Idle),
         };
@@ -221,6 +313,20 @@ async fn read_request_head(
     if let Some(end) = find_double_crlf(buf) {
         return Ok(end);
     }
+
+    tokio::time::timeout(
+        header_timeout,
+        read_request_head_rest(reader, buf, MAX_HEADER_BYTES),
+    )
+    .await
+    .unwrap_or(Err(ReadError::Idle))
+}
+
+async fn read_request_head_rest(
+    reader: &mut BufReader<OwnedReadHalf>,
+    buf: &mut Vec<u8>,
+    max_header_bytes: usize,
+) -> Result<usize, ReadError> {
     let mut chunk = [0u8; 1024];
     loop {
         let n = reader.read(&mut chunk).await?;
@@ -235,7 +341,7 @@ async fn read_request_head(
         if let Some(end) = find_double_crlf(buf) {
             return Ok(end);
         }
-        if buf.len() >= MAX_HEADER_BYTES {
+        if buf.len() >= max_header_bytes {
             return Err(ReadError::TooLarge);
         }
     }
@@ -264,6 +370,50 @@ mod tests {
     #[test]
     fn extract_query_token_handles_trailing_amp() {
         assert_eq!(extract_query_token(Some("token=jwt&")), Some("jwt"));
+    }
+
+    #[test]
+    fn metrics_access_log_uses_write_outcome() {
+        let src = include_str!("http.rs");
+        let body = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("http source must contain production body");
+
+        assert!(
+            body.contains("let metrics_outcome = write_metrics_response"),
+            "/metrics dispatch must keep the direct writer outcome"
+        );
+        assert!(
+            body.contains("metrics_outcome.status()"),
+            "/metrics access log must not hard-code status=200 after write failure"
+        );
+        assert!(
+            body.contains("metrics_outcome.bytes()"),
+            "/metrics access log must use the writer's emitted body size"
+        );
+    }
+
+    #[test]
+    fn regular_access_log_uses_response_write_outcome() {
+        let src = include_str!("http.rs");
+        let body = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("http source must contain production body");
+
+        assert!(
+            !body.contains("let _ = response.write(&mut writer).await"),
+            "regular web/API access logs must not discard Response::write outcome"
+        );
+        assert!(
+            body.contains("write_outcome.status()"),
+            "regular web/API access logs must use actual response write status"
+        );
+        assert!(
+            body.contains("write_outcome.bytes()"),
+            "regular web/API access logs must use actual response write byte count"
+        );
     }
 
     #[test]
@@ -301,5 +451,31 @@ mod tests {
     #[test]
     fn extract_query_token_returns_none_for_none_input() {
         assert_eq!(extract_query_token(None), None);
+    }
+
+    #[tokio::test]
+    async fn partial_header_times_out_after_first_byte() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        client.write_all(b"G").await.unwrap();
+
+        let (read_half, _) = server.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut buf = Vec::new();
+
+        let result = read_request_head_with_timeouts(
+            &mut reader,
+            &mut buf,
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ReadError::Idle)));
     }
 }

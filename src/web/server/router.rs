@@ -16,15 +16,19 @@ const MANAGEMENT_PREFIXES: &[&str] = &["/api/admin/"];
 /// queries. Sso role and Admin role may call them; Anonymous cannot
 /// regardless of `ui_anonymous`.
 ///
-/// `/api/top/queries` returns SQL previews (first 120 chars of cached
-/// statements). Previews can include tenant ids, literal values,
-/// schema names, and secrets accidentally embedded in SQL, so the
-/// path is gated alongside `/api/logs` and the prepared-statement
-/// views.
+/// Prepared-statement views expose client-controlled statement names and
+/// hashes; `/api/top/queries` also returns SQL previews (first 120 chars
+/// of cached statements). These can include tenant ids, literal values,
+/// schema names, and secrets accidentally embedded in SQL, so they are
+/// gated alongside `/api/logs`. `/api/events` carries admin timeline
+/// messages with pool names, users, databases, and config validation errors.
 const PERSONAL_DATA_PREFIXES: &[&str] = &[
     "/api/logs",
+    "/api/events",
+    "/api/prepared",
     "/api/prepared/text/",
     "/api/interner/top",
+    "/api/top/prepared",
     "/api/top/queries",
 ];
 
