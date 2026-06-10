@@ -115,7 +115,13 @@ pub async fn retain_connections() {
     let config = get_config();
     let retain_time = config.general.retain_connections_time.as_std();
     let retain_max = config.general.retain_connections_max;
+    let dead_check_timeout = config.general.dead_backend_check_timeout.as_std();
+    let dead_check_max = config.general.dead_backend_check_max_per_cycle;
     let mut interval = tokio::time::interval(retain_time);
+    // Skip - after a runtime stall (eviction storm, paging),
+    // the retain loop should not fire all backlog ticks at once and
+    // re-acquire every pool's slots lock back-to-back.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let count = Arc::new(AtomicUsize::new(0));
 
     info!(
@@ -127,9 +133,26 @@ pub async fn retain_connections() {
             retain_max.to_string()
         }
     );
+    if dead_check_timeout.is_zero() || dead_check_max == 0 {
+        info!("Dead-backend liveness scan: disabled");
+    } else {
+        info!(
+            "Dead-backend liveness scan: enabled, per-backend timeout={}, max_per_pool_per_cycle={}",
+            format_elapsed(dead_check_timeout),
+            dead_check_max,
+        );
+    }
 
     // Prewarm pools with min_pool_size before the first retain cycle
     for (_, pool) in get_all_pools().iter() {
+        // drift from the steady-state replenish path
+        // (which skips paused pools). If a pool starts paused (e.g.
+        // admin issued PAUSE between `from_config` Ok and retain
+        // task start), the initial prewarm bypassed the
+        // pause and created backends regardless.
+        if pool.database.is_paused() {
+            continue;
+        }
         if let Some(min_pool_size) = pool.settings.user.min_pool_size {
             let min = min_pool_size as usize;
             let created = pool.database.replenish(min).await;
@@ -178,7 +201,7 @@ pub async fn retain_connections() {
         // `min_connection_lifetime_ms`, close them the old way. These
         // two steps together guarantee that `reserve_used` converges to
         // the number of reserve permits actually defending against live
-        // pressure, not to the number of historical grants.
+        // pressure, not to the number of grants.
         //
         // Pools currently under client pressure are skipped: closing a
         // reserve connection in front of a queued client just forces a
@@ -213,6 +236,56 @@ pub async fn retain_connections() {
                     );
                 }
             }
+        }
+
+        // Dead-backend liveness scan. Runs BEFORE idle/lifetime trimming so
+        // that a backend whose TCP socket died (e.g. PostgreSQL restart) is
+        // dropped here and `slots.size` reflects reality by the time the
+        // replenish phase below decides whether `current_size < min`.
+        // Skipped per-pool when disabled, under_pressure, or paused - see
+        // `Pool::evict_dead_backends` for the gating.
+        //
+        // Re-fetch `dead_backend_check_*` from the current config on every
+        // tick so SIGHUP / admin RELOAD that adjusts these knobs takes
+        // effect immediately, without needing a process restart.
+        // (`retain_time` / `retain_max` are still read once at task start
+        // because changing them at runtime would also require rebuilding
+        // the `interval` ticker - a larger refactor.)
+        let live_cfg = get_config();
+        let dead_check_timeout = live_cfg.general.dead_backend_check_timeout.as_std();
+        let dead_check_max = live_cfg.general.dead_backend_check_max_per_cycle;
+
+        // Pools are probed concurrently with a small fan-out cap so a
+        // mass-PG-outage (every pool's backends timing out simultaneously)
+        // collapses what would otherwise be `N_pools × max_per_cycle ×
+        // timeout` of serial wall-clock - which on a 10+ pool deployment
+        // with the defaults (8 × 2s = 16s per pool) easily exceeds the
+        // 30s `retain_connections_time` tick. The cap keeps the dead-check
+        // from monopolising the runtime when N is large; bounded
+        // concurrency of 8 is enough to stay under one tick for typical
+        // deployments while leaving headroom for the replenish phase
+        // below.
+        if !dead_check_timeout.is_zero() && dead_check_max > 0 {
+            use futures::stream::{self, StreamExt};
+            const SCAN_CONCURRENCY: usize = 8;
+            stream::iter(pool_refs.iter())
+                .for_each_concurrent(SCAN_CONCURRENCY, |pool| async move {
+                    let (checked, evicted) = pool
+                        .database
+                        .evict_dead_backends(dead_check_timeout, dead_check_max, retain_time)
+                        .await;
+                    if evicted > 0 {
+                        info!(
+                            "[{}@{}] evicted {} dead backend{} (checked {} idle)",
+                            pool.address.username,
+                            pool.address.pool_name,
+                            evicted,
+                            if evicted == 1 { "" } else { "s" },
+                            checked,
+                        );
+                    }
+                })
+                .await;
         }
 
         // Idle / lifetime trimming. Pools under client pressure are skipped
@@ -301,7 +374,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::config::{Address, PoolMode, User};
-    use crate::pool::{Pool, PoolSettings, ServerParameters, ServerPool};
+    use crate::pool::{Pool, PoolSettings, ServerPool};
     use dashmap::DashMap;
 
     fn build_test_connection_pool() -> ConnectionPool {
@@ -333,7 +406,7 @@ mod tests {
         ConnectionPool {
             database,
             address: Address::default(),
-            original_server_parameters: Arc::new(tokio::sync::Mutex::new(ServerParameters::new())),
+            original_server_parameters: Arc::new(tokio::sync::OnceCell::new()),
             settings: PoolSettings {
                 pool_mode: PoolMode::Transaction,
                 user: User::default(),

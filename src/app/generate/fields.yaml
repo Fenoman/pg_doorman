@@ -169,6 +169,9 @@ texts:
   talos_databases:
     en: "List of databases that use Talos authentication."
     ru: "Список баз данных, использующих аутентификацию Talos."
+  talos_resource_prefixes:
+    en: "Allowed resource_access key prefixes for Talos tokens."
+    ru: "Разрешённые префиксы ключей resource_access для Talos-токенов."
   pools_title:
     en: "CONNECTION POOLS"
     ru: "ПУЛЫ ПОДКЛЮЧЕНИЙ"
@@ -395,6 +398,78 @@ fields:
         Set to `0` to disable the check (not recommended for production environments with potential network instability
         or PostgreSQL restarts).
       default: "60s (60 seconds)"
+
+    dead_backend_check_timeout:
+      config:
+        en: |
+          Per-backend deadline for the background liveness scan that runs
+          inside the retain loop. Each tick of `retain_connections_time`
+          pops up to `dead_backend_check_max_per_cycle` idle backends per
+          pool, runs `check_alive` with this timeout, and drops the ones
+          that fail. Fixes the "zombie pool" regression where idle TCP
+          sockets survive a PostgreSQL restart and keep `slots.size` high
+          enough that `replenish` never refills the pool.
+          0 disables the scan entirely.
+        ru: |
+          Бюджет на проверку одного backend во время фоновой liveness-сверки,
+          которая запускается внутри retain-цикла. На каждом тике
+          `retain_connections_time` для каждого пула извлекается до
+          `dead_backend_check_max_per_cycle` idle-backend, к каждому
+          применяется `check_alive` с этим таймаутом; не прошедшие проверку
+          удаляются. Лечит регрессию "zombie pool", когда TCP-сокеты
+          переживают рестарт PostgreSQL и `slots.size` остаётся высоким,
+          из-за чего `replenish` не дозаливает пул.
+          0 полностью выключает фоновую сверку.
+      doc: |
+        Bounded health check for idle backends. Without this scan, after a PostgreSQL
+        restart `slots.size` keeps counting the now-dead TCP sockets until either
+        `idle_timeout` or `server_lifetime` evicts them, which can take many minutes;
+        meanwhile `retain_connections` sees `current_size >= min_pool_size` and never
+        calls `replenish`, so the pool degrades to whatever handful of backends still
+        respond. With the scan enabled, dead sockets are detected within one
+        `retain_connections_time` tick and `replenish` brings the pool back to
+        `min_pool_size` on the next tick. Pools that are `under_pressure()` or
+        `paused` are skipped so the scan never steals an idle connection out from
+        under a queued client.
+      default: "2s"
+
+    dead_backend_check_max_per_cycle:
+      config:
+        en: |
+          Cap on how many idle backends the liveness scan probes per pool per
+          retain cycle. Bounds CPU and TCP-probe traffic when a pool is large.
+          0 disables the scan.
+        ru: |
+          Ограничение на число idle-backend, которое liveness-проверка опрашивает
+          в одном retain-цикле для одного пула. Ограничивает CPU и TCP-пинги,
+          когда пул большой. 0 выключает проверку.
+      doc: |
+        Upper bound on per-pool work performed by `evict_dead_backends` each retain tick.
+        A pool with 500 idle backends would otherwise spend up to
+        `500 × dead_backend_check_timeout` worth of awaits on a single tick; capping at
+        8 keeps the scan amortised across multiple cycles while staying well under the
+        default 30s `retain_connections_time` tick (8 × 2s = 16s worst case). Raise it
+        for eager detection on small pools, or set `0` to disable the scan entirely
+        (paired with `dead_backend_check_timeout = 0` for clarity).
+      default: "8"
+
+    log_level:
+      config:
+        en: |
+          Optional override for the runtime log filter; takes the same
+          syntax as the `--log-level` CLI flag plus per-module overrides
+          (e.g. `"warn"`, `"info,pg_doorman::pool=debug"`).
+        ru: |
+          Опциональный override для уровня логирования. Принимает тот же
+          синтаксис что и `--log-level` CLI флаг, плюс per-module overrides
+          (например `"warn"`, `"info,pg_doorman::pool=debug"`).
+      doc: |
+        When set, applied after the CLI / env logger is constructed and overrides the
+        `--log-level` default. Operators who set `[general] log_level = "warn"` in the
+        TOML ignores it if left unvalidated - a 25% TPS regression on SET-heavy
+        workloads where `info!` cleanup spam dominated. Set to `null` (omit) to fall
+        back to the CLI / env default.
+      default: "null"
 
     shutdown_timeout:
       config:
@@ -1044,7 +1119,7 @@ fields:
       doc: |
         Access to the virtual admin database is carried out through the administrator's username and password.
         It should be replaced with your secret.
-      default: '"admin"'
+      default: '"change_me_to_a_long_random_secret"'
 
     tls_certificate:
       config:
@@ -1389,6 +1464,163 @@ fields:
         to save the cleanup roundtrip.
       default: "true"
 
+    prewarm_query:
+      config:
+        en: |
+          SQL executed exactly once on a backend right after it finishes
+          authentication, before the connection joins the idle pool. Used to
+          warm planner caches, preload libraries, or hydrate temp tables
+          consumed by the workload.
+          Do not use SET here: transaction-pool cleanup uses RESET ALL/RESET ROLE
+          before reuse and would erase or mis-scope one-shot prewarm state.
+          Use startup_parameters for persistent backend GUCs.
+          Leave empty (the default) to disable the prewarm.
+          A failure (SQL error or transport error) marks the backend bad -
+          the connection is dropped and the per-pool `prewarm_failures`
+          counter is bumped.
+          Per-user `prewarm_query` overrides this when present.
+        ru: |
+          SQL, выполняемый ровно один раз на backend сразу после аутентификации,
+          до того как соединение попадает в idle-пул. Прогрев planner-кэша,
+          preload библиотек или инициализация временных таблиц, используемых
+          приложением.
+          Не используйте SET здесь: cleanup в transaction pool выполняет
+          RESET ALL/RESET ROLE перед переиспользованием и сотрет или некорректно
+          переобластит одноразовое prewarm-состояние. Для постоянных backend GUC
+          используйте startup_parameters.
+          Пустая строка (значение по умолчанию) - prewarm выключен.
+          Любая ошибка (SQL или транспорт) помечает backend bad: соединение
+          выбрасывается, счётчик `prewarm_failures` инкрементируется.
+          Per-user `prewarm_query` переопределяет этот при наличии.
+      doc: |
+        Optional per-pool prewarm hook. Maximum length 4096 bytes; whitespace-only
+        values are rejected at config-test time. Common cases: `SELECT 1` to
+        validate the connection, `LOAD 'extension_name'` to preload a library,
+        or a project-specific
+        warm-up SQL that runs `ANALYZE` on hot tables. Failures bump
+        `total_prewarm_failures` (visible via `SHOW STATS`).
+
+        `SET` / `SET ROLE` / `SET SESSION AUTHORIZATION` are rejected because
+        prewarm runs only once on backend creation, while transaction-pool
+        cleanup can later issue `RESET ALL` / `RESET ROLE`. Use
+        `startup_parameters` for persistent backend GUCs.
+
+        **Hard 30-second timeout**: the prewarm reuses the internal
+        housekeeping path, which kills any statement that does not respond
+        within 30s and marks the backend bad. Slow bulk-warming SQL
+        (`VACUUM ANALYZE big_table`, large `pg_prewarm` calls) will churn
+        every new backend. Keep the prewarm fast and offload bulk preload
+        to a scheduled job.
+      default: "\"\" (disabled)"
+
+    intercept_discard_all:
+      config:
+        en: |
+          Whether pg_doorman should answer a standalone `DISCARD ALL` simple
+          query locally without forwarding it to PostgreSQL.
+
+          With the default `true` the iServ contract holds for the common
+          driver-traffic case: in transaction pooling, outside of an open
+          transaction and outside COPY mode, a `DISCARD ALL` (optionally
+          wrapped in leading or trailing `--` line / `/* */` block comments
+          - common ORM and bench tagging) is replaced with a synthetic
+          `CommandComplete` + `ReadyForQuery`. The per-client prepared-
+          statement cache is cleared at the same instant so the next `Bind`
+          cannot reach a backend that does not know the statement.
+
+          NOT intercepted (these still reach PostgreSQL):
+          - multi-statement batches containing `DISCARD ALL`
+            (`SELECT 1; DISCARD ALL`) - extracting one statement's effect
+            from a batch is ambiguous;
+          - `DISCARD ALL` issued via the extended (Parse/Bind/Execute)
+            protocol rather than simple-query - rare in real driver
+            traffic;
+          - `DISCARD ALL` inside an open transaction or COPY mode.
+
+          Set `false` only when the application relies on real DISCARD ALL
+          side effects in a pooled connection: `UNLISTEN *`, dropping
+          session-temp tables, releasing `PREPARE TRANSACTION` gids, or
+          clearing session-level sequence/plan caches.
+        ru: |
+          Должен ли pg_doorman отвечать на standalone `DISCARD ALL` simple
+          query локально, не форвардя его на PostgreSQL.
+
+          По умолчанию `true` - соблюдается iServ-контракт для типичного
+          driver-трафика: в transaction pooling, вне открытой транзакции и
+          вне COPY mode, `DISCARD ALL` (с опциональными `--`-строчными или
+          `/* */`-блочными комментариями вокруг - стандартный ORM/бенч
+          tagging) подменяется синтетическим `CommandComplete` +
+          `ReadyForQuery`. Per-client prepared-statement cache сбрасывается
+          одновременно, чтобы следующий `Bind` не попал на backend,
+          который не знает этого statement'а.
+
+          НЕ перехватывается (эти случаи доходят до PostgreSQL):
+          - multi-statement пакеты, содержащие `DISCARD ALL`
+            (`SELECT 1; DISCARD ALL`) - выделение одного statement
+            из пакета неоднозначно;
+          - `DISCARD ALL`, отправленный через extended-протокол
+            (Parse/Bind/Execute) вместо simple-query - редкость
+            в реальном driver-трафике;
+          - `DISCARD ALL` внутри открытой транзакции или COPY mode.
+
+          Установить `false` стоит, если приложение опирается на реальные
+          побочные эффекты DISCARD ALL в pooled-соединении: `UNLISTEN *`,
+          сброс session-temp таблиц, освобождение `PREPARE TRANSACTION`
+          gid'ов, очистка session-level кэшей последовательностей/планов.
+      doc: |
+        Operator switch for the DISCARD ALL fast path. The default `true`
+        keeps simple-query `DISCARD ALL` (including the comment-wrapped
+        variants drivers commonly emit - `/* app */ DISCARD ALL`,
+        `DISCARD ALL -- tag`) from reaching PostgreSQL in transaction
+        pooling, which is critical for workloads that deliberately share
+        long-lived `CREATE TEMP TABLE`s across recycled clients (catalog
+        bloat avoidance, planner cache reuse). Multi-statement batches and
+        extended-protocol `DISCARD ALL` are not intercepted - for those
+        rare cases the operator's choice is to either rely on the
+        application not sending them, or to set this switch false and
+        accept the cache-amortisation loss for the whole pool. Disable per
+        pool when the application uses LISTEN/NOTIFY, ON COMMIT DROP temp
+        tables, or two-phase commits - those need real backend-side
+        DISCARD ALL semantics that pg_doorman does not emulate. Session
+        pooling, queries inside an open transaction, and COPY mode all
+        bypass this switch regardless of its value.
+      default: "true"
+
+    release_query:
+      config:
+        en: |
+          SQL executed on every backend right before it returns to the pool, to clear
+          session-scoped state PostgreSQL does not reset between transactions
+          (advisory locks, `pg_variables` session vars, etc.).
+          * Omit  -> iServ-compatible default: `SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();`
+            (requires the `pg_variables` extension to provide `pgv_free()`)
+          * `""`  -> release-query disabled, nothing is executed at checkin
+          * other -> exactly that SQL runs on every checkin
+          A SQL error in the release query marks the backend bad so a dirty
+          session is never reused by another client.
+        ru: |
+          SQL, выполняемый на каждом backend-соединении непосредственно перед его
+          возвратом в пул. Очищает session-scoped состояние, которое PostgreSQL сам
+          между транзакциями не сбрасывает (advisory-локи, session-переменные
+          расширения `pg_variables` и т.п.).
+          * не указано -> iServ-compatible default: `SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();`
+            (требуется расширение `pg_variables` для `pgv_free()`)
+          * `""` -> release-query отключён, на checkin ничего не выполняется
+          * иначе -> ровно эта SQL выполняется на каждом checkin
+          SQL-ошибка release-query помечает backend bad, чтобы грязная сессия
+          не попала следующему клиенту.
+      doc: |
+        Per-pool checkin hook. By default pg_doorman runs the iServ-compatible
+        statement (`pg_advisory_unlock_all()` plus `pg_variables`' `pgv_free()`)
+        on every backend before it goes back into the idle set. Set `release_query = ""`
+        when the target database does not have the `pg_variables` extension -
+        otherwise every checkin will fail with `function public.pgv_free() does
+        not exist` and the backend will be marked bad. Set to a custom statement
+        when you need different teardown (`DISCARD ALL`, project-specific
+        cleanup function, etc.). Maximum length 4096 bytes; whitespace-only
+        values are rejected.
+      default: "None (uses iServ-compatible default)"
+
     prepared_statements_cache_size:
       config:
         en: "Override global prepared_statements_cache_size for this pool."
@@ -1641,7 +1873,7 @@ fields:
           Formats:
           - MD5: "md5" + md5(password + username)
           - SCRAM-SHA-256: "SCRAM-SHA-256$iterations:salt$StoredKey:ServerKey"
-          - JWT public key: "jwt-pkey-fpath:/path/to/public.pem"
+          - JWT public key: "jwt-pkey-fpath:/path/to/public.pem?iss=issuer&aud=audience"
 
           Generate MD5: echo -n "passwordusername" | md5sum
           Copy from PostgreSQL: SELECT usename, passwd FROM pg_shadow;
@@ -1650,12 +1882,14 @@ fields:
           Форматы:
           - MD5: "md5" + md5(пароль + имя_пользователя)
           - SCRAM-SHA-256: "SCRAM-SHA-256$iterations:salt$StoredKey:ServerKey"
-          - JWT: "jwt-pkey-fpath:/path/to/public.pem"
+          - JWT: "jwt-pkey-fpath:/path/to/public.pem?iss=issuer&aud=audience"
 
           Сгенерировать MD5: echo -n "парольимяпользователя" | md5sum
           Скопировать из PostgreSQL: SELECT usename, passwd FROM pg_shadow;
       doc: |
         Password verifier for client authentication. Supports MD5, SCRAM-SHA-256, and JWT formats.
+        JWT passwords must include exact issuer and audience scopes as `?iss=<issuer>&aud=<audience>`;
+        incoming tokens signed by the configured public key are rejected unless both claims match.
         You can copy password hashes directly from PostgreSQL: `SELECT usename, passwd FROM pg_shadow`.
 
     pool_size:
@@ -1740,6 +1974,26 @@ fields:
         en: "PAM service name for PAM authentication (requires 'pam' feature)."
         ru: "Имя PAM-сервиса для PAM-аутентификации (требуется фича 'pam')."
       doc: "The pam-service that is responsible for client authorization. In this case, pg_doorman will ignore the `password` value."
+
+    prewarm_query:
+      config:
+        en: |
+          Per-user override of the pool-level `prewarm_query`. When set, it
+          replaces the pool value entirely; an explicit empty string `""`
+          disables prewarm for this user only while keeping it enabled for
+          others. Omit to inherit the pool default. SET-like statements are
+          rejected for the same reason as the pool-level field.
+        ru: |
+          Per-user переопределение pool-level `prewarm_query`. Если задан -
+          полностью заменяет значение из пула; явная пустая строка `""`
+          отключает prewarm только для этого пользователя, не трогая других.
+          Опустите, чтобы использовать значение пула. SET-подобные запросы
+          запрещены по той же причине, что и на уровне пула.
+      doc: |
+        Same 4096-byte / non-whitespace validation as the pool-level field.
+        Same rejection of SET-like statements as the pool-level field.
+        Useful when one heavy reporting user needs an `ANALYZE` warm-up that
+        the OLTP users do not.
 
   auth_query:
     query:
@@ -1964,3 +2218,10 @@ fields:
         ru: "Отклонять SSO-учётные данные, пришедшие по обычному HTTP."
       doc: "When true, Bearer/cookie/query SSO tokens are accepted only if the request peer is in trusted_proxies and the proxy forwarded X-Forwarded-Proto: https. Defaults to false so SSO works through a TLS-terminating proxy reaching pg_doorman over a private HTTP leg. Enable on shared networks where the proxy → pg_doorman hop is exposed."
       default: "false"
+
+    allowed_admin_origins:
+      config:
+        en: "Allowlist of origins permitted to issue admin POST mutations."
+        ru: "Список origin-ов, которым разрешены admin POST мутации (CSRF protection)."
+      doc: "The CSRF gate on POST /api/admin/* checks request Origin (or Referer authority) against this list. Empty list = legacy Host-matching fallback (bypassable by SSRF/scripted clients with forged Host header). On multi-tenant networks populate with the canonical origin operators use, e.g. [\"https://pgd.example:7777\"]. Each entry is a scheme://host[:port] URL; comparison is case-insensitive."
+      default: "[]"

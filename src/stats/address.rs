@@ -4,35 +4,71 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::*;
 
+/// Cache-line-aligned wrapper around an `AtomicU64`.
+///
+/// an `AddressStatFields` struct packs 8 `AtomicU64` fields into a
+/// single 64-byte cache line. Two cores incrementing different counters
+/// - e.g. one thread bumping `xact_count` while another bumps
+/// `query_count` - repeatedly invalidate each other's cache line, costing
+/// 30-100 ns per increment under MESI/MOESI coherence traffic on ARM64
+/// and EPYC. Padding each hot atomic to its own cache line removes the
+/// false-sharing penalty entirely. The cost is 7 × 8 = 56 bytes of
+/// padding per atomic (negligible vs the hundreds of MB the pool reserves
+/// per backend connection).
+#[repr(align(64))]
+#[derive(Debug, Default)]
+pub struct PaddedAtomicU64(pub AtomicU64);
+
+impl std::ops::Deref for PaddedAtomicU64 {
+    type Target = AtomicU64;
+    #[inline(always)]
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
+
 /// Fields for tracking various statistics related to PostgreSQL connections by address.
 ///
 /// Each field is an atomic counter allowing safe sharing and updating
 /// across multiple threads without additional reference counting.
+///
+/// the four highest-frequency counters (`xact_count`, `query_count`,
+/// `bytes_received`, `bytes_sent`) are wrapped in [`PaddedAtomicU64`] so
+/// concurrent writes from different cores do not invalidate each other's
+/// cache line. The remaining four (latency totals, wait time, errors) are
+/// touched once per query in the slow accounting tail and don't justify
+/// the extra padding.
 #[derive(Debug, Default)]
 pub struct AddressStatFields {
     /// Number of transactions processed
-    pub xact_count: AtomicU64,
+    pub xact_count: PaddedAtomicU64,
 
     /// Number of queries processed
-    pub query_count: AtomicU64,
+    pub query_count: PaddedAtomicU64,
 
     /// Total bytes received from clients
-    pub bytes_received: AtomicU64,
+    pub bytes_received: PaddedAtomicU64,
 
     /// Total bytes sent to clients
-    pub bytes_sent: AtomicU64,
+    pub bytes_sent: PaddedAtomicU64,
 
     /// Total transaction processing time in microseconds
-    pub xact_time_microseconds: AtomicU64,
+    ///
+    /// also padded -  originally claimed this was a "slow
+    /// accounting tail" but `xact_time_add()` is called on EVERY query,
+    /// so it false-shared with `query_time_microseconds` / `wait_time` /
+    /// `errors` (all four packed in one 64-byte line). Pad all four to
+    /// finish what  started.
+    pub xact_time_microseconds: PaddedAtomicU64,
 
     /// Total query processing time in microseconds
-    pub query_time_microseconds: AtomicU64,
+    pub query_time_microseconds: PaddedAtomicU64,
 
     /// Total time spent waiting for resources in microseconds
-    pub wait_time: AtomicU64,
+    pub wait_time: PaddedAtomicU64,
 
     /// Number of errors encountered
-    pub errors: AtomicU64,
+    pub errors: PaddedAtomicU64,
 }
 
 /// Maximum trackable time in microseconds for HDR histogram (10 minutes)
@@ -46,6 +82,9 @@ fn is_valid_sqlstate(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
+
+const MAX_TRACKED_SQLSTATE_CODES: usize = 256;
+const SQLSTATE_OTHER_BUCKET: &str = "other";
 
 /// Number of significant digits for HDR histogram precision (3 = 0.1% error)
 const HISTOGRAM_SIGFIG: u8 = 2;
@@ -98,11 +137,105 @@ pub struct AddressStats {
     /// instead of locking the histogram mutex on every eviction call.
     pub p95_xact_time_us: AtomicU64,
 
+    /// Cached p99 transaction time in microseconds. Updated every stats cycle
+    /// (15s) from `xact_histogram`, alongside `p95_xact_time_us`.
+    ///
+    /// the burst-gate hot path needs `p99_xact_time` to size its
+    /// adaptive budget. Previously this called `get_xact_percentiles()`,
+    /// which takes a blocking `Mutex` lock on the HDR histogram on every
+    /// checkout - a periodic 100+ms stall during the 15s reset cycle, and
+    /// constant cacheline contention with the recorder side's `try_lock`.
+    /// The atomic cache eliminates both: one `Relaxed` load on the hot
+    /// path; the histogram is touched only by the recorder (`try_lock`,
+    /// no contention with the reader anymore) and by the 15s collector.
+    pub p99_xact_time_us: AtomicU64,
+
+    /// cached query-time percentiles (p50/p90/p95/p99) in
+    /// microseconds. Updated every stats cycle (15s) from
+    /// `query_histogram` alongside the xact cache. Read by
+    /// `initialize_pool_stats` for SHOW POOLS / /api/pools so the hot
+    /// scrape path doesn't take a blocking lock on the query
+    /// histogram on every Prometheus scrape.
+    pub p50_query_time_us: AtomicU64,
+    pub p90_query_time_us: AtomicU64,
+    pub p95_query_time_us: AtomicU64,
+    pub p99_query_time_us: AtomicU64,
+
+    /// cached wait-time percentiles, same shape.
+    pub p50_wait_time_us: AtomicU64,
+    pub p90_wait_time_us: AtomicU64,
+    pub p95_wait_time_us: AtomicU64,
+    pub p99_wait_time_us: AtomicU64,
+
+    /// cached xact-time p50/p90 too, for completeness.
+    pub p50_xact_time_us: AtomicU64,
+    pub p90_xact_time_us: AtomicU64,
+
     /// Cumulative error counter keyed by PostgreSQL SQLSTATE code (5-char).
     /// Updated alongside `total.errors`. Sharded; the hot path takes a single
     /// shard's read lock for the atomic increment, the slow path inserts a
     /// new shard entry under a brief write lock.
     pub errors_by_sqlstate: DashMap<String, AtomicU64>,
+
+    /// distinct-key count mirror for `errors_by_sqlstate`.
+    /// `DashMap::len()` sums every shard under a read lock; on the
+    /// unknown-SQLSTATE branch of `error_with_sqlstate` (hot under an
+    /// error storm once the cap is reached) that was paid per error. This
+    /// atomic is bumped only when `entry` inserts a brand-new key
+    /// (including the OTHER bucket), so a relaxed load replaces the
+    /// all-shard scan while staying exactly in step with `len()`.
+    errors_by_sqlstate_distinct: AtomicUsize,
+
+    /// Total number of idle backends probed by the dead-backend liveness
+    /// scan since process start. Bumped once per `check_alive` invocation
+    /// inside `Pool::evict_dead_backends`, regardless of outcome - i.e. this
+    /// counts ALL backends the scan touched, including healthy ones. The
+    /// "actually dead" signal lives in `dead_backends_evicted_total`.
+    /// Operators wiring Prometheus alerts on the dead-backend feature should
+    /// alert on `dead_backends_evicted_total > 0` (not on probed, which
+    /// advances continuously even on a healthy fleet).
+    pub dead_backends_probed_total: AtomicU64,
+
+    /// Cumulative number of backends the liveness scan actually dropped
+    /// because `check_alive` failed (or the connection was already
+    /// `mark_bad`). Each increment corresponds to one fewer entry in
+    /// `slots.size`; a sudden growth here followed by `replenish recovered`
+    /// log entries is the canonical signature of a PostgreSQL restart that
+    /// the scan healed without operator action.
+    pub dead_backends_evicted_total: AtomicU64,
+
+    /// Cumulative number of times the configured `prewarm_query` failed on
+    /// a newly created backend, causing that backend to be rejected from
+    /// the pool. A non-zero value is a config smell: the SQL is wrong, or
+    /// it references objects/extensions absent on the target database.
+    pub prewarm_failures_total: AtomicU64,
+
+    /// Cumulative number of times the per-pool `intercept_discard_all`
+    /// fast path absorbed a client `DISCARD ALL` simple-query (with the
+    /// synthetic CommandComplete + ReadyForQuery response). Operators
+    /// use this to verify the iServ contract is actually firing - a
+    /// regression that silently bypassed the gate (transaction-mode
+    /// detection breakage, intercept_discard_all caching drift after
+    /// RELOAD, etc.) would leave this counter flat while clients keep
+    /// losing temp-table state. Pair with a Prometheus rate-of-change
+    /// check for early warning.
+    pub discard_all_intercepted_total: AtomicU64,
+
+    /// cumulative number of CancelRequest messages routed at this
+    /// pool's address since process start. Populates the `cl_cancel_req`
+    /// column in SHOW POOLS (earlier always 0 - dead in production)
+    /// so dashboards alerting on cancel storms actually fire.
+    pub cancel_requests_total: AtomicU64,
+
+    /// number of HDR histogram samples that were discarded because
+    /// `xact_time_add` / `query_time_add_microseconds` / `wait_time_add`
+    /// could not acquire `try_lock()`. Under heavy concurrent recording
+    /// (the moment when p99 matters most) samples were silently dropped,
+    /// biasing percentile reads downward. Operators reading p99 during
+    /// an incident need to know if the value is statistically meaningful
+    /// - a non-zero rate here means histogram percentiles are
+    /// under-counting the slow tail.
+    pub histogram_samples_dropped_total: AtomicU64,
 
     /// Process-unique identifier for this `AddressStats` instance.
     /// Every `Default::default()` mints a fresh value from a static
@@ -139,9 +272,74 @@ impl Default for AddressStats {
             query_histogram: Mutex::new(new_histogram()),
             wait_histogram: Mutex::new(new_histogram()),
             p95_xact_time_us: AtomicU64::new(0),
+            p99_xact_time_us: AtomicU64::new(0),
+            p50_query_time_us: AtomicU64::new(0),
+            p90_query_time_us: AtomicU64::new(0),
+            p95_query_time_us: AtomicU64::new(0),
+            p99_query_time_us: AtomicU64::new(0),
+            p50_wait_time_us: AtomicU64::new(0),
+            p90_wait_time_us: AtomicU64::new(0),
+            p95_wait_time_us: AtomicU64::new(0),
+            p99_wait_time_us: AtomicU64::new(0),
+            p50_xact_time_us: AtomicU64::new(0),
+            p90_xact_time_us: AtomicU64::new(0),
             errors_by_sqlstate: DashMap::new(),
+            errors_by_sqlstate_distinct: AtomicUsize::new(0),
+            dead_backends_probed_total: AtomicU64::new(0),
+            dead_backends_evicted_total: AtomicU64::new(0),
+            prewarm_failures_total: AtomicU64::new(0),
+            discard_all_intercepted_total: AtomicU64::new(0),
+            histogram_samples_dropped_total: AtomicU64::new(0),
+            cancel_requests_total: AtomicU64::new(0),
             generation: next_address_stats_generation(),
         }
+    }
+}
+
+impl AddressStats {
+    /// Bump the dead-backend liveness-scan counters by the work performed in
+    /// one `Pool::evict_dead_backends` cycle. `checked` is the number of
+    /// backends probed by `check_alive`; `evicted` is how many failed and
+    /// were dropped. Callers may pass zero values; the increment is a
+    /// no-op then.
+    #[inline]
+    pub fn record_dead_backend_scan(&self, checked: usize, evicted: usize) {
+        if checked > 0 {
+            self.dead_backends_probed_total
+                .fetch_add(checked as u64, Ordering::Relaxed);
+        }
+        if evicted > 0 {
+            self.dead_backends_evicted_total
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Bump `discard_all_intercepted_total`. Called from the synthetic
+    /// DISCARD ALL fast path in `Client::handle_simple_query` every
+    /// time the iServ gate fires and pg_doorman absorbs a client
+    /// `DISCARD ALL` without forwarding to PostgreSQL.
+    #[inline]
+    pub fn discard_all_intercepted(&self) {
+        self.discard_all_intercepted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// bump the per-pool CancelRequest counter. Called from the
+    /// cancel-mode handler when a CancelRequest is routed to a backend
+    /// in this address's pool. Populates the `cl_cancel_req` column in
+    /// SHOW POOLS (earlier a dead always-zero column).
+    #[inline]
+    pub fn cancel_request(&self) {
+        self.cancel_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `prewarm_failures_total`. Called from `ServerPool::run_prewarm_query`
+    /// on any SQL/transport failure or cancellation of the configured prewarm
+    /// statement; explicit query failures mark the backend bad before the create
+    /// path drops it.
+    #[inline]
+    pub fn prewarm_failure(&self) {
+        self.prewarm_failures_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -308,6 +506,12 @@ impl AddressStats {
             // Clamp value to histogram max to avoid errors
             let value = microseconds.min(HISTOGRAM_MAX_VALUE_US);
             let _ = histogram.record(value);
+        } else {
+            // bump the drop counter so operators know percentiles
+            // are biased low under contention. The hot path stays
+            // non-blocking.
+            self.histogram_samples_dropped_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -334,6 +538,11 @@ impl AddressStats {
             // Clamp value to histogram max to avoid errors
             let value = microseconds.min(HISTOGRAM_MAX_VALUE_US);
             let _ = histogram.record(value);
+        } else {
+            // see xact_time_add - operators need visibility into
+            // contention-driven sample loss.
+            self.histogram_samples_dropped_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -359,6 +568,10 @@ impl AddressStats {
         if let Some(mut histogram) = self.wait_histogram.try_lock() {
             let value = time.min(HISTOGRAM_MAX_VALUE_US);
             let _ = histogram.record(value);
+        } else {
+            // see xact_time_add.
+            self.histogram_samples_dropped_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -387,10 +600,42 @@ impl AddressStats {
         if !is_valid_sqlstate(sqlstate) {
             return;
         }
-        self.errors_by_sqlstate
-            .entry(sqlstate.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+        // borrow-only fast path for an already-tracked code -
+        // a shard read lock and an atomic increment, no allocation. The
+        // per-error `to_string()` now runs only when a new key must be
+        // inserted (the cold path). Apps repeat a small set of SQLSTATEs,
+        // so this is the common case.
+        if let Some(counter) = self.errors_by_sqlstate.get(sqlstate) {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // read the distinct-key mirror instead of
+        // `DashMap::len()` (which locks every shard) so an unknown
+        // SQLSTATE under an error storm - once the cap is reached, every
+        // fresh code folds into OTHER - does not pay an all-shard scan
+        // per error.
+        let bucket = if self.errors_by_sqlstate_distinct.load(Ordering::Relaxed)
+            < MAX_TRACKED_SQLSTATE_CODES
+        {
+            sqlstate
+        } else {
+            SQLSTATE_OTHER_BUCKET
+        };
+        // Bump the distinct-key mirror exactly when `entry` inserts a
+        // brand-new key (including the OTHER bucket), keeping it in step
+        // with `errors_by_sqlstate.len()`. The OTHER bucket may already
+        // exist here (a prior overflow created it), so still match.
+        match self.errors_by_sqlstate.entry(bucket.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                occupied.get().fetch_add(1, Ordering::Relaxed);
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                self.errors_by_sqlstate_distinct
+                    .fetch_add(1, Ordering::Relaxed);
+                vacant.insert(AtomicU64::new(1));
+            }
+        }
     }
 
     /// Snapshot of the SQLSTATE breakdown as a plain map. Reading is O(N)
@@ -404,27 +649,31 @@ impl AddressStats {
 
     /// Returns transaction time percentiles (p50, p90, p95, p99) in microseconds.
     ///
-    /// Uses HDR histogram for O(1) percentile calculation.
+    /// read the cached atomic snapshot maintained by
+    /// `reset_histograms` (refreshed every 15s by the Collector).
+    /// Prior shape took a blocking `xact_histogram.lock()` here,
+    /// contending against `reset_histograms()` and against recorders
+    /// that use `try_lock` and increment
+    /// `histogram_samples_dropped_total`. Under a `/metrics` scrape
+    /// storm during the 15s collector tick, reader threads serialised
+    /// on each pool's lock.
     pub fn get_xact_percentiles(&self) -> (u64, u64, u64, u64) {
-        let histogram = self.xact_histogram.lock();
         (
-            histogram.value_at_quantile(0.50),
-            histogram.value_at_quantile(0.90),
-            histogram.value_at_quantile(0.95),
-            histogram.value_at_quantile(0.99),
+            self.p50_xact_time_us.load(Ordering::Relaxed),
+            self.p90_xact_time_us.load(Ordering::Relaxed),
+            self.p95_xact_time_us.load(Ordering::Relaxed),
+            self.p99_xact_time_us.load(Ordering::Relaxed),
         )
     }
 
     /// Returns query time percentiles (p50, p90, p95, p99) in microseconds.
-    ///
-    /// Uses HDR histogram for O(1) percentile calculation.
+    /// See `get_xact_percentiles` for the cache rationale.
     pub fn get_query_percentiles(&self) -> (u64, u64, u64, u64) {
-        let histogram = self.query_histogram.lock();
         (
-            histogram.value_at_quantile(0.50),
-            histogram.value_at_quantile(0.90),
-            histogram.value_at_quantile(0.95),
-            histogram.value_at_quantile(0.99),
+            self.p50_query_time_us.load(Ordering::Relaxed),
+            self.p90_query_time_us.load(Ordering::Relaxed),
+            self.p95_query_time_us.load(Ordering::Relaxed),
+            self.p99_query_time_us.load(Ordering::Relaxed),
         )
     }
 
@@ -435,33 +684,94 @@ impl AddressStats {
     /// semaphore wait, Phase 4 anticipation, coordinator Phase A/R/B/C/D,
     /// pre-create recycle, burst gate, and `server_pool.create()`. Use
     /// the p99 value to correlate client-side latency spikes against the
-    /// pool.
+    /// pool. See `get_xact_percentiles` for the cache rationale.
     pub fn get_wait_percentiles(&self) -> (u64, u64, u64, u64) {
-        let histogram = self.wait_histogram.lock();
         (
-            histogram.value_at_quantile(0.50),
-            histogram.value_at_quantile(0.90),
-            histogram.value_at_quantile(0.95),
-            histogram.value_at_quantile(0.99),
+            self.p50_wait_time_us.load(Ordering::Relaxed),
+            self.p90_wait_time_us.load(Ordering::Relaxed),
+            self.p95_wait_time_us.load(Ordering::Relaxed),
+            self.p99_wait_time_us.load(Ordering::Relaxed),
         )
     }
 
     /// Resets the histograms for the new time window.
     ///
     /// Called at the end of each stats period (15 seconds) to start fresh.
-    pub fn reset_histograms(&self) {
-        if let Some(mut histogram) = self.xact_histogram.try_lock() {
-            // Cache p95 before reset — used by eviction scoring to prefer
-            // slow pools as donors without locking the histogram on every
-            // eviction call.
+    pub fn refresh_percentile_cache(&self) {
+        {
+            let histogram = self.xact_histogram.lock();
+            self.p50_xact_time_us
+                .store(histogram.value_at_quantile(0.50), Ordering::Relaxed);
+            self.p90_xact_time_us
+                .store(histogram.value_at_quantile(0.90), Ordering::Relaxed);
             self.p95_xact_time_us
                 .store(histogram.value_at_quantile(0.95), Ordering::Relaxed);
+            self.p99_xact_time_us
+                .store(histogram.value_at_quantile(0.99), Ordering::Relaxed);
+        }
+        {
+            let histogram = self.query_histogram.lock();
+            self.p50_query_time_us
+                .store(histogram.value_at_quantile(0.50), Ordering::Relaxed);
+            self.p90_query_time_us
+                .store(histogram.value_at_quantile(0.90), Ordering::Relaxed);
+            self.p95_query_time_us
+                .store(histogram.value_at_quantile(0.95), Ordering::Relaxed);
+            self.p99_query_time_us
+                .store(histogram.value_at_quantile(0.99), Ordering::Relaxed);
+        }
+        {
+            let histogram = self.wait_histogram.lock();
+            self.p50_wait_time_us
+                .store(histogram.value_at_quantile(0.50), Ordering::Relaxed);
+            self.p90_wait_time_us
+                .store(histogram.value_at_quantile(0.90), Ordering::Relaxed);
+            self.p95_wait_time_us
+                .store(histogram.value_at_quantile(0.95), Ordering::Relaxed);
+            self.p99_wait_time_us
+                .store(histogram.value_at_quantile(0.99), Ordering::Relaxed);
+        }
+    }
+
+    pub fn reset_histograms(&self) {
+        // Cache p50/p90/p95/p99 for query_histogram and wait_histogram
+        // alongside xact_histogram, so SHOW POOLS and initialize_pool_stats
+        // can read percentiles from atomic loads instead of taking histogram
+        // locks per pool per scrape.
+        {
+            let mut histogram = self.xact_histogram.lock();
+            self.p50_xact_time_us
+                .store(histogram.value_at_quantile(0.50), Ordering::Relaxed);
+            self.p90_xact_time_us
+                .store(histogram.value_at_quantile(0.90), Ordering::Relaxed);
+            self.p95_xact_time_us
+                .store(histogram.value_at_quantile(0.95), Ordering::Relaxed);
+            self.p99_xact_time_us
+                .store(histogram.value_at_quantile(0.99), Ordering::Relaxed);
             histogram.reset();
         }
-        if let Some(mut histogram) = self.query_histogram.try_lock() {
+        {
+            let mut histogram = self.query_histogram.lock();
+            self.p50_query_time_us
+                .store(histogram.value_at_quantile(0.50), Ordering::Relaxed);
+            self.p90_query_time_us
+                .store(histogram.value_at_quantile(0.90), Ordering::Relaxed);
+            self.p95_query_time_us
+                .store(histogram.value_at_quantile(0.95), Ordering::Relaxed);
+            self.p99_query_time_us
+                .store(histogram.value_at_quantile(0.99), Ordering::Relaxed);
             histogram.reset();
         }
-        if let Some(mut histogram) = self.wait_histogram.try_lock() {
+        {
+            let mut histogram = self.wait_histogram.lock();
+            self.p50_wait_time_us
+                .store(histogram.value_at_quantile(0.50), Ordering::Relaxed);
+            self.p90_wait_time_us
+                .store(histogram.value_at_quantile(0.90), Ordering::Relaxed);
+            self.p95_wait_time_us
+                .store(histogram.value_at_quantile(0.95), Ordering::Relaxed);
+            self.p99_wait_time_us
+                .store(histogram.value_at_quantile(0.99), Ordering::Relaxed);
             histogram.reset();
         }
     }
@@ -472,7 +782,10 @@ impl AddressStats {
     /// It is called periodically by the stats collector to update the reported averages.
     pub fn update_averages(&self) {
         // Convert the stat period from milliseconds to seconds for per-second calculations
-        let stat_period_per_second = crate::stats::STAT_PERIOD / 1_000;
+        // floor at 1 so a future change that drops
+        // STAT_PERIOD below 1000 ms (e.g. for testing) cannot
+        // cause integer-division-by-zero panic on every tick.
+        let stat_period_per_second = (crate::stats::STAT_PERIOD / 1_000).max(1);
 
         // Calculate transaction-related averages
         self.update_transaction_averages(stat_period_per_second);
@@ -557,26 +870,33 @@ impl AddressStats {
     /// Resets all current period counters to zero.
     ///
     /// This method is called after the averages have been updated to prepare for the next period.
+    ///
+    /// Use `swap(0)` instead of `store(0)` so increments racing with
+    /// the reset are either returned by the swap for this period or
+    /// preserved for the next period. No increment can be wiped between
+    /// the average update and the reset.
     pub fn reset_current_counts(&self) {
         // Reset transaction-related counters
-        self.current.xact_count.store(0, Ordering::Relaxed);
-        self.current
+        let _ = self.current.xact_count.swap(0, Ordering::Relaxed);
+        let _ = self
+            .current
             .xact_time_microseconds
-            .store(0, Ordering::Relaxed);
+            .swap(0, Ordering::Relaxed);
 
         // Reset query-related counters
-        self.current.query_count.store(0, Ordering::Relaxed);
-        self.current
+        let _ = self.current.query_count.swap(0, Ordering::Relaxed);
+        let _ = self
+            .current
             .query_time_microseconds
-            .store(0, Ordering::Relaxed);
+            .swap(0, Ordering::Relaxed);
 
         // Reset throughput counters
-        self.current.bytes_received.store(0, Ordering::Relaxed);
-        self.current.bytes_sent.store(0, Ordering::Relaxed);
+        let _ = self.current.bytes_received.swap(0, Ordering::Relaxed);
+        let _ = self.current.bytes_sent.swap(0, Ordering::Relaxed);
 
         // Reset wait time and error counters
-        self.current.wait_time.store(0, Ordering::Relaxed);
-        self.current.errors.store(0, Ordering::Relaxed);
+        let _ = self.current.wait_time.swap(0, Ordering::Relaxed);
+        let _ = self.current.errors.swap(0, Ordering::Relaxed);
     }
 
     /// Populates a row vector with string representations of all statistics.
@@ -712,6 +1032,23 @@ mod tests {
     }
 
     #[test]
+    fn test_error_with_sqlstate_caps_distinct_codes() {
+        let stats = AddressStats::default();
+
+        for i in 0..(MAX_TRACKED_SQLSTATE_CODES + 8) {
+            stats.error_with_sqlstate(&format!("Z{i:04}"));
+        }
+
+        let snap = stats.errors_by_sqlstate_snapshot();
+        assert!(
+            snap.len() <= MAX_TRACKED_SQLSTATE_CODES + 1,
+            "snapshot grew beyond cap: {}",
+            snap.len()
+        );
+        assert_eq!(snap.get(SQLSTATE_OTHER_BUCKET), Some(&8));
+    }
+
+    #[test]
     fn test_is_valid_sqlstate() {
         // Canonical codes accepted across the documented PG classes.
         assert!(is_valid_sqlstate("00000"));
@@ -784,48 +1121,78 @@ mod tests {
             stats.query_time_add_microseconds(i as u64);
         }
 
+        // `get_*_percentiles` now read the cached
+        // atomic snapshot maintained by `reset_histograms` (every
+        // 15s by the Collector in production). In tests we must
+        // call `reset_histograms` explicitly to refresh the cache
+        // from the live histogram data before reading.
+        stats.reset_histograms();
+
         let (p50, p90, p95, p99) = stats.get_xact_percentiles();
         assert!(
             (45..=55).contains(&p50),
-            "p50 xact should be ~50, got {}",
-            p50
+            "p50 xact should be ~50, got {p50}"
         );
         assert!(
             (85..=95).contains(&p90),
-            "p90 xact should be ~90, got {}",
-            p90
+            "p90 xact should be ~90, got {p90}"
         );
         assert!(
             (90..=100).contains(&p95),
-            "p95 xact should be ~95, got {}",
-            p95
+            "p95 xact should be ~95, got {p95}"
         );
         assert!(
             (95..=105).contains(&p99),
-            "p99 xact should be ~99, got {}",
-            p99
+            "p99 xact should be ~99, got {p99}"
         );
 
         let (p50, p90, p95, p99) = stats.get_query_percentiles();
         assert!(
             (45..=55).contains(&p50),
-            "p50 query should be ~50, got {}",
-            p50
+            "p50 query should be ~50, got {p50}"
         );
         assert!(
             (85..=95).contains(&p90),
-            "p90 query should be ~90, got {}",
-            p90
+            "p90 query should be ~90, got {p90}"
         );
         assert!(
             (90..=100).contains(&p95),
-            "p95 query should be ~95, got {}",
-            p95
+            "p95 query should be ~95, got {p95}"
         );
         assert!(
             (95..=105).contains(&p99),
-            "p99 query should be ~99, got {}",
-            p99
+            "p99 query should be ~99, got {p99}"
+        );
+    }
+
+    #[test]
+    fn refresh_percentile_cache_publishes_current_window_without_reset() {
+        let stats = AddressStats::default();
+
+        for value in [100, 100, 100, 200] {
+            stats.query_time_add_microseconds(value);
+        }
+
+        assert_eq!(
+            stats.get_query_percentiles(),
+            (0, 0, 0, 0),
+            "cached percentile atoms should start cold before collector/admin refresh"
+        );
+
+        stats.refresh_percentile_cache();
+        let (p50, _p90, _p95, p99) = stats.get_query_percentiles();
+        assert!(
+            (90..=110).contains(&p50),
+            "fresh p50 query should be ~100us, got {p50}"
+        );
+        assert!(
+            (190..=210).contains(&p99),
+            "fresh p99 query should be ~200us, got {p99}"
+        );
+        assert_eq!(
+            stats.query_histogram.lock().len(),
+            4,
+            "admin refresh must not reset the collector window"
         );
     }
 

@@ -13,6 +13,11 @@ use once_cell::sync::Lazy;
 use std::mem;
 use std::sync::Arc;
 
+use crate::errors::Error;
+use crate::messages::MAX_MESSAGE_SIZE;
+
+const SIMPLE_QUERY_LENGTH_OVERHEAD: usize = mem::size_of::<i32>() + 1;
+
 /// Atomic snapshot of `general.pooler_check_query` and its pre-encoded
 /// SimpleQuery wire bytes. Initialized with the default `;` value.
 pub static POOLER_CHECK_QUERY_SNAPSHOT: Lazy<ArcSwap<PoolerCheckQuerySnapshot>> =
@@ -26,9 +31,16 @@ pub struct PoolerCheckQuerySnapshot {
 
 impl PoolerCheckQuerySnapshot {
     pub fn new(query: &str) -> Self {
+        let wire_len = pooler_check_query_wire_len(query.len())
+            .expect("pooler_check_query length must be validated before snapshot publish");
+        debug_assert!(
+            validate_pooler_check_query(query).is_ok(),
+            "pooler_check_query must be validated before snapshot publish"
+        );
+
         let mut buf = BytesMut::with_capacity(query.len() + 6);
         buf.put_u8(b'Q');
-        buf.put_i32(query.len() as i32 + mem::size_of::<i32>() as i32 + 1);
+        buf.put_i32(wire_len);
         buf.put_slice(query.as_bytes());
         buf.put_u8(b'\0');
         Self {
@@ -36,6 +48,30 @@ impl PoolerCheckQuerySnapshot {
             request_bytes: buf.freeze(),
         }
     }
+}
+
+fn pooler_check_query_wire_len(query_len: usize) -> Result<i32, Error> {
+    let wire_len = query_len
+        .checked_add(SIMPLE_QUERY_LENGTH_OVERHEAD)
+        .ok_or_else(|| Error::BadConfig("general.pooler_check_query is too large".to_string()))?;
+
+    if wire_len >= MAX_MESSAGE_SIZE as usize {
+        return Err(Error::BadConfig(format!(
+            "general.pooler_check_query encoded SimpleQuery length must be < {MAX_MESSAGE_SIZE} bytes"
+        )));
+    }
+
+    Ok(wire_len as i32)
+}
+
+pub(crate) fn validate_pooler_check_query(query: &str) -> Result<(), Error> {
+    if query.as_bytes().contains(&0) {
+        return Err(Error::BadConfig(
+            "general.pooler_check_query must not contain NUL bytes".to_string(),
+        ));
+    }
+
+    pooler_check_query_wire_len(query.len()).map(|_| ())
 }
 
 /// Atomically replace the global snapshot. Called from config `parse()`
@@ -67,6 +103,23 @@ mod tests {
             v
         };
         assert_eq!(snap.request_bytes.as_ref(), &expected[..]);
+    }
+
+    #[test]
+    fn validation_rejects_embedded_nul() {
+        let err = validate_pooler_check_query("select\0 1").expect_err("NUL must be rejected");
+        assert!(err.to_string().contains("NUL"));
+    }
+
+    #[test]
+    fn validation_rejects_protocol_message_cap_without_allocating() {
+        let err =
+            pooler_check_query_wire_len(MAX_MESSAGE_SIZE as usize - SIMPLE_QUERY_LENGTH_OVERHEAD)
+                .expect_err("length exactly at protocol cap must be rejected");
+        assert!(
+            err.to_string().contains("encoded SimpleQuery length"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

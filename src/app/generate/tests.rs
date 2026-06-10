@@ -35,6 +35,7 @@ pub fn generate_config_with_client<
                     server_lifetime: None,
                     server_username: None,
                     server_password: None,
+                    prewarm_query: None,
                     auth_pam_service: None,
                 };
                 users_vec.push(user);
@@ -92,6 +93,9 @@ pub fn generate_config_with_client<
                         fallback_connect_timeout: None,
                         fallback_lifetime: None,
                         startup_parameters: std::collections::BTreeMap::new(),
+                        release_query: None,
+                        prewarm_query: String::new(),
+                        intercept_discard_all: true,
                         users: users_vec.clone(),
                     },
                 );

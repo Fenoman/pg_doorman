@@ -75,6 +75,27 @@ retain_connections_max = 3
 # Default: "60s"
 server_idle_check_timeout = 60000
 
+# Per-backend deadline for the background liveness scan that runs
+# inside the retain loop. Each tick of `retain_connections_time`
+# pops up to `dead_backend_check_max_per_cycle` idle backends per
+# pool, runs `check_alive` with this timeout, and drops the ones
+# that fail. Fixes the "zombie pool" regression where idle TCP
+# sockets survive a PostgreSQL restart and keep `slots.size` high
+# enough that `replenish` never refills the pool.
+# 0 disables the scan entirely.
+# Default: "2s"
+dead_backend_check_timeout = 2000
+
+# Cap on how many idle backends the liveness scan probes per pool per
+# retain cycle. Bounds CPU and TCP-probe traffic when a pool is large.
+# 0 disables the scan.
+dead_backend_check_max_per_cycle = 8
+
+# Optional override for the runtime log filter; takes the same
+# syntax as the `--log-level` CLI flag plus per-module overrides
+# (e.g. `"warn"`, `"info,pg_doorman::pool=debug"`).
+# log_level = "warn"
+
 # Time to wait for active transactions to finish during graceful shutdown.
 # Default: 10000 (10000 ms)
 shutdown_timeout = 10000
@@ -300,8 +321,8 @@ admin_username = "admin"
 
 # Admin password for the virtual admin database.
 # IMPORTANT: Change this in production!
-# Default: "admin"
-admin_password = "admin"
+# Default: "change_me_to_a_long_random_secret"
+admin_password = "change_me_to_a_long_random_secret"
 
 # --------------------------------------------------------------------------
 # TLS Settings (Client-facing)
@@ -503,6 +524,10 @@ sso_groups_claim = "groups"
 # Default: false
 sso_require_https = false
 
+# Allowlist of origins permitted to issue admin POST mutations.
+# Default: []
+allowed_admin_origins = []
+
 # ############################################################################
 # TALOS AUTHENTICATION (Optional)
 # ############################################################################
@@ -512,6 +537,8 @@ sso_require_https = false
 # keys = ["/etc/pg_doorman/talos/public-key-1.pem", "/etc/pg_doorman/talos/public-key-2.pem"]
 # # List of databases that use Talos authentication.
 # databases = ["talos_db1", "talos_db2"]
+# # Allowed resource_access key prefixes for Talos tokens.
+# resource_prefixes = ["postgres.stg"]
 
 # ############################################################################
 # CONNECTION POOLS
@@ -649,6 +676,61 @@ log_client_parameter_status_changes = false
 # Default: {} (empty)
 # startup_parameters = { plan_cache_mode = "force_custom_plan" }
 
+# SQL executed on every backend right before it returns to the pool, to clear
+# session-scoped state PostgreSQL does not reset between transactions
+# (advisory locks, `pg_variables` session vars, etc.).
+# * Omit  -> iServ-compatible default: `SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();`
+#   (requires the `pg_variables` extension to provide `pgv_free()`)
+# * `""`  -> release-query disabled, nothing is executed at checkin
+# * other -> exactly that SQL runs on every checkin
+# A SQL error in the release query marks the backend bad so a dirty
+# session is never reused by another client.
+# Default: None (uses iServ-compatible default)
+# release_query = ""
+
+# SQL executed exactly once on a backend right after it finishes
+# authentication, before the connection joins the idle pool. Used to
+# warm planner caches, preload libraries, or hydrate temp tables
+# consumed by the workload.
+# Do not use SET here: transaction-pool cleanup uses RESET ALL/RESET ROLE
+# before reuse and would erase or mis-scope one-shot prewarm state.
+# Use startup_parameters for persistent backend GUCs.
+# Leave empty (the default) to disable the prewarm.
+# A failure (SQL error or transport error) marks the backend bad -
+# the connection is dropped and the per-pool `prewarm_failures`
+# counter is bumped.
+# Per-user `prewarm_query` overrides this when present.
+# Default: "" (disabled)
+# prewarm_query = "SELECT 1"
+
+# Whether pg_doorman should answer a standalone `DISCARD ALL` simple
+# query locally without forwarding it to PostgreSQL.
+#
+# With the default `true` the iServ contract holds for the common
+# driver-traffic case: in transaction pooling, outside of an open
+# transaction and outside COPY mode, a `DISCARD ALL` (optionally
+# wrapped in leading or trailing `--` line / `/* */` block comments
+# - common ORM and bench tagging) is replaced with a synthetic
+# `CommandComplete` + `ReadyForQuery`. The per-client prepared-
+# statement cache is cleared at the same instant so the next `Bind`
+# cannot reach a backend that does not know the statement.
+#
+# NOT intercepted (these still reach PostgreSQL):
+# - multi-statement batches containing `DISCARD ALL`
+#   (`SELECT 1; DISCARD ALL`) - extracting one statement's effect
+#   from a batch is ambiguous;
+# - `DISCARD ALL` issued via the extended (Parse/Bind/Execute)
+#   protocol rather than simple-query - rare in real driver
+#   traffic;
+# - `DISCARD ALL` inside an open transaction or COPY mode.
+#
+# Set `false` only when the application relies on real DISCARD ALL
+# side effects in a pooled connection: `UNLISTEN *`, dropping
+# session-temp tables, releasing `PREPARE TRANSACTION` gids, or
+# clearing session-level sequence/plan caches.
+# Default: true
+intercept_discard_all = true
+
 # --------------------------------------------------------------------------
 # Users Configuration (TOML uses indexed format)
 # --------------------------------------------------------------------------
@@ -663,7 +745,7 @@ username = "app_user"
 # Formats:
 # - MD5: "md5" + md5(password + username)
 # - SCRAM-SHA-256: "SCRAM-SHA-256$iterations:salt$StoredKey:ServerKey"
-# - JWT public key: "jwt-pkey-fpath:/path/to/public.pem"
+# - JWT public key: "jwt-pkey-fpath:/path/to/public.pem?iss=issuer&aud=audience"
 #
 # Generate MD5: echo -n "passwordusername" | md5sum
 # Copy from PostgreSQL: SELECT usename, passwd FROM pg_shadow;
@@ -699,6 +781,13 @@ pool_size = 40
 
 # PAM service name for PAM authentication (requires 'pam' feature).
 # auth_pam_service = "pg_doorman"
+
+# Per-user override of the pool-level `prewarm_query`. When set, it
+# replaces the pool value entirely; an explicit empty string `""`
+# disables prewarm for this user only while keeping it enabled for
+# others. Omit to inherit the pool default. SET-like statements are
+# rejected for the same reason as the pool-level field.
+# prewarm_query = ""
 
 # --------------------------------------------------------------------------
 # Dynamic Authentication (auth_query)
@@ -774,7 +863,7 @@ pool_size = 40
 #
 # [pools.jwt_auth_db.users.0]
 # username = "jwt_user"
-# password = "jwt-pkey-fpath:/etc/pg_doorman/jwt/public.pem"
+# password = "jwt-pkey-fpath:/etc/pg_doorman/jwt/public.pem?iss=issuer&aud=audience"
 # pool_size = 30
 # server_username = "actual_db_user"
 # server_password = "actual_password"

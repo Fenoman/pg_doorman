@@ -50,6 +50,27 @@ pub fn print_all_stats() {
                 pool_stats.avg_wait_time as f64 / 1_000f64,
             );
         }
+        // surface change/change counters in the periodic log
+        // so operators see prewarm/discard/dead-backend activity even
+        // when the pool is idle (total_clients == 0). Emitted only when
+        // at least one counter is non-zero - keeps the steady-state log
+        // line out of the journal during boring uptime.
+        let dead_probed = pool_stats.total_dead_backends_probed;
+        let dead_evicted = pool_stats.total_dead_backends_evicted;
+        let prewarm_failures = pool_stats.total_prewarm_failures;
+        let discard_intercepted = pool_stats.total_discard_all_intercepted;
+        if dead_probed > 0 || dead_evicted > 0 || prewarm_failures > 0 || discard_intercepted > 0 {
+            info!(
+                "[{}@{}] maintenance discard_all_intercepted={} prewarm_failures={} \
+                dead_backends_probed={} dead_backends_evicted={}",
+                identifier.user,
+                identifier.db,
+                discard_intercepted,
+                prewarm_failures,
+                dead_probed,
+                dead_evicted,
+            );
+        }
     });
     #[cfg(target_os = "linux")]
     {

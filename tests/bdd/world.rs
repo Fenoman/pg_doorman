@@ -216,7 +216,7 @@ impl DoormanWorld {
             .ok()
             .filter(|s| !s.is_empty());
 
-        // C1 always needs 1 thread to avoid pgbench error: "number of clients (1) must be a multiple of number of threads"
+        // The 1-client (C1) config always needs 1 thread to avoid the pgbench error: "number of clients (1) must be a multiple of number of threads"
         let pgbench_jobs_c1 = "1".to_string();
         result = result.replace("${PGBENCH_JOBS_C1}", &pgbench_jobs_c1);
 

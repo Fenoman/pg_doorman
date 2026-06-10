@@ -111,6 +111,7 @@ pub fn generate_config_with_client(
                 server_lifetime: None,
                 server_username: None,
                 server_password: None,
+                prewarm_query: None,
                 auth_pam_service: None,
             };
             users.push(user);
@@ -169,6 +170,9 @@ pub fn generate_config_with_client(
                     server_tls_private_key: None,
                     auth_query: None,
                     startup_parameters: std::collections::BTreeMap::new(),
+                    release_query: None,
+                    prewarm_query: String::new(),
+                    intercept_discard_all: true,
                     users: users.clone(),
                 },
             );
