@@ -2,7 +2,7 @@
 name = "pg_doorman"
 version = "3.10.6"
 edition = "2021"
-rust-version = "1.87.0"
+rust-version = "1.88.0"
 license = "MIT"
 
 
@@ -32,6 +32,12 @@ arc-swap = "1.7.1"
 toml = "0.8"
 prometheus = "0.14.0"
 tokio = { version = "1.48.4", features = ["rt-multi-thread", "fs", "parking_lot", "sync", "io-util", "net", "macros", "signal", "time"] }
+# async-channel is MPMC (multi-producer multi-consumer) - the receiver
+# is Send+Sync, so we can clone it across N auth_query workers and get
+# real parallelism. Tokio's `mpsc` is SPMC by design (one receiver), so
+# the receiver-sharing workaround wrapped it in `tokio::sync::Mutex` and forced
+# all workers to serialize on one mutex.
+async-channel = "2"
 exitcode = "1.1.2"
 pin-project = "1"
 bytes = "1.10.1"
@@ -62,8 +68,8 @@ jwt = { version = "0.16.0", features = ["openssl"] }
 # adding a second JWT crate would only duplicate functionality and
 # pull extra transitive licenses (ring, ISC) into the vendor set.
 thiserror = "1"
-openssl = { version = "0.10.78" }
-openssl-sys = { version = "0.9.114" }
+openssl = { version = "0.10.80" }
+openssl-sys = { version = "0.9.116" }
 iota = { version = "0.2.3" }
 pin-project-lite = "0.2.16"
 pam-client = { version =  "0.5.0", optional = true }
@@ -143,6 +149,10 @@ harness = false
 
 [[bench]]
 name = "pool_anticipation_benchmarks"
+harness = false
+
+[[bench]]
+name = "prepared_cache_memory_benchmarks"
 harness = false
 
 [features]

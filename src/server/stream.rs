@@ -236,6 +236,7 @@ pub(crate) async fn create_tcp_stream_inner(
                         server_tls.mode,
                         elapsed.as_secs_f64() * 1000.0
                     );
+                    crate::web::metrics::record_pool_only_fallback_tls_label(pool_name);
                     crate::web::metrics::SHOW_SERVER_TLS_HANDSHAKE_DURATION
                         .with_label_values(&[pool_name])
                         .observe(elapsed.as_secs_f64());
@@ -255,6 +256,7 @@ pub(crate) async fn create_tcp_stream_inner(
                         server_tls.mode,
                         elapsed.as_secs_f64() * 1000.0
                     );
+                    crate::web::metrics::record_pool_only_fallback_tls_label(pool_name);
                     crate::web::metrics::SHOW_SERVER_TLS_HANDSHAKE_ERRORS
                         .with_label_values(&[pool_name])
                         .inc();
@@ -270,6 +272,7 @@ pub(crate) async fn create_tcp_stream_inner(
                     "tls required but server does not support tls, host={host} port={port} server_tls_mode={}",
                     server_tls.mode
                 );
+                crate::web::metrics::record_pool_only_fallback_tls_label(pool_name);
                 crate::web::metrics::SHOW_SERVER_TLS_HANDSHAKE_ERRORS
                     .with_label_values(&[pool_name])
                     .inc();

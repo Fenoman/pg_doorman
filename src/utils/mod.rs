@@ -26,15 +26,15 @@ pub fn format_duration_ms(ms: u64) -> String {
         return "0ms".to_string();
     }
     if ms < 1_000 {
-        return format!("{}ms", ms);
+        return format!("{ms}ms");
     }
     if ms < 60_000 {
         let secs = ms / 1_000;
         let frac = ms % 1_000;
         return if frac > 0 {
-            format!("{}.{:03}s", secs, frac)
+            format!("{secs}.{frac:03}s")
         } else {
-            format!("{}s", secs)
+            format!("{secs}s")
         };
     }
 
@@ -46,19 +46,19 @@ pub fn format_duration_ms(ms: u64) -> String {
 
     let mut result = String::new();
     if days > 0 {
-        result.push_str(&format!("{}d", days));
+        result.push_str(&format!("{days}d"));
     }
 
     let mut sub_day = String::new();
     if hours > 0 {
-        sub_day.push_str(&format!("{}h", hours));
+        sub_day.push_str(&format!("{hours}h"));
     }
     if mins > 0 {
-        sub_day.push_str(&format!("{}m", mins));
+        sub_day.push_str(&format!("{mins}m"));
     }
     // Drop seconds when days are present (too much precision)
     if secs > 0 && days == 0 {
-        sub_day.push_str(&format!("{}s", secs));
+        sub_day.push_str(&format!("{secs}s"));
     }
 
     if !sub_day.is_empty() {

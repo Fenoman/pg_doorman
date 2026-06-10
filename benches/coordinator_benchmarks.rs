@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use pg_doorman::pool::pool_coordinator::{CoordinatorConfig, EvictionSource, PoolCoordinator};
 
@@ -250,22 +250,21 @@ fn pool_checkout_without_coordinator(c: &mut Criterion) {
     group.finish();
 }
 
-/// Isolated cost of `PoolCoordinator::notify_idle_returned` — a single
-/// `tokio::sync::Notify::notify_one()` call behind an `Arc` deref. This is
-/// the full overhead added to `Pool::return_object` when the pool has a
+/// Isolated cost of the primitive used by
+/// `PoolCoordinator::notify_idle_returned`: a single
+/// `tokio::sync::Notify::notify_one()` call behind an `Arc` deref. This is the
+/// full overhead added to `Pool::return_object` when the pool has a
 /// coordinator. Bench target: ~10-20 ns, small enough to be invisible on the
 /// return_object hot path.
 fn notify_idle_returned_standalone(c: &mut Criterion) {
-    let rt = runtime();
     let mut group = c.benchmark_group("notify_idle_returned");
     group.throughput(Throughput::Elements(1));
 
-    let coord =
-        rt.block_on(async { PoolCoordinator::new("bench_db".to_string(), make_config(100)) });
+    let notify = Arc::new(Notify::new());
 
     group.bench_function("no_waiters", |b| {
         b.iter(|| {
-            coord.notify_idle_returned();
+            notify.notify_one();
         });
     });
 
@@ -275,12 +274,11 @@ fn notify_idle_returned_standalone(c: &mut Criterion) {
 /// Simulates `Pool::return_object` with and without the coordinator notify.
 /// Both variants do the same VecDeque push and semaphore add_permits; the
 /// "with_coordinator_notify" variant additionally calls
-/// `coordinator.notify_idle_returned()`. The delta between them is the
-/// added hot-path cost.
+/// the same Notify primitive used by `coordinator.notify_idle_returned()`.
+/// The delta between them is the added hot-path cost.
 fn return_object_with_coordinator_notify(c: &mut Criterion) {
     use std::collections::VecDeque;
 
-    let rt = runtime();
     let mut group = c.benchmark_group("return_object_hot_path");
     group.throughput(Throughput::Elements(1));
 
@@ -299,13 +297,12 @@ fn return_object_with_coordinator_notify(c: &mut Criterion) {
         });
     });
 
-    // With coordinator notify: after push + add_permits, notify Phase C
+    // With coordinator notify: after push + add_permits, notify the wait queue
     // waiters so they can opportunistically retry eviction.
     group.bench_function("with_coordinator_notify", |b| {
         let sem = Arc::new(Semaphore::new(10));
         let slots = Arc::new(parking_lot::Mutex::new(VecDeque::from([1u64, 2, 3, 4, 5])));
-        let coord =
-            rt.block_on(async { PoolCoordinator::new("bench_db".to_string(), make_config(100)) });
+        let notify = Arc::new(Notify::new());
 
         b.iter(|| {
             let mut guard = slots.lock();
@@ -313,7 +310,7 @@ fn return_object_with_coordinator_notify(c: &mut Criterion) {
             guard.push_back(conn);
             drop(guard);
             sem.add_permits(1);
-            coord.notify_idle_returned();
+            notify.notify_one();
         });
     });
 
