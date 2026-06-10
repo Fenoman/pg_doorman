@@ -59,28 +59,19 @@ fn log_overhead(c: &mut Criterion) {
 
     group.bench_function("debug_at_info_level", |b| {
         b.iter(|| {
-            log::debug!("[{}@{}] talking to server {}", username, pool_name, addr);
+            log::debug!("[{username}@{pool_name}] talking to server {addr}");
         });
     });
 
     group.bench_function("info_direct_logger", |b| {
         b.iter(|| {
-            log::info!(
-                "[{}@{}] client connected from {}",
-                username,
-                pool_name,
-                addr
-            );
+            log::info!("[{username}@{pool_name}] client connected from {addr}");
         });
     });
 
     group.bench_function("warn_direct_logger", |b| {
         b.iter(|| {
-            log::warn!(
-                "[{}@{}] pool exhausted cl_waiting=15 sv_active=50",
-                username,
-                pool_name
-            );
+            log::warn!("[{username}@{pool_name}] pool exhausted cl_waiting=15 sv_active=50");
         });
     });
 
@@ -92,10 +83,7 @@ fn log_overhead(c: &mut Criterion) {
 
     group.bench_function("format_string_alloc", |b| {
         b.iter(|| {
-            let msg = format!(
-                "[{}@{}] client connected from {}",
-                username, pool_name, addr
-            );
+            let msg = format!("[{username}@{pool_name}] client connected from {addr}");
             std::hint::black_box(&msg);
         });
     });
@@ -105,8 +93,7 @@ fn log_overhead(c: &mut Criterion) {
         b.iter(|| {
             let _ = writeln!(
                 sink,
-                "INFO [{}@{}] client connected from {}",
-                username, pool_name, addr
+                "INFO [{username}@{pool_name}] client connected from {addr}"
             );
         });
     });
@@ -114,12 +101,7 @@ fn log_overhead(c: &mut Criterion) {
     group.bench_function("debug_expensive_args_at_info", |b| {
         let data: Vec<u32> = (0..100).collect();
         b.iter(|| {
-            log::debug!(
-                "[{}@{}] eviction candidates: {:?}",
-                username,
-                pool_name,
-                data
-            );
+            log::debug!("[{username}@{pool_name}] eviction candidates: {data:?}");
         });
     });
 
@@ -129,7 +111,7 @@ fn log_overhead(c: &mut Criterion) {
                 for i in 0..4 {
                     s.spawn(move || {
                         for _ in 0..100 {
-                            log::info!("[user_{}@db] query completed", i);
+                            log::info!("[user_{i}@db] query completed");
                         }
                     });
                 }

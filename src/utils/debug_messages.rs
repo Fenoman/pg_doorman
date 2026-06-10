@@ -1,7 +1,8 @@
+use dashmap::DashMap;
 use log::{debug, warn};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Maximum number of messages to buffer before flushing
@@ -261,11 +262,17 @@ impl ProtocolState {
     }
 }
 
-/// Global protocol state tracker per server connection (server_pid -> state)
-/// We track by server_pid to detect when a new client gets a "dirty" connection
-/// that still has pending operations from a previous client.
-static PROTOCOL_STATES: Lazy<Mutex<HashMap<i32, ProtocolState>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+/// Global protocol state tracker per server connection (server_pid -> state).
+/// We track by server_pid to detect when a new client gets a "dirty"
+/// connection that still has pending operations from a previous client.
+///
+/// the previous `parking_lot::Mutex<HashMap>` serialised
+/// every wire byte through a single mutex when `RUST_LOG=debug` was
+/// set under high client concurrency - every client+server message
+/// took the lock. `DashMap` shards by hash of `server_pid` so disjoint
+/// pids never contend; debug-tracing scales with `num_cpus` instead of
+/// being bottlenecked on one lock.
+static PROTOCOL_STATES: Lazy<DashMap<i32, ProtocolState>> = Lazy::new(DashMap::new);
 
 /// Buffered debug message for grouping
 #[derive(Clone, Debug)]
@@ -409,18 +416,19 @@ pub fn log_client_to_server(client_addr: &str, server_pid: i32, buffer: &[u8]) {
 
     let message_types = extract_message_types(buffer);
 
-    // Update protocol state for this server connection
+    // Update protocol state for this server connection.
+    // DashMap::entry shards on hash(server_pid); each shard has
+    // its own RwLock so concurrent debug traffic on different pids
+    // does not contend.
     {
-        let mut states = PROTOCOL_STATES.lock();
-        let state = states.entry(server_pid).or_default();
+        let mut state = PROTOCOL_STATES.entry(server_pid).or_default();
 
         // Check if server has pending operations from a previous client
         // This can happen when a client disconnects without completing the protocol
         if state.has_pending() {
             let pending = state.pending_summary();
             warn!(
-                "PROTOCOL WARNING {} -> Server [{}]: Server has pending operations from previous client: {} (new request: {})",
-                client_addr, server_pid, pending, message_types
+                "PROTOCOL WARNING {client_addr} -> Server [{server_pid}]: Server has pending operations from previous client: {pending} (new request: {message_types})"
             );
         }
 
@@ -453,13 +461,12 @@ pub fn log_server_to_client(client_addr: &str, server_pid: i32, buffer: &[u8]) {
 
     let message_types = extract_message_types(buffer);
 
-    // Check for protocol violations based on server connection state
+    // Check for protocol violations based on server connection state.
+    // same DashMap shard semantics as `log_client_to_server`.
     let violations: Vec<String>;
     let pending_before: String;
     {
-        let mut states = PROTOCOL_STATES.lock();
-        let state = states.entry(server_pid).or_default();
-
+        let mut state = PROTOCOL_STATES.entry(server_pid).or_default();
         pending_before = state.pending_summary();
 
         // Extract raw message types and check for violations
@@ -473,8 +480,7 @@ pub fn log_server_to_client(client_addr: &str, server_pid: i32, buffer: &[u8]) {
     // Log violations as warnings
     for violation in &violations {
         warn!(
-            "PROTOCOL VIOLATION {} <-> Server [{}]: {} (pending: {})",
-            client_addr, server_pid, violation, pending_before
+            "PROTOCOL VIOLATION {client_addr} <-> Server [{server_pid}]: {violation} (pending: {pending_before})"
         );
     }
 
@@ -497,8 +503,8 @@ pub fn log_server_to_client(client_addr: &str, server_pid: i32, buffer: &[u8]) {
 /// by another client. The state will be naturally cleaned up when the server
 /// connection is closed or when ReadyForQuery resets the state.
 pub fn cleanup_protocol_state(client_addr: &str, server_pid: i32) {
-    let states = PROTOCOL_STATES.lock();
-    if let Some(state) = states.get(&server_pid) {
+    // DashMap::get returns a Ref guard scoped to one shard.
+    if let Some(state) = PROTOCOL_STATES.get(&server_pid) {
         if state.has_pending() {
             warn!(
                 "Client {} disconnected with pending protocol state: {} (server [{}])",
@@ -508,6 +514,22 @@ pub fn cleanup_protocol_state(client_addr: &str, server_pid: i32) {
             );
         }
     }
+}
+
+/// Remove the PROTOCOL_STATES entry for a server connection that is being
+/// dropped. Called from `Server::drop` unconditionally - entries may have
+/// been added when DEBUG was enabled and need to be removed even if the
+/// log level was lowered since. Without this, PROTOCOL_STATES grows
+/// unbounded over the lifetime of the pooler: one stale `i32 -> ProtocolState`
+/// per long-lived backend, accumulating across reloads/reconnects.
+///
+/// `cleanup_protocol_state` intentionally only emits a warn - it must keep
+/// the entry alive in case the same server connection is handed to another
+/// client. `remove_protocol_state` is the terminal counterpart called on
+/// final drop, where no client can ever see the state again.
+pub fn remove_protocol_state(server_pid: i32) {
+    // shard-scoped remove on DashMap.
+    PROTOCOL_STATES.remove(&server_pid);
 }
 
 /// Force flush the debug buffer (call periodically or on shutdown)
@@ -581,11 +603,7 @@ pub fn extract_message_types(buffer: &[u8]) -> String {
                         Some("*".to_string()) // anonymous
                     } else {
                         let name = read_cstring(&buffer[name_start..]);
-                        if name.len() > 20 {
-                            Some(format!("{}...", &name[..20]))
-                        } else {
-                            Some(name)
-                        }
+                        Some(truncate_at_char_boundary(&name, 20))
                     }
                 } else {
                     None
@@ -602,11 +620,7 @@ pub fn extract_message_types(buffer: &[u8]) -> String {
                             Some("*".to_string()) // anonymous
                         } else {
                             let name = read_cstring(&buffer[stmt_start..]);
-                            if name.len() > 20 {
-                                Some(format!("{}...", &name[..20]))
-                            } else {
-                                Some(name)
-                            }
+                            Some(truncate_at_char_boundary(&name, 20))
                         }
                     } else {
                         None
@@ -662,7 +676,7 @@ fn format_grouped_messages(messages: &[(char, Option<String>)]) -> String {
         first = false;
 
         if count > 1 {
-            result.push_str(&format!("{}x", count));
+            result.push_str(&format!("{count}x"));
         }
 
         result.push(*msg_type);
@@ -691,9 +705,48 @@ fn find_null(buf: &[u8]) -> usize {
     buf.iter().position(|&b| b == 0).unwrap_or(buf.len())
 }
 
+/// char-boundary-safe truncation. Byte-indexing into a
+/// `String` (`&name[..20]`) panics when the 20-byte boundary falls
+/// mid-codepoint - an authenticated client can drive this by sending
+/// Parse / Bind with a statement name like 19 ASCII bytes + a
+/// multi-byte codepoint. When operator runs with `RUST_LOG=debug`
+/// (common during incident response), the per-message debug logger
+/// panics inside the client task - a per-connection DoS.
+#[inline]
+fn truncate_at_char_boundary(s: &str, max_chars: usize) -> String {
+    let mut iter = s.char_indices();
+    if let Some((byte_index, _)) = iter.nth(max_chars) {
+        // Only show the ellipsis when we actually truncated.
+        format!("{}...", &s[..byte_index])
+    } else {
+        s.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// byte-indexed slice used to panic on
+    /// `&name[..20]` when the codepoint at position 19 was multi-byte.
+    #[test]
+    fn truncate_at_char_boundary_does_not_panic_on_multibyte() {
+        // 19 ASCII bytes + Cyrillic ё (2 bytes) - 21 bytes total,
+        // codepoint boundary at byte index 19 then 21 (not 20).
+        let s = "a".repeat(19) + "ё";
+        // Truncate to 20 CHARS - the name is 20 chars long, so no
+        // truncation; no ellipsis.
+        let out = truncate_at_char_boundary(&s, 20);
+        assert_eq!(out, s);
+
+        // Truncate to 5 chars - splits cleanly on ASCII boundary.
+        let out = truncate_at_char_boundary("abcdefghij", 5);
+        assert_eq!(out, "abcde...");
+
+        // Multi-byte at the boundary.
+        let out = truncate_at_char_boundary("ёёёёёёё", 3);
+        assert_eq!(out, "ёёё...");
+    }
 
     #[test]
     fn test_extract_simple_query() {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::messages::constants::SCRAM_SHA_256;
 use bytes::{Buf, BufMut, BytesMut};
@@ -7,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::startup_parameters::full_packet_bytes;
 use crate::errors::Error;
-use crate::messages::socket::{write_all, write_all_flush};
+use crate::messages::socket::{write_all, write_all_flush, write_all_flush_timeout};
 use crate::messages::types::DataType;
 
 const PARSE_COMPLETE_SIZE: usize = 5; // '1' (1) + length (4)
@@ -134,6 +135,16 @@ where
     }
 
     let len = i32::from_be_bytes(len_buf);
+    // validate length bounds before allocating. An unauthenticated client
+    // controls `len`. `len < 4` underflows on the `len - 4` subtraction, and
+    // unbounded `len` (e.g., `i32::MAX`) attempts a 2 GiB allocation. PG
+    // password/SCRAM messages are well under 16 KiB.
+    const MAX_PASSWORD_MESSAGE_BODY: i32 = 16 * 1024;
+    if !(4..=MAX_PASSWORD_MESSAGE_BODY).contains(&len) {
+        return Err(Error::ProtocolSyncError(format!(
+            "password message length out of range: {len}"
+        )));
+    }
     let mut password = vec![0u8; (len - 4) as usize];
     match stream.read_exact(&mut password).await {
         Ok(_) => {}
@@ -160,8 +171,8 @@ pub fn simple_query(query: &str) -> BytesMut {
 
 /// Send startup message to the server.
 ///
-/// Required parameters (`user`, `application_name`, `database`) keep their
-/// historical wire order when `extra_params` is empty. Additional parameters
+/// Required parameters (`user`, `application_name`, `database`) keep a stable
+/// wire order when `extra_params` is empty. Additional parameters
 /// are appended in BTreeMap order. `extra_params["application_name"]`
 /// overrides the default application name.
 pub async fn startup<S>(
@@ -248,23 +259,64 @@ pub async fn ssl_request(stream: &mut tokio::net::TcpStream) -> Result<(), Error
 }
 
 /// Parse the params the server sends as a key/value format.
+///
+/// this function is reached pre-auth via `parse_startup` for client
+/// StartupMessage parsing. The inner loop MUST NOT call `get_u8()` past the
+/// end of the buffer - an unauthenticated client could send a body whose
+/// last C-string is unterminated, and `bytes::Buf::get_u8` panics on
+/// "advance past end of buffer". Use `has_remaining()` before every read
+/// and treat a missing nul terminator as a protocol error.
 pub fn parse_params(mut bytes: BytesMut) -> Result<HashMap<String, String>, Error> {
+    // bound the parser against pre-auth memory amplification.
+    // The startup body is attacker-controlled up to MAX_MESSAGE_SIZE
+    // (256 MiB). A pathological body of `a\0a\0a\0...` earlier
+    // accumulated tens of millions of `String` instances before
+    // authentication and consumed GiB of RSS. PostgreSQL exposes
+    // <300 GUCs in practice; 512 entries + 8 KiB per token is a
+    // generous cap.
+    const MAX_STARTUP_PARAMS: usize = 512;
+    const MAX_STARTUP_TOKEN_LEN: usize = 8 * 1024;
+
     let mut result = HashMap::new();
     let mut buf = Vec::new();
-    let mut tmp = String::new();
+    let mut token: Vec<u8> = Vec::new();
 
     while bytes.has_remaining() {
         let mut c = bytes.get_u8();
 
         // Null-terminated C-strings.
         while c != 0 {
-            tmp.push(c as char);
+            if token.len() >= MAX_STARTUP_TOKEN_LEN {
+                return Err(Error::ProtocolSyncError(format!(
+                    "Startup parameter token exceeds {MAX_STARTUP_TOKEN_LEN} bytes"
+                )));
+            }
+            token.push(c);
+            if !bytes.has_remaining() {
+                return Err(Error::ProtocolSyncError(
+                    "Unterminated C-string in startup parameters".to_string(),
+                ));
+            }
             c = bytes.get_u8();
         }
 
-        if !tmp.is_empty() {
-            buf.push(tmp.clone());
-            tmp.clear();
+        if !token.is_empty() {
+            if buf.len() >= MAX_STARTUP_PARAMS {
+                return Err(Error::ProtocolSyncError(format!(
+                    "Startup message contains more than {MAX_STARTUP_PARAMS} parameters"
+                )));
+            }
+            // decode the whole C-string
+            // token as UTF-8 in one shot. The previous `tmp.push(c as char)`
+            // mapped each byte 0x80..=0xFF to U+0080..=U+00FF (Latin-1) and
+            // re-encoded it as 2-byte UTF-8 mojibake, corrupting any multibyte
+            // value (e.g. a non-ASCII application_name 'café' became 'cafÃ©'
+            // in pg_stat_activity). Reject invalid UTF-8 rather than silently
+            // mangling it. Keys are separately ASCII-validated downstream.
+            let value = String::from_utf8(std::mem::take(&mut token)).map_err(|_| {
+                Error::ProtocolSyncError("Startup parameter contains invalid UTF-8".to_string())
+            })?;
+            buf.push(value);
         }
     }
 
@@ -374,6 +426,20 @@ where
     let mut buf = error_message(message, code);
     buf.put(ready_for_query(false));
     write_all_flush(stream, &buf).await
+}
+
+pub async fn error_response_timeout<S>(
+    stream: &mut S,
+    message: &str,
+    code: &str,
+    duration: Duration,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    let mut buf = error_message(message, code);
+    buf.put(ready_for_query(false));
+    write_all_flush_timeout(stream, &buf, duration).await
 }
 
 pub fn error_message(message: &str, code: &str) -> BytesMut {
@@ -658,11 +724,19 @@ pub fn has_error_response(bytes: &[u8]) -> bool {
 }
 
 /// Create a deallocate response message.
+///
+/// synthetic reply for a simple-query (`Q`) DEALLOCATE intercept.
+/// Real PostgreSQL only emits CommandComplete + ReadyForQuery on this
+/// path - `ParseComplete` belongs exclusively to the extended-protocol
+/// Parse exchange. Strict drivers (pgjdbc with state validation) throw
+/// `PSQLException("Unexpected packet type during query: ParseComplete")`
+/// when they see a stray `1` in a simple-query reply. Drop the
+/// `parse_complete()` line that snuck in from an earlier extended-
+/// protocol variant of this synthesizer.
 #[inline]
 pub fn deallocate_response() -> BytesMut {
-    // ParseComplete(5) + CommandComplete("DEALLOCATE" = 10 + 1 + 4 + 1 = 16) + ReadyForQuery(6) = 27
-    let mut bytes = BytesMut::with_capacity(27);
-    bytes.put(parse_complete());
+    // CommandComplete("DEALLOCATE" = 10 + 1 + 4 + 1 = 16) + ReadyForQuery(6) = 22
+    let mut bytes = BytesMut::with_capacity(22);
     bytes.put(command_complete("DEALLOCATE"));
     bytes.put(ready_for_query(false));
     bytes
@@ -726,12 +800,23 @@ pub fn insert_parse_complete_before_bind_complete(buffer: BytesMut, count: u32) 
                 break;
             }
             let msg_type = bytes[pos];
-            let msg_len = i32::from_be_bytes([
+            let msg_len_i32 = i32::from_be_bytes([
                 bytes[pos + 1],
                 bytes[pos + 2],
                 bytes[pos + 3],
                 bytes[pos + 4],
-            ]) as usize;
+            ]);
+            // negative `msg_len` cast to `usize` produces
+            // `usize::MAX` (sign-extend on 64-bit). Without the guard
+            // `pos + 1 + huge` wraps and the parser re-enters at a
+            // random offset, possibly mis-identifying tags in the
+            // buffer. Backend-controlled value (corrupted stream /
+            // MITM); not exploitable for code execution but produces
+            // confusing response-buffer corruption visible to clients.
+            if msg_len_i32 < 4 {
+                break;
+            }
+            let msg_len = msg_len_i32 as usize;
 
             if needs_parse_complete(msg_type) && prev_msg_type != b'1' {
                 // Found position for insertion
@@ -762,12 +847,17 @@ pub fn insert_parse_complete_before_bind_complete(buffer: BytesMut, count: u32) 
             break;
         }
         let msg_type = bytes[pos];
-        let msg_len = i32::from_be_bytes([
+        let msg_len_i32 = i32::from_be_bytes([
             bytes[pos + 1],
             bytes[pos + 2],
             bytes[pos + 3],
             bytes[pos + 4],
-        ]) as usize;
+        ]);
+        // same overflow guard as single-insertion path.
+        if msg_len_i32 < 4 {
+            break;
+        }
+        let msg_len = msg_len_i32 as usize;
 
         if needs_parse_complete(msg_type) && prev_msg_type != b'1' {
             // BindComplete/ParameterDescription/NoData without preceding ParseComplete
@@ -832,12 +922,24 @@ pub fn insert_close_complete_after_last_close_complete(
         }
 
         let msg_type = bytes[pos];
-        let msg_len = i32::from_be_bytes([
+        // validate frame length. Negative or sub-header
+        // values (<4) used to wrap on cast-to-usize, producing
+        // out-of-bounds slice indices below - DoS via malformed or
+        // truncated backend frame.
+        let msg_len_i32 = i32::from_be_bytes([
             bytes[pos + 1],
             bytes[pos + 2],
             bytes[pos + 3],
             bytes[pos + 4],
-        ]) as usize;
+        ]);
+        if msg_len_i32 < 4 {
+            break;
+        }
+        let msg_len = msg_len_i32 as usize;
+
+        if pos + 1 + msg_len > bytes.len() {
+            break;
+        }
 
         if msg_type == b'3' {
             last_close_complete_pos = Some(pos + 1 + msg_len);
@@ -901,12 +1003,22 @@ pub fn insert_parse_complete_before_parameter_description(
         if msg_type == b't' {
             insert_positions.push(pos);
         }
-        let msg_len = i32::from_be_bytes([
+        // validate msg_len; negative or sub-header wraps
+        // on cast-to-usize and produces unbounded `pos` advance -
+        // panic on slice index when result buffer is built below.
+        let msg_len_i32 = i32::from_be_bytes([
             bytes[pos + 1],
             bytes[pos + 2],
             bytes[pos + 3],
             bytes[pos + 4],
-        ]) as usize;
+        ]);
+        if msg_len_i32 < 4 {
+            break;
+        }
+        let msg_len = msg_len_i32 as usize;
+        if pos + 1 + msg_len > bytes.len() {
+            break;
+        }
         pos += 1 + msg_len;
     }
 
@@ -1001,6 +1113,38 @@ pub fn insert_close_complete_before_ready_for_query(mut buffer: BytesMut, count:
 mod startup_tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn parse_params_decodes_multibyte_utf8_values() {
+        use bytes::{BufMut, BytesMut};
+        // a non-ASCII parameter value must
+        // round-trip as UTF-8, not be mangled by a byte-wise Latin-1 decode.
+        let mut body = BytesMut::new();
+        body.extend_from_slice(b"application_name\0");
+        body.extend_from_slice("café".as_bytes()); // 63 61 66 C3 A9
+        body.put_u8(0);
+        let params = parse_params(body).expect("valid UTF-8 startup params must parse");
+        assert_eq!(
+            params.get("application_name").map(String::as_str),
+            Some("café"),
+            "multibyte UTF-8 value must not be corrupted into Latin-1 mojibake"
+        );
+    }
+
+    #[test]
+    fn parse_params_rejects_invalid_utf8_value() {
+        use bytes::{BufMut, BytesMut};
+        // An invalid UTF-8 byte sequence in a value must be rejected, not
+        // silently reinterpreted.
+        let mut body = BytesMut::new();
+        body.extend_from_slice(b"application_name\0");
+        body.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8
+        body.put_u8(0);
+        assert!(
+            parse_params(body).is_err(),
+            "invalid UTF-8 in a startup value must be rejected"
+        );
+    }
 
     #[tokio::test]
     async fn startup_with_extra_params_includes_them_in_order() {
