@@ -55,5 +55,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     app::init_logging(&args, &config)?;
+    // apply TOML `[general] log_level` override on top of
+    // the CLI / env default the logger was just built with. Silently
+    // ignore parse errors and log them at warn-level - a malformed
+    // TOML value should not block startup.
+    if let Some(level) = config.general.log_level.as_deref() {
+        if let Err(err) = app::log_level::set_log_level(level) {
+            log::warn!(
+                "[general] log_level = {level:?} failed to apply: {err}; \
+                 keeping CLI default"
+            );
+        }
+    }
     app::run_server(args, config)
 }
