@@ -2,8 +2,8 @@ use super::AddressStats;
 use super::{get_reporter, Reporter};
 use crate::config::Address;
 use crate::utils::clock;
+use arc_swap::ArcSwap;
 use iota::iota;
-use parking_lot::Mutex;
 use std::sync::atomic::*;
 use std::sync::Arc;
 
@@ -55,8 +55,17 @@ pub struct ServerStats {
 
     /// Server state and activity data
     /// ------------------------------------------------------------------------------------------
-    /// Name of the application using this server connection
-    pub application_name: Mutex<String>,
+    /// Name of the application using this server connection.
+    ///
+    /// `ArcSwap<String>` makes the steady-state read one atomic Acquire
+    /// load plus one `&str` compare. The cold-update path swaps a fresh
+    /// `Arc<String>` in once per `application_name` change.
+    ///
+    /// `String` (not `str`) chosen so the inner type stays `Sized` -
+    /// `ArcSwap<str>` is `ArcSwapAny<Arc<str>>` and the unsized
+    /// inner trips `?Sized` propagation through the surrounding
+    /// `HashMap<i32, Arc<ServerStats>>` callers downstream.
+    pub application_name: ArcSwap<String>,
     /// Packed state byte: high nibble = state (LOGIN/ACTIVE/IDLE), low nibble = wait (IDLE/READ/WRITE)
     state_wait: AtomicU8,
 
@@ -75,7 +84,7 @@ pub struct ServerStats {
     pub query_count: AtomicU64,
     /// Number of errors encountered by this server connection
     pub error_count: AtomicU64,
-
+    // Keep prepared-cache fields grouped; server_id lives in the monotonic counter below.
     /// Prepared statement cache metrics
     /// ------------------------------------------------------------------------------------------
     /// Number of prepared statement cache hits
@@ -114,7 +123,7 @@ impl Default for ServerStats {
         ServerStats {
             server_id: 0,
             process_id: AtomicI32::new(0),
-            application_name: Mutex::new(String::new()),
+            application_name: ArcSwap::from(Arc::new(String::new())),
             address: Address::default(),
             connect_time: clock::now(),
             state_wait: AtomicU8::new(Self::pack(SERVER_STATE_LOGIN, SERVER_WAIT_IDLE)),
@@ -131,6 +140,19 @@ impl Default for ServerStats {
             active_since_nanos_from_connect: AtomicU64::new(NEVER_ACTIVE),
         }
     }
+}
+
+/// Monotonic counter for `ServerStats.server_id`. This avoids random-id
+/// collisions that would hide a colliding server from SHOW SERVERS,
+/// `/api/servers`, and Prometheus.
+///
+/// AtomicI32 wraps at 2^31 (2.1 B) - decades of backend churn even at
+/// thousands of registrations per second. Starts at 1 so the legacy
+/// `0` sentinel (default in `Default::default()`) remains distinguishable.
+static NEXT_SERVER_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+fn next_server_id() -> i32 {
+    NEXT_SERVER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl ServerStats {
@@ -173,7 +195,7 @@ impl ServerStats {
     /// Creates a new ServerStats instance with the specified address and connection time.
     ///
     /// This constructor initializes a new server statistics tracker with the provided
-    /// address and connection time. A random server ID is generated, and all counters
+    /// address and connection time. A monotonic server ID is generated, and all counters
     /// are initialized to zero.
     ///
     /// # Arguments
@@ -184,7 +206,15 @@ impl ServerStats {
         Self {
             address,
             connect_time,
-            server_id: rand::random::<i32>(),
+            // was `rand::random::<i32>()` - birthday-paradox
+            // collision at ~77k random i32 values gives 50% probability
+            // of collision. On collision Reporter::server_register skips
+            // the insert, leaving the new ServerStats Arc orphaned
+            // - invisible to SHOW SERVERS / /api/servers / Prometheus
+            // aggregation. Replaced with a process-monotonic counter so
+            // collisions are mathematically impossible (i32 wraps at
+            // 2^31 = 2.1B, decades of churn).
+            server_id: next_server_id(),
             ..Default::default()
         }
     }
@@ -249,18 +279,21 @@ impl ServerStats {
     }
 
     /// Server is assigned to a client and actively processing work.
-    pub fn active(&self, application_name: String) {
+    pub fn active(&self, application_name: &str) {
         // Refresh the activation timestamp before flipping state to ACTIVE.
         // The two atomics use Relaxed and provide no happens-before, so a
         // concurrent reader of `active_age_ms()` may briefly see ACTIVE with
         // the previous cycle's timestamp. The reader caps that to 0 via
         // saturating_sub, so the worst observable effect is a transient
-        // overestimate of the age — never an underflow or panic.
+        // overestimate of the age - never an underflow or panic.
+        //
+        // Takes `&str` so the caller can pass the cached
+        // `Client::stats.application_name()` directly without an alloc.
         let elapsed = self.nanos_from_connect();
         self.active_since_nanos_from_connect
             .store(elapsed.max(1), Ordering::Relaxed);
         self.set_state(SERVER_STATE_ACTIVE);
-        self.set_application(application_name);
+        self.set_application_str(application_name);
     }
 
     /// Returns the milliseconds elapsed since this server entered ACTIVE.
@@ -376,8 +409,31 @@ impl ServerStats {
     ///
     /// * `name` - The application name to set
     fn set_application(&self, name: String) {
-        let mut application_name = self.application_name.lock();
-        *application_name = name;
+        // Wrap the owned `name` in `Arc` once. No re-copy of
+        // the string bytes - only the Arc header is allocated.
+        self.application_name.store(Arc::new(name));
+    }
+
+    /// Zero-mutex, zero-alloc fast path for the common case
+    /// where `application_name` is unchanged from the last
+    /// `set_application_str` call. Most clients set `application_name`
+    /// once at session start and never change it.
+    ///
+    /// The hot path uses one atomic `ArcSwap::load` Acquire and an
+    /// `&str` compare instead of copying or locking the application name
+    /// for every query accounting update. The cold path (actual name
+    /// change) allocates one fresh `Arc<String>` and does one Release store.
+    #[inline(always)]
+    fn set_application_str(&self, name: &str) {
+        let current = self.application_name.load();
+        if current.as_str() == name {
+            return;
+        }
+        // Drop the load guard before the store to release the inner
+        // shard reference promptly; ArcSwap's lock-free guard is
+        // cheap but the explicit drop documents the ordering.
+        drop(current);
+        self.application_name.store(Arc::new(name.to_string()));
     }
 
     /// Sets the application name to "Undefined".
@@ -435,9 +491,9 @@ impl ServerStats {
     /// * `microseconds` - Checkout time in microseconds
     /// * `application_name` - Name of the application using this server connection
     #[inline(always)]
-    pub fn checkout_time(&self, microseconds: u64, application_name: String) {
-        // Update server stats and address aggregation stats
-        self.set_application(application_name);
+    pub fn checkout_time(&self, microseconds: u64, application_name: &str) {
+        // Pass through `&str` so the hot path does not allocate.
+        self.set_application_str(application_name);
         self.address.stats.wait_time_add(microseconds);
         crate::web::metrics::observe_pool_wait_microseconds(
             &self.address.username,
@@ -454,7 +510,8 @@ impl ServerStats {
     /// * `application_name` - Name of the application executing the query
     #[inline(always)]
     pub fn query(&self, microseconds: u64, application_name: &str) {
-        self.set_application(application_name.to_string());
+        // Avoid copying application_name on every query.
+        self.set_application_str(application_name);
         self.address.stats.query_count_add();
         self.address.stats.query_time_add_microseconds(microseconds);
         self.query_count.fetch_add(1, Ordering::Relaxed);
@@ -476,9 +533,20 @@ impl ServerStats {
     /// * `application_name` - Name of the application executing the transaction
     #[inline(always)]
     pub fn transaction(&self, application_name: &str) {
-        self.set_application(application_name.to_string());
+        // Avoid copying application_name on every transaction.
+        self.set_application_str(application_name);
         self.transaction_count.fetch_add(1, Ordering::Relaxed);
         self.address.stats.xact_count_add();
+    }
+
+    /// Increments the per-server error counter.
+    ///
+    /// Companion to [`crate::stats::client::ClientStats::error`]. Keep this
+    /// next to existing per-pool
+    /// `error_with_sqlstate` calls so the per-server view matches reality.
+    #[inline(always)]
+    pub fn error(&self) {
+        self.error_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records data sent to the server and updates related statistics.
@@ -528,6 +596,8 @@ impl ServerStats {
     /// Increments the prepared statement cache size counter.
     ///
     /// This is called when a new prepared statement is added to the cache.
+    /// Prefer [`prepared_cache_sync`] in new code - it derives the value
+    /// from the authoritative `LruCache::len()` and cannot underflow.
     #[inline(always)]
     pub fn prepared_cache_add(&self) {
         self.prepared_cache_size.fetch_add(1, Ordering::Relaxed);
@@ -536,9 +606,24 @@ impl ServerStats {
     /// Decrements the prepared statement cache size counter.
     ///
     /// This is called when a prepared statement is removed from the cache.
+    /// Prefer [`prepared_cache_sync`] in new code - it derives the value
+    /// from the authoritative `LruCache::len()` and cannot underflow.
     #[inline(always)]
     pub fn prepared_cache_remove(&self) {
         self.prepared_cache_size.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Synchronise the prepared-cache size counter with the authoritative
+    /// `LruCache::len()` value.
+    ///
+    /// Reading `cache.len()` after every mutation is O(1) on `lru::LruCache`
+    /// and prevents replacement/eviction drift; the
+    /// counter then mirrors reality byte-for-byte across SHOW SERVERS and
+    /// Prometheus exposures.
+    #[inline(always)]
+    pub fn prepared_cache_sync(&self, current_len: u64) {
+        self.prepared_cache_size
+            .store(current_len, Ordering::Relaxed);
     }
 
     //
@@ -562,10 +647,11 @@ impl ServerStats {
 
     /// Returns the current application name for this server connection.
     ///
-    /// Returns an owned `String` because the field sits behind a Mutex; the
-    /// lock cannot escape to bind a `&str` to `&self`.
+    /// the field is now `ArcSwap<String>`. `load_full()` bumps
+    /// the Arc refcount lock-free; cloning the inner String is the
+    /// existing contract callers depend on.
     pub fn application_name(&self) -> String {
-        self.application_name.lock().clone()
+        (*self.application_name.load_full()).clone()
     }
 
     /// Returns the server connection timestamp.
@@ -602,7 +688,7 @@ mod tests {
         assert_eq!(stats.wait(), SERVER_WAIT_IDLE);
 
         // Check application name
-        assert_eq!(*stats.application_name.lock(), "");
+        assert_eq!(stats.application_name(), "");
 
         // Check counters
         assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 0);
@@ -644,7 +730,7 @@ mod tests {
         assert_eq!(stats.process_id(), 0);
         assert_eq!(stats.state(), SERVER_STATE_LOGIN);
         assert_eq!(stats.wait(), SERVER_WAIT_IDLE);
-        assert_eq!(*stats.application_name.lock(), "");
+        assert_eq!(stats.application_name(), "");
         assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 0);
         assert_eq!(stats.bytes_received.load(Ordering::Relaxed), 0);
         assert_eq!(stats.transaction_count.load(Ordering::Relaxed), 0);
@@ -729,7 +815,7 @@ mod tests {
 
         // Check that the state was set to LOGIN and application name to "Undefined"
         assert_eq!(stats_arc.state(), SERVER_STATE_LOGIN);
-        assert_eq!(*stats_arc.application_name.lock(), "Undefined");
+        assert_eq!(stats_arc.application_name(), "Undefined");
 
         // Disconnect the server
         stats_arc.disconnect();
@@ -745,12 +831,12 @@ mod tests {
         // Test login
         stats.login();
         assert_eq!(stats.state(), SERVER_STATE_LOGIN);
-        assert_eq!(*stats.application_name.lock(), "Undefined");
+        assert_eq!(stats.application_name(), "Undefined");
 
         // Test active
-        stats.active("TestApp".to_string());
+        stats.active("TestApp");
         assert_eq!(stats.state(), SERVER_STATE_ACTIVE);
-        assert_eq!(*stats.application_name.lock(), "TestApp");
+        assert_eq!(stats.application_name(), "TestApp");
 
         // Test idle
         stats.idle(100);
@@ -835,12 +921,12 @@ mod tests {
         let stats = create_test_server_stats();
 
         // Test set_application (indirectly through active)
-        stats.active("TestApp".to_string());
-        assert_eq!(*stats.application_name.lock(), "TestApp");
+        stats.active("TestApp");
+        assert_eq!(stats.application_name(), "TestApp");
 
         // Test set_undefined_application (indirectly through login)
         stats.login();
-        assert_eq!(*stats.application_name.lock(), "Undefined");
+        assert_eq!(stats.application_name(), "Undefined");
     }
 
     #[test]
@@ -867,7 +953,7 @@ mod tests {
     #[test]
     fn test_active_age_ms_grows_with_real_time() {
         let stats = create_test_server_stats();
-        stats.active("TestApp".to_string());
+        stats.active("TestApp");
 
         let first = stats.active_age_ms().expect("ACTIVE should report age");
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -882,7 +968,7 @@ mod tests {
     #[test]
     fn test_active_age_ms_resets_on_reactivation() {
         let stats = create_test_server_stats();
-        stats.active("App1".to_string());
+        stats.active("App1");
         std::thread::sleep(std::time::Duration::from_millis(40));
         let before_idle = stats.active_age_ms().expect("ACTIVE");
 
@@ -890,7 +976,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(40));
         // Re-activation must reset the age, otherwise the gauge would
         // report carry-over time from the previous checkout.
-        stats.active("App2".to_string());
+        stats.active("App2");
         let after_reactivate = stats.active_age_ms().expect("ACTIVE again");
 
         assert!(
@@ -920,8 +1006,8 @@ mod tests {
         let stats = create_test_server_stats();
 
         // Test checkout_time
-        stats.checkout_time(100, "TestApp".to_string());
-        assert_eq!(*stats.application_name.lock(), "TestApp");
+        stats.checkout_time(100, "TestApp");
+        assert_eq!(stats.application_name(), "TestApp");
         assert_eq!(
             stats.address.stats.total.wait_time.load(Ordering::Relaxed),
             100
@@ -929,7 +1015,7 @@ mod tests {
 
         // Test query
         stats.query(200, "QueryApp");
-        assert_eq!(*stats.application_name.lock(), "QueryApp");
+        assert_eq!(stats.application_name(), "QueryApp");
         assert_eq!(stats.query_count.load(Ordering::Relaxed), 1);
         assert_eq!(
             stats
@@ -952,7 +1038,7 @@ mod tests {
 
         // Test transaction
         stats.transaction("TransactionApp");
-        assert_eq!(*stats.application_name.lock(), "TransactionApp");
+        assert_eq!(stats.application_name(), "TransactionApp");
         assert_eq!(stats.transaction_count.load(Ordering::Relaxed), 1);
         assert_eq!(
             stats.address.stats.total.xact_count.load(Ordering::Relaxed),

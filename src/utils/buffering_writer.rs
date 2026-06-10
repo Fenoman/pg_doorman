@@ -11,11 +11,19 @@ use tokio::io::AsyncWrite;
 
 pub struct BufferingWriter<'a> {
     buf: &'a mut BytesMut,
+    max_len: Option<usize>,
 }
 
 impl<'a> BufferingWriter<'a> {
     pub fn new(buf: &'a mut BytesMut) -> Self {
-        Self { buf }
+        Self { buf, max_len: None }
+    }
+
+    pub fn capped(buf: &'a mut BytesMut, max_len: usize) -> Self {
+        Self {
+            buf,
+            max_len: Some(max_len),
+        }
     }
 }
 
@@ -25,7 +33,25 @@ impl<'a> AsyncWrite for BufferingWriter<'a> {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        self.get_mut().buf.extend_from_slice(buf);
+        let this = self.get_mut();
+        if let Some(max_len) = this.max_len {
+            let next_len = match this.buf.len().checked_add(buf.len()) {
+                Some(next_len) => next_len,
+                None => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "buffering writer length overflow",
+                    )))
+                }
+            };
+            if next_len > max_len {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("buffering writer cap exceeded: max {max_len} bytes"),
+                )));
+            }
+        }
+        this.buf.extend_from_slice(buf);
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -86,5 +112,19 @@ mod tests {
             writer.write_all(b"").await.unwrap();
         }
         assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capped_writer_rejects_oversize_before_append() {
+        let mut buf = BytesMut::from(&b"abcd"[..]);
+        {
+            let mut writer = BufferingWriter::capped(&mut buf, 5);
+            let err = writer
+                .write_all(b"ef")
+                .await
+                .expect_err("write beyond cap must fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+        assert_eq!(&buf[..], b"abcd", "rejected bytes must not be appended");
     }
 }
