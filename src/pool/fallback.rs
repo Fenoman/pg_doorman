@@ -203,6 +203,7 @@ impl FallbackState {
                 *guard = None;
                 drop(guard);
 
+                crate::web::metrics::record_pool_only_fallback_tls_label(&self.pool_name);
                 crate::web::metrics::FALLBACK_ACTIVE
                     .with_label_values(&[&self.pool_name])
                     .set(0.0);
@@ -219,6 +220,7 @@ impl FallbackState {
                         &host,
                         &port.to_string(),
                     ]);
+                    crate::web::metrics::forget_fallback_host_label(&self.pool_name, &host, port);
                 }
 
                 BlacklistCheck::JustExpired
@@ -253,9 +255,11 @@ impl FallbackState {
                 &host,
                 &port.to_string(),
             ]);
+            crate::web::metrics::forget_fallback_host_label(&self.pool_name, &host, port);
         }
         self.unhealthy_candidates.lock().clear();
         self.blacklist_logged.store(false, Ordering::Relaxed);
+        crate::web::metrics::record_pool_only_fallback_tls_label(&self.pool_name);
         crate::web::metrics::FALLBACK_ACTIVE
             .with_label_values(&[&self.pool_name])
             .set(0.0);
@@ -289,6 +293,7 @@ impl FallbackState {
                 &host,
                 &port.to_string(),
             ]);
+            crate::web::metrics::forget_fallback_host_label(&self.pool_name, &host, port);
         }
     }
 
@@ -298,6 +303,7 @@ impl FallbackState {
     /// Also records the reason in metrics. Host-independent errors increment
     /// the metric but do not create a cooldown entry.
     pub fn mark_unhealthy(&self, host: &str, port: u16, reason: FailureReason) {
+        crate::web::metrics::record_pool_only_fallback_tls_label(&self.pool_name);
         crate::web::metrics::FALLBACK_CANDIDATE_FAILURES_TOTAL
             .with_label_values(&[self.pool_name.as_str(), reason.as_str()])
             .inc();
@@ -420,6 +426,7 @@ impl FallbackState {
                         "[pool: {}] fallback: returning whitelisted host {}:{}",
                         self.pool_name, host_owned, port
                     );
+                    crate::web::metrics::record_pool_only_fallback_tls_label(&self.pool_name);
                     crate::web::metrics::FALLBACK_CACHE_HITS_TOTAL
                         .with_label_values(&[&self.pool_name])
                         .inc();
@@ -457,7 +464,7 @@ impl FallbackState {
             candidates.len(),
             candidates
                 .iter()
-                .map(|(h, p, r)| format!("{}:{}({:?})", h, p, r))
+                .map(|(h, p, r)| format!("{h}:{p}({r:?})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -501,6 +508,11 @@ impl FallbackState {
                     &old_host,
                     &old_port.to_string(),
                 ]);
+                crate::web::metrics::forget_fallback_host_label(
+                    &self.pool_name,
+                    &old_host,
+                    old_port,
+                );
             }
         }
         info!(
@@ -510,6 +522,7 @@ impl FallbackState {
         crate::web::metrics::FALLBACK_HOST
             .with_label_values(&[&self.pool_name, &host, &port.to_string()])
             .set(1.0);
+        crate::web::metrics::record_fallback_host_label(&self.pool_name, &host, port);
     }
 
     async fn fetch_cluster_coalesced(&self) -> Result<ClusterResponse, String> {
@@ -532,6 +545,7 @@ impl FallbackState {
         };
 
         if is_creator {
+            crate::web::metrics::record_pool_only_fallback_tls_label(&self.pool_name);
             crate::web::metrics::PATRONI_API_REQUESTS_TOTAL
                 .with_label_values(&[&self.pool_name])
                 .inc();
@@ -542,9 +556,15 @@ impl FallbackState {
 
         // Joiners measure wait time, not discovery time — only the creator records it.
         if is_creator {
+            crate::web::metrics::record_pool_only_fallback_tls_label(&self.pool_name);
             crate::web::metrics::PATRONI_API_DURATION
                 .with_label_values(&[&self.pool_name])
                 .observe(start.elapsed().as_secs_f64());
+            if result.is_err() {
+                crate::web::metrics::PATRONI_API_ERRORS_TOTAL
+                    .with_label_values(&[&self.pool_name])
+                    .inc();
+            }
         }
 
         // On creator-side error: drop the cached future so the next caller starts
@@ -746,9 +766,7 @@ mod tests {
         let remaining = entry.until.saturating_duration_since(Instant::now());
         assert!(
             remaining > Duration::from_millis(2 * base_ms),
-            "remaining {:?} should reflect 4x base ({}ms)",
-            remaining,
-            base_ms
+            "remaining {remaining:?} should reflect 4x base ({base_ms}ms)"
         );
     }
 
@@ -775,9 +793,7 @@ mod tests {
         let remaining = until.saturating_duration_since(Instant::now());
         assert!(
             remaining <= COOLDOWN_MAX + Duration::from_millis(50),
-            "remaining {:?} must not exceed COOLDOWN_MAX={:?}",
-            remaining,
-            COOLDOWN_MAX
+            "remaining {remaining:?} must not exceed COOLDOWN_MAX={COOLDOWN_MAX:?}"
         );
     }
 
@@ -1245,7 +1261,7 @@ mod tests {
 
     /// Mock HTTP/1.1 server replying with `response_body` to every request.
     /// Lives until the tokio runtime shuts down.
-    async fn start_mock_patroni_success(response_body: String) -> u16 {
+    async fn start_mock_patroni_response(response_body: String, delay: Duration) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -1262,6 +1278,9 @@ mod tests {
                     // Buffer for a typical HTTP/1.1 request; not parsed.
                     let mut buf = [0u8; 4096];
                     let _ = stream.read(&mut buf).await;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                         body.len(),
@@ -1273,6 +1292,10 @@ mod tests {
             }
         });
         port
+    }
+
+    async fn start_mock_patroni_success(response_body: String) -> u16 {
+        start_mock_patroni_response(response_body, Duration::ZERO).await
     }
 
     /// Bind a TCP listener that just accepts and drops connections, simulating
@@ -1407,5 +1430,46 @@ mod tests {
             1,
             "second call must coalesce on cached success, not start fresh discovery"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_inflight_records_one_api_error_for_creator() {
+        let port =
+            start_mock_patroni_response("not-json".to_string(), Duration::from_millis(100)).await;
+
+        let pool = "test_pool_inflight_error_once";
+        let state = FallbackState::new(
+            pool.to_string(),
+            vec![format!("http://127.0.0.1:{}/cluster", port)],
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            30_000,
+        )
+        .unwrap();
+
+        let before_requests = crate::web::metrics::PATRONI_API_REQUESTS_TOTAL
+            .with_label_values(&[pool])
+            .get();
+        let before_errors = crate::web::metrics::PATRONI_API_ERRORS_TOTAL
+            .with_label_values(&[pool])
+            .get();
+
+        let (r1, r2) = tokio::join!(
+            state.fetch_cluster_coalesced(),
+            state.fetch_cluster_coalesced()
+        );
+
+        let after_requests = crate::web::metrics::PATRONI_API_REQUESTS_TOTAL
+            .with_label_values(&[pool])
+            .get();
+        let after_errors = crate::web::metrics::PATRONI_API_ERRORS_TOTAL
+            .with_label_values(&[pool])
+            .get();
+
+        assert!(r1.is_err(), "first caller must see the failed fetch");
+        assert!(r2.is_err(), "joiner must see the same failed fetch");
+        assert_eq!(after_requests - before_requests, 1);
+        assert_eq!(after_errors - before_errors, 1);
     }
 }

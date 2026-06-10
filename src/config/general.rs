@@ -135,6 +135,52 @@ pub struct General {
     #[serde(default = "General::default_server_idle_check_timeout")]
     pub server_idle_check_timeout: Duration,
 
+    /// Per-backend deadline used by the retain loop's background liveness scan.
+    /// Each tick pops up to `dead_backend_check_max_per_cycle` idle backends,
+    /// runs `check_alive` with this timeout, and drops the ones that fail.
+    /// Fixes the "zombie pool" regression where idle TCP sockets survive a
+    /// PostgreSQL restart and keep `slots.size` high enough that `replenish`
+    /// never refills the pool. 0 disables the scan entirely.
+    /// Default: 2s
+    #[serde(default = "General::default_dead_backend_check_timeout")]
+    pub dead_backend_check_timeout: Duration,
+
+    /// Cap on how many idle backends `evict_dead_backends` will probe per
+    /// retain tick per pool. Bounds worst-case work and CPU spent on the
+    /// background scan when a pool has many idle connections. 0 disables.
+    /// Default: 8 (8 × 2s timeout ≈ 16s worst-case scan per pool, well
+    /// under the default 30s `retain_connections_time` tick).
+    #[serde(default = "General::default_dead_backend_check_max_per_cycle")]
+    pub dead_backend_check_max_per_cycle: usize,
+
+    /// optional TOML override for the runtime log filter.
+    ///
+    /// profiling evidence: on an SET-heavy simple-protocol workload
+    /// (`pgbench` with frequent `SET search_path` statements forcing
+    /// session-state cleanup) the `info!` line at
+    /// `server_backend.rs:769` plus chrono timestamp formatting in
+    /// `TextLogger::log` consumed ~1.4% of CPU and bottlenecked the
+    /// run at 8854 TPS / 5.65 ms p_avg. Running the same binary with
+    /// `--log-level warn` lifted the same workload to 11068 TPS /
+    /// 4.52 ms (+25% TPS, −1.1 ms latency).
+    ///
+    /// Historical bug: there was no TOML knob at all - the only way
+    /// to lower the level was the CLI flag. Operators who set
+    /// `[general] log_level = "warn"` in `pg_doorman.toml` (a
+    /// reasonable assumption - every other knob lives there) were
+    /// silently ignored. This field accepts the same string syntax
+    /// as `set_log_level` ("warn", "info,pg_doorman::pool=debug",
+    /// "default"). When `None`, the CLI / env default (`--log-level`
+    /// or `LOG_LEVEL`, defaults to `info`) is used unchanged.
+    ///
+    /// Apply order: CLI builds the initial logger, then `main.rs`
+    /// reads this field after config load and calls `set_log_level`
+    /// to apply the TOML override. CLI explicit `--log-level X`
+    /// therefore loses to TOML if both are set - operators should
+    /// pick one source of truth per deployment.
+    #[serde(default)]
+    pub log_level: Option<String>,
+
     #[serde(default = "General::default_server_round_robin")] // False
     pub server_round_robin: bool,
 
@@ -321,6 +367,19 @@ impl General {
 
     pub fn default_server_idle_check_timeout() -> Duration {
         Duration::from_secs(60) // 60 seconds
+    }
+
+    pub fn default_dead_backend_check_timeout() -> Duration {
+        Duration::from_secs(2)
+    }
+
+    pub fn default_dead_backend_check_max_per_cycle() -> usize {
+        // 8 × dead_backend_check_timeout (2s default) = 16s worst-case scan
+        // per pool. That is within one default `retain_connections_time` tick,
+        // so idle trimming and replenish are not starved when an entire batch
+        // of half-open sockets times out. Larger pools recover over several
+        // cycles instead of stalling for a minute on a single tick.
+        8
     }
 
     pub fn default_connect_timeout() -> Duration {
@@ -585,11 +644,14 @@ impl Default for General {
             fallback_connect_timeout: None,
             fallback_lifetime: None,
             admin_username: String::from("admin"),
-            admin_password: String::from("admin"),
+            admin_password: String::from("change_me_to_a_long_random_secret"),
             server_lifetime: Self::default_server_lifetime(),
             retain_connections_time: Self::default_retain_connections_time(),
             retain_connections_max: Self::default_retain_connections_max(),
             server_idle_check_timeout: Self::default_server_idle_check_timeout(),
+            dead_backend_check_timeout: Self::default_dead_backend_check_timeout(),
+            dead_backend_check_max_per_cycle: Self::default_dead_backend_check_max_per_cycle(),
+            log_level: None,
             server_round_robin: Self::default_server_round_robin(),
             prepared_statements: Self::default_prepared_statements(),
             prepared_statements_cache_size: Self::default_prepared_statements_cache_size(),

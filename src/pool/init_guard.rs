@@ -66,7 +66,7 @@ impl Drop for PoolInitGuard {
             return;
         }
         if let Some(id) = self.identifier.take() {
-            crate::pool::drop_dynamic_pool(&id);
+            crate::pool::drop_dynamic_pool_if_init_guard_matches(&id, &self.init_complete);
         }
     }
 }

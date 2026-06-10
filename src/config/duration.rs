@@ -184,17 +184,22 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         (&s[..s.len() - 1], 24 * 60 * 60 * 1000u64)
     } else {
         return Err(format!(
-            "invalid duration format: '{}'. Expected a number or a string with suffix (ms, s, m, h, d)",
-            s
+            "invalid duration format: '{s}'. Expected a number or a string with suffix (ms, s, m, h, d)"
         ));
     };
 
     let num: u64 = num_str
         .trim()
         .parse()
-        .map_err(|_| format!("invalid number in duration: '{}'", num_str))?;
+        .map_err(|_| format!("invalid number in duration: '{num_str}'"))?;
 
-    Ok(Duration(num * multiplier))
+    let millis = num.checked_mul(multiplier).ok_or_else(|| {
+        format!(
+            "duration value overflows u64 milliseconds: '{num_str}' with multiplier {multiplier}"
+        )
+    })?;
+
+    Ok(Duration(millis))
 }
 
 #[cfg(test)]
@@ -264,6 +269,12 @@ mod tests {
         assert!(parse_duration("5x").is_err());
         assert!(parse_duration("-5s").is_err());
         assert!(parse_duration("5.5s").is_err()); // no float support
+    }
+
+    #[test]
+    fn test_parse_duration_rejects_suffix_overflow() {
+        assert!(parse_duration(&format!("{}s", u64::MAX / 1000 + 1)).is_err());
+        assert!(parse_duration(&format!("{}d", u64::MAX / (24 * 60 * 60 * 1000) + 1)).is_err());
     }
 
     #[test]

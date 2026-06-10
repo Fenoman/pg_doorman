@@ -197,17 +197,20 @@ fn parse_byte_size(s: &str) -> Result<ByteSize, String> {
         (&s[..s.len() - 1], 1u64)
     } else {
         return Err(format!(
-            "invalid byte size format: '{}'. Expected a number or a string with suffix (B, K, KB, M, MB, G, GB)",
-            s
+            "invalid byte size format: '{s}'. Expected a number or a string with suffix (B, K, KB, M, MB, G, GB)"
         ));
     };
 
     let num: u64 = num_str
         .trim()
         .parse()
-        .map_err(|_| format!("invalid number in byte size: '{}'", num_str))?;
+        .map_err(|_| format!("invalid number in byte size: '{num_str}'"))?;
 
-    Ok(ByteSize(num * multiplier))
+    let bytes = num.checked_mul(multiplier).ok_or_else(|| {
+        format!("byte size value overflows u64 bytes: '{num_str}' with multiplier {multiplier}")
+    })?;
+
+    Ok(ByteSize(bytes))
 }
 
 #[cfg(test)]
@@ -284,6 +287,12 @@ mod tests {
         assert!(parse_byte_size("-5MB").is_err());
         assert!(parse_byte_size("5.5MB").is_err()); // no float support
         assert!(parse_byte_size("5TB").is_err()); // TB not supported
+    }
+
+    #[test]
+    fn test_parse_byte_size_rejects_suffix_overflow() {
+        assert!(parse_byte_size(&format!("{}K", u64::MAX / 1024 + 1)).is_err());
+        assert!(parse_byte_size(&format!("{}GB", u64::MAX / (1024 * 1024 * 1024) + 1)).is_err());
     }
 
     #[test]
