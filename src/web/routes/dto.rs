@@ -79,6 +79,26 @@ pub(crate) struct OverviewDto {
     pub shutdown_in_progress: bool,
     /// Set during binary upgrade — clients are migrating to the new process.
     pub migration_in_progress: bool,
+    /// Checkout parameter-sync plan counters. Mirrors
+    /// `pg_doorman_sync_params_plan_total{plan,path}` in a compact fixed-shape
+    /// payload for the Overview page.
+    pub sync_params: SyncParamsDto,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SyncParamsDto {
+    pub empty_none: u64,
+    pub complex_standalone: u64,
+    pub app_name_only: SyncParamsAppNameOnlyDto,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SyncParamsAppNameOnlyDto {
+    pub total: u64,
+    pub simple_query_piggyback: u64,
+    pub deferred_begin_preflush: u64,
+    pub non_simple_preflush: u64,
+    pub discard_all_intercept_dropped: u64,
 }
 
 /// Database that holds the most live backend connections at the moment
@@ -482,7 +502,7 @@ pub(crate) struct CgroupMemoryDto {
     pub version: u8,
     pub current_bytes: u64,
     /// On cgroup v2: `memory.peak` (kernels ≥ 5.19); `None` otherwise.
-    /// On cgroup v1: historical maximum from `memory.max_usage_in_bytes`.
+    /// On cgroup v1: recorded maximum from `memory.max_usage_in_bytes`.
     pub peak_bytes: Option<u64>,
     /// `None` when the limit is "max" (uncapped).
     pub max_bytes: Option<u64>,
@@ -702,6 +722,7 @@ pub(crate) struct PoolCoordinatorRowDto {
 /// Field names mirror the backend `SocketStateCount` and (transitively)
 /// the columns of `SHOW SOCKETS`.
 #[derive(Debug, Serialize)]
+#[cfg(target_os = "linux")]
 pub(crate) struct SocketsDto {
     pub ts: u64,
     pub tcp: TcpCounts,
@@ -713,6 +734,7 @@ pub(crate) struct SocketsDto {
 }
 
 #[derive(Debug, Serialize, Default)]
+#[cfg(target_os = "linux")]
 pub(crate) struct TcpCounts {
     pub established: u64,
     pub syn_sent: u64,
@@ -730,6 +752,7 @@ pub(crate) struct TcpCounts {
 }
 
 #[derive(Debug, Serialize, Default)]
+#[cfg(target_os = "linux")]
 pub(crate) struct UnixStreamCounts {
     pub free: u64,
     pub unconnected: u64,
@@ -746,6 +769,7 @@ pub(crate) struct UnixStreamCounts {
 #[derive(Debug, Serialize)]
 pub(crate) struct PreparedDto {
     pub ts: u64,
+    pub truncated: bool,
     pub prepared: Vec<PreparedRowDto>,
 }
 
@@ -994,6 +1018,7 @@ pub(crate) struct TopPreparedDto {
     pub ts: u64,
     pub by: String,
     pub n: u64,
+    pub truncated: bool,
     pub prepared: Vec<TopPreparedRowDto>,
 }
 

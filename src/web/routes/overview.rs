@@ -34,6 +34,15 @@ mod tests {
             "\"prepared_misses_total\"",
             "\"pools_total\"",
             "\"pools_paused\"",
+            "\"sync_params\"",
+            "\"empty_none\"",
+            "\"complex_standalone\"",
+            "\"app_name_only\"",
+            "\"total\"",
+            "\"simple_query_piggyback\"",
+            "\"deferred_begin_preflush\"",
+            "\"non_simple_preflush\"",
+            "\"discard_all_intercept_dropped\"",
         ] {
             assert!(body.contains(field), "missing {field} in body={body}");
         }

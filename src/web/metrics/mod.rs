@@ -21,9 +21,14 @@ mod tests;
 // Re-exports
 pub(crate) use handler::write_metrics_response;
 pub use metrics::{
-    observe_anonymous_eviction, observe_backend_create_phase, observe_pool_query_microseconds,
-    observe_pool_transaction_microseconds, observe_pool_wait_microseconds, observe_streaming_bytes,
-    observe_streaming_event, record_interner_gc, record_listener_rejection, record_synthetic_miss,
+    forget_fallback_host_label, inc_sync_params_applied, inc_sync_params_plan,
+    inc_sync_params_skipped, observe_anonymous_eviction, observe_backend_create_phase,
+    observe_backend_startup_parameter_error, observe_named_eviction,
+    observe_pool_query_microseconds, observe_pool_transaction_microseconds,
+    observe_pool_wait_microseconds, observe_startup_parameters_dropped, observe_streaming_bytes,
+    observe_streaming_event, observe_sync_params_rtt_seconds, record_fallback_host_label,
+    record_interner_gc, record_listener_rejection, record_migration_client_dropped,
+    record_migration_receiver_failure, record_pool_only_fallback_tls_label, record_synthetic_miss,
     refresh_static_info_metrics,
 };
 
@@ -226,7 +231,7 @@ pub(crate) static SHOW_POOLS_MAXWAIT_MICROSECONDS: Lazy<GaugeVec> = Lazy::new(||
 /// constrained to a fixed whitelist — `08` (connection_exception), `53`
 /// (insufficient_resources), `57` (operator_intervention), the exact codes
 /// `25P02` (in_failed_sql_transaction) and `26000` (invalid_sql_statement_name),
-/// and `other` for everything else — so the cardinality stays at 6 ×
+/// and `other` for everything else - so the cardinality stays at 6 ×
 /// pool count regardless of what the backend returns. The full 5-character
 /// breakdown is still available through `/api/pools` and the Web UI;
 /// Prometheus only carries the class-level rollup.
@@ -243,6 +248,35 @@ pub(crate) static SHOW_POOLS_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
              the Web UI; Prometheus only carries the class-level rollup.",
         ),
         &["user", "database", "sqlstate"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// per-pool counter family for atomic event counters
+/// that were exposed via SHOW STATS but missing from `/metrics`. Operators
+/// using Grafana / Alertmanager cannot alert on values they can't scrape.
+/// `kind` label distinguishes the source counter:
+/// - `discard_all_intercepted` (DISCARD ALL interception count)
+/// - `prewarm_failures` (non-zero = bad prewarm SQL)
+/// - `dead_backends_probed` (dead-backend scan throughput)
+/// - `dead_backends_evicted` (alert on rate > 0 after PG restart)
+/// - `cancel_requests` (alert on storm)
+/// - `histogram_samples_dropped` (non-zero = percentiles biased low under contention)
+pub(crate) static SHOW_POOLS_EVENT_COUNTERS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "pg_doorman_pools_events_total",
+            "Cumulative per-pool event counters: discard_all_intercepted, \
+             prewarm_failures, dead_backends_probed, dead_backends_evicted, \
+             cancel_requests, histogram_samples_dropped. Use the `kind` label \
+             to select. Alert on `rate(... {kind=\"dead_backends_evicted\"}) > 0` \
+             after a PostgreSQL restart, `rate(... {kind=\"cancel_requests\"}) > N` \
+             for cancel storms, and `... {kind=\"histogram_samples_dropped\"} > 0` \
+             to detect histogram contention bias.",
+        ),
+        &["user", "database", "kind"],
     )
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
@@ -388,6 +422,28 @@ pub(crate) static SHOW_CLIENT_PREPARED_ANONYMOUS_EVICTIONS_TOTAL: Lazy<IntCounte
         counter
     });
 
+/// Named-cap evictions, distinct from anonymous so operators
+/// can attribute pressure to the right capacity knob (named cap is a
+/// hard-coded constant; bumping it requires recompile or - future -
+/// a `client_named_prepared_cache_size` config option).
+pub(crate) static SHOW_CLIENT_PREPARED_NAMED_EVICTIONS_TOTAL: Lazy<IntCounterVec> =
+    Lazy::new(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "pg_doorman_clients_prepared_named_evictions_total",
+                "Cumulative count of Named cap evictions on the per-client cache by user and \
+                 database. A sustained non-zero rate signals that the ORM's working set of \
+                 unique prepared statement names exceeds MAX_NAMED_PREPARED_PER_CLIENT (2048). \
+                 Either the client is leaking prepared statements (cycle names instead of \
+                 reusing) or genuinely needs more - raise the cap and rebuild.",
+            ),
+            &["user", "database"],
+        )
+        .unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    });
+
 /// Wall-clock duration of each phase of backend connection setup, split
 /// by phase. Phases are disjoint and additive:
 /// - `tcp_connect` — raw socket connect (TcpStream::connect or
@@ -437,7 +493,7 @@ pub(crate) static BACKEND_CREATE_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::ne
 /// - `too_many_clients` — listener at `max_clients` capacity
 ///
 /// A sustained non-zero `hba` or `tls_handshake_fail` rate is the bruteforce
-/// signal pg_doorman previously only logged.
+/// signal pg_doorman earlier only logged.
 pub(crate) static LISTENER_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -457,6 +513,45 @@ pub(crate) static LISTENER_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| 
     counter
 });
 
+pub(crate) static MIGRATION_RECEIVER_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "pg_doorman_migration_receiver_failures_total",
+            "Cumulative count of non-EOF migration receiver failures by bounded reason. \
+             Reasons: recvmsg (initial fd/message receive failed), truncated_frame \
+             (sender closed mid-frame), protocol (malformed/oversized migration frame), \
+             socket (other Unix socket receive error), other (unexpected app error), \
+             join_panic/join_error (blocking receive task failed).",
+        ),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// Cumulative count of clients that failed to migrate during a graceful binary
+/// upgrade and were dropped (the old process closes the session). `reason`
+/// label is bounded: `deadline` (waited past the shutdown deadline for a
+/// channel slot - typically an unreachable/stuck successor), `channel_closed`
+/// (the migration channel closed before a slot was granted), `prepare_failed`
+/// (the client fd/state could not be serialized for transfer). A healthy
+/// upgrade keeps this at zero; a non-zero rate means sessions are being lost
+/// across upgrades.
+pub(crate) static MIGRATION_CLIENTS_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "pg_doorman_migration_clients_dropped_total",
+            "Cumulative count of clients dropped (not migrated) during a graceful \
+             binary upgrade, by bounded reason: deadline, channel_closed, prepare_failed.",
+        ),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
 /// Counts backend startup attempts pg_doorman aborted because PostgreSQL
 /// returned an `ErrorResponse` that names a key the pool actually sent in
 /// `StartupMessage`. Labels:
@@ -466,9 +561,9 @@ pub(crate) static LISTENER_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| 
 ///   The label is *not* `<user>@<database>`: pg_doorman emits one
 ///   series per pool name, so a multi-user database collapses into a
 ///   single row. Per-user attribution lives in the warn log line.
-/// * `sqlstate` — PG SQLSTATE on the rejection (`22023`, `42704`,
-///   `42501`, `55P02`, or any other code under the startup-parameter
-///   family — pg_doorman does not pre-filter by SQLSTATE).
+/// * `sqlstate` - bounded PG SQLSTATE class for the rejection (`22`,
+///   `42`, `53`, `55`, or `other`). The full PG SQLSTATE is kept in
+///   the forwarded client error and warn log, not in Prometheus labels.
 ///
 /// SQLSTATEs with the `57P` prefix (server unavailable) are excluded: those
 /// `ErrorResponse`s are surfaced as `ServerUnavailableError` to drive the
@@ -564,8 +659,9 @@ pub(crate) static BACKEND_STARTUP_PARAMETER_ERRORS_TOTAL: Lazy<IntCounterVec> = 
             "Cumulative count of backend startup attempts pg_doorman \
              aborted because PostgreSQL ErrorResponse identified a key \
              this pool sent in StartupMessage (configured \
-             startup_parameters). Labels: pool, sqlstate. \
-             SQLSTATEs with the 57P prefix (server unavailable) are excluded — \
+             startup_parameters). Labels: pool, sqlstate \
+             (22, 42, 53, 55, or other). \
+             SQLSTATEs with the 57P prefix (server unavailable) are excluded - \
              those rejections take the Patroni-assisted fallback path \
              instead. The failing parameter name and username are in \
              the corresponding warn log line; kept out of the label set \
@@ -713,6 +809,66 @@ pub(crate) static POOLER_CHECK_QUERY_BACKEND_TOTAL: Lazy<IntCounter> = Lazy::new
     counter
 });
 
+/// Phase 0 (SET application_name measurement): checkouts where parameter
+/// sync found an empty diff (no SET/RESET round-trip). Gates the Phase 1
+/// piggyback decision - see the parameter-sync design
+pub(crate) static SYNC_PARAMS_SKIPPED: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "pg_doorman_sync_params_skipped_total",
+        "Checkouts where parameter sync found an empty diff (no SET/RESET round-trip).",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// Phase 0: checkouts where parameter sync emitted a SET/RESET round-trip
+/// before the client query (the cost Phase 1 would remove).
+pub(crate) static SYNC_PARAMS_APPLIED: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "pg_doorman_sync_params_applied_total",
+        "Checkouts where parameter sync emitted a SET/RESET round-trip before \
+         the client query.",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// Checkout-time parameter sync plan breakdown and AppNameOnly execution path.
+///
+/// Label cardinality is intentionally fixed and tiny: `plan` is one of
+/// empty/app_name_only/complex; `path` tells whether the plan needed no work,
+/// used standalone sync, hit the SimpleQuery piggyback, or had to preflush/drop
+/// the deferred application_name SET.
+pub(crate) static SYNC_PARAMS_PLAN_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "pg_doorman_sync_params_plan_total",
+            "Checkouts by parameter-sync plan and execution path.",
+        ),
+        &["plan", "path"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// Phase 0: wall-clock duration of the parameter-sync SET/RESET round-trip.
+pub(crate) static SYNC_PARAMS_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "pg_doorman_sync_params_rtt_seconds",
+        "Wall-clock duration of the parameter-sync SET/RESET round-trip to the backend.",
+    )
+    .buckets(vec![
+        0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.002_5, 0.005,
+        0.010, 0.025, 0.050,
+    ]);
+    let histogram = Histogram::with_opts(opts).unwrap();
+    REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
 /// Times pg_doorman answered a `pooler_check_query` SimpleQuery from the
 /// per-pool response cache without touching the backend. The ratio
 /// `cache_total / (cache_total + backend_total)` is the cache hit rate.
@@ -721,6 +877,19 @@ pub(crate) static POOLER_CHECK_QUERY_CACHE_TOTAL: Lazy<IntCounter> = Lazy::new(|
         "pg_doorman_pooler_check_query_cache_total",
         "Pooler check queries answered from the per-pool response cache \
          without forwarding to PostgreSQL.",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// Times a backend response to `general.pooler_check_query` exceeded the
+/// retained response/cache byte cap and was rejected without being cached.
+pub(crate) static POOLER_CHECK_QUERY_OVERSIZE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "pg_doorman_pooler_check_query_oversize_total",
+        "Pooler check query backend responses rejected because they exceeded \
+         the retained response/cache byte cap.",
     )
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
@@ -1383,6 +1552,32 @@ pub(crate) static WEB_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     counter
 });
 
+pub(crate) static WEB_RESPONSE_WRITE_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "pg_doorman_web_response_write_errors_total",
+            "Web UI response write failures by bounded stage and reason. `stage` is header/body/flush; `reason` is io/timeout.",
+        ),
+        &["stage", "reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+pub(crate) static ADMIN_RESPONSE_WRITE_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "pg_doorman_admin_response_write_errors_total",
+            "PostgreSQL admin protocol response write failures by bounded stage and reason. `stage` is write/flush; `reason` is io/timeout.",
+        ),
+        &["stage", "reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
 pub(crate) static WEB_SSO_VALIDATION_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -1390,6 +1585,44 @@ pub(crate) static WEB_SSO_VALIDATION_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| 
             "JWT validation failures by reason: signature, expired, audience, no_username, allowlist, insecure_transport. A sustained signature spike means the SSO proxy rotated keys without updating sso_public_key_file; allowlist spikes mean someone outside the allowlist is trying to log in; insecure_transport means [web].sso_require_https is on and a JWT arrived without the trusted-proxy + X-Forwarded-Proto: https hop required to accept it.",
         ),
         &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+pub(crate) static WEB_ADMIN_CSRF_REJECTED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "pg_doorman_web_admin_csrf_rejected_total",
+            "Number of admin POST /api/admin/* requests rejected because Origin/Referer did not match Host. A sustained non-zero value means a browser is being asked to fire admin mutations from an attacker-controlled origin while the operator is signed in via SSO cookies; investigate the source IP via access log.",
+        ),
+        &[],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// Cumulative panics observed by the worker panic hook (`src/app/panic.rs`).
+/// `IntCounter` (not IntGauge) so
+/// `_total` suffix matches Prometheus convention AND `rate(...)`
+/// queries detect process-restart resets cleanly. The C1 source
+/// counter (`WORKER_PANIC_COUNT` AtomicU64) is monotonic by
+/// construction, so the delta-emit pattern used by the rest of the
+/// `_total` metrics applies: each scrape `inc_by(delta)` to bring
+/// the IntCounter in sync with the source.
+///
+/// Without this counter the C1 fix converted a loud `exit(1)`
+/// failure into a silent degradation (tokio task aborts, other
+/// clients continue, no operator signal).
+pub(crate) static WORKER_PANICS: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let counter = prometheus::IntCounter::new(
+        "pg_doorman_worker_panics_total",
+        "Cumulative panics caught by the worker panic hook since process start. \
+         A non-zero rate indicates a bug - investigate stderr / log for the \
+         panic location. Per-task panics no longer terminate the process \
+         (C1 fix); without this counter the failure mode would be invisible.",
     )
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();

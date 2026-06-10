@@ -1,9 +1,7 @@
-//! Short-TTL request snapshot cache. Codex Arch P2#6 / Perf P1#3 flagged
-//! that adjacent endpoints (`/api/overview`, `/api/pools`, `/api/clients`,
-//! `/api/servers`, `/api/apps`, `/api/stats`) each cloned the global
-//! `CLIENT_STATS` / `SERVER_STATS` maps under their own read lock — the
-//! same data was walked four to five times per UI poll cycle, and the
-//! UI tabs disagreed on which "moment" they were reading.
+//! Short-TTL request snapshot cache. Adjacent endpoints (`/api/overview`,
+//! `/api/pools`, `/api/clients`, `/api/servers`, `/api/apps`, `/api/stats`)
+//! reuse one coherent snapshot instead of walking `CLIENT_STATS` and
+//! `SERVER_STATS` separately during the same UI poll cycle.
 //!
 //! This module exposes a single [`snapshot()`] that returns an
 //! `Arc<Snapshot>`. Within a 250 ms TTL window every caller reuses the

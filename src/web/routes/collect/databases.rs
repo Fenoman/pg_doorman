@@ -6,8 +6,8 @@ use super::now_unix_ms;
 pub(crate) fn collect_databases() -> DatabasesDto {
     let pools_map = get_all_pools();
     let mut databases: Vec<DatabaseDto> = pools_map
-        .iter()
-        .map(|(_identifier, pool)| {
+        .values()
+        .map(|pool| {
             let address = pool.address();
             let settings = &pool.settings;
             DatabaseDto {

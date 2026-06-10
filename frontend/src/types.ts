@@ -40,11 +40,26 @@ export interface OverviewDto {
   clients_in_transactions: number;
   shutdown_in_progress: boolean;
   migration_in_progress: boolean;
+  sync_params: SyncParamsDto;
   // Database currently holding the most live backend connections, summed
   // across every user@db pool that targets it. Sidebar surfaces it so
   // any page shows which database is taking the load right now. Omitted
   // when no pool has a live backend connection.
   hottest_database?: HottestDatabaseDto;
+}
+
+export interface SyncParamsDto {
+  empty_none: number;
+  complex_standalone: number;
+  app_name_only: SyncParamsAppNameOnlyDto;
+}
+
+export interface SyncParamsAppNameOnlyDto {
+  total: number;
+  simple_query_piggyback: number;
+  deferred_begin_preflush: number;
+  non_simple_preflush: number;
+  discard_all_intercept_dropped: number;
 }
 
 export interface HottestDatabaseDto {

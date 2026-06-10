@@ -26,6 +26,7 @@ import type {
   PoolsDto,
   ProcessDto,
   SocketsDto,
+  SyncParamsDto,
 } from "../types";
 
 const POLL_MS = 1500;
@@ -541,6 +542,7 @@ export default function Overview() {
             </ChartLink>
           </div>
         </Card>
+        <SyncParamsCard sync={overviewPoll.data?.sync_params ?? null} />
         <Card
           title="Connection breakdown ↗"
           onTitleClick={() => openPanelById("conn_breakdown")}
@@ -601,7 +603,7 @@ export default function Overview() {
             thresholds: {
               healthy: "waiting ≈ 0 · oldest < 30 s",
               warn: "oldest ≥ 30 s",
-              crit: "oldest ≥ 5 min — stuck transaction",
+              crit: "oldest ≥ 5 min - stuck transaction",
             },
             related: ["wait_p95_ms", "active_clients", "backend_p99"],
             docsHref:
@@ -728,6 +730,69 @@ function Card({
     );
   }
   return <section className="rounded-md border border-border bg-surface shadow-card">{inner}</section>;
+}
+
+function SyncParamsCard({ sync }: { sync: SyncParamsDto | null }) {
+  const app = sync?.app_name_only;
+  const appTotal = app?.total ?? 0;
+  const piggyback = app?.simple_query_piggyback ?? 0;
+  const hitPct = appTotal > 0 ? (piggyback / appTotal) * 100 : null;
+  const fmtCount = (n: number | undefined) => (n === undefined ? "-" : n.toLocaleString());
+  const fmtRatio = (n: number | null) => (n === null ? "-" : `${n.toFixed(1)}%`);
+  const rows: Array<[string, number | undefined]> = [
+    ["simple query piggyback", piggyback],
+    ["non-simple preflush", app?.non_simple_preflush],
+    ["deferred BEGIN preflush", app?.deferred_begin_preflush],
+    ["DISCARD ALL dropped", app?.discard_all_intercept_dropped],
+    ["complex standalone", sync?.complex_standalone],
+    ["empty diff", sync?.empty_none],
+  ];
+
+  return (
+    <Card
+      title="SET application_name piggyback"
+      helpStructured={{
+        definition:
+          "Checkout parameter-sync outcomes from pg_doorman_sync_params_plan_total.",
+        source: "/api/overview · pg_doorman_sync_params_plan_total{plan,path}",
+        formula:
+          "hit = app_name_only/simple_query_piggyback ÷ all app_name_only outcomes",
+        thresholds: {
+          healthy: "hit close to 100% when clients use SimpleQuery first",
+          warn: "non-simple preflush dominates app_name_only outcomes",
+          crit: "complex standalone dominates while sync_server_parameters is enabled",
+        },
+        related: ["sync_server_parameters", "application_name", "extended protocol"],
+      }}
+    >
+      <div className="grid gap-4 lg:grid-cols-[minmax(180px,240px)_1fr]">
+        <div className="flex flex-col justify-center border-b border-border pb-4 lg:border-b-0 lg:border-r lg:pb-0 lg:pr-4">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-text-muted">
+            piggyback hit
+          </span>
+          <span className="mt-1 font-mono text-3xl font-semibold tabular text-text">
+            {fmtRatio(hitPct)}
+          </span>
+          <span className="mt-1 font-mono text-xs tabular text-text-dim">
+            {fmtCount(piggyback)} / {fmtCount(appTotal)}
+          </span>
+        </div>
+        <div className="grid gap-x-6 gap-y-2 sm:grid-cols-2 xl:grid-cols-3">
+          {rows.map(([label, value]) => (
+            <div
+              key={label}
+              className="flex items-baseline justify-between gap-3 border-b border-border/50 py-1.5 last:border-b-0 sm:last:border-b"
+            >
+              <span className="min-w-0 truncate text-xs text-text-muted">{label}</span>
+              <span className="font-mono text-sm font-semibold tabular text-text">
+                {fmtCount(value)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </Card>
+  );
 }
 
 // Wrapper that turns a Sparkline card into a button-like region: any click
@@ -1154,7 +1219,7 @@ function ProcessBar({
   // Two refs: the previous snapshot we computed against, and the most
   // recent percentage. Re-renders that don't bring a new ts (a sibling
   // poll updated state) reuse the cached delta instead of nulling it
-  // out — without that we'd flicker "sampling…" between every real poll.
+  // out - without that we'd flicker "sampling…" between every real poll.
   // Persist the previous ProcessDto in localStorage so CPU% and per-thread
   // deltas survive a page navigation. Without this, every reopen of
   // Overview started with "sampling…" until two snapshots accumulated

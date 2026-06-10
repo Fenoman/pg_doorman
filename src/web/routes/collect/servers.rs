@@ -59,7 +59,7 @@ fn server_matches(s: &crate::stats::ServerStats, f: &ServerFilters) -> bool {
     let user = s.username();
 
     if let Some(p) = &f.pool {
-        let id = format!("{}@{}", user, pool_name);
+        let id = format!("{user}@{pool_name}");
         if id != *p {
             return false;
         }

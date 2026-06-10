@@ -39,6 +39,7 @@ async fn test_prometheus_server_basic() {
                 trusted_proxies: Vec::new(),
                 sso_admin_groups_configured: false,
                 sso_require_https: false,
+                allowed_admin_origins: Vec::new(),
             },
         )
         .await;
@@ -127,6 +128,7 @@ async fn test_prometheus_server_basic() {
 }
 
 #[test]
+#[serial]
 fn test_streaming_counters_register_and_increment() {
     use crate::web::metrics::{
         observe_streaming_bytes, observe_streaming_event, STREAMING_BYTES_TOTAL,
@@ -172,6 +174,70 @@ fn test_streaming_counters_register_and_increment() {
             .get(),
         8_388_608
     );
+}
+
+#[test]
+#[serial]
+fn sync_params_plan_metric_registers_plan_and_path_labels() {
+    use crate::web::metrics::{inc_sync_params_plan, SYNC_PARAMS_PLAN_TOTAL};
+    use prometheus::Encoder;
+
+    let plan = "app_name_only";
+    let path = "simple_query_piggyback";
+    let before = SYNC_PARAMS_PLAN_TOTAL
+        .with_label_values(&[plan, path])
+        .get();
+
+    inc_sync_params_plan(plan, path);
+
+    assert_eq!(
+        SYNC_PARAMS_PLAN_TOTAL
+            .with_label_values(&[plan, path])
+            .get(),
+        before + 1
+    );
+
+    let families = crate::web::metrics::REGISTRY.gather();
+    let mut buffer = Vec::new();
+    prometheus::TextEncoder::new()
+        .encode(&families, &mut buffer)
+        .unwrap();
+    let exported = String::from_utf8(buffer).unwrap();
+
+    assert!(exported.contains("pg_doorman_sync_params_plan_total"));
+    assert!(exported.contains(r#"plan="app_name_only""#));
+    assert!(exported.contains(r#"path="simple_query_piggyback""#));
+}
+
+#[test]
+#[serial]
+fn migration_clients_dropped_metric_registers_and_increments() {
+    use crate::web::metrics::{record_migration_client_dropped, MIGRATION_CLIENTS_DROPPED_TOTAL};
+    use prometheus::Encoder;
+
+    let reason = "deadline";
+    let before = MIGRATION_CLIENTS_DROPPED_TOTAL
+        .with_label_values(&[reason])
+        .get();
+
+    record_migration_client_dropped(reason);
+
+    assert_eq!(
+        MIGRATION_CLIENTS_DROPPED_TOTAL
+            .with_label_values(&[reason])
+            .get(),
+        before + 1
+    );
+
+    let families = crate::web::metrics::REGISTRY.gather();
+    let mut buffer = Vec::new();
+    prometheus::TextEncoder::new()
+        .encode(&families, &mut buffer)
+        .unwrap();
+    let exported = String::from_utf8(buffer).unwrap();
+
+    assert!(exported.contains("pg_doorman_migration_clients_dropped_total"));
+    assert!(exported.contains(r#"reason="deadline""#));
 }
 
 #[test]
@@ -244,6 +310,7 @@ async fn test_prometheus_server_integration() {
                 trusted_proxies: Vec::new(),
                 sso_admin_groups_configured: false,
                 sso_require_https: false,
+                allowed_admin_origins: Vec::new(),
             },
         )
         .await;

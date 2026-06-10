@@ -34,22 +34,27 @@ enum SocketAddr {
     V6(SocketAddrV6),
 }
 
+// per-state counters widened from u16 to u32. A pooler
+// fronting an OLTP fleet routinely sees >65 535 client connections
+// in TCP_ESTABLISHED on a single address family; release-profile
+// builds silently wrapped, causing SHOW SOCKETS / /api/sockets /
+// Prometheus `tcp_est` to under-report by 65 536 per wrap.
 #[derive(Default)]
 pub struct TcpStateCount {
     // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/net/tcp_states.h
-    pub established: u16,
-    pub syn_sent: u16,
-    pub syn_recv: u16,
-    pub fin_wait1: u16,
-    pub fin_wait2: u16,
-    pub time_wait: u16,
-    pub close: u16,
-    pub close_wait: u16,
-    pub last_ack: u16,
-    pub listen: u16,
-    pub closing: u16,
-    pub new_syn_recv: u16,
-    pub bound_inactive: u16,
+    pub established: u32,
+    pub syn_sent: u32,
+    pub syn_recv: u32,
+    pub fin_wait1: u32,
+    pub fin_wait2: u32,
+    pub time_wait: u32,
+    pub close: u32,
+    pub close_wait: u32,
+    pub last_ack: u32,
+    pub listen: u32,
+    pub closing: u32,
+    pub new_syn_recv: u32,
+    pub bound_inactive: u32,
 
     pub total_count: u32,
 }
@@ -57,11 +62,11 @@ pub struct TcpStateCount {
 #[derive(Default)]
 pub struct UnixStreamStateCount {
     // https://github.com/ecki/net-tools/blob/master/netstat.c#L121
-    pub free: u16,          /* not allocated                */
-    pub unconnected: u16,   /* unconnected to any socket    */
-    pub connecting: u16,    /* in process of connecting     */
-    pub connected: u16,     /* connected to socket          */
-    pub disconnecting: u16, /* in process of disconnecting  */
+    pub free: u32,          /* not allocated                */
+    pub unconnected: u32,   /* unconnected to any socket    */
+    pub connecting: u32,    /* in process of connecting     */
+    pub connected: u32,     /* connected to socket          */
+    pub disconnecting: u32, /* in process of disconnecting  */
 
     pub total_count: u32,
 }
@@ -71,9 +76,9 @@ pub struct SocketStateCount {
     pub tcp: TcpStateCount,
     pub tcp6: TcpStateCount,
     pub unix_stream: UnixStreamStateCount,
-    pub unix_dgram: u16,
-    pub unix_seq_packet: u16,
-    pub unknown: u16,
+    pub unix_dgram: u32,
+    pub unix_seq_packet: u32,
+    pub unknown: u32,
 }
 
 impl SocketStateCount {
@@ -99,7 +104,7 @@ impl SocketStateCount {
     }
 
     pub fn get_unknown(&self) -> u32 {
-        self.unknown as u32
+        self.unknown
     }
 }
 
@@ -225,19 +230,19 @@ impl SocketStateCount {
         let t4 = &self.tcp;
         let t6 = &self.tcp6;
         MergedTcpBreakdown {
-            established: t4.established as u32 + t6.established as u32,
-            listen: t4.listen as u32 + t6.listen as u32,
-            time_wait: t4.time_wait as u32 + t6.time_wait as u32,
-            fin_wait1: t4.fin_wait1 as u32 + t6.fin_wait1 as u32,
-            fin_wait2: t4.fin_wait2 as u32 + t6.fin_wait2 as u32,
-            close_wait: t4.close_wait as u32 + t6.close_wait as u32,
-            last_ack: t4.last_ack as u32 + t6.last_ack as u32,
-            syn_sent: t4.syn_sent as u32 + t6.syn_sent as u32,
-            syn_recv: t4.syn_recv as u32 + t6.syn_recv as u32,
-            new_syn_recv: t4.new_syn_recv as u32 + t6.new_syn_recv as u32,
-            closing: t4.closing as u32 + t6.closing as u32,
-            close: t4.close as u32 + t6.close as u32,
-            bound_inactive: t4.bound_inactive as u32 + t6.bound_inactive as u32,
+            established: t4.established + t6.established,
+            listen: t4.listen + t6.listen,
+            time_wait: t4.time_wait + t6.time_wait,
+            fin_wait1: t4.fin_wait1 + t6.fin_wait1,
+            fin_wait2: t4.fin_wait2 + t6.fin_wait2,
+            close_wait: t4.close_wait + t6.close_wait,
+            last_ack: t4.last_ack + t6.last_ack,
+            syn_sent: t4.syn_sent + t6.syn_sent,
+            syn_recv: t4.syn_recv + t6.syn_recv,
+            new_syn_recv: t4.new_syn_recv + t6.new_syn_recv,
+            closing: t4.closing + t6.closing,
+            close: t4.close + t6.close,
+            bound_inactive: t4.bound_inactive + t6.bound_inactive,
         }
     }
 }
@@ -364,7 +369,7 @@ pub fn get_socket_states_count(pid: u32) -> Result<SocketStateCount, SocketInfoE
         fill_unix(reader, &mut inodes, &mut result);
     }
 
-    result.unknown += u16::try_from(inodes.len())?;
+    result.unknown += u32::try_from(inodes.len())?;
     Ok(result)
 }
 
@@ -535,7 +540,19 @@ fn fill_unix<R: BufRead>(mut reader: R, h_map: &mut HashSet<u64>, counts: &mut S
 }
 
 fn is_socket(path: &Path) -> bool {
+    let Some(mut result) = fstatat_mode(path) else {
+        return false;
+    };
+    // prune permission bits
+    result = result >> 9 << 9;
+    result == libc::S_IFSOCK
+}
+
+fn fstatat_mode(path: &Path) -> Option<mode_t> {
     let path_bytes = path.as_os_str().as_encoded_bytes();
+    if path_bytes.len() + 1 > PATH_BUF_SIZE {
+        return None;
+    }
     let mut buf_res: MaybeUninit<stat> = mem::MaybeUninit::uninit();
     let mut buf = MaybeUninit::<[u8; PATH_BUF_SIZE]>::uninit();
     let buf_ptr = buf.as_mut_ptr() as *mut u8;
@@ -546,7 +563,7 @@ fn is_socket(path: &Path) -> bool {
     match CStr::from_bytes_with_nul(unsafe { slice::from_raw_parts(buf_ptr, path_bytes.len() + 1) })
     {
         Ok(s) => {
-            unsafe {
+            let rc = unsafe {
                 libc::fstatat(
                     libc::AT_FDCWD,
                     s.as_ptr(),
@@ -554,18 +571,12 @@ fn is_socket(path: &Path) -> bool {
                     c_int::default(),
                 )
             };
-            let mut result: mode_t;
-            unsafe {
-                result = buf_res.assume_init().st_mode;
+            if rc != 0 {
+                return None;
             }
-            // prune permission bits
-            result = result >> 9 << 9;
-            if result == libc::S_IFSOCK {
-                return true;
-            }
-            false
+            Some(unsafe { buf_res.assume_init().st_mode })
         }
-        Err(_) => false,
+        Err(_) => None,
     }
 }
 
@@ -840,6 +851,15 @@ mod tests {
     fn get_inode_u64_rejects_malformed_inode() {
         assert_eq!(get_inode_u64("socket:[]"), None);
         assert_eq!(get_inode_u64("socket:[abc]"), None);
+    }
+
+    #[test]
+    fn fstatat_mode_returns_none_for_missing_path() {
+        let path =
+            std::env::temp_dir().join(format!("pg_doorman_missing_fd_path_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(fstatat_mode(&path), None);
     }
 
     fn tcp_row(state_hex: &str, inode: u64) -> String {

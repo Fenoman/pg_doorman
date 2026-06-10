@@ -1,23 +1,21 @@
-use crate::server::{anon_snapshot, named_snapshot, now_monotonic_ms};
+use crate::server::{anon_snapshot, anon_stats, named_snapshot, named_stats, now_monotonic_ms};
 use crate::web::routes::dto::{InternerDto, InternerKindDto, InternerTopDto, InternerTopRowDto};
 
 use super::{clamp_top_n, now_unix_ms};
 
 pub(crate) fn collect_interner() -> InternerDto {
-    let named = named_snapshot();
-    let anon = anon_snapshot();
-    let named_bytes: u64 = named.iter().map(|(_, e)| e.text().len() as u64).sum();
-    let anon_bytes: u64 = anon.iter().map(|(_, e)| e.text().len() as u64).sum();
+    let named = named_stats();
+    let anon = anon_stats();
 
     InternerDto {
         ts: now_unix_ms(),
         named: InternerKindDto {
-            entries: named.len() as u64,
-            bytes: named_bytes,
+            entries: named.entries,
+            bytes: named.bytes,
         },
         anonymous: InternerKindDto {
-            entries: anon.len() as u64,
-            bytes: anon_bytes,
+            entries: anon.entries,
+            bytes: anon.bytes,
         },
     }
 }
@@ -53,7 +51,7 @@ pub(crate) fn collect_interner_top(n: u64) -> InternerTopDto {
             };
             let preview = crate::utils::strings::preview_query(&text);
             InternerTopRowDto {
-                hash: format!("{:#x}", hash),
+                hash: format!("{hash:#x}"),
                 kind: kind.to_string(),
                 bytes: bytes as u64,
                 idle_ms,
@@ -66,5 +64,33 @@ pub(crate) fn collect_interner_top(n: u64) -> InternerTopDto {
         ts: now_unix_ms(),
         n,
         entries,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn aggregate_collector_does_not_materialize_interner_snapshots() {
+        let src = include_str!("interner.rs");
+        let start = src
+            .find("pub(crate) fn collect_interner()")
+            .expect("aggregate collector must exist");
+        let end = src
+            .find("pub(crate) fn collect_interner_top")
+            .expect("top collector should follow aggregate collector");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("named_stats()"),
+            "aggregate endpoint must use O(1) named interner stats"
+        );
+        assert!(
+            body.contains("anon_stats()"),
+            "aggregate endpoint must use O(1) anonymous interner stats"
+        );
+        assert!(
+            !body.contains("named_snapshot()") && !body.contains("anon_snapshot()"),
+            "public aggregate endpoint must not clone full interner snapshots"
+        );
     }
 }
