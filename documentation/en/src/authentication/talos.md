@@ -9,10 +9,10 @@ If you operate inside Ozon's Talos identity stack, this is the integration. Outs
 1. A client connects with username `talos` and a JWT as the password.
 2. PgDoorman reads the `kid` field from the JWT header and looks up the matching public key in `general.talos.keys`.
 3. The token is verified (RS256, `exp`, `nbf`).
-4. PgDoorman walks `resource_access` keys, splits each on `:`, and matches the part **after the colon** against `general.talos.databases`. So a key like `"postgres.stg:billing"` matches the `billing` database. The roles from every matching entry are collected; the highest wins (`owner` > `read_write` > `read_only`).
+4. PgDoorman builds exact allowed `resource_access` keys from `general.talos.resource_prefixes` and the requested database, then matches only those keys. For example, prefix `"postgres.stg"` plus database `billing` accepts `"postgres.stg:billing"` and rejects `"postgres.dev:billing"`. The roles from every matching entry are collected; the highest wins (`owner` > `read_write` > `read_only`).
 5. The connection is authenticated against a pool user named after the role: `owner`, `read_write`, or `read_only`. That user must exist in the pool with `server_username` and `server_password` configured.
 
-The client identity (`clientId` from the token) is preserved in `application_name` and audit logs.
+The client identity (`clientId` from the token) is preserved in `application_name` and reviews.
 
 ## Configuration
 
@@ -27,6 +27,8 @@ general:
     databases:
       - "billing"
       - "inventory"
+    resource_prefixes:
+      - "postgres.stg"
 
 pools:
   billing:
@@ -50,7 +52,7 @@ pools:
 
 The file stem of each key (`abc123`, `def456`) is the `kid` matched against the JWT header.
 
-`databases` is a filter: only listed databases are eligible for Talos. A token without an entry for the requested database is rejected.
+`databases` is a filter: only listed databases are eligible for Talos. `resource_prefixes` scopes which Talos resources are accepted for those databases. A token without an exact `resource_prefix:database` entry for the requested database is rejected.
 
 ## Token shape
 
@@ -71,7 +73,7 @@ The file stem of each key (`abc123`, `def456`) is the `kid` matched against the 
 }
 ```
 
-`resource_access` keys must include a colon. PgDoorman ignores everything before it and matches the suffix against `general.talos.databases`. A token built without the colon prefix will produce no role and authentication will fail with "Token may not contain valid roles for the requested databases".
+`resource_access` keys must match one of the configured `resource_prefixes` plus the requested database. PgDoorman does not accept suffix-only matches; a token for another resource prefix will produce no role and authentication will fail with "Token may not contain valid roles for the requested database".
 
 A client connecting to `inventory` with this token lands in the `read_write` user (max of the two listed roles).
 
