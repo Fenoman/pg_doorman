@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use crate::app::server::{
-    CLIENTS_IN_TRANSACTIONS, CURRENT_CLIENT_COUNT, MIGRATION_IN_PROGRESS, SHUTDOWN_IN_PROGRESS,
+    migration_in_progress, CLIENTS_IN_TRANSACTIONS, CURRENT_CLIENT_COUNT, SHUTDOWN_IN_PROGRESS,
     STARTED_AT, STARTED_AT_MS,
 };
 use crate::pool::PoolIdentifier;
@@ -12,7 +12,10 @@ use crate::stats::{
     TOTAL_CONNECTION_COUNTER,
 };
 use crate::web::metrics::system::get_process_memory_usage;
-use crate::web::routes::dto::{HottestDatabaseDto, OverviewDto};
+use crate::web::metrics::SYNC_PARAMS_PLAN_TOTAL;
+use crate::web::routes::dto::{
+    HottestDatabaseDto, OverviewDto, SyncParamsAppNameOnlyDto, SyncParamsDto,
+};
 
 use super::{cnt, now_unix_ms, snapshot};
 
@@ -101,7 +104,38 @@ pub(crate) fn collect_overview() -> OverviewDto {
         current_clients: CURRENT_CLIENT_COUNT.load(Ordering::Relaxed),
         clients_in_transactions: CLIENTS_IN_TRANSACTIONS.load(Ordering::Relaxed),
         shutdown_in_progress: SHUTDOWN_IN_PROGRESS.load(Ordering::Relaxed),
-        migration_in_progress: MIGRATION_IN_PROGRESS.load(Ordering::Relaxed),
+        migration_in_progress: migration_in_progress(),
+        sync_params: collect_sync_params_overview(),
+    }
+}
+
+fn sync_params_plan_count(plan: &str, path: &str) -> u64 {
+    SYNC_PARAMS_PLAN_TOTAL
+        .with_label_values(&[plan, path])
+        .get()
+}
+
+fn collect_sync_params_overview() -> SyncParamsDto {
+    let simple_query_piggyback = sync_params_plan_count("app_name_only", "simple_query_piggyback");
+    let deferred_begin_preflush =
+        sync_params_plan_count("app_name_only", "deferred_begin_preflush");
+    let non_simple_preflush = sync_params_plan_count("app_name_only", "non_simple_preflush");
+    let discard_all_intercept_dropped =
+        sync_params_plan_count("app_name_only", "discard_all_intercept_dropped");
+
+    SyncParamsDto {
+        empty_none: sync_params_plan_count("empty", "none"),
+        complex_standalone: sync_params_plan_count("complex", "standalone"),
+        app_name_only: SyncParamsAppNameOnlyDto {
+            total: simple_query_piggyback
+                + deferred_begin_preflush
+                + non_simple_preflush
+                + discard_all_intercept_dropped,
+            simple_query_piggyback,
+            deferred_begin_preflush,
+            non_simple_preflush,
+            discard_all_intercept_dropped,
+        },
     }
 }
 
@@ -251,5 +285,39 @@ mod tests {
         assert_eq!(hottest.name, "login_heavy");
         assert_eq!(hottest.total_connections, 8);
         assert_eq!(hottest.active_connections, 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn collect_overview_reads_sync_params_plan_counters() {
+        let before = collect_overview().sync_params;
+
+        crate::web::metrics::inc_sync_params_plan("app_name_only", "simple_query_piggyback");
+        crate::web::metrics::inc_sync_params_plan("app_name_only", "deferred_begin_preflush");
+        crate::web::metrics::inc_sync_params_plan("app_name_only", "non_simple_preflush");
+        crate::web::metrics::inc_sync_params_plan("app_name_only", "discard_all_intercept_dropped");
+        crate::web::metrics::inc_sync_params_plan("complex", "standalone");
+        crate::web::metrics::inc_sync_params_plan("empty", "none");
+
+        let after = collect_overview().sync_params;
+        assert_eq!(
+            after.app_name_only.simple_query_piggyback,
+            before.app_name_only.simple_query_piggyback + 1
+        );
+        assert_eq!(
+            after.app_name_only.deferred_begin_preflush,
+            before.app_name_only.deferred_begin_preflush + 1
+        );
+        assert_eq!(
+            after.app_name_only.non_simple_preflush,
+            before.app_name_only.non_simple_preflush + 1
+        );
+        assert_eq!(
+            after.app_name_only.discard_all_intercept_dropped,
+            before.app_name_only.discard_all_intercept_dropped + 1
+        );
+        assert_eq!(after.app_name_only.total, before.app_name_only.total + 4);
+        assert_eq!(after.complex_standalone, before.complex_standalone + 1);
+        assert_eq!(after.empty_none, before.empty_none + 1);
     }
 }

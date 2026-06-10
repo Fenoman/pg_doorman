@@ -1,4 +1,4 @@
-//! GET /api/prepared handler. Public — aggregate without SQL text.
+//! GET /api/prepared handler. SSO/Admin - aggregate includes client-supplied statement names.
 
 use crate::web::routes::collect::collect_prepared;
 use crate::web::server::Response;
@@ -18,5 +18,6 @@ mod tests {
         let body = std::str::from_utf8(&r.body).unwrap();
         assert!(body.contains("\"ts\""));
         assert!(body.contains("\"prepared\""));
+        assert!(body.contains("\"truncated\":false"));
     }
 }

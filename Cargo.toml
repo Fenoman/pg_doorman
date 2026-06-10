@@ -3,7 +3,6 @@ edition = "2021"
 rust-version = "1.88.0"
 license = "MIT"
 name = "pg_doorman"
-rust-version = "1.87.0"
 version = "3.11.2"
 
 [profile.release]
@@ -45,12 +44,7 @@ serde_derive = "1"
 serde_json = "1.0.140"
 serde_yaml = "0.9"
 sha-1 = "0.10"
-ipnet = { version = "2.11.0", features = ["serde"] }
-once_cell = "1.21.3"
-quanta = "0.12"
-arc-swap = "1.7.1"
 toml = "0.8"
-prometheus = "0.14.0"
 tokio = { version = "1.48.4", features = ["rt-multi-thread", "fs", "parking_lot", "sync", "io-util", "net", "macros", "signal", "time"] }
 # async-channel is MPMC (multi-producer multi-consumer) - the receiver
 # is Send+Sync, so we can clone it across N auth_query workers and get
@@ -58,25 +52,14 @@ tokio = { version = "1.48.4", features = ["rt-multi-thread", "fs", "parking_lot"
 # the receiver-sharing workaround wrapped it in `tokio::sync::Mutex` and forced
 # all workers to serialize on one mutex.
 async-channel = "2"
-exitcode = "1.1.2"
-pin-project = "1"
-bytes = "1.10.1"
-md-5 = "0.10"
 socket2 = { version = "0.6.1", features = ["all"] }
-chrono = "0.4"
-rand = "0.9.1"
-base64 = "0.22.1"
-hmac = "0.12"
 sha2 = "0.10"
-socket2 = {version = "0.6.1", features = ["all"]}
 stringprep = "0.1"
 subtle = "2"
 syslog = "7.0.0"
 tikv-jemalloc-ctl = {version = "0.6.0", features = ["stats"]}
 tikv-jemallocator = {version = "0.6.0", features = ["background_threads_runtime_support"]}
-tokio = {version = "1.48.4", features = ["rt-multi-thread", "fs", "parking_lot", "sync", "io-util", "net", "macros", "signal", "time"]}
 tokio-native-tls = {version = "0.3.1"}
-toml = "0.8"
 tracing = "0.1.37"
 tracing-subscriber = {version = "0.3.20", features = ["json", "env-filter", "std"]}
 # `jwt` (above) is shared with the web UI SSO flow. Both code paths
@@ -90,7 +73,6 @@ iota = { version = "0.2.3" }
 pam-client = { version = "0.5.0", optional = true }
 pin-project-lite = "0.2.16"
 postgres = "0.19.10"
-thiserror = "1"
 # `with-serde_json-1` lets `Row::try_get` decode `json`/`jsonb`
 # columns directly into `serde_json::Value`, which allows auth_query
 # startup_parameters to come from a native JSON column.

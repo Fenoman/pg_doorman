@@ -17,9 +17,10 @@ use std::sync::LazyLock;
 
 use crate::app::server::{STARTED_AT, STARTED_AT_MS};
 use crate::web::metrics::system::get_process_memory_usage;
+#[cfg(target_os = "linux")]
+use crate::web::routes::dto::CgroupMemoryDto;
 use crate::web::routes::dto::{
-    CgroupMemoryDto, JemallocStatsDto, MemoryBreakdownDto, MemoryCategoryDto, ProcessDto,
-    ProcessThreadDto,
+    JemallocStatsDto, MemoryBreakdownDto, MemoryCategoryDto, ProcessDto, ProcessThreadDto,
 };
 
 use super::now_unix_ms;

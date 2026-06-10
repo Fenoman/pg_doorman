@@ -21,19 +21,26 @@ use super::SHOW_SOCKETS;
 use super::{
     AUTH_QUERY_AUTH, AUTH_QUERY_AUTH_TOTAL, AUTH_QUERY_CACHE, AUTH_QUERY_CACHE_TOTAL,
     AUTH_QUERY_DYNAMIC_POOLS, AUTH_QUERY_DYNAMIC_POOLS_TOTAL, AUTH_QUERY_EXECUTOR,
-    AUTH_QUERY_EXECUTOR_TOTAL, COORDINATOR, COORDINATOR_TOTALS, POOL_SCALING_GAUGE,
+    AUTH_QUERY_EXECUTOR_TOTAL, BACKEND_STARTUP_PARAMETER_ERRORS_TOTAL, COORDINATOR,
+    COORDINATOR_TOTALS, FALLBACK_ACTIVE, FALLBACK_CACHE_HITS_TOTAL,
+    FALLBACK_CANDIDATE_FAILURES_TOTAL, FALLBACK_CONNECTIONS_TOTAL, FALLBACK_HOST,
+    PATRONI_API_DURATION, PATRONI_API_ERRORS_TOTAL, PATRONI_API_REQUESTS_TOTAL, POOL_SCALING_GAUGE,
     POOL_SCALING_TOTALS, SHOW_ASYNC_CLIENTS_COUNT, SHOW_CLIENT_CACHE_BYTES,
     SHOW_CLIENT_CACHE_ENTRIES, SHOW_CLIENT_PREPARED_ANONYMOUS_ENTRIES,
     SHOW_CLIENT_PREPARED_ANONYMOUS_EVICTIONS_TOTAL, SHOW_CLIENT_PREPARED_NAMED_ENTRIES,
-    SHOW_CONNECTIONS, SHOW_CONNECTIONS_TOTAL, SHOW_POOLS_BYTES, SHOW_POOLS_BYTES_TOTAL,
-    SHOW_POOLS_CLIENT, SHOW_POOLS_ERRORS_TOTAL, SHOW_POOLS_MAXWAIT_MICROSECONDS,
-    SHOW_POOLS_OLDEST_ACTIVE_AGE_MS, SHOW_POOLS_PAUSED, SHOW_POOLS_QUERIES_COUNTER,
-    SHOW_POOLS_QUERIES_PERCENTILE, SHOW_POOLS_QUERIES_TOTAL, SHOW_POOLS_QUERIES_TOTAL_TIME,
-    SHOW_POOLS_SERVER, SHOW_POOLS_TRANSACTIONS_COUNTER, SHOW_POOLS_TRANSACTIONS_PERCENTILE,
-    SHOW_POOLS_TRANSACTIONS_TOTAL, SHOW_POOLS_TRANSACTIONS_TOTAL_TIME, SHOW_POOLS_WAIT_TIME_AVG,
-    SHOW_POOL_CACHE_BYTES, SHOW_POOL_CACHE_ENTRIES, SHOW_POOL_SIZE, SHOW_SERVERS_PREPARED_HITS,
+    SHOW_CLIENT_PREPARED_NAMED_EVICTIONS_TOTAL, SHOW_CONNECTIONS, SHOW_CONNECTIONS_TOTAL,
+    SHOW_POOLS_BYTES, SHOW_POOLS_BYTES_TOTAL, SHOW_POOLS_CLIENT, SHOW_POOLS_ERRORS_TOTAL,
+    SHOW_POOLS_MAXWAIT_MICROSECONDS, SHOW_POOLS_OLDEST_ACTIVE_AGE_MS, SHOW_POOLS_PAUSED,
+    SHOW_POOLS_QUERIES_COUNTER, SHOW_POOLS_QUERIES_PERCENTILE, SHOW_POOLS_QUERIES_TOTAL,
+    SHOW_POOLS_QUERIES_TOTAL_TIME, SHOW_POOLS_SERVER, SHOW_POOLS_TRANSACTIONS_COUNTER,
+    SHOW_POOLS_TRANSACTIONS_PERCENTILE, SHOW_POOLS_TRANSACTIONS_TOTAL,
+    SHOW_POOLS_TRANSACTIONS_TOTAL_TIME, SHOW_POOLS_WAIT_TIME_AVG, SHOW_POOL_CACHE_BYTES,
+    SHOW_POOL_CACHE_ENTRIES, SHOW_POOL_SIZE, SHOW_SERVERS_PREPARED_HITS,
     SHOW_SERVERS_PREPARED_HITS_TOTAL, SHOW_SERVERS_PREPARED_MISSES,
-    SHOW_SERVERS_PREPARED_MISSES_TOTAL, SHOW_SERVER_TLS_CONNECTIONS, TOTAL_MEMORY,
+    SHOW_SERVERS_PREPARED_MISSES_TOTAL, SHOW_SERVER_TLS_CONNECTIONS,
+    SHOW_SERVER_TLS_HANDSHAKE_DURATION, SHOW_SERVER_TLS_HANDSHAKE_ERRORS,
+    STARTUP_PARAMETERS_DROPPED_TOTAL, SYNC_PARAMS_APPLIED, SYNC_PARAMS_PLAN_TOTAL,
+    SYNC_PARAMS_RTT_SECONDS, SYNC_PARAMS_SKIPPED, TOTAL_MEMORY,
 };
 
 /// Updates all metrics before they are exposed via the Prometheus endpoint.
@@ -50,6 +57,114 @@ pub fn update_metrics() {
     update_auth_query_metrics();
     update_coordinator_metrics();
     update_pool_scaling_metrics();
+    update_worker_panic_metric();
+    update_pool_event_counters_metrics();
+}
+
+/// publish per-pool atomic event counters that were
+/// SHOW STATS-only. Uses the same CounterDeltaTracker pattern
+/// as `update_pool_errors_metrics` so `Pool::from_config` reload resets
+/// (which mint a fresh AddressStats with zeroed counters) emit deltas
+/// correctly across the boundary.
+fn update_pool_event_counters_metrics() {
+    use super::SHOW_POOLS_EVENT_COUNTERS;
+    use crate::pool::get_all_pools;
+
+    // Six counters per pool, each tracked independently via the
+    // shared CounterDeltaTracker keyed on (user, database, kind).
+    type PoolEventKey = (String, String, &'static str);
+    static POOL_EVENT_PREV: Lazy<CounterDeltaTracker<PoolEventKey>> =
+        Lazy::new(CounterDeltaTracker::new);
+
+    let mut current_sums: std::collections::HashMap<PoolEventKey, u64> =
+        std::collections::HashMap::new();
+    let mut pool_generations: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::new();
+
+    for (identifier, pool) in get_all_pools().iter() {
+        let user = identifier.user.as_str();
+        let database = identifier.db.as_str();
+        let address_stats = &pool.address().stats;
+        pool_generations.insert(
+            (user.to_string(), database.to_string()),
+            address_stats.generation,
+        );
+
+        let pairs: [(&'static str, u64); 6] = [
+            (
+                "discard_all_intercepted",
+                address_stats
+                    .discard_all_intercepted_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            (
+                "prewarm_failures",
+                address_stats
+                    .prewarm_failures_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            (
+                "dead_backends_probed",
+                address_stats
+                    .dead_backends_probed_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            (
+                "dead_backends_evicted",
+                address_stats
+                    .dead_backends_evicted_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            (
+                "cancel_requests",
+                address_stats
+                    .cancel_requests_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            (
+                "histogram_samples_dropped",
+                address_stats
+                    .histogram_samples_dropped_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        ];
+        for (kind, value) in pairs {
+            current_sums.insert((user.to_string(), database.to_string(), kind), value);
+        }
+    }
+
+    for (key, &current_sum) in &current_sums {
+        let counter =
+            SHOW_POOLS_EVENT_COUNTERS.with_label_values(&[key.0.as_str(), key.1.as_str(), key.2]);
+        let generation = pool_generations
+            .get(&(key.0.clone(), key.1.clone()))
+            .copied()
+            .unwrap_or(0);
+        POOL_EVENT_PREV.observe(&counter, key.clone(), generation, current_sum);
+    }
+
+    // GC stale entries for pools removed by RELOAD.
+    let current_keys: std::collections::HashSet<PoolEventKey> =
+        current_sums.keys().cloned().collect();
+    for stale in POOL_EVENT_PREV.drain_stale(&current_keys) {
+        let _ = SHOW_POOLS_EVENT_COUNTERS.remove_label_values(&[
+            stale.0.as_str(),
+            stale.1.as_str(),
+            stale.2,
+        ]);
+    }
+}
+
+/// Publish the worker panic counter via delta-emit.
+/// IntCounter only supports `inc()` / `inc_by(delta)` - read current
+/// metric value and compute the delta from the source atomic.
+fn update_worker_panic_metric() {
+    use super::WORKER_PANICS;
+    let source = crate::app::panic::WORKER_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let emitted = WORKER_PANICS.get();
+    if source > emitted {
+        WORKER_PANICS.inc_by(source - emitted);
+    }
 }
 
 fn update_memory_metrics() {
@@ -233,9 +348,13 @@ fn update_pool_metrics() {
     // The shared 250 ms snapshot keeps both paths from cloning CLIENT_STATS
     // and SERVER_STATS under separate read locks inside the TTL.
     let snap = crate::web::routes::collect::snapshot();
+    let pool_lookup = PoolStats::construct_pool_lookup_from_fresh_percentiles(
+        &snap.client_states,
+        &snap.server_states,
+    );
     reset_pool_metrics();
 
-    for (identifier, stats) in snap.pool_lookup.iter() {
+    for (identifier, stats) in pool_lookup.iter() {
         update_pool_avg_metrics(identifier, stats);
         update_pool_server_metrics(identifier, stats);
         update_client_state_metrics(identifier, stats);
@@ -251,11 +370,12 @@ fn update_pool_metrics() {
     // never go backwards in Prometheus; this only removes the time
     // series so a later pool with the same `(user, database)` does
     // not inherit a non-zero `previous` mark from the tracker.
-    let current_pool_keys: std::collections::HashSet<PoolKey> = snap
-        .pool_lookup
+    let current_pool_keys: std::collections::HashSet<PoolKey> = pool_lookup
         .keys()
         .map(|id| (id.user.clone(), id.db.clone()))
         .collect();
+    let current_pool_labels: std::collections::HashSet<String> =
+        pool_lookup.keys().map(|id| id.db.clone()).collect();
 
     for stale in POOL_QUERIES_PREV.drain_stale(&current_pool_keys) {
         let _ = SHOW_POOLS_QUERIES_TOTAL.remove_label_values(&[&stale.0, &stale.1]);
@@ -265,14 +385,406 @@ fn update_pool_metrics() {
     }
 
     let mut current_bytes_keys: std::collections::HashSet<PoolBytesKey> =
-        std::collections::HashSet::with_capacity(snap.pool_lookup.len() * 2);
-    for id in snap.pool_lookup.keys() {
+        std::collections::HashSet::with_capacity(pool_lookup.len() * 2);
+    for id in pool_lookup.keys() {
         current_bytes_keys.insert(("received".to_string(), id.user.clone(), id.db.clone()));
         current_bytes_keys.insert(("sent".to_string(), id.user.clone(), id.db.clone()));
     }
     for stale in POOL_BYTES_PREV.drain_stale(&current_bytes_keys) {
         let _ = SHOW_POOLS_BYTES_TOTAL.remove_label_values(&[&stale.0, &stale.1, &stale.2]);
     }
+
+    // producer-side label-leak sweeper. The change
+    // attempt used `parking_lot::RwLock<HashSet>` and starved under
+    // `/metrics` worker contention, hanging
+    // `metrics_endpoint_serves_prometheus_body_when_ui_inactive`. This
+    // rewrite uses `parking_lot::Mutex<HashSet>` so every record and
+    // drain holds the lock for one short critical section - no
+    // read/write upgrade transitions, no starvation. The drain runs
+    // once per `/metrics` scrape, just like the existing
+    // `POOL_QUERIES_PREV.drain_stale` block above.
+    for stale in CLIENT_PREPARED_EVICTIONS_KEYS.drain_stale(&current_pool_keys) {
+        let _ = SHOW_CLIENT_PREPARED_ANONYMOUS_EVICTIONS_TOTAL
+            .remove_label_values(&[&stale.0, &stale.1]);
+        let _ =
+            SHOW_CLIENT_PREPARED_NAMED_EVICTIONS_TOTAL.remove_label_values(&[&stale.0, &stale.1]);
+    }
+    for stale in STREAMING_KEYS.drain_stale(&current_pool_keys) {
+        // STREAMING_EVENTS_TOTAL carries (user, db, kind, result) and
+        // STREAMING_BYTES_TOTAL carries (user, db, kind). The tracker
+        // only knows (user, db); we cannot enumerate the kind/result
+        // combos to delete, so we delete every entry that matches the
+        // (user, db) prefix by sampling the live label set.
+        // Mixed `String` / literal label types confuse `remove_label_values`
+        // inference; coerce both to `&str` explicitly.
+        let user = stale.0.as_str();
+        let db = stale.1.as_str();
+        for kind in ["data_row", "copy_data"] {
+            for result in ["ok", "error"] {
+                let _ =
+                    super::STREAMING_EVENTS_TOTAL.remove_label_values(&[user, db, kind, result]);
+            }
+            let _ = super::STREAMING_BYTES_TOTAL.remove_label_values(&[user, db, kind]);
+        }
+    }
+    for stale in POOL_LATENCY_KEYS.drain_stale(&current_pool_keys) {
+        let _ = super::SHOW_POOLS_QUERY_DURATION_SECONDS.remove_label_values(&[&stale.0, &stale.1]);
+        let _ = super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
+            .remove_label_values(&[&stale.0, &stale.1]);
+        let _ = super::SHOW_POOLS_WAIT_DURATION_SECONDS.remove_label_values(&[&stale.0, &stale.1]);
+    }
+
+    for pool in POOL_ONLY_FALLBACK_TLS_KEYS.drain_stale(&current_pool_labels) {
+        let pool = pool.as_str();
+        let _ = SHOW_SERVER_TLS_CONNECTIONS.remove_label_values(&[pool]);
+        let _ = SHOW_SERVER_TLS_HANDSHAKE_DURATION.remove_label_values(&[pool]);
+        let _ = SHOW_SERVER_TLS_HANDSHAKE_ERRORS.remove_label_values(&[pool]);
+        let _ = PATRONI_API_REQUESTS_TOTAL.remove_label_values(&[pool]);
+        let _ = PATRONI_API_ERRORS_TOTAL.remove_label_values(&[pool]);
+        let _ = PATRONI_API_DURATION.remove_label_values(&[pool]);
+        let _ = FALLBACK_CONNECTIONS_TOTAL.remove_label_values(&[pool]);
+        let _ = FALLBACK_ACTIVE.remove_label_values(&[pool]);
+        let _ = FALLBACK_CACHE_HITS_TOTAL.remove_label_values(&[pool]);
+        for reason in FALLBACK_FAILURE_REASON_LABELS {
+            let _ = FALLBACK_CANDIDATE_FAILURES_TOTAL.remove_label_values(&[pool, reason]);
+        }
+    }
+    for (pool, host, port) in FALLBACK_HOST_KEYS.drain_stale_pools(&current_pool_labels) {
+        let _ = FALLBACK_HOST.remove_label_values(&[&pool, &host, &port]);
+    }
+    for (pool, reason) in STARTUP_PARAMETERS_DROPPED_KEYS.drain_stale_pools(&current_pool_labels) {
+        let _ = STARTUP_PARAMETERS_DROPPED_TOTAL.remove_label_values(&[&pool, &reason]);
+    }
+    for (pool, sqlstate) in
+        BACKEND_STARTUP_PARAMETER_ERROR_KEYS.drain_stale_pools(&current_pool_labels)
+    {
+        let _ = BACKEND_STARTUP_PARAMETER_ERRORS_TOTAL.remove_label_values(&[&pool, &sqlstate]);
+    }
+}
+
+/// producer-side label key tracker.
+///
+/// A sweep based on `parking_lot::RwLock<HashSet>` deadlocked under
+/// `/metrics` worker contention. Moving to `parking_lot::Mutex<HashSet>`
+/// fixed the deadlock but kept the requirement that callers preallocate
+/// `(String, String)` even for
+/// the warm-hit case, which fires once per query × 3 trackers (query +
+/// transaction + wait) = 3 String allocations per query just to
+/// confirm "yes, this label is already tracked." On 100K qps that is
+/// 300K wasted heap allocations + 3 mutex acquires per second per
+/// observer site.
+///
+/// the implementation switches to `DashMap<u64, PoolKey>` keyed by a precomputed
+/// AHash of `(user, db)`. The warm-hit path is one inlined hash + one
+/// `DashMap::contains_key(&u64)` (shard-internal read lock only). No
+/// allocation, no global mutex. The cold-insert path still owns the
+/// `String`s - that allocation moves to the first observe per
+/// `(user, db)` for the lifetime of the pool, mirroring how server-
+/// side `PreparedStatementCache::total_memory_bytes` (the implementation pattern)
+/// owns its key once and never reallocates.
+///
+/// Hash collisions on 64-bit AHash for ~100K live `(user, db)` pairs:
+/// P ≈ 10⁻¹⁰. A collision would leave one orphan label set on the
+/// Prometheus registry until process restart - bounded, acceptable,
+/// and identical in spirit to the bounded approximation of the
+/// `cache_memory_usage` `Arc::strong_count` term that the implementation
+/// deliberately dropped.
+pub(crate) struct LabelKeyTracker {
+    inner: crate::utils::dashmap::FastDashMap<u64, PoolKey>,
+    hasher: ahash::RandomState,
+}
+
+impl LabelKeyTracker {
+    fn new() -> Self {
+        // ahash-backed DashMap. The tracker's `hasher`
+        // (used to fold (user, db) -> u64) and the DashMap's internal
+        // hasher are both AHash, so the warm-hit probe pays one
+        // AHash hash and one AHash table lookup - ~3 ns total vs the
+        // 10+ ns SipHash-1-3 cost surfaced in the VM-wave perf
+        // profile.
+        Self {
+            inner: crate::utils::dashmap::new_fast_dashmap(1),
+            hasher: ahash::RandomState::new(),
+        }
+    }
+
+    /// Stable hash of `(user, db)` using the tracker's randomly
+    /// seeded AHash state. A `0xff` separator prevents
+    /// `(user="ab", db="c")` from colliding with `(user="a", db="bc")`.
+    #[inline]
+    fn hash_pair(&self, user: &str, db: &str) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = self.hasher.build_hasher();
+        h.write(user.as_bytes());
+        h.write(&[0xff]);
+        h.write(db.as_bytes());
+        h.finish()
+    }
+
+    /// the implementation fast path: zero allocation on warm hits. The DashMap
+    /// shard read lock acquired by `contains_key` is local to one
+    /// shard, so concurrent `observe_*` on disjoint `(user, db)`
+    /// pairs scale with `num_cpus` instead of being serialised on
+    /// one global mutex (which the implementation HashSet+Mutex still was).
+    #[inline]
+    fn record(&self, user: &str, db: &str) {
+        let hash = self.hash_pair(user, db);
+        if self.inner.contains_key(&hash) {
+            return;
+        }
+        // Cold path: first observation of this (user, db). One
+        // `String` per side; happens once per pool lifetime, not per
+        // query, so the allocation cost is amortised away.
+        self.inner
+            .entry(hash)
+            .or_insert_with(|| (user.to_string(), db.to_string()));
+    }
+
+    /// Atomically drop and return every tracked key that is not in
+    /// `current_keys`. Called from `/metrics` scrape, post-snapshot
+    /// of the live pool set. `retain` walks every shard but only
+    /// removes entries whose owned `PoolKey` is missing from
+    /// `current_keys` - collected `stale` Vec drives the
+    /// `remove_label_values` calls on the owning Counter/Histogram.
+    fn drain_stale(&self, current_keys: &std::collections::HashSet<PoolKey>) -> Vec<PoolKey> {
+        let mut stale: Vec<PoolKey> = Vec::new();
+        self.inner.retain(|_, key| {
+            if current_keys.contains(key) {
+                true
+            } else {
+                stale.push(key.clone());
+                false
+            }
+        });
+        stale
+    }
+}
+
+pub(crate) struct PoolLabelTracker {
+    inner: crate::utils::dashmap::FastDashMap<u64, String>,
+    hasher: ahash::RandomState,
+}
+
+impl PoolLabelTracker {
+    fn new() -> Self {
+        Self {
+            inner: crate::utils::dashmap::new_fast_dashmap(1),
+            hasher: ahash::RandomState::new(),
+        }
+    }
+
+    #[inline]
+    fn hash_pool(&self, pool: &str) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = self.hasher.build_hasher();
+        h.write(pool.as_bytes());
+        h.finish()
+    }
+
+    #[inline]
+    fn record(&self, pool: &str) {
+        let hash = self.hash_pool(pool);
+        if self.inner.contains_key(&hash) {
+            return;
+        }
+        self.inner.entry(hash).or_insert_with(|| pool.to_string());
+    }
+
+    fn drain_stale(&self, current_pools: &std::collections::HashSet<String>) -> Vec<String> {
+        let mut stale = Vec::new();
+        self.inner.retain(|_, pool| {
+            if current_pools.contains(pool) {
+                true
+            } else {
+                stale.push(pool.clone());
+                false
+            }
+        });
+        stale
+    }
+}
+
+type PoolDimensionKey = (String, String);
+
+pub(crate) struct PoolDimensionLabelTracker {
+    inner: crate::utils::dashmap::FastDashMap<u64, PoolDimensionKey>,
+    hasher: ahash::RandomState,
+}
+
+impl PoolDimensionLabelTracker {
+    fn new() -> Self {
+        Self {
+            inner: crate::utils::dashmap::new_fast_dashmap(1),
+            hasher: ahash::RandomState::new(),
+        }
+    }
+
+    #[inline]
+    fn hash_pair(&self, pool: &str, label: &str) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = self.hasher.build_hasher();
+        h.write(pool.as_bytes());
+        h.write(&[0xff]);
+        h.write(label.as_bytes());
+        h.finish()
+    }
+
+    #[inline]
+    fn record(&self, pool: &str, label: &str) {
+        let hash = self.hash_pair(pool, label);
+        if self.inner.contains_key(&hash) {
+            return;
+        }
+        self.inner
+            .entry(hash)
+            .or_insert_with(|| (pool.to_string(), label.to_string()));
+    }
+
+    fn drain_stale_pools(
+        &self,
+        current_pools: &std::collections::HashSet<String>,
+    ) -> Vec<PoolDimensionKey> {
+        let mut stale = Vec::new();
+        self.inner.retain(|_, key| {
+            if current_pools.contains(&key.0) {
+                true
+            } else {
+                stale.push(key.clone());
+                false
+            }
+        });
+        stale
+    }
+}
+
+type FallbackHostKey = (String, String, String);
+
+pub(crate) struct FallbackHostLabelTracker {
+    inner: crate::utils::dashmap::FastDashMap<u64, FallbackHostKey>,
+    hasher: ahash::RandomState,
+}
+
+impl FallbackHostLabelTracker {
+    fn new() -> Self {
+        Self {
+            inner: crate::utils::dashmap::new_fast_dashmap(1),
+            hasher: ahash::RandomState::new(),
+        }
+    }
+
+    #[inline]
+    fn hash_key(&self, pool: &str, host: &str, port: &str) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = self.hasher.build_hasher();
+        h.write(pool.as_bytes());
+        h.write(&[0xff]);
+        h.write(host.as_bytes());
+        h.write(&[0xfe]);
+        h.write(port.as_bytes());
+        h.finish()
+    }
+
+    #[inline]
+    fn record(&self, pool: &str, host: &str, port: &str) {
+        let hash = self.hash_key(pool, host, port);
+        if self.inner.contains_key(&hash) {
+            return;
+        }
+        self.inner
+            .entry(hash)
+            .or_insert_with(|| (pool.to_string(), host.to_string(), port.to_string()));
+    }
+
+    #[inline]
+    fn forget(&self, pool: &str, host: &str, port: &str) {
+        let hash = self.hash_key(pool, host, port);
+        self.inner.remove(&hash);
+    }
+
+    fn drain_stale_pools(
+        &self,
+        current_pools: &std::collections::HashSet<String>,
+    ) -> Vec<FallbackHostKey> {
+        let mut stale = Vec::new();
+        self.inner.retain(|_, key| {
+            if current_pools.contains(&key.0) {
+                true
+            } else {
+                stale.push(key.clone());
+                false
+            }
+        });
+        stale
+    }
+}
+
+// tracker statics - record on the producer side (observe_*),
+// drain on the consumer side (gather_pool_metrics -> drain_stale ->
+// remove_label_values). One tracker per label-shape family that the
+// change-A5 deadlock first tried to clean up:
+//
+//   * `CLIENT_PREPARED_EVICTIONS_KEYS` covers
+//     `SHOW_CLIENT_PREPARED_ANONYMOUS_EVICTIONS_TOTAL` and
+//     `SHOW_CLIENT_PREPARED_NAMED_EVICTIONS_TOTAL` (both `(user, db)`).
+//   * `STREAMING_KEYS` covers `STREAMING_EVENTS_TOTAL` and
+//     `STREAMING_BYTES_TOTAL` - but only the `(user, db)` prefix; the
+//     `kind`/`result` label dimensions stay in the registry until
+//     cleared by a process restart (their cardinality is bounded by
+//     the protocol).
+//   * `POOL_LATENCY_KEYS` covers the three `(user, db)` HistogramVec
+//     instruments for query / transaction / wait durations.
+pub(crate) static CLIENT_PREPARED_EVICTIONS_KEYS: Lazy<LabelKeyTracker> =
+    Lazy::new(LabelKeyTracker::new);
+pub(crate) static STREAMING_KEYS: Lazy<LabelKeyTracker> = Lazy::new(LabelKeyTracker::new);
+pub(crate) static POOL_LATENCY_KEYS: Lazy<LabelKeyTracker> = Lazy::new(LabelKeyTracker::new);
+pub(crate) static POOL_ONLY_FALLBACK_TLS_KEYS: Lazy<PoolLabelTracker> =
+    Lazy::new(PoolLabelTracker::new);
+pub(crate) static FALLBACK_HOST_KEYS: Lazy<FallbackHostLabelTracker> =
+    Lazy::new(FallbackHostLabelTracker::new);
+pub(crate) static STARTUP_PARAMETERS_DROPPED_KEYS: Lazy<PoolDimensionLabelTracker> =
+    Lazy::new(PoolDimensionLabelTracker::new);
+pub(crate) static BACKEND_STARTUP_PARAMETER_ERROR_KEYS: Lazy<PoolDimensionLabelTracker> =
+    Lazy::new(PoolDimensionLabelTracker::new);
+
+const FALLBACK_FAILURE_REASON_LABELS: &[&str] = &[
+    "connect_error",
+    "resource_exhausted",
+    "startup_error",
+    "server_unavailable",
+    "timeout",
+    "startup_parameter_rejection",
+    "other",
+];
+
+#[inline]
+pub fn record_pool_only_fallback_tls_label(pool: &str) {
+    POOL_ONLY_FALLBACK_TLS_KEYS.record(pool);
+}
+
+#[inline]
+pub fn record_fallback_host_label(pool: &str, host: &str, port: u16) {
+    FALLBACK_HOST_KEYS.record(pool, host, &port.to_string());
+}
+
+#[inline]
+pub fn observe_startup_parameters_dropped(pool: &str, reason: &str) {
+    STARTUP_PARAMETERS_DROPPED_KEYS.record(pool, reason);
+    STARTUP_PARAMETERS_DROPPED_TOTAL
+        .with_label_values(&[pool, reason])
+        .inc();
+}
+
+#[inline]
+pub fn observe_backend_startup_parameter_error(pool: &str, sqlstate: &str) {
+    BACKEND_STARTUP_PARAMETER_ERROR_KEYS.record(pool, sqlstate);
+    BACKEND_STARTUP_PARAMETER_ERRORS_TOTAL
+        .with_label_values(&[pool, sqlstate])
+        .inc();
+}
+
+#[inline]
+pub fn forget_fallback_host_label(pool: &str, host: &str, port: u16) {
+    FALLBACK_HOST_KEYS.forget(pool, host, &port.to_string());
 }
 
 fn update_pool_state_metrics(identifier: &PoolIdentifier, stats: &PoolStats) {
@@ -334,6 +846,24 @@ pub fn observe_anonymous_eviction(user: &str, database: &str) {
     SHOW_CLIENT_PREPARED_ANONYMOUS_EVICTIONS_TOTAL
         .with_label_values(&[user, database])
         .inc();
+    // record key so the post-scrape sweep can shed dead labels
+    // after a pool with this (user, db) disappears via RELOAD.
+    CLIENT_PREPARED_EVICTIONS_KEYS.record(user, database);
+}
+
+/// bump the Named-cap eviction counter. Separate label space
+/// from anonymous so operators can tell apart "ORM working set exceeds
+/// cap" (alert: raise MAX_NAMED_PREPARED_PER_CLIENT or fix client) from
+/// "anonymous LRU pressure" (alert: tune anon cache size).
+#[inline]
+pub fn observe_named_eviction(user: &str, database: &str) {
+    SHOW_CLIENT_PREPARED_NAMED_EVICTIONS_TOTAL
+        .with_label_values(&[user, database])
+        .inc();
+    // same tracker as `observe_anonymous_eviction` - the two
+    // metrics live in the same label-shape family so they share the
+    // tracker and the sweep removes both in one pass.
+    CLIENT_PREPARED_EVICTIONS_KEYS.record(user, database);
 }
 
 fn update_server_metrics() {
@@ -346,7 +876,7 @@ fn update_server_metrics() {
     let snap = crate::web::routes::collect::snapshot();
 
     // Aggregate hits and misses per (user, database) across all backends.
-    // The PID-level breakdown lived here historically but exploded the
+    // The PID-level breakdown used to live here but exploded the
     // cardinality once `server_lifetime` expired the first generation
     // of backends — every reconnect minted a fresh PID label that
     // Prometheus then carried for the staleness window.
@@ -380,33 +910,39 @@ fn update_server_metrics() {
             .with_label_values(&[user.as_str(), database.as_str()])
             .set(misses);
 
-        // Use the pool's `AddressStats` generation so the tracker
-        // detects a reload that wipes server stats. If the pool no
-        // longer exists in the snapshot — extremely rare race with
-        // RELOAD — fall back to 0; the next scrape will pick up the
-        // real generation and emit the post-reset delta then.
+        // skip the cumulative-counter `observe` entirely
+        // for orphan-pool aggregates (server lives in
+        // `snap.server_states` but its pool was already removed from
+        // `snap.pool_lookup`). The previous fallback to
+        // `source_generation = 0` made the tracker store
+        // `(current, 0)`; if sustained pool churn (tight RELOAD loop,
+        // dynamic-pool flapping) made `current < last_value` on a
+        // later scrape, the defensive "treat as reset" branch
+        // emitted `current` AS A FRESH DELTA on top of the already
+        // counted value, inflating Prometheus totals.
         let source_generation = snap
             .pool_lookup
             .iter()
             .find(|(id, _)| id.user == user && id.db == database)
-            .map(|(_, s)| s.source_generation)
-            .unwrap_or(0);
+            .map(|(_, s)| s.source_generation);
 
         let key: PoolKey = (user.clone(), database.clone());
-        SERVERS_PREPARED_HITS_PREV.observe(
-            &SHOW_SERVERS_PREPARED_HITS_TOTAL
-                .with_label_values(&[user.as_str(), database.as_str()]),
-            key.clone(),
-            source_generation,
-            hits as u64,
-        );
-        SERVERS_PREPARED_MISSES_PREV.observe(
-            &SHOW_SERVERS_PREPARED_MISSES_TOTAL
-                .with_label_values(&[user.as_str(), database.as_str()]),
-            key.clone(),
-            source_generation,
-            misses as u64,
-        );
+        if let Some(generation) = source_generation {
+            SERVERS_PREPARED_HITS_PREV.observe(
+                &SHOW_SERVERS_PREPARED_HITS_TOTAL
+                    .with_label_values(&[user.as_str(), database.as_str()]),
+                key.clone(),
+                generation,
+                hits as u64,
+            );
+            SERVERS_PREPARED_MISSES_PREV.observe(
+                &SHOW_SERVERS_PREPARED_MISSES_TOTAL
+                    .with_label_values(&[user.as_str(), database.as_str()]),
+                key.clone(),
+                generation,
+                misses as u64,
+            );
+        }
         current_keys.insert(key);
     }
 
@@ -499,6 +1035,13 @@ fn reset_pool_metrics() {
     SHOW_POOL_SIZE.reset();
     SHOW_POOLS_PAUSED.reset();
     SHOW_POOLS_MAXWAIT_MICROSECONDS.reset();
+    SHOW_POOL_CACHE_ENTRIES.reset();
+    SHOW_POOL_CACHE_BYTES.reset();
+    SHOW_CLIENT_CACHE_ENTRIES.reset();
+    SHOW_CLIENT_CACHE_BYTES.reset();
+    SHOW_CLIENT_PREPARED_NAMED_ENTRIES.reset();
+    SHOW_CLIENT_PREPARED_ANONYMOUS_ENTRIES.reset();
+    SHOW_ASYNC_CLIENTS_COUNT.reset();
 }
 
 fn update_pool_size_metrics(identifier: &PoolIdentifier, stats: &PoolStats) {
@@ -582,10 +1125,6 @@ fn update_auth_query_metrics() {
     AUTH_QUERY_DYNAMIC_POOLS.reset();
 
     let states = AUTH_QUERY_STATE.load();
-    if states.is_empty() {
-        return;
-    }
-
     let dynamic = DYNAMIC_POOLS.load();
 
     let mut cache_keys: std::collections::HashSet<AuthQueryKey> = std::collections::HashSet::new();
@@ -800,14 +1339,11 @@ fn update_coordinator_metrics() {
     }
 }
 
-/// (type, user, db) → last observed counter value. Used by the scaling
-/// totals exporter so it can emit `inc_by(delta)` rather than overwrite a
-/// monotonic counter, and so it can drop stale label combinations on pool
-/// removal.
-type PoolScalingPrev = std::collections::HashMap<(String, String, String), u64>;
+/// (user, db, type) key for generation-aware pool-scaling counter deltas.
+type PoolScalingKey = (String, String, &'static str);
 
-static POOL_SCALING_PREV: Lazy<std::sync::Mutex<PoolScalingPrev>> =
-    Lazy::new(|| std::sync::Mutex::new(PoolScalingPrev::new()));
+static POOL_SCALING_PREV: Lazy<CounterDeltaTracker<PoolScalingKey>> =
+    Lazy::new(CounterDeltaTracker::new);
 
 const POOL_SCALING_TOTAL_TYPES: &[&str] = &[
     "creates_started",
@@ -829,19 +1365,16 @@ fn reset_pool_scaling_metrics(user: &str, database: &str) {
 fn update_pool_scaling_metrics() {
     use crate::pool::get_all_pools;
 
-    // One mutex acquisition for both delta emission and stale-label cleanup.
-    // The lock spans the iteration but each per-pool body is a few atomic
-    // loads plus HashMap lookups, so the critical section stays microsecond-scale.
-    let Ok(mut prev) = POOL_SCALING_PREV.lock() else {
-        return;
-    };
-
-    let mut current: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut current_pairs: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut current_keys: std::collections::HashSet<PoolScalingKey> =
+        std::collections::HashSet::new();
 
     for (identifier, pool) in get_all_pools().iter() {
         let user = identifier.user.as_str();
         let database = identifier.db.as_str();
-        current.insert((user.to_string(), database.to_string()));
+        current_pairs.insert((user.to_string(), database.to_string()));
+        let generation = pool.address().stats.generation;
 
         let snapshot = pool.database.scaling_stats();
 
@@ -872,33 +1405,26 @@ fn update_pool_scaling_metrics() {
         ];
 
         for (label, value) in totals {
-            let key = (label.to_string(), user.to_string(), database.to_string());
-            let prev_value = prev.get(&key).copied().unwrap_or(0);
-            let delta = value.saturating_sub(prev_value);
-            if delta > 0 {
-                POOL_SCALING_TOTALS
-                    .with_label_values(&[label, user, database])
-                    .inc_by(delta);
-            }
-            prev.insert(key, value);
+            let key = (user.to_string(), database.to_string(), label);
+            current_keys.insert(key.clone());
+            let counter = POOL_SCALING_TOTALS.with_label_values(&[label, user, database]);
+            POOL_SCALING_PREV.observe(&counter, key, generation, value);
         }
     }
 
     // Drop stale labels for pools that have disappeared since the last
-    // scrape. Order matters: collect the (user, db) pairs to reset BEFORE
-    // removing them from `prev`, otherwise we lose the information needed
-    // to clear the corresponding Prometheus labels and they linger forever.
-    let stale_pairs: std::collections::HashSet<(String, String)> = prev
-        .keys()
-        .filter(|(_, user, db)| !current.contains(&(user.clone(), db.clone())))
-        .map(|(_, user, db)| (user.clone(), db.clone()))
+    // scrape. `CounterDeltaTracker` forgets counter baselines; reset the
+    // corresponding GaugeVec/CounterVec labels once per (user, db) pair.
+    let stale_pairs: std::collections::HashSet<(String, String)> = POOL_SCALING_PREV
+        .drain_stale(&current_keys)
+        .into_iter()
+        .filter(|(user, db, _)| !current_pairs.contains(&(user.clone(), db.clone())))
+        .map(|(user, db, _)| (user, db))
         .collect();
 
     for (user, db) in &stale_pairs {
         reset_pool_scaling_metrics(user, db);
     }
-
-    prev.retain(|(_, user, db), _| !stale_pairs.contains(&(user.clone(), db.clone())));
 }
 
 /// Maps a 5-character canonical SQLSTATE code to its bounded label
@@ -1042,6 +1568,8 @@ pub fn observe_streaming_event(user: &str, database: &str, kind: &str, result: &
     super::STREAMING_EVENTS_TOTAL
         .with_label_values(&[user, database, kind, result])
         .inc();
+    // track (user, db) prefix for post-scrape sweep.
+    STREAMING_KEYS.record(user, database);
 }
 
 /// Records bytes forwarded for one streaming event. Called once per
@@ -1052,6 +1580,9 @@ pub fn observe_streaming_bytes(user: &str, database: &str, kind: &str, bytes: u6
     super::STREAMING_BYTES_TOTAL
         .with_label_values(&[user, database, kind])
         .inc_by(bytes);
+    // same tracker as `observe_streaming_event` (shared label
+    // prefix, shared sweep pass).
+    STREAMING_KEYS.record(user, database);
 }
 
 /// Records one client rejection at the listener / pre-auth stage.
@@ -1061,6 +1592,26 @@ pub fn observe_streaming_bytes(user: &str, database: &str, kind: &str, bytes: u6
 #[inline]
 pub fn record_listener_rejection(reason: &'static str) {
     super::LISTENER_REJECTIONS_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Records a non-EOF migration receiver failure. `reason` must stay in the
+/// bounded label set documented on `MIGRATION_RECEIVER_FAILURES_TOTAL`.
+#[inline]
+pub fn record_migration_receiver_failure(reason: &'static str) {
+    super::MIGRATION_RECEIVER_FAILURES_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Records a client dropped (not migrated) during a graceful binary upgrade.
+/// `reason` must stay in the bounded label set documented on
+/// `MIGRATION_CLIENTS_DROPPED_TOTAL`: `deadline`, `channel_closed`,
+/// `prepare_failed`.
+#[inline]
+pub fn record_migration_client_dropped(reason: &'static str) {
+    super::MIGRATION_CLIENTS_DROPPED_TOTAL
         .with_label_values(&[reason])
         .inc();
 }
@@ -1086,6 +1637,36 @@ pub fn observe_pool_query_microseconds(user: &str, database: &str, microseconds:
     super::SHOW_POOLS_QUERY_DURATION_SECONDS
         .with_label_values(&[user, database])
         .observe(microseconds as f64 / 1_000_000.0);
+    // tracker covers all three pool-latency HistogramVecs (query,
+    // transaction, wait) - they share `(user, db)` label shape so a
+    // single sweep removes the dead series for all three at once.
+    POOL_LATENCY_KEYS.record(user, database);
+}
+
+/// Phase 0: record a checkout whose parameter diff was empty (no SET round-trip).
+#[inline]
+pub fn inc_sync_params_skipped() {
+    SYNC_PARAMS_SKIPPED.inc();
+}
+
+/// Phase 0: record a checkout that emitted a SET/RESET round-trip.
+#[inline]
+pub fn inc_sync_params_applied() {
+    SYNC_PARAMS_APPLIED.inc();
+}
+
+/// Record which checkout sync plan was selected and how it was executed.
+#[inline]
+pub fn inc_sync_params_plan(plan: &'static str, path: &'static str) {
+    SYNC_PARAMS_PLAN_TOTAL
+        .with_label_values(&[plan, path])
+        .inc();
+}
+
+/// Phase 0: record the duration of the parameter-sync SET/RESET round-trip.
+#[inline]
+pub fn observe_sync_params_rtt_seconds(seconds: f64) {
+    SYNC_PARAMS_RTT_SECONDS.observe(seconds);
 }
 
 /// Observes one transaction duration in the per-pool transaction
@@ -1102,6 +1683,8 @@ pub fn observe_pool_transaction_microseconds(user: &str, database: &str, microse
     super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
         .with_label_values(&[user, database])
         .observe(microseconds as f64 / 1_000_000.0);
+    // shared tracker - see `observe_pool_query_microseconds`.
+    POOL_LATENCY_KEYS.record(user, database);
 }
 
 /// Observes one client checkout wait in the per-pool wait histogram.
@@ -1111,6 +1694,8 @@ pub fn observe_pool_wait_microseconds(user: &str, database: &str, microseconds: 
     super::SHOW_POOLS_WAIT_DURATION_SECONDS
         .with_label_values(&[user, database])
         .observe(microseconds as f64 / 1_000_000.0);
+    // shared tracker - see `observe_pool_query_microseconds`.
+    POOL_LATENCY_KEYS.record(user, database);
 }
 
 /// Refreshes the trio of static info gauges: `build_info` (constant
@@ -1150,6 +1735,18 @@ pub fn refresh_static_info_metrics() {
 #[cfg(test)]
 mod tests {
     use super::classify_sqlstate;
+    use serial_test::serial;
+
+    fn encoded_metrics() -> String {
+        use prometheus::Encoder;
+
+        let families = super::super::REGISTRY.gather();
+        let mut buffer = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&families, &mut buffer)
+            .unwrap();
+        String::from_utf8(buffer).unwrap()
+    }
 
     #[test]
     fn class_08_collapses_connection_exception_codes() {
@@ -1197,6 +1794,167 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn auth_query_totals_are_removed_when_state_becomes_empty() {
+        use crate::config::{AuthQueryConfig, Duration};
+        use crate::pool::{AuthQueryState, AUTH_QUERY_STATE};
+        use crate::stats::auth_query::AuthQueryStats;
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let database = "i14_m3_empty_state_db";
+        let stats = Arc::new(AuthQueryStats::default());
+        stats.cache_hits.store(1, Ordering::Relaxed);
+        stats.auth_success.store(1, Ordering::Relaxed);
+        stats.executor_queries.store(1, Ordering::Relaxed);
+        stats.dynamic_pools_created.store(1, Ordering::Relaxed);
+
+        let state = Arc::new(AuthQueryState::new(
+            AuthQueryConfig {
+                query: "SELECT username, password FROM users WHERE username = $1".to_string(),
+                user: "auth_query_executor".to_string(),
+                password: String::new(),
+                database: None,
+                workers: 1,
+                server_user: None,
+                server_password: None,
+                pool_size: 1,
+                min_pool_size: 0,
+                cache_ttl: Duration::from_secs(60),
+                cache_failure_ttl: Duration::from_secs(1),
+                min_interval: Duration::from_secs(1),
+            },
+            0,
+            0,
+            database.to_string(),
+            "127.0.0.1".to_string(),
+            5432,
+            None,
+            stats,
+        ));
+
+        let mut states = HashMap::new();
+        states.insert(database.to_string(), state);
+        AUTH_QUERY_STATE.store(Arc::new(states));
+        super::update_auth_query_metrics();
+
+        assert!(encoded_metrics().contains(r#"database="i14_m3_empty_state_db""#));
+
+        AUTH_QUERY_STATE.store(Arc::new(HashMap::new()));
+        super::update_auth_query_metrics();
+
+        assert!(!encoded_metrics().contains(r#"database="i14_m3_empty_state_db""#));
+    }
+
+    #[test]
+    #[serial]
+    fn reset_pool_metrics_clears_pool_cache_and_async_gauges() {
+        let user = "i14_m7_user";
+        let database = "i14_m7_db";
+
+        super::super::SHOW_POOL_CACHE_ENTRIES
+            .with_label_values(&[user, database])
+            .set(1.0);
+        super::super::SHOW_POOL_CACHE_BYTES
+            .with_label_values(&[user, database])
+            .set(128.0);
+        super::super::SHOW_CLIENT_CACHE_ENTRIES
+            .with_label_values(&[user, database])
+            .set(2.0);
+        super::super::SHOW_CLIENT_CACHE_BYTES
+            .with_label_values(&[user, database])
+            .set(256.0);
+        super::super::SHOW_CLIENT_PREPARED_NAMED_ENTRIES
+            .with_label_values(&[user, database])
+            .set(3.0);
+        super::super::SHOW_CLIENT_PREPARED_ANONYMOUS_ENTRIES
+            .with_label_values(&[user, database])
+            .set(4.0);
+        super::super::SHOW_ASYNC_CLIENTS_COUNT
+            .with_label_values(&[user, database])
+            .set(5.0);
+
+        assert!(encoded_metrics().contains(r#"database="i14_m7_db""#));
+
+        super::reset_pool_metrics();
+
+        assert!(!encoded_metrics().contains(r#"database="i14_m7_db""#));
+    }
+
+    #[test]
+    #[serial]
+    fn pool_only_fallback_tls_metrics_drop_removed_pool_labels() {
+        let pool = "i16_m11_removed_pool";
+        let host = "10.16.11.1";
+        let port = 6543;
+        let port_label = port.to_string();
+
+        super::record_pool_only_fallback_tls_label(pool);
+        super::super::SHOW_SERVER_TLS_CONNECTIONS
+            .with_label_values(&[pool])
+            .set(1.0);
+        super::super::SHOW_SERVER_TLS_HANDSHAKE_DURATION
+            .with_label_values(&[pool])
+            .observe(0.01);
+        super::super::SHOW_SERVER_TLS_HANDSHAKE_ERRORS
+            .with_label_values(&[pool])
+            .inc();
+        super::super::PATRONI_API_REQUESTS_TOTAL
+            .with_label_values(&[pool])
+            .inc();
+        super::super::PATRONI_API_ERRORS_TOTAL
+            .with_label_values(&[pool])
+            .inc();
+        super::super::PATRONI_API_DURATION
+            .with_label_values(&[pool])
+            .observe(0.01);
+        super::super::FALLBACK_CONNECTIONS_TOTAL
+            .with_label_values(&[pool])
+            .inc();
+        super::super::FALLBACK_ACTIVE
+            .with_label_values(&[pool])
+            .set(1.0);
+        super::super::FALLBACK_CACHE_HITS_TOTAL
+            .with_label_values(&[pool])
+            .inc();
+        super::super::FALLBACK_CANDIDATE_FAILURES_TOTAL
+            .with_label_values(&[pool, "other"])
+            .inc();
+        super::record_fallback_host_label(pool, host, port);
+        super::super::FALLBACK_HOST
+            .with_label_values(&[pool, host, port_label.as_str()])
+            .set(1.0);
+
+        assert!(encoded_metrics().contains(pool));
+
+        super::update_pool_metrics();
+
+        assert!(
+            !encoded_metrics().contains(pool),
+            "pool-only fallback/backend-TLS labels should disappear when the pool is gone"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn startup_parameter_metrics_drop_removed_pool_labels() {
+        let pool = "i17_m4_removed_startup_pool";
+
+        super::observe_startup_parameters_dropped(pool, "auth_query_invalid_json");
+        super::observe_backend_startup_parameter_error(pool, "42");
+
+        assert!(encoded_metrics().contains(pool));
+
+        super::update_pool_metrics();
+
+        assert!(
+            !encoded_metrics().contains(pool),
+            "startup-parameter metric labels should disappear when the pool is gone"
+        );
+    }
+
+    #[test]
     fn pool_transaction_observe_drops_zero_microseconds() {
         // idle(0) and add_xact_time_and_idle(0) fire on backend
         // creation and on `Drop for Client`; recording those zeros
@@ -1216,7 +1974,7 @@ mod tests {
 
     #[test]
     fn pool_query_observe_records_zero_microseconds() {
-        // query_time_add_microseconds historically records zero-elapsed
+        // query_time_add_microseconds records zero-elapsed
         // queries (sub-microsecond ones) — keep parity here so the
         // gauge family and the histogram see the same denominator.
         let user = "zero_q_user";
@@ -1298,6 +2056,34 @@ mod tests {
             counter.get(),
             1_015 + 1_500 + 100,
             "subsequent scrapes within the same generation use the in-generation delta",
+        );
+    }
+
+    #[test]
+    fn pool_scaling_delta_tracker_uses_pool_generation() {
+        let tracker: super::CounterDeltaTracker<super::PoolScalingKey> =
+            super::CounterDeltaTracker::new();
+        let counter = prometheus::IntCounter::new(
+            "pg_doorman_test_pool_scaling_generation_counter",
+            "test counter",
+        )
+        .unwrap();
+        let key = (
+            "scaling_user".to_string(),
+            "scaling_db".to_string(),
+            "creates_started",
+        );
+
+        tracker.observe(&counter, key.clone(), 10, 50);
+        tracker.observe(&counter, key.clone(), 10, 70);
+        assert_eq!(counter.get(), 70);
+
+        tracker.observe(&counter, key.clone(), 11, 120);
+        assert_eq!(
+            counter.get(),
+            190,
+            "same-label pool replacement must emit the new generation's \
+             current value, even when it already exceeds the old value"
         );
     }
 

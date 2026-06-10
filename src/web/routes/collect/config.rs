@@ -35,15 +35,30 @@ fn is_startup_parameter_key(key: &str) -> bool {
 /// restart; most other fields take effect on `RELOAD` or on the next
 /// backend. The list uses full flattened keys because `/api/config`
 /// emits paths such as `general.host` and `web.host`.
-/// `worker_threads`, `unix_socket_dir`, and `backlog` shape the Tokio
-/// runtime and listener socket at process start; SIGHUP cannot rebuild
-/// those.
+/// `worker_threads`, `unix_socket_dir`, `unix_socket_mode`, and
+/// `backlog` shape the Tokio runtime and listener socket at process
+/// start; SIGHUP cannot rebuild those.
 const IMMUTABLES: &[&str] = &[
     "general.host",
     "general.port",
     "general.worker_threads",
+    "general.worker_cpu_affinity_pinning",
+    "general.worker_stack_size",
+    "general.max_blocking_threads",
+    "general.tokio_global_queue_interval",
+    "general.tokio_event_interval",
+    "general.query_interner_gc_interval_seconds",
+    "general.retain_connections_time",
+    "general.retain_connections_max",
     "general.unix_socket_dir",
+    "general.unix_socket_mode",
     "general.backlog",
+    "general.tls_certificate",
+    "general.tls_private_key",
+    "general.tls_ca_cert",
+    "general.tls_mode",
+    "general.tls_rate_limit_per_second",
+    "web.enabled",
     "web.host",
     "web.port",
 ];
@@ -243,6 +258,8 @@ mod tests {
     fn is_immutable_key_matches_bind_addresses() {
         assert!(super::is_immutable_key("general.host"));
         assert!(super::is_immutable_key("general.port"));
+        assert!(super::is_immutable_key("general.unix_socket_mode"));
+        assert!(super::is_immutable_key("web.enabled"));
         assert!(super::is_immutable_key("web.host"));
         assert!(super::is_immutable_key("web.port"));
     }
@@ -250,8 +267,27 @@ mod tests {
     #[test]
     fn is_immutable_key_matches_runtime_construction_fields() {
         assert!(super::is_immutable_key("general.worker_threads"));
+        assert!(super::is_immutable_key(
+            "general.worker_cpu_affinity_pinning"
+        ));
+        assert!(super::is_immutable_key("general.worker_stack_size"));
+        assert!(super::is_immutable_key("general.max_blocking_threads"));
+        assert!(super::is_immutable_key(
+            "general.tokio_global_queue_interval"
+        ));
+        assert!(super::is_immutable_key("general.tokio_event_interval"));
+        assert!(super::is_immutable_key(
+            "general.query_interner_gc_interval_seconds"
+        ));
+        assert!(super::is_immutable_key("general.retain_connections_time"));
+        assert!(super::is_immutable_key("general.retain_connections_max"));
         assert!(super::is_immutable_key("general.unix_socket_dir"));
         assert!(super::is_immutable_key("general.backlog"));
+        assert!(super::is_immutable_key("general.tls_certificate"));
+        assert!(super::is_immutable_key("general.tls_private_key"));
+        assert!(super::is_immutable_key("general.tls_ca_cert"));
+        assert!(super::is_immutable_key("general.tls_mode"));
+        assert!(super::is_immutable_key("general.tls_rate_limit_per_second"));
     }
 
     #[test]

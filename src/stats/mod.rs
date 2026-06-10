@@ -15,7 +15,6 @@
 use arc_swap::ArcSwap;
 use log::{info, warn};
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -58,6 +57,12 @@ pub use socket::{
 // -----------------------------------------------------------------------------
 /// Type alias for the client statistics lookup table.
 /// Maps client IDs to their corresponding statistics objects.
+///
+/// snapshot type for `get_client_stats()` consumers (admin SHOW
+/// commands, JSON API). The live registry is a `DashMap` so producer
+/// (connect/disconnect) and consumer (collector tick / scrape) paths
+/// operate on independent shards instead of serialising through one
+/// global `RwLock`.
 type ClientStatesLookup = HashMap<u64, Arc<ClientStats>>;
 
 /// Type alias for the server statistics lookup table.
@@ -69,16 +74,36 @@ type ServerStatesLookup = HashMap<i32, Arc<ServerStats>>;
 /// This static variable maintains a thread-safe collection of all active client
 /// connections and their associated statistics. It is used by the SHOW CLIENTS
 /// administrative command to display information about connected clients.
-static CLIENT_STATS: Lazy<Arc<RwLock<ClientStatesLookup>>> =
-    Lazy::new(|| Arc::new(RwLock::new(ClientStatesLookup::default())));
+///
+/// earlier `RwLock<HashMap>`; every client connect/disconnect took
+/// the global write lock. Under a connect storm (PG restart wave ->
+/// thousands of reconnects) every event serialised through this one
+/// lock, and the 15s stats collector held the read lock for the full
+/// per-server update pass, blocking all new connects during that window.
+/// Migrated to `DashMap` so the producer side is shard-local and the
+/// collector iterates without blocking new connects.
+// route the connect-storm-hottest DashMaps through the
+// `utils::dashmap` helper. Default `DashMap::new()` sizes shards via
+// `num_cpus::get() * 4` (next-pow-of-2) - under k8s with a 4-vCPU
+// quota on a 96-core host that gives 512 shards and 512 lock objects
+// (cache-line waste); on small VMs it can undershoot. The helper
+// derives shard count from the configured worker_threads, matching
+// the actual concurrency. At Lazy init the config isn't loaded yet,
+// so we approximate via `num_cpus::get()` clamped to a sane range.
+static CLIENT_STATS: Lazy<Arc<dashmap::DashMap<u64, Arc<ClientStats>>>> = Lazy::new(|| {
+    let cpus = num_cpus::get().clamp(2, 16);
+    Arc::new(crate::utils::dashmap::new_dashmap(cpus))
+});
 
 /// Global registry of server statistics.
 ///
 /// This static variable maintains a thread-safe collection of all active server
 /// connections and their associated statistics. It is used by the SHOW SERVERS
 /// administrative command to display information about server connections.
-static SERVER_STATS: Lazy<Arc<RwLock<ServerStatesLookup>>> =
-    Lazy::new(|| Arc::new(RwLock::new(ServerStatesLookup::default())));
+static SERVER_STATS: Lazy<Arc<dashmap::DashMap<i32, Arc<ServerStats>>>> = Lazy::new(|| {
+    let cpus = num_cpus::get().clamp(2, 16);
+    Arc::new(crate::utils::dashmap::new_dashmap(cpus))
+});
 
 /// Global statistics reporter instance.
 ///
@@ -108,8 +133,8 @@ pub struct Reporter {}
 impl Reporter {
     /// Registers client stats; duplicate ids are logged and ignored.
     fn client_register(&self, client_id: u64, stats: Arc<ClientStats>) {
-        use std::collections::hash_map::Entry;
-        match CLIENT_STATS.write().entry(client_id) {
+        use dashmap::mapref::entry::Entry;
+        match CLIENT_STATS.entry(client_id) {
             Entry::Occupied(_) => {
                 warn!("[#c{client_id}] duplicate stats registration, skipping (likely migrated client id collision)");
             }
@@ -120,15 +145,15 @@ impl Reporter {
     }
 
     fn client_disconnecting(&self, client_id: u64) {
-        CLIENT_STATS.write().remove(&client_id);
+        CLIENT_STATS.remove(&client_id);
     }
 
     /// Inserts one `SERVER_STATS` row unless another row already uses
     /// `server_id`. The caller retries collisions so a startup guard never
     /// owns another server's slot.
     fn server_register(&self, server_id: i32, stats: Arc<ServerStats>) -> bool {
-        use std::collections::hash_map::Entry;
-        match SERVER_STATS.write().entry(server_id) {
+        use dashmap::mapref::entry::Entry;
+        match SERVER_STATS.entry(server_id) {
             Entry::Occupied(_) => {
                 warn!("[server_id={server_id}] server stats id collision, retrying with a new id");
                 false
@@ -141,7 +166,7 @@ impl Reporter {
     }
 
     fn server_disconnecting(&self, server_id: i32) {
-        SERVER_STATS.write().remove(&server_id);
+        SERVER_STATS.remove(&server_id);
     }
 }
 
@@ -177,22 +202,30 @@ impl Collector {
             // Create a periodic interval for statistics collection
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(STAT_PERIOD));
+            // default Burst would fire ALL missed ticks
+            // back-to-back after a runtime stall (paging, /metrics scrape
+            // contention), thundering the histogram lock paths exactly
+            // when they would otherwise drain. Skip means "skip missed
+            // ticks, resume the cadence".
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 // Wait for the next interval
                 interval.tick().await;
 
-                // Process server statistics
-                // Hold read lock for duration of update to retain all server stats
-                {
-                    let server_stats = SERVER_STATS.read();
+                // snapshot Arc references under shard-local locks, then
+                // do all the work off-lock. This used to hold the global
+                // RwLock for the full update + reset pass - blocking every
+                // client connect/disconnect for ~tens of milliseconds.
+                let snapshot: Vec<Arc<ServerStats>> = SERVER_STATS
+                    .iter()
+                    .map(|entry| entry.value().clone())
+                    .collect();
 
-                    // Update averages for each server that hasn't been updated yet
-                    for stats in server_stats.values() {
-                        if !stats.check_address_stat_average_is_updated_status() {
-                            stats.address_stats().update_averages();
-                            stats.set_address_stat_average_is_updated_status(true);
-                        }
+                for stats in &snapshot {
+                    if !stats.check_address_stat_average_is_updated_status() {
+                        stats.address_stats().update_averages();
+                        stats.set_address_stat_average_is_updated_status(true);
                     }
                 }
 
@@ -200,13 +233,10 @@ impl Collector {
                 print_all_stats();
 
                 // Now reset counters and histograms for the next period
-                {
-                    let server_stats = SERVER_STATS.read();
-                    for stats in server_stats.values() {
-                        stats.address_stats().reset_current_counts();
-                        stats.address_stats().reset_histograms();
-                        stats.set_address_stat_average_is_updated_status(false);
-                    }
+                for stats in &snapshot {
+                    stats.address_stats().reset_current_counts();
+                    stats.address_stats().reset_histograms();
+                    stats.set_address_stat_average_is_updated_status(false);
                 }
             }
         });
@@ -223,7 +253,13 @@ impl Collector {
 ///
 /// A HashMap mapping client IDs to their corresponding statistics objects
 pub fn get_client_stats() -> ClientStatesLookup {
-    CLIENT_STATS.read().clone()
+    // shard-local iteration -> HashMap snapshot. Cheaper than the old
+    // `clone()` of a held read-lock guard because no full RwLock acquire
+    // is involved; admin SHOW CLIENTS path stays consistent.
+    CLIENT_STATS
+        .iter()
+        .map(|entry| (*entry.key(), entry.value().clone()))
+        .collect()
 }
 
 /// Gets a snapshot of all server statistics.
@@ -236,7 +272,11 @@ pub fn get_client_stats() -> ClientStatesLookup {
 ///
 /// A HashMap mapping server IDs to their corresponding statistics objects
 pub fn get_server_stats() -> ServerStatesLookup {
-    SERVER_STATS.read().clone()
+    // shard-local snapshot, see `get_client_stats`.
+    SERVER_STATS
+        .iter()
+        .map(|entry| (*entry.key(), entry.value().clone()))
+        .collect()
 }
 
 /// Gets the global statistics reporter instance.
