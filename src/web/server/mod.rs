@@ -16,6 +16,7 @@
 //! - [`router`]   — path dispatch and admin-only gating.
 //! - [`listener`] — TCP bind and accept loop.
 
+pub(crate) mod csrf;
 mod http;
 mod listener;
 mod router;

@@ -34,6 +34,7 @@ fn opts(ui_active: bool, ui_anonymous: bool) -> WebServerOptions {
         trusted_proxies: Vec::new(),
         sso_admin_groups_configured: false,
         sso_require_https: false,
+        allowed_admin_origins: Vec::new(),
     }
 }
 
@@ -56,6 +57,7 @@ fn opts_with_sso(ui_anonymous: bool) -> WebServerOptions {
         trusted_proxies: Vec::new(),
         sso_admin_groups_configured: false,
         sso_require_https: false,
+        allowed_admin_origins: Vec::new(),
     }
 }
 
@@ -110,6 +112,41 @@ async fn send(port: u16, request: &str) -> String {
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await;
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+async fn read_one_http_response(stream: &mut TcpStream) -> String {
+    let mut response = Vec::new();
+    loop {
+        let mut chunk = [0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("response read timeout")
+            .expect("response read");
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..n]);
+
+        let Some(head_end) = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|idx| idx + 4)
+        else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&response[..head_end]);
+        let content_len = head
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        if response.len() >= head_end + content_len {
+            break;
+        }
+    }
     String::from_utf8_lossy(&response).into_owned()
 }
 
@@ -419,13 +456,25 @@ async fn api_sockets_returns_503_on_non_linux() {
 
 #[tokio::test]
 #[serial]
-async fn api_prepared_returns_envelope() {
+async fn api_prepared_anonymous_returns_401() {
     let port = spawn_server(opts(true, true)).await;
     let raw = send(
         port,
         "GET /api/prepared HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
     .await;
+    assert!(raw.starts_with("HTTP/1.1 401"), "raw={raw}");
+}
+
+#[tokio::test]
+#[serial]
+async fn api_prepared_admin_returns_envelope() {
+    let port = spawn_server(opts(true, true)).await;
+    let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+    let req = format!(
+        "GET /api/prepared HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {creds}\r\n\r\n"
+    );
+    let raw = send(port, &req).await;
     assert!(raw.starts_with("HTTP/1.1 200 OK"), "raw={raw}");
     assert!(raw.contains("\"prepared\""), "raw={raw}");
 }
@@ -547,13 +596,25 @@ async fn api_prepared_text_admin_unknown_hash_returns_404() {
 
 #[tokio::test]
 #[serial]
-async fn api_top_prepared_returns_envelope() {
+async fn api_top_prepared_anonymous_returns_401() {
     let port = spawn_server(opts(true, true)).await;
     let raw = send(
         port,
         "GET /api/top/prepared HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
     .await;
+    assert!(raw.starts_with("HTTP/1.1 401"), "raw={raw}");
+}
+
+#[tokio::test]
+#[serial]
+async fn api_top_prepared_admin_returns_envelope() {
+    let port = spawn_server(opts(true, true)).await;
+    let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+    let req = format!(
+        "GET /api/top/prepared HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {creds}\r\n\r\n"
+    );
+    let raw = send(port, &req).await;
     assert!(raw.starts_with("HTTP/1.1 200 OK"), "raw={raw}");
     assert!(raw.contains("\"by\":\"hits\""), "raw={raw}");
     assert!(raw.contains("\"prepared\""), "raw={raw}");
@@ -561,9 +622,21 @@ async fn api_top_prepared_returns_envelope() {
 
 #[tokio::test]
 #[serial]
-async fn api_events_returns_envelope() {
+async fn api_events_anonymous_returns_401() {
     let port = spawn_server(opts(true, true)).await;
     let raw = send(port, "GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+    assert!(raw.starts_with("HTTP/1.1 401"), "raw={raw}");
+}
+
+#[tokio::test]
+#[serial]
+async fn api_events_admin_returns_envelope() {
+    let port = spawn_server(opts(true, true)).await;
+    let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+    let req = format!(
+        "GET /api/events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {creds}\r\n\r\n"
+    );
+    let raw = send(port, &req).await;
     assert!(raw.starts_with("HTTP/1.1 200 OK"), "raw={raw}");
     assert!(raw.contains("\"events\""), "raw={raw}");
     assert!(raw.contains("\"next_seq\""), "raw={raw}");
@@ -611,14 +684,54 @@ async fn http_keep_alive_serves_two_requests_on_one_connection() {
 
 #[tokio::test]
 #[serial]
+async fn http_keep_alive_reloads_auth_options_between_requests() {
+    let port = spawn_server(opts(true, true)).await;
+    let old_creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("connect");
+
+    let first = format!(
+        "GET /api/events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {old_creds}\r\n\r\n"
+    );
+    stream.write_all(first.as_bytes()).await.unwrap();
+    let first_raw = read_one_http_response(&mut stream).await;
+    assert!(
+        first_raw.starts_with("HTTP/1.1 200 OK"),
+        "first request with original password should pass: {first_raw}"
+    );
+
+    let mut rotated = opts(true, true);
+    rotated.admin_password = "rotated".into();
+    crate::web::server::state::replace_options_for_test(rotated);
+
+    let second = format!(
+        "GET /api/events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {old_creds}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(second.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf)).await;
+    let raw = String::from_utf8_lossy(&buf);
+    assert!(
+        raw.contains("HTTP/1.1 401 Unauthorized"),
+        "second request on same keep-alive connection must use reloaded auth options: {raw}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn sso_bearer_grants_logs_access() {
     let port = spawn_server(opts_with_sso(false)).await;
     let token = mint_jwt("alice", 600);
     let raw = send(
         port,
         &format!(
-            "GET /api/logs HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\r\n",
-            token
+            "GET /api/logs HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"
         ),
     )
     .await;
@@ -637,13 +750,32 @@ async fn sso_post_admin_returns_403() {
     let raw = send(
         port,
         &format!(
-            "POST /api/admin/reload HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
-            token
+            "POST /api/admin/reload HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
         ),
     )
     .await;
     assert!(raw.starts_with("HTTP/1.1 403"), "raw={raw}");
     assert!(raw.contains("admin role required"), "raw={raw}");
+}
+
+#[tokio::test]
+#[serial]
+async fn api_admin_post_preserves_scope_query() {
+    let port = spawn_server(opts(true, true)).await;
+    let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+    let req = format!(
+        "POST /api/admin/pause?db=nonexistent_db HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Origin: http://localhost\r\n\
+         Authorization: Basic {creds}\r\n\
+         Content-Length: 0\r\n\r\n"
+    );
+
+    let raw = send(port, &req).await;
+
+    assert!(raw.starts_with("HTTP/1.1 404"), "raw={raw}");
+    assert!(raw.contains(r#""error":"no_matching_db""#), "raw={raw}");
+    assert!(raw.contains(r#""db":"nonexistent_db""#), "raw={raw}");
 }
 
 #[tokio::test]
@@ -671,8 +803,7 @@ async fn cookie_fed_jwt_grants_logs_access() {
     let raw = send(
         port,
         &format!(
-            "GET /api/logs HTTP/1.1\r\nHost: localhost\r\nCookie: sso_access_token={}\r\n\r\n",
-            token
+            "GET /api/logs HTTP/1.1\r\nHost: localhost\r\nCookie: sso_access_token={token}\r\n\r\n"
         ),
     )
     .await;

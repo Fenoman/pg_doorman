@@ -4,9 +4,10 @@
 //!
 //! Log level is chosen by the request kind, not by who is asking:
 //!
-//!   * `info`  — admin actions (`POST /api/admin/*`), personal-data
-//!     reads (`/api/logs`, `/api/prepared/text/*`, `/api/interner/top`,
-//!     `/api/top/queries`), auth/SSO endpoints (`/api/auth/*`,
+//!   * `info`  - admin actions (`POST /api/admin/*`), personal-data
+//!     reads (`/api/logs`, `/api/prepared`, `/api/prepared/text/*`,
+//!     `/api/interner/top`, `/api/top/prepared`, `/api/top/queries`),
+//!     auth/SSO endpoints (`/api/auth/*`,
 //!     `/api/sso/*`), and every non-success response (400/401/403/
 //!     404/5xx).
 //!   * `debug` — every other successful read, anonymous *or*
@@ -142,8 +143,10 @@ fn pick_level(path: &str, status: u16, _auth: &AuthOutcome) -> log::Level {
 
 fn is_personal_data_path(path: &str) -> bool {
     path == "/api/logs"
+        || path == "/api/prepared"
         || path.starts_with("/api/prepared/text/")
         || path == "/api/interner/top"
+        || path == "/api/top/prepared"
         || path == "/api/top/queries"
 }
 
@@ -230,6 +233,15 @@ mod tests {
         // sensitive enough to warrant info.
         assert_eq!(
             pick_level("/api/logs", 200, &AuthOutcome::Anonymous),
+            log::Level::Info
+        );
+    }
+
+    #[test]
+    fn prepared_aggregate_reads_are_info() {
+        assert_eq!(pick_level("/api/prepared", 200, &admin()), log::Level::Info);
+        assert_eq!(
+            pick_level("/api/top/prepared", 200, &sso()),
             log::Level::Info
         );
     }

@@ -18,6 +18,8 @@ use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Public};
 use serde::Deserialize;
 
+use crate::auth::jwt::validate_supported_jwt_public_key;
+
 #[derive(Debug, Clone)]
 pub enum AllowedUsers {
     /// Any JWT that passes signature, audience, and expiry checks is
@@ -51,6 +53,11 @@ struct SsoClaims {
     preferred_username: Option<String>,
     sub: Option<String>,
     exp: Option<i64>,
+    /// Not-before time (seconds since Unix epoch). The token is invalid
+    /// before this instant. Optional per RFC 7519; absence means "no lower
+    /// bound". Mirrors the backend JWT `not_before` check in src/auth/jwt.rs.
+    #[serde(default)]
+    nbf: Option<i64>,
     /// `aud` may be a single string or an array of strings (RFC 7519).
     /// We deserialize the raw value and walk it ourselves below.
     aud: Option<serde_json::Value>,
@@ -77,12 +84,16 @@ pub enum SsoError {
     PublicKeyIo(#[from] std::io::Error),
     #[error("public key not valid PEM RSA: {0}")]
     PublicKeyDecode(openssl::error::ErrorStack),
+    #[error("public key type not supported: {0}")]
+    PublicKeyUnsupported(String),
     #[error("jwt signature or shape invalid: {0}")]
     Verification(jwt::Error),
     #[error("jwt has no exp claim")]
     NoExp,
     #[error("jwt expired")]
     Expired,
+    #[error("jwt not yet valid (nbf in the future)")]
+    NotYetValid,
     #[error("jwt aud claim missing or did not match any configured audience")]
     BadAudience,
     #[error("jwt has no preferred_username or sub claim")]
@@ -96,10 +107,8 @@ pub enum SsoError {
 pub struct SsoRuntime {
     public_key: PKeyWithDigest<Public>,
     audience: Vec<String>,
-    /// Default leeway in seconds applied to the `exp` check. Matches
-    /// the historical behaviour of the previous validator and gives a
-    /// little slack to clock drift between pg_doorman and the SSO
-    /// proxy.
+    /// Default leeway in seconds applied to the `exp` check. Gives a
+    /// little slack to clock drift between pg_doorman and the SSO proxy.
     leeway_secs: i64,
     allowed_users: AllowedUsers,
     proxy_url: Option<String>,
@@ -149,6 +158,8 @@ impl SsoRuntime {
         admin_bridge: AdminBridge,
     ) -> Result<Self, SsoError> {
         let key = PKey::public_key_from_pem(pem).map_err(SsoError::PublicKeyDecode)?;
+        validate_supported_jwt_public_key(&key, "web.sso_public_key_file")
+            .map_err(|err| SsoError::PublicKeyUnsupported(err.to_string()))?;
         let public_key = PKeyWithDigest {
             digest: MessageDigest::sha256(),
             key,
@@ -199,6 +210,14 @@ impl SsoRuntime {
             return Err(SsoError::Expired);
         }
 
+        // Reject tokens that are not yet valid (nbf), honoring the same
+        // leeway used for exp. Mirrors src/auth/jwt.rs not_before handling.
+        if let Some(nbf) = claims.nbf {
+            if nbf - self.leeway_secs > now {
+                return Err(SsoError::NotYetValid);
+            }
+        }
+
         if !self.audience.is_empty() {
             let aud = claims.aud.as_ref().ok_or(SsoError::BadAudience)?;
             if !audience_matches(aud, &self.audience) {
@@ -247,12 +266,15 @@ fn record_validation_error(err: &SsoError) {
     let reason = match err {
         SsoError::Verification(_) => "signature",
         SsoError::NoExp | SsoError::Expired => "expired",
+        SsoError::NotYetValid => "not_yet_valid",
         SsoError::BadAudience => "audience",
         SsoError::NoUsername => "no_username",
         SsoError::NotAllowed(_) => "allowlist",
-        // PublicKeyIo / PublicKeyDecode happen at config load, not in
-        // the request hot path — they cannot reach this function.
-        SsoError::PublicKeyIo(_) | SsoError::PublicKeyDecode(_) => "config",
+        // PublicKey* errors happen at config load, not in
+        // the request hot path - they cannot reach this function.
+        SsoError::PublicKeyIo(_)
+        | SsoError::PublicKeyDecode(_)
+        | SsoError::PublicKeyUnsupported(_) => "config",
     };
     crate::web::metrics::WEB_SSO_VALIDATION_ERRORS
         .with_label_values(&[reason])
@@ -376,6 +398,29 @@ mod tests {
             bridge,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn rejects_unsupported_public_key_type() {
+        let dsa = openssl::dsa::Dsa::generate(2048).unwrap();
+        let public_pem = dsa.public_key_to_pem().unwrap();
+
+        let err = match SsoRuntime::from_pem_bytes(
+            &public_pem,
+            &["pg_doorman".to_string()],
+            AllowedUsers::Any,
+            Some("https://sso.example.com/oauth2/start".to_string()),
+            AdminBridge::default(),
+        ) {
+            Ok(_) => panic!("unsupported SSO public key type must be rejected at config load"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            SsoError::PublicKeyUnsupported(msg)
+                if msg.contains("unsupported JWT public key type")
+        ));
     }
 
     #[test]
@@ -561,5 +606,75 @@ mod tests {
             }
             _ => panic!("expected List"),
         }
+    }
+
+    /// Mint a signed JWT from a raw JSON claims object (mirrors the
+    /// admin-bridge tests, which need claims `ClaimsBuilder` cannot express).
+    fn mint_raw(claims: serde_json::Value) -> String {
+        let header = jwt::Header {
+            algorithm: jwt::AlgorithmType::Rs256,
+            ..Default::default()
+        };
+        let token = jwt::Token::new(header, claims);
+        jwt::SignWithKey::sign_with_key(token, &test_helpers::private_key())
+            .unwrap()
+            .as_str()
+            .to_string()
+    }
+
+    // a token whose not-before (nbf) is in the future must be
+    // rejected, not accepted early. Only `exp` was checked earlier.
+    #[test]
+    fn rejects_future_nbf_token() {
+        let token = mint_raw(serde_json::json!({
+            "preferred_username": "alice",
+            "aud": "pg_doorman",
+            "exp": now() + 600,
+            "nbf": now() + 1800, // well beyond the 60s leeway
+        }));
+        let rt = runtime(AllowedUsers::Any);
+        assert!(matches!(
+            rt.validate(&token).unwrap_err(),
+            SsoError::NotYetValid
+        ));
+    }
+
+    // A token whose nbf is in the recent past must be accepted.
+    #[test]
+    fn accepts_past_nbf_token() {
+        let token = mint_raw(serde_json::json!({
+            "preferred_username": "alice",
+            "aud": "pg_doorman",
+            "exp": now() + 600,
+            "nbf": now() - 10,
+        }));
+        let rt = runtime(AllowedUsers::Any);
+        assert_eq!(rt.validate(&token).unwrap().username, "alice");
+    }
+
+    // nbf slightly in the future but inside the leeway window must be accepted.
+    #[test]
+    fn accepts_nbf_within_leeway() {
+        let token = mint_raw(serde_json::json!({
+            "preferred_username": "alice",
+            "aud": "pg_doorman",
+            "exp": now() + 600,
+            "nbf": now() + 30, // < 60s leeway
+        }));
+        let rt = runtime(AllowedUsers::Any);
+        assert!(rt.validate(&token).is_ok());
+    }
+
+    // A token without nbf must still be accepted (nbf is optional).
+    #[test]
+    fn accepts_token_without_nbf() {
+        let token = mint_jwt(&ClaimsBuilder {
+            preferred_username: Some("alice"),
+            sub: None,
+            aud: serde_json::json!("pg_doorman"),
+            exp: now() + 600,
+        });
+        let rt = runtime(AllowedUsers::Any);
+        assert!(rt.validate(&token).is_ok());
     }
 }

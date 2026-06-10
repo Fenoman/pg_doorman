@@ -48,17 +48,23 @@ pub struct WebServerOptions {
     /// where the SSO proxy reaches pg_doorman over a private HTTP leg
     /// keep working without configuration changes.
     pub sso_require_https: bool,
+    /// allowlist of origins permitted to issue admin POST
+    /// mutations. Empty = legacy Host-matching behaviour (still better
+    /// than nothing). When populated, the CSRF gate requires Origin (or
+    /// Referer authority) to match one of these entries - closes the
+    /// Host-header injection bypass.
+    pub allowed_admin_origins: Vec<String>,
 }
 
 impl WebServerOptions {
     /// Build the request-time options from a config snapshot. `ui_active`
     /// is gated on a non-default admin password — `web.ui = true` paired
-    /// with an empty/`"admin"` password is silently demoted to "metrics
-    /// only", matching the explicit warning the startup path logs in
-    /// `app::server::run_server`.
+    /// with an empty or published default password is silently demoted to
+    /// "metrics only", matching the explicit warning the startup path logs
+    /// in `app::server::run_server`.
     pub fn from_config(cfg: &Config) -> Self {
-        let admin_default =
-            cfg.general.admin_password.is_empty() || cfg.general.admin_password == "admin";
+        let admin_default = cfg.general.admin_password.is_empty()
+            || crate::config::is_published_admin_password(&cfg.general.admin_password);
         let (sso, sso_config_error) = if cfg.web.sso_enabled {
             match build_sso_runtime(&cfg.web) {
                 Ok(rt) => (Some(rt), None),
@@ -77,6 +83,7 @@ impl WebServerOptions {
             trusted_proxies: cfg.web.trusted_proxies.clone(),
             sso_admin_groups_configured: !cfg.web.sso_admin_groups.is_empty(),
             sso_require_https: cfg.web.sso_require_https,
+            allowed_admin_origins: cfg.web.allowed_admin_origins.clone(),
         }
     }
 }
@@ -151,6 +158,11 @@ pub(super) fn current_options() -> Arc<WebServerOptions> {
             // when it binds.
             Arc::new(WebServerOptions::from_config(&crate::config::get_config()))
         })
+}
+
+#[cfg(test)]
+pub(crate) fn replace_options_for_test(opts: WebServerOptions) {
+    install_options(Arc::new(opts));
 }
 
 /// Re-derive the listener's runtime options from the current global config.

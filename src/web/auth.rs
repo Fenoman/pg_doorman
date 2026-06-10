@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn rejected_when_decoded_is_invalid_utf8() {
         let raw = base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe, 0xfd]);
-        let header = format!("Basic {}", raw);
+        let header = format!("Basic {raw}");
         assert_eq!(
             classify_default(Some(&header), None, None, "admin", "secret", None),
             AuthOutcome::Rejected
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn sso_valid_bearer_yields_sso_role() {
         let token = mint(600, "alice");
-        let header = format!("Bearer {}", token);
+        let header = format!("Bearer {token}");
         let rt = sso_rt(AllowedUsers::Any);
         let out = classify_default(Some(&header), None, None, "admin", "secret", Some(&rt));
         match out {
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn sso_cookie_works() {
         let token = mint(600, "alice");
-        let cookie = format!("foo=bar; sso_access_token={}; baz=qux", token);
+        let cookie = format!("foo=bar; sso_access_token={token}; baz=qux");
         let rt = sso_rt(AllowedUsers::Any);
         let out = classify_default(None, Some(&cookie), None, "admin", "secret", Some(&rt));
         assert!(matches!(out, AuthOutcome::Sso(_)));
@@ -455,7 +455,7 @@ mod tests {
         // when Basic is in the header and a valid Bearer arrives via cookie.
         let token = mint(600, "alice");
         let basic = format!("Basic {}", b64("admin:secret"));
-        let cookie = format!("sso_access_token={}", token);
+        let cookie = format!("sso_access_token={token}");
         let rt = sso_rt(AllowedUsers::Any);
         let out = classify_default(
             Some(&basic),
@@ -477,7 +477,7 @@ mod tests {
         // arrives via cookie. SSO must still pass.
         let token = mint(600, "alice");
         let basic = format!("Basic {}", b64("admin:wrong"));
-        let cookie = format!("sso_access_token={}", token);
+        let cookie = format!("sso_access_token={token}");
         let rt = sso_rt(AllowedUsers::Any);
         let out = classify_default(
             Some(&basic),
@@ -495,7 +495,7 @@ mod tests {
         // jsonwebtoken's default `Validation` carries 60s of leeway.
         // Mint with -600s so we are unambiguously outside the window.
         let token = mint(-600, "alice");
-        let header = format!("Bearer {}", token);
+        let header = format!("Bearer {token}");
         let rt = sso_rt(AllowedUsers::Any);
         let out = classify_default(Some(&header), None, None, "admin", "secret", Some(&rt));
         assert_eq!(out, AuthOutcome::Rejected);
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn allowlist_miss_yields_rejected() {
         let token = mint(600, "charlie");
-        let header = format!("Bearer {}", token);
+        let header = format!("Bearer {token}");
         let rt = sso_rt(AllowedUsers::List(
             ["alice".to_string()].into_iter().collect(),
         ));
@@ -518,7 +518,7 @@ mod tests {
         // branch can't parse it (not "Basic ..."), and SSO branch is None,
         // so a credential was attempted but nothing took it: Rejected.
         let token = mint(600, "alice");
-        let header = format!("Bearer {}", token);
+        let header = format!("Bearer {token}");
         let out = classify_default(Some(&header), None, None, "admin", "secret", None);
         assert_eq!(out, AuthOutcome::Rejected);
     }
@@ -529,7 +529,7 @@ mod tests {
         // Bearer JWT is treated as a credential attempt that failed, so
         // the caller gets a 401 instead of an Anonymous fall-through.
         let token = mint(600, "alice");
-        let header = format!("Bearer {}", token);
+        let header = format!("Bearer {token}");
         let rt = sso_rt(AllowedUsers::Any);
         let out = classify(
             Some(&header),
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn require_https_accepts_bearer_on_secure_hop() {
         let token = mint(600, "alice");
-        let header = format!("Bearer {}", token);
+        let header = format!("Bearer {token}");
         let rt = sso_rt(AllowedUsers::Any);
         let out = classify(
             Some(&header),
@@ -601,7 +601,7 @@ mod tests {
         // backward-compatible behaviour for the SSO-proxy-fronts-pg_doorman
         // deployment where the proxy → pg_doorman hop is private HTTP.
         let token = mint(600, "alice");
-        let header = format!("Bearer {}", token);
+        let header = format!("Bearer {token}");
         let rt = sso_rt(AllowedUsers::Any);
         let out = classify(
             Some(&header),

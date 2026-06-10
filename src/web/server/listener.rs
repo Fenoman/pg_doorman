@@ -10,14 +10,17 @@ use std::time::Duration;
 
 use log::{error, info};
 use tokio::net::{TcpListener, TcpSocket};
+use tokio::sync::Semaphore;
 
 use crate::messages::configure_web_tcp_socket;
+use crate::web::metrics::record_listener_rejection;
 
 use super::http::handle_connection;
-use super::state::{current_options, install_options, WebServerOptions};
+use super::state::{install_options, WebServerOptions};
 
 static WEB_ACCEPT_RESOURCE_LOG_LAST: AtomicI64 = AtomicI64::new(0);
 const WEB_ACCEPT_RESOURCE_LOG_INTERVAL_SECS: i64 = 5;
+const MAX_WEB_CONNECTIONS: usize = 1024;
 
 #[cfg(unix)]
 fn is_fd_exhaustion_io(e: &std::io::Error) -> bool {
@@ -68,14 +71,20 @@ pub fn bind_web_listener(host: &str) -> std::io::Result<TcpListener> {
 /// Drive the accept loop on a pre-bound listener.
 pub async fn serve_on(listener: TcpListener, opts: WebServerOptions) {
     install_options(Arc::new(opts));
+    let connection_slots = Arc::new(Semaphore::new(MAX_WEB_CONNECTIONS));
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let Ok(connection_permit) = Arc::clone(&connection_slots).try_acquire_owned()
+                else {
+                    record_listener_rejection("too_many_clients");
+                    continue;
+                };
                 configure_web_tcp_socket(&stream);
-                let opts = current_options();
                 tokio::spawn(async move {
-                    handle_connection(stream, opts).await;
+                    let _connection_permit = connection_permit;
+                    handle_connection(stream).await;
                 });
             }
             Err(e) => {

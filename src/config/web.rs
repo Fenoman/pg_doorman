@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde_derive::{Deserialize, Serialize};
 
+pub const MAX_LOG_TAP_ENTRIES: u32 = 65_536;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Web {
     #[serde(default = "Web::default_host")]
@@ -86,6 +88,22 @@ pub struct Web {
     /// between the proxy and pg_doorman.
     #[serde(default)]
     pub sso_require_https: bool,
+
+    /// allowlist of origins permitted to issue admin POST
+    /// mutations. The C11 CSRF check originally compared client-supplied
+    /// `Origin`/`Referer` against client-supplied `Host` - a forgeable
+    /// pair from any non-browser HTTP client (SSRF reflector, scripted
+    /// curl, mis-configured reverse proxy). With this allowlist set,
+    /// only requests whose Origin (or Referer) authority matches one of
+    /// the configured entries pass the CSRF gate.
+    ///
+    /// When empty, falls back to the legacy Host-matching behaviour
+    /// (still better than nothing, but operators on multi-tenant
+    /// networks should populate this list).
+    ///
+    /// Example: `["https://pgd.example:7777", "https://admin.local"]`
+    #[serde(default)]
+    pub allowed_admin_origins: Vec<String>,
 }
 
 impl Web {
@@ -106,6 +124,7 @@ impl Web {
             sso_groups_claim: Self::default_sso_groups_claim(),
             sso_admin_groups: Vec::new(),
             sso_require_https: false,
+            allowed_admin_origins: Vec::new(),
         }
     }
 
@@ -140,7 +159,7 @@ impl Web {
         false
     }
 
-    /// Capacity of in-memory log ring buffer (entries, not bytes). 8192 ≈ 1.5–2 minutes of history
+    /// Capacity of in-memory log ring buffer (entries, not bytes). 8192 ≈ 1.5-2 minutes of history
     /// at info-level under 5kTPS, ~2 MB RSS at 250 bytes/entry. Smaller values (e.g., 1024) lose
     /// live-tail usefulness on a hot pooler; larger values waste RSS for the default.
     pub fn default_log_tap_max_entries() -> u32 {
