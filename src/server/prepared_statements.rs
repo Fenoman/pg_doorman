@@ -4,8 +4,17 @@ use lru::LruCache;
 
 use crate::stats::ServerStats;
 
+// the per-server prepared statement LRU is hashed by
+// `String` (the rewritten `DOORMAN_<n>` name). profiling attributed
+// 0.30 % CPU to `prepared_statements::has` and 0.30 % to
+// `sip::Hasher::write` on the same hot path - every Bind/Parse goes
+// through `has()` and every cached Parse goes through `add_to_cache()`.
+// `ahash::RandomState` parameterises the LRU's hasher without changing
+// any public API; the LRU keys are not adversary-controlled so SipHash's
+// HashDoS guarantee is unnecessary.
+
 pub(crate) fn add_to_cache(
-    prepared_statement_cache: &mut Option<LruCache<String, ()>>,
+    prepared_statement_cache: &mut Option<LruCache<String, (), ahash::RandomState>>,
     stats: &Arc<ServerStats>,
     name: &str,
 ) -> Option<String> {
@@ -14,20 +23,20 @@ pub(crate) fn add_to_cache(
         None => return None,
     };
 
-    stats.prepared_cache_add();
-
-    // If we evict something, we need to close it on the server
-    if let Some((evicted_name, _)) = cache.push(name.to_string(), ()) {
-        if evicted_name != name {
-            return Some(evicted_name);
-        }
+    // derive the size counter from the authoritative `cache.len()`
+    // AFTER the mutation, so the per-server prepared_cache_size atomic
+    // cannot drift up on key-replacement (push returning Some with the
+    // same name) and cannot underflow to u64::MAX on subsequent removes.
+    let evicted_name = match cache.push(name.to_string(), ()) {
+        Some((evicted_name, _)) if evicted_name != name => Some(evicted_name),
+        _ => None,
     };
-
-    None
+    stats.prepared_cache_sync(cache.len() as u64);
+    evicted_name
 }
 
 pub(crate) fn remove_from_cache(
-    prepared_statement_cache: &mut Option<LruCache<String, ()>>,
+    prepared_statement_cache: &mut Option<LruCache<String, (), ahash::RandomState>>,
     stats: &Arc<ServerStats>,
     name: &str,
 ) {
@@ -36,12 +45,15 @@ pub(crate) fn remove_from_cache(
         None => return,
     };
 
-    stats.prepared_cache_remove();
     cache.pop(name);
+    // same as `add_to_cache` - use `cache.len()` as the source of
+    // truth instead of a manual fetch_sub that could underflow when the
+    // name was already absent (e.g., LRU-evicted).
+    stats.prepared_cache_sync(cache.len() as u64);
 }
 
 pub(crate) fn has(
-    prepared_statement_cache: &mut Option<LruCache<String, ()>>,
+    prepared_statement_cache: &mut Option<LruCache<String, (), ahash::RandomState>>,
     stats: &Arc<ServerStats>,
     name: &str,
 ) -> bool {
@@ -74,7 +86,10 @@ mod tests {
     #[test]
     fn test_has_promotes_in_lru() {
         let stats = make_stats();
-        let mut cache = Some(LruCache::new(NonZeroUsize::new(2).unwrap()));
+        let mut cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(2).unwrap(),
+            ahash::RandomState::new(),
+        ));
 
         // Fill cache: A then B → LRU order: [A, B]
         assert!(add_to_cache(&mut cache, &stats, "DOORMAN_1").is_none());
@@ -96,7 +111,10 @@ mod tests {
     #[test]
     fn test_push_promotes_existing_in_lru_016() {
         let stats = make_stats();
-        let mut cache = Some(LruCache::new(NonZeroUsize::new(2).unwrap()));
+        let mut cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(2).unwrap(),
+            ahash::RandomState::new(),
+        ));
 
         add_to_cache(&mut cache, &stats, "DOORMAN_1");
         add_to_cache(&mut cache, &stats, "DOORMAN_2");
@@ -118,7 +136,10 @@ mod tests {
     #[test]
     fn test_batch_eviction_scenario_fixed() {
         let stats = make_stats();
-        let mut cache = Some(LruCache::new(NonZeroUsize::new(2).unwrap()));
+        let mut cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(2).unwrap(),
+            ahash::RandomState::new(),
+        ));
 
         add_to_cache(&mut cache, &stats, "DOORMAN_1"); // A
         add_to_cache(&mut cache, &stats, "DOORMAN_2"); // B

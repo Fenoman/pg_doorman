@@ -1,11 +1,11 @@
-use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use log::{info, log_enabled, trace, Level};
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::messages::Parse;
-use crate::utils::dashmap::new_dashmap_with_capacity;
+use crate::utils::dashmap::{new_fast_dashmap_with_capacity, FastDashMap};
 use crate::utils::strings::truncate_query_for_log;
 
 /// Worker-thread hint for the lazy interner DashMaps. `run_server` calls
@@ -134,10 +134,59 @@ impl AnonEntry {
 /// per-entry TTL for anonymous). The same hash interned both as named and
 /// anonymous lives in both maps with independent `Arc<str>` allocations —
 /// dedup loss in this rare case is accepted.
-static NAMED_INTERNER: Lazy<DashMap<u64, Arc<NamedEntry>>> =
-    Lazy::new(|| new_dashmap_with_capacity(8192, interner_worker_threads()));
-static ANON_INTERNER: Lazy<DashMap<u64, Arc<AnonEntry>>> =
-    Lazy::new(|| new_dashmap_with_capacity(8192, interner_worker_threads()));
+// ahash-backed interners. Hot per-Parse lookup paths
+// (server-side cache + interner indirection) used SipHash-1-3, which
+// is the std `RandomState` default and ~2.5× slower than AHash for
+// the same payload (bench evidence captured by the profiling).
+static NAMED_INTERNER: Lazy<FastDashMap<u64, Arc<NamedEntry>>> =
+    Lazy::new(|| new_fast_dashmap_with_capacity(8192, interner_worker_threads()));
+static ANON_INTERNER: Lazy<FastDashMap<u64, Arc<AnonEntry>>> =
+    Lazy::new(|| new_fast_dashmap_with_capacity(8192, interner_worker_threads()));
+static NAMED_INTERNER_BYTES: AtomicU64 = AtomicU64::new(0);
+static ANON_INTERNER_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueryInternerKindStats {
+    pub entries: u64,
+    pub bytes: u64,
+}
+
+fn adjust_interner_bytes(counter: &AtomicU64, old_bytes: u64, new_bytes: u64) {
+    if new_bytes >= old_bytes {
+        counter.fetch_add(new_bytes - old_bytes, Ordering::Relaxed);
+    } else {
+        subtract_interner_bytes(counter, old_bytes - new_bytes);
+    }
+}
+
+fn subtract_interner_bytes(counter: &AtomicU64, bytes: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn remove_named_entry_if_same(hash: u64, expected: &Arc<NamedEntry>) -> Option<Arc<NamedEntry>> {
+    match NAMED_INTERNER.entry(hash) {
+        Entry::Occupied(occupied) if Arc::ptr_eq(occupied.get(), expected) => {
+            Some(occupied.remove())
+        }
+        _ => None,
+    }
+}
+
+fn remove_anon_entry_if_same(hash: u64, expected: &Arc<AnonEntry>) -> Option<Arc<AnonEntry>> {
+    match ANON_INTERNER.entry(hash) {
+        Entry::Occupied(occupied) if Arc::ptr_eq(occupied.get(), expected) => {
+            Some(occupied.remove())
+        }
+        _ => None,
+    }
+}
 
 /// Monotonic millisecond clock anchored at the first call. Used by
 /// `AnonEntry::last_used` so wall-clock jumps don't perturb TTL decisions.
@@ -150,25 +199,36 @@ pub fn now_monotonic_ms() -> u64 {
 /// Increments the Bind-count atomic on the interner entry that owns `hash`.
 /// No-op if the entry has been GC'd or not yet inserted; we accept the
 /// resulting count gap to keep the hot path lock-free.
+///
+/// also call `touch()` on the entry so a hot query keeps its
+/// "recently used" marker fresh in the GC. Previously a high-rate query
+/// that interned, then Bind'd repeatedly without re-Parsing, never
+/// touched the entry - the two-cycle GC could reap it between Parse
+/// and the next Bind, and the count gap silently grew. Touch is just
+/// an atomic store, so the Bind path stays cheap.
 pub fn record_query_count(hash: u64, is_anonymous: bool) {
     if is_anonymous {
         if let Some(entry) = ANON_INTERNER.get(&hash) {
             entry.count.fetch_add(1, Ordering::Relaxed);
+            entry.touch(now_monotonic_ms());
         }
     } else if let Some(entry) = NAMED_INTERNER.get(&hash) {
         entry.count.fetch_add(1, Ordering::Relaxed);
+        entry.touch();
     }
 }
 
 /// Adds `micros` to the cumulative duration on the interner entry. Same
-/// no-op-on-miss policy as `record_query_count`.
+/// no-op-on-miss policy as `record_query_count`. also touches.
 pub fn record_query_duration_us(hash: u64, is_anonymous: bool, micros: u64) {
     if is_anonymous {
         if let Some(entry) = ANON_INTERNER.get(&hash) {
             entry.total_duration_us.fetch_add(micros, Ordering::Relaxed);
+            entry.touch(now_monotonic_ms());
         }
     } else if let Some(entry) = NAMED_INTERNER.get(&hash) {
         entry.total_duration_us.fetch_add(micros, Ordering::Relaxed);
+        entry.touch();
     }
 }
 
@@ -184,24 +244,84 @@ pub fn intern_query(query: &str, hash: u64, is_anonymous: bool) -> Arc<str> {
 }
 
 fn intern_named(query: &str, hash: u64) -> Arc<str> {
+    // collision-safe interning with an atomic recovery
+    // path. The fast read-only branch handles the steady-state hit; on
+    // miss-or-collision we take the shard write lock via `entry()` so
+    // the equality check + insert/replace is a single atomic step. The
+    // earlier shape did `get -> drop -> remove -> entry().or_insert` -
+    // three independent lock acquisitions interleaving with peers,
+    // which could mis-attribute later `record_query_count(hash, ...)`
+    // calls to a different (newer) entry installed in the gap.
     if let Some(entry) = NAMED_INTERNER.get(&hash) {
-        entry.touch();
-        return entry.text.clone();
+        if &*entry.text == query {
+            entry.touch();
+            return entry.text.clone();
+        }
     }
-    let arc_str: Arc<str> = Arc::from(query);
-    let new_entry = Arc::new(NamedEntry::new(arc_str.clone()));
-    NAMED_INTERNER.entry(hash).or_insert(new_entry).text.clone()
+    // Collision OR cache miss: take the entry-level write lock so the
+    // compare/insert is atomic against concurrent callers on this shard.
+    use dashmap::mapref::entry::Entry;
+    match NAMED_INTERNER.entry(hash) {
+        Entry::Occupied(mut occ) => {
+            if &*occ.get().text == query {
+                occ.get().touch();
+                occ.get().text.clone()
+            } else {
+                // Real hash collision while we held the write lock - replace.
+                let arc_str: Arc<str> = Arc::from(query);
+                let old_bytes = occ.get().text.len() as u64;
+                let new_bytes = arc_str.len() as u64;
+                let new_entry = Arc::new(NamedEntry::new(arc_str.clone()));
+                *occ.get_mut() = new_entry;
+                adjust_interner_bytes(&NAMED_INTERNER_BYTES, old_bytes, new_bytes);
+                arc_str
+            }
+        }
+        Entry::Vacant(vac) => {
+            let arc_str: Arc<str> = Arc::from(query);
+            let bytes = arc_str.len() as u64;
+            let new_entry = Arc::new(NamedEntry::new(arc_str.clone()));
+            vac.insert(new_entry);
+            NAMED_INTERNER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            arc_str
+        }
+    }
 }
 
 fn intern_anon(query: &str, hash: u64) -> Arc<str> {
     let now = now_monotonic_ms();
+    // same atomic-recovery shape as `intern_named`.
     if let Some(entry) = ANON_INTERNER.get(&hash) {
-        entry.touch(now);
-        return entry.text.clone();
+        if &*entry.text == query {
+            entry.touch(now);
+            return entry.text.clone();
+        }
     }
-    let arc_str: Arc<str> = Arc::from(query);
-    let new_entry = Arc::new(AnonEntry::new(arc_str.clone(), now));
-    ANON_INTERNER.entry(hash).or_insert(new_entry).text.clone()
+    use dashmap::mapref::entry::Entry;
+    match ANON_INTERNER.entry(hash) {
+        Entry::Occupied(mut occ) => {
+            if &*occ.get().text == query {
+                occ.get().touch(now);
+                occ.get().text.clone()
+            } else {
+                let arc_str: Arc<str> = Arc::from(query);
+                let old_bytes = occ.get().text.len() as u64;
+                let new_bytes = arc_str.len() as u64;
+                let new_entry = Arc::new(AnonEntry::new(arc_str.clone(), now));
+                *occ.get_mut() = new_entry;
+                adjust_interner_bytes(&ANON_INTERNER_BYTES, old_bytes, new_bytes);
+                arc_str
+            }
+        }
+        Entry::Vacant(vac) => {
+            let arc_str: Arc<str> = Arc::from(query);
+            let bytes = arc_str.len() as u64;
+            let new_entry = Arc::new(AnonEntry::new(arc_str.clone(), now));
+            vac.insert(new_entry);
+            ANON_INTERNER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            arc_str
+        }
+    }
 }
 
 /// Snapshot of the named interner. Cloning `Arc<NamedEntry>` is cheap;
@@ -228,10 +348,26 @@ pub fn anon_len() -> usize {
     ANON_INTERNER.len()
 }
 
+pub fn named_stats() -> QueryInternerKindStats {
+    QueryInternerKindStats {
+        entries: NAMED_INTERNER.len() as u64,
+        bytes: NAMED_INTERNER_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+pub fn anon_stats() -> QueryInternerKindStats {
+    QueryInternerKindStats {
+        entries: ANON_INTERNER.len() as u64,
+        bytes: ANON_INTERNER_BYTES.load(Ordering::Relaxed),
+    }
+}
+
 /// Force-clear both interners. Used by the `RESET INTERNER` admin command.
 pub fn reset_interners_force() {
     NAMED_INTERNER.clear();
     ANON_INTERNER.clear();
+    NAMED_INTERNER_BYTES.store(0, Ordering::Relaxed);
+    ANON_INTERNER_BYTES.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -320,14 +456,19 @@ pub fn gc_sweep_named() -> GcStats {
             text_len,
             &mut stats,
             || {
-                let removed = NAMED_INTERNER.remove(&hash).is_some();
-                if removed && log_enabled!(Level::Trace) {
-                    trace!(
-                        "query_interner evict named: hash={hash:#x}, bytes={text_len}, query=\"{}\"",
-                        truncate_query_for_log(&entry.text)
-                    );
+                if let Some(removed) = remove_named_entry_if_same(hash, &entry) {
+                    let removed_len = removed.text.len() as u64;
+                    subtract_interner_bytes(&NAMED_INTERNER_BYTES, removed_len);
+                    if log_enabled!(Level::Trace) {
+                        trace!(
+                            "query_interner evict named: hash={hash:#x}, bytes={removed_len}, query=\"{}\"",
+                            truncate_query_for_log(&removed.text)
+                        );
+                    }
+                    true
+                } else {
+                    false
                 }
-                removed
             },
         );
     }
@@ -351,14 +492,19 @@ pub fn gc_sweep_anon(anon_idle_ttl_ms: u64) -> GcStats {
             text_len,
             &mut stats,
             || {
-                let removed = ANON_INTERNER.remove(&hash).is_some();
-                if removed && log_enabled!(Level::Trace) {
-                    trace!(
-                        "query_interner evict anon: hash={hash:#x}, bytes={text_len}, idle_ms={idle_ms}, query=\"{}\"",
-                        truncate_query_for_log(&entry.text)
-                    );
+                if let Some(removed) = remove_anon_entry_if_same(hash, &entry) {
+                    let removed_len = removed.text.len() as u64;
+                    subtract_interner_bytes(&ANON_INTERNER_BYTES, removed_len);
+                    if log_enabled!(Level::Trace) {
+                        trace!(
+                            "query_interner evict anon: hash={hash:#x}, bytes={removed_len}, idle_ms={idle_ms}, query=\"{}\"",
+                            truncate_query_for_log(&removed.text)
+                        );
+                    }
+                    true
+                } else {
+                    false
                 }
-                removed
             },
         );
     }
@@ -373,8 +519,21 @@ const FLAG_ANONYMOUS: u8 = 0b10;
 /// Entry in the prepared statement cache with LRU ordering.
 struct CacheEntry {
     parse: Arc<Parse>,
-    /// Counter for LRU ordering (higher = more recently used)
-    count_used: u64,
+    planner_param_hash: u64,
+    /// Counter for LRU ordering (higher = more recently used).
+    ///
+    /// was `u64`. The fast path in
+    /// `get_or_insert` and `promote` needed `cache.get_mut(&hash)`
+    /// to bump the value - a DashMap **write lock** on the shard.
+    /// Under high-concurrency Parse traffic skewed onto the same
+    /// hot bucket (the typical OLTP shape - a few prepared queries
+    /// dominate), the shard write lock serialised every Parse
+    /// against every other Parse on that shard. `AtomicU64` lets
+    /// the fast path use `cache.get(&hash)` (shard read lock,
+    /// allows concurrent reads) and bump `count_used` via a
+    /// Relaxed `store` - concurrent Parse on the same hot entry
+    /// no longer serialise.
+    count_used: AtomicU64,
     /// Bitmask of `CacheEntryKind` flags. Bit 0 = seen as named,
     /// bit 1 = seen as anonymous. At least one bit is always set after
     /// construction (`CacheEntry::new`); bits only ever flip from 0 to 1.
@@ -392,7 +551,12 @@ impl CacheEntry {
     /// Construct an entry with the bitmask reflecting the initial classification.
     /// `initial_kind` must be `Named` or `Anonymous` at the call site of
     /// `get_or_insert`; `Mixed` is supported for completeness.
-    fn new(parse: Arc<Parse>, count_used: u64, initial_kind: CacheEntryKind) -> Self {
+    fn new(
+        parse: Arc<Parse>,
+        planner_param_hash: u64,
+        count_used: u64,
+        initial_kind: CacheEntryKind,
+    ) -> Self {
         let bits = match initial_kind {
             CacheEntryKind::Named => FLAG_NAMED,
             CacheEntryKind::Anonymous => FLAG_ANONYMOUS,
@@ -400,7 +564,8 @@ impl CacheEntry {
         };
         Self {
             parse,
-            count_used,
+            planner_param_hash,
+            count_used: AtomicU64::new(count_used),
             kind_flags: AtomicU8::new(bits),
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
@@ -469,7 +634,7 @@ impl CacheEntryKind {
 /// This implementation provides lock-free reads and fine-grained locking for writes,
 /// significantly reducing contention compared to a global Mutex<LruCache>.
 pub struct PreparedStatementCache {
-    cache: DashMap<u64, CacheEntry>,
+    cache: FastDashMap<u64, CacheEntry>,
     /// Maximum number of entries in the cache
     max_size: usize,
     /// Global counter for LRU ordering
@@ -480,12 +645,9 @@ pub struct PreparedStatementCache {
     /// hotspot on every `/api/pools` poll for instances with large
     /// per-pool prepared caches.
     ///
-    /// Approximate, not exact: two threads racing the slow path on the
-    /// same hash both `fetch_add` while DashMap keeps a single entry,
-    /// leaving a phantom-entry overshoot until the slot eventually
-    /// evicts. The pre-existing walk was also racy under concurrent
-    /// inserts; this counter trades one shape of approximation for one
-    /// that is far cheaper to read.
+    /// Updated only when a `DashMap::entry` insert wins and when eviction
+    /// removes a live entry, so same-hash slow-path races cannot leave
+    /// phantom bytes behind.
     total_memory_bytes: AtomicU64,
 }
 
@@ -498,6 +660,20 @@ const ENTRY_OVERHEAD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_
 /// converges to identical totals.
 fn entry_bytes(parse: &Parse) -> u64 {
     (parse.memory_usage() + ENTRY_OVERHEAD_BYTES) as u64
+}
+
+fn parse_shape_matches(entry: &CacheEntry, incoming: &Parse, planner_param_hash: u64) -> bool {
+    entry.planner_param_hash == planner_param_hash
+        && entry.parse.query() == incoming.query()
+        && entry.parse.param_types() == incoming.param_types()
+}
+
+fn adjust_total_memory_bytes(total: &AtomicU64, old_bytes: u64, new_bytes: u64) {
+    if new_bytes >= old_bytes {
+        total.fetch_add(new_bytes - old_bytes, Ordering::Relaxed);
+    } else {
+        total.fetch_sub(old_bytes - new_bytes, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for PreparedStatementCache {
@@ -517,7 +693,7 @@ impl PreparedStatementCache {
         }
 
         PreparedStatementCache {
-            cache: new_dashmap_with_capacity(size, worker_threads),
+            cache: new_fast_dashmap_with_capacity(size, worker_threads),
             max_size: size,
             counter: AtomicU64::new(0),
             total_memory_bytes: AtomicU64::new(0),
@@ -540,18 +716,34 @@ impl PreparedStatementCache {
         hash: u64,
         client_given_name: Option<&str>,
     ) -> Arc<Parse> {
+        self.get_or_insert_with_planner(parse, hash, client_given_name, 0)
+    }
+
+    pub fn get_or_insert_with_planner(
+        &self,
+        parse: &Parse,
+        hash: u64,
+        client_given_name: Option<&str>,
+        planner_param_hash: u64,
+    ) -> Arc<Parse> {
         let timestamp = self.counter.fetch_add(1, Ordering::Relaxed);
         let is_anonymous = client_given_name.is_none();
 
-        // Fast path: check if already exists
-        if let Some(mut entry) = self.cache.get_mut(&hash) {
-            entry.count_used = timestamp;
-            if is_anonymous {
-                entry.note_anonymous();
-            } else {
-                entry.note_named();
+        // Fast path: check if already exists.
+        // `cache.get` returns a shard read lock; concurrent
+        // Parse on the same hot bucket no longer serialise on a
+        // shard write lock. count_used + kind_flags are atomics, so
+        // an immutable Ref is enough to bump them.
+        if let Some(entry) = self.cache.get(&hash) {
+            if parse_shape_matches(&entry, parse, planner_param_hash) {
+                entry.count_used.store(timestamp, Ordering::Relaxed);
+                if is_anonymous {
+                    entry.note_anonymous();
+                } else {
+                    entry.note_named();
+                }
+                return entry.parse.clone();
             }
-            return entry.parse.clone();
         }
 
         // Slow path: insert new entry
@@ -565,16 +757,44 @@ impl PreparedStatementCache {
             CacheEntryKind::Named
         };
 
-        // Insert first, then evict excess. Reversing the order closes
-        // the race where N concurrent callers all pass len() >= max_size
-        // before any eviction runs, pushing the cache far above the limit.
-        let inserted_bytes = entry_bytes(&new_parse);
-        self.cache.insert(
-            hash,
-            CacheEntry::new(new_parse.clone(), timestamp, initial_kind),
-        );
-        self.total_memory_bytes
-            .fetch_add(inserted_bytes, Ordering::Relaxed);
+        // Re-check and insert under the shard write lock. Without the
+        // `entry()` guard, two cold callers for the same hash could both
+        // miss the fast path, overwrite the same DashMap slot, and both
+        // add bytes to `total_memory_bytes` while only one entry survived.
+        match self.cache.entry(hash) {
+            Entry::Occupied(mut occupied) => {
+                let entry = occupied.get();
+                if parse_shape_matches(entry, parse, planner_param_hash) {
+                    entry.count_used.store(timestamp, Ordering::Relaxed);
+                    if is_anonymous {
+                        entry.note_anonymous();
+                    } else {
+                        entry.note_named();
+                    }
+                    return entry.parse.clone();
+                }
+                let old_bytes = entry_bytes(&entry.parse);
+                let new_bytes = entry_bytes(&new_parse);
+                *occupied.get_mut() = CacheEntry::new(
+                    new_parse.clone(),
+                    planner_param_hash,
+                    timestamp,
+                    initial_kind,
+                );
+                adjust_total_memory_bytes(&self.total_memory_bytes, old_bytes, new_bytes);
+            }
+            Entry::Vacant(vacant) => {
+                let inserted_bytes = entry_bytes(&new_parse);
+                vacant.insert(CacheEntry::new(
+                    new_parse.clone(),
+                    planner_param_hash,
+                    timestamp,
+                    initial_kind,
+                ));
+                self.total_memory_bytes
+                    .fetch_add(inserted_bytes, Ordering::Relaxed);
+            }
+        }
 
         while self.cache.len() > self.max_size {
             self.evict_oldest();
@@ -593,9 +813,11 @@ impl PreparedStatementCache {
         self.cache.is_empty()
     }
 
-    /// Approximate memory usage of the cache in bytes. Single atomic load
-    /// — kept in sync with `get_or_insert` and `evict_oldest` so the
-    /// dashboard polling path does not pay an O(N) walk on every snapshot.
+    /// Approximate memory usage of the cache in bytes.
+    ///
+    /// A single atomic load is kept in sync with `get_or_insert` and
+    /// `evict_oldest` so the dashboard polling path does not pay an O(N)
+    /// walk on every snapshot.
     pub fn memory_usage(&self) -> usize {
         self.total_memory_bytes.load(Ordering::Relaxed) as usize
     }
@@ -611,22 +833,38 @@ impl PreparedStatementCache {
             .map(|entry| (entry.parse.clone(), entry.kind()))
     }
 
+    /// Visit entries until the callback returns `false`. Returns `true`
+    /// when the whole cache was visited and `false` when iteration stopped
+    /// early. This lets bounded admin renderers avoid materializing a Vec of
+    /// every entry before applying their own response budget.
+    pub fn for_each_entry_until<F>(&self, mut visit: F) -> bool
+    where
+        F: FnMut(u64, Arc<Parse>, u64, CacheEntryKind, u64, u64) -> bool,
+    {
+        for entry in self.cache.iter() {
+            if !visit(
+                *entry.key(),
+                entry.parse.clone(),
+                entry.count_used.load(Ordering::Relaxed),
+                entry.kind(),
+                entry.hit_count.load(Ordering::Relaxed),
+                entry.miss_count.load(Ordering::Relaxed),
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Returns all entries with stats. Tuple is
     /// `(hash, parse, count_used, kind, hit_count, miss_count)`.
     pub fn get_entries(&self) -> Vec<(u64, Arc<Parse>, u64, CacheEntryKind, u64, u64)> {
-        self.cache
-            .iter()
-            .map(|entry| {
-                (
-                    *entry.key(),
-                    entry.parse.clone(),
-                    entry.count_used,
-                    entry.kind(),
-                    entry.hit_count.load(Ordering::Relaxed),
-                    entry.miss_count.load(Ordering::Relaxed),
-                )
-            })
-            .collect()
+        let mut entries = Vec::new();
+        self.for_each_entry_until(|hash, parse, count_used, kind, hits, misses| {
+            entries.push((hash, parse, count_used, kind, hits, misses));
+            true
+        });
+        entries
     }
 
     /// Atomically increments the hit counter on the entry for `hash`.
@@ -645,30 +883,88 @@ impl PreparedStatementCache {
         }
     }
 
-    /// Marks the hash as most recently used if it exists
+    /// Marks the hash as most recently used if it exists.
+    /// shard read lock + atomic store - concurrent promotes
+    /// of the same entry no longer serialise.
     pub fn promote(&self, hash: &u64) {
-        if let Some(mut entry) = self.cache.get_mut(hash) {
-            entry.count_used = self.counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(entry) = self.cache.get(hash) {
+            entry.count_used.store(
+                self.counter.fetch_add(1, Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
     }
 
     /// Evict the oldest entry from the cache (approximate LRU).
+    ///
+    /// sampled approximate LRU instead of a full O(N)
+    /// scan. Default `max_size = 8192`; under churn workloads
+    /// (heterogeneous SaaS clients, ORMs that auto-prepare unique
+    /// names) every Parse past steady-state used to walk all 8192
+    /// entries to find the lowest `count_used`. At 10k Parse/sec
+    /// this was 80M atomic loads + comparisons per second on the
+    /// cache hot path. Sampling K=8 random entries picks the
+    /// oldest among them with O(K) cost - provably close to true
+    /// LRU for K ≥ ln(max_size) under uniform access. Falls back
+    /// to full scan when the cache is small.
     fn evict_oldest(&self) {
-        // Find the entry with the smallest count_used timestamp
+        const SAMPLE_SIZE: usize = 8;
+        const FULL_SCAN_THRESHOLD: usize = SAMPLE_SIZE * 4;
+
         let mut oldest_key: Option<u64> = None;
         let mut oldest_time = u64::MAX;
 
-        // Sample entries to find the oldest one
-        // We iterate through all entries but this is still efficient because
-        // DashMap uses sharding and we only read, not write
-        for entry in self.cache.iter() {
-            if entry.count_used < oldest_time {
-                oldest_time = entry.count_used;
-                oldest_key = Some(*entry.key());
+        let len = self.cache.len();
+        if len <= FULL_SCAN_THRESHOLD {
+            // Small cache - full scan is cheaper than sampling overhead.
+            for entry in self.cache.iter() {
+                let cu = entry.count_used.load(Ordering::Relaxed);
+                if cu < oldest_time {
+                    oldest_time = cu;
+                    oldest_key = Some(*entry.key());
+                }
+            }
+        } else {
+            // Sample SAMPLE_SIZE entries via a single scan that stops
+            // early. DashMap iteration order is shard-then-bucket which
+            // already approximates random against insertion-order
+            // `count_used`. To avoid bias toward the first shard, use
+            // the count_used counter as a poor-man's RNG seed.
+            let seed = self.counter.load(Ordering::Relaxed) as usize;
+            let stride = (len / SAMPLE_SIZE).max(1);
+            let start = seed % stride.max(1);
+            let mut sampled = 0;
+            for (i, entry) in self.cache.iter().enumerate() {
+                if i < start {
+                    continue;
+                }
+                if (i - start) % stride == 0 {
+                    let cu = entry.count_used.load(Ordering::Relaxed);
+                    if cu < oldest_time {
+                        oldest_time = cu;
+                        oldest_key = Some(*entry.key());
+                    }
+                    sampled += 1;
+                    if sampled >= SAMPLE_SIZE {
+                        break;
+                    }
+                }
+            }
+            // Fallback: if sampling somehow saw nothing (e.g.,
+            // concurrent removals), do one full pass to guarantee
+            // forward progress so the size-bounded loop terminates.
+            if oldest_key.is_none() {
+                for entry in self.cache.iter() {
+                    let cu = entry.count_used.load(Ordering::Relaxed);
+                    if cu < oldest_time {
+                        oldest_time = cu;
+                        oldest_key = Some(*entry.key());
+                    }
+                }
             }
         }
 
-        // Remove the oldest entry
+        // Remove the selected entry
         if let Some(key) = oldest_key {
             if let Some((_, entry)) = self.cache.remove(&key) {
                 self.total_memory_bytes
@@ -737,7 +1033,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     for i in 0..inserts_per_thread {
-                        let query = format!("SELECT {} FROM t{}", i, t);
+                        let query = format!("SELECT {i} FROM t{t}");
                         let hash = hash_query(&query);
                         let parse = make_parse("stmt", &query);
                         cache.get_or_insert(&parse, hash, Some("stmt"));
@@ -756,11 +1052,7 @@ mod tests {
         let allowed = max + threads;
         assert!(
             final_size <= allowed,
-            "cache size {} exceeded allowed {} (max_size {} + {} threads)",
-            final_size,
-            allowed,
-            max,
-            threads,
+            "cache size {final_size} exceeded allowed {allowed} (max_size {max} + {threads} threads)",
         );
     }
 
@@ -792,6 +1084,25 @@ mod tests {
         cache.get_or_insert(&p2, 1, None);
         let entries = cache.get_entries();
         assert_eq!(entries[0].3, CacheEntryKind::Mixed);
+    }
+
+    #[test]
+    fn for_each_entry_until_stops_when_callback_returns_false() {
+        let cache = PreparedStatementCache::new(8, 1);
+        for i in 0..3 {
+            let query = format!("SELECT {i}");
+            let parse = make_parse("stmt", &query);
+            cache.get_or_insert(&parse, i, Some("stmt"));
+        }
+
+        let mut visited = 0;
+        let completed = cache.for_each_entry_until(|_, _, _, _, _, _| {
+            visited += 1;
+            false
+        });
+
+        assert!(!completed);
+        assert_eq!(visited, 1);
     }
 
     #[test]
@@ -866,6 +1177,75 @@ mod tests {
         assert_eq!(cache.memory_usage(), after_one);
     }
 
+    #[test]
+    fn same_hash_different_parse_does_not_reuse_wrong_statement() {
+        let cache = PreparedStatementCache::new(8, 1);
+        let p1 = make_parse("stmt_one", "SELECT 1");
+        let p2 = make_parse("stmt_two", "SELECT 2");
+        let collision_hash = 0xC011_1510_u64;
+
+        let first = cache.get_or_insert(&p1, collision_hash, Some("stmt_one"));
+        let second = cache.get_or_insert(&p2, collision_hash, Some("stmt_two"));
+
+        assert_eq!(first.query(), "SELECT 1");
+        assert_eq!(
+            second.query(),
+            "SELECT 2",
+            "hash collision must not return the first query's rewritten Parse"
+        );
+        assert_ne!(
+            first.name, second.name,
+            "colliding parses must use distinct backend statement names"
+        );
+        assert_eq!(cache.len(), 1, "collision replacement stays bounded");
+        let (current, _) = cache
+            .lookup_by_hash(collision_hash)
+            .expect("replacement entry must remain visible");
+        assert_eq!(current.query(), "SELECT 2");
+    }
+
+    #[test]
+    fn same_hash_same_parse_different_planner_state_does_not_reuse_wrong_statement() {
+        let cache = PreparedStatementCache::new(8, 1);
+        let parse = make_parse("stmt", "SELECT * FROM t WHERE id = $1");
+        let collision_hash = 0xC011_1511_u64;
+
+        let first = cache.get_or_insert_with_planner(&parse, collision_hash, Some("stmt"), 0xAAAA);
+        let second = cache.get_or_insert_with_planner(&parse, collision_hash, Some("stmt"), 0xBBBB);
+
+        assert_eq!(first.query(), second.query());
+        assert_ne!(
+            first.name, second.name,
+            "same SQL with a colliding planner-state hash must use a fresh backend statement"
+        );
+        let (current, _) = cache
+            .lookup_by_hash(collision_hash)
+            .expect("replacement entry must remain visible");
+        assert_eq!(current.name, second.name);
+    }
+
+    #[test]
+    fn slow_path_uses_entry_api_to_avoid_same_hash_overwrite_accounting() {
+        let src = include_str!("prepared_statement_cache.rs");
+        let start = src
+            .find("pub fn get_or_insert(")
+            .expect("get_or_insert must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n    /// Returns number of entries")
+            .expect("len docs should follow get_or_insert");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("self.cache.entry(hash)"),
+            "slow path must re-check and insert through DashMap entry API"
+        );
+        assert!(
+            !body.contains("self.cache.insert("),
+            "slow path must not overwrite an existing same-hash entry while adding bytes"
+        );
+    }
+
     /// A repeated hit with the same kind must not mutate the bitmask
     /// beyond the bit set at construction. The cache-line-friendly
     /// test-and-set guard relies on this invariant; verify the visible
@@ -923,6 +1303,46 @@ mod tests {
         let a = intern_query("select 4", 0xDD, false);
         let b = intern_query("select 4", 0xDD, false);
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    #[serial(query_interner)]
+    fn query_interner_stats_track_insert_replace_and_reset() {
+        reset_interners_for_test();
+
+        let named_start = named_stats().bytes;
+        let _named = intern_query("select named", 0xAAA0, false);
+        let named_after_insert = named_stats().bytes;
+        assert!(
+            named_after_insert >= named_start + "select named".len() as u64,
+            "named insert must add at least the inserted query bytes"
+        );
+        let _named_hit = intern_query("select named", 0xAAA0, false);
+        let named_after_hit = named_stats().bytes;
+        assert!(named_after_hit >= named_after_insert);
+        let _named_replacement = intern_query("select named collision", 0xAAA0, false);
+        let named_replacement_delta =
+            ("select named collision".len() - "select named".len()) as u64;
+        assert!(
+            named_stats().bytes >= named_after_hit + named_replacement_delta,
+            "same-hash replacement must adjust the named byte gauge"
+        );
+
+        let anon_start = anon_stats().bytes;
+        let _anon = intern_query("select anon", 0xBBB0, true);
+        let anon_after_insert = anon_stats().bytes;
+        assert!(
+            anon_after_insert >= anon_start + "select anon".len() as u64,
+            "anonymous insert must add at least the inserted query bytes"
+        );
+        let _anon_replacement = intern_query("select anon collision", 0xBBB0, true);
+        let anon_replacement_delta = ("select anon collision".len() - "select anon".len()) as u64;
+        assert!(
+            anon_stats().bytes >= anon_after_insert + anon_replacement_delta,
+            "same-hash replacement must adjust the anonymous byte gauge"
+        );
+
+        reset_interners_for_test();
     }
 
     #[test]

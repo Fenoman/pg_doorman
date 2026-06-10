@@ -715,13 +715,19 @@ log_client_parameter_status_changes = false
 # statement cache is cleared at the same instant so the next `Bind`
 # cannot reach a backend that does not know the statement.
 #
+# An extended-protocol `DISCARD ALL` (a zero-parameter `Parse`
+# whose text is `DISCARD ALL`) is intercepted too: its `Parse`
+# query is rewritten to `SELECT 1` and forwarded, so the backend
+# keeps its prepared-statement cache, planner state, advisory
+# locks, session-temp tables and `pg_variables` state. The only
+# client-visible difference is the `CommandComplete` tag, which
+# reads `SELECT 1` instead of `DISCARD ALL`; a driver that
+# strictly checks that tag should set this switch `false`.
+#
 # NOT intercepted (these still reach PostgreSQL):
 # - multi-statement batches containing `DISCARD ALL`
 #   (`SELECT 1; DISCARD ALL`) - extracting one statement's effect
 #   from a batch is ambiguous;
-# - `DISCARD ALL` issued via the extended (Parse/Bind/Execute)
-#   protocol rather than simple-query - rare in real driver
-#   traffic;
 # - `DISCARD ALL` inside an open transaction or COPY mode.
 #
 # Set `false` only when the application relies on real DISCARD ALL

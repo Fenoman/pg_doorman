@@ -6,14 +6,13 @@ use std::sync::atomic::*;
 
 /// Cache-line-aligned wrapper around an `AtomicU64`.
 ///
-/// an `AddressStatFields` struct packs 8 `AtomicU64` fields into a
+/// An `AddressStatFields` struct packs 8 `AtomicU64` fields into a
 /// single 64-byte cache line. Two cores incrementing different counters
-/// - e.g. one thread bumping `xact_count` while another bumps
-/// `query_count` - repeatedly invalidate each other's cache line, costing
-/// 30-100 ns per increment under MESI/MOESI coherence traffic on ARM64
-/// and EPYC. Padding each hot atomic to its own cache line removes the
+/// repeatedly invalidate each other's cache line, costing 30-100 ns per
+/// increment under MESI/MOESI coherence traffic on ARM64 and EPYC. Padding
+/// each hot atomic to its own cache line removes the
 /// false-sharing penalty entirely. The cost is 7 × 8 = 56 bytes of
-/// padding per atomic (negligible vs the hundreds of MB the pool reserves
+/// padding per atomic, negligible vs the hundreds of MB the pool reserves
 /// per backend connection).
 #[repr(align(64))]
 #[derive(Debug, Default)]
@@ -233,8 +232,8 @@ pub struct AddressStats {
     /// (the moment when p99 matters most) samples were silently dropped,
     /// biasing percentile reads downward. Operators reading p99 during
     /// an incident need to know if the value is statistically meaningful
-    /// - a non-zero rate here means histogram percentiles are
-    /// under-counting the slow tail.
+    /// A non-zero rate here means histogram percentiles are under-counting
+    /// the slow tail.
     pub histogram_samples_dropped_total: AtomicU64,
 
     /// Process-unique identifier for this `AddressStats` instance.
