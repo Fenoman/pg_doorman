@@ -22,7 +22,7 @@ use crate::client::util::{
     extract_set_cleanup_commands, is_standalone_begin, simple_query_body,
     simple_query_starts_with_prepare, QUERY_DEALLOCATE,
 };
-use crate::config::get_config;
+use crate::config::config_arc;
 use crate::errors::Error;
 use crate::messages::{
     ends_with_idle_ready_for_query, error_response_timeout, has_error_response,
@@ -788,7 +788,7 @@ where
                         0, // CommandComplete("BEGIN")
                         b'Z', 0, 0, 0, 5, b'T', // ReadyForQuery('T')
                     ];
-                    let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+                    let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
                     write_all_flush_timeout(
                         &mut self.write,
                         SYNTHETIC_EXTENDED_BEGIN_RESPONSE,
@@ -914,7 +914,7 @@ where
                                     self.username, self.pool_name, self.connection_id, name
                                 );
                                 let write_timeout =
-                                    get_config().general.proxy_copy_data_timeout.as_std();
+                                    config_arc().general.proxy_copy_data_timeout.as_std();
                                 write_all_flush_timeout(
                                     &mut self.write,
                                     &SIMPLE_DEALLOCATE_NAMED_ACK,
@@ -991,7 +991,7 @@ where
     ) -> Result<(), Error> {
         if let Some(cached) = pool.check_query_cache.get(&snapshot.query) {
             POOLER_CHECK_QUERY_CACHE_TOTAL.inc();
-            let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+            let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
             write_all_flush_timeout(&mut self.write, cached.as_ref(), write_timeout).await?;
             return Ok(());
         }
@@ -1096,7 +1096,7 @@ where
         conn.finish_internal_round_trip();
         drop(conn);
 
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         write_all_flush_timeout(&mut self.write, &response, write_timeout).await?;
 
         if !has_error_response(&response) && ends_with_idle_ready_for_query(&response) {
@@ -1385,7 +1385,7 @@ where
         } else {
             DISCARD_ALL_RESPONSE_IDLE
         };
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         write_all_flush_timeout(&mut self.write, response, write_timeout).await?;
         Ok(())
     }
@@ -1542,7 +1542,7 @@ where
         for _ in 0..count {
             synthetic_response.extend_from_slice(&PARSE_COMPLETE_MSG);
         }
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         write_all_flush_timeout(&mut self.write, &synthetic_response, write_timeout).await?;
         self.prepared.skipped_parses.clear();
         self.prepared.batch_operations.clear();
@@ -1644,7 +1644,7 @@ where
         let response = self.recv_copy_completion_with_timeout(server).await?;
 
         self.stats.active_write();
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         match write_all_flush_timeout(&mut self.write, &response, write_timeout).await {
             Ok(_) => self.stats.active_idle(),
             Err(err) => {
@@ -1670,7 +1670,7 @@ where
     }
 
     async fn write_shutdown_error_and_disconnect(&mut self) -> Result<(), Error> {
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         if let Err(err) = error_response_timeout(
             &mut self.write,
             "pooler is shut down now",
@@ -1689,7 +1689,7 @@ where
     }
 
     async fn write_checkout_error(&mut self, message: &str, sqlstate: &str) -> Result<(), Error> {
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         error_response_timeout(&mut self.write, message, sqlstate, write_timeout).await
     }
 
@@ -1961,7 +1961,7 @@ where
                     b'C', 0, 0, 0, 10, b'B', b'E', b'G', b'I', b'N', 0, // CommandComplete
                     b'Z', 0, 0, 0, 5, b'T', // ReadyForQuery('T')
                 ];
-                let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+                let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
                 write_all_flush_timeout(&mut self.write, SYNTHETIC_BEGIN_RESPONSE, write_timeout)
                     .await?;
 
@@ -2298,7 +2298,7 @@ where
                             let _ = server;
                             drop(conn);
                             let write_timeout =
-                                get_config().general.proxy_copy_data_timeout.as_std();
+                                config_arc().general.proxy_copy_data_timeout.as_std();
                             let _ = error_response_timeout(
                                 &mut self.write,
                                 "pooler is shut down now (deferred BEGIN timeout: server did not finish within the timeout period)",
@@ -2337,7 +2337,7 @@ where
                                 let _ = server;
                                 drop(conn);
                                 let write_timeout =
-                                    get_config().general.proxy_copy_data_timeout.as_std();
+                                    config_arc().general.proxy_copy_data_timeout.as_std();
                                 let _ = error_response_timeout(
                                     &mut self.write,
                                     "pooler is shut down now (deferred BEGIN timeout: server did not finish within the timeout period)",
@@ -2389,7 +2389,7 @@ where
                                     self.release();
                                     drop(conn);
                                     let write_timeout =
-                                        get_config().general.proxy_copy_data_timeout.as_std();
+                                        config_arc().general.proxy_copy_data_timeout.as_std();
                                     let _ = error_response_timeout(
                                         &mut self.write,
                                         "server closed the connection unexpectedly while client was idle in transaction",
@@ -2742,7 +2742,7 @@ where
                                 let _ = server;
                                 drop(conn);
                                 let write_timeout =
-                                    get_config().general.proxy_copy_data_timeout.as_std();
+                                    config_arc().general.proxy_copy_data_timeout.as_std();
                                 let _ = error_response_timeout(
                                     &mut self.write,
                                     message,
@@ -2796,7 +2796,7 @@ where
 
             if !self.client_last_messages_in_tx.is_empty() {
                 self.stats.idle_write(); // go to idle_read if success.
-                let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+                let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
                 match write_all_flush_timeout(
                     &mut self.write,
                     &self.client_last_messages_in_tx,
@@ -2824,7 +2824,7 @@ where
             // send error to client and exit. When migration is active,
             // let the client return to idle loop where it will migrate.
             if shutdown_in_progress && !migration_in_progress() {
-                let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+                let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
                 error_response_timeout(
                     &mut self.write,
                     "pooler is shut down now",
@@ -2928,7 +2928,7 @@ where
     /// loop: same recv, same ParseComplete reorder, same pending CloseComplete
     /// insertion, same fast-release condition, same error handling.
     pub(crate) async fn relay_response(&mut self, server: &mut Server) -> Result<(), Error> {
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
 
         // Single initial state update
         self.stats.active_idle();
@@ -3298,7 +3298,7 @@ mod checkout_error_tests {
         let helper_body = &helper_body[..helper_end];
 
         assert!(
-            helper_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            helper_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "checkout failure helper must use proxy_copy_data_timeout"
         );
         assert!(
@@ -3530,7 +3530,7 @@ mod internal_round_trip_timeout_tests {
             "pooler_check_query cache miss must finish and release the backend before bounded client response write and cache insertion"
         );
         assert!(
-            body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "pooler_check_query client response writes must use proxy_copy_data_timeout"
         );
         assert!(
@@ -3562,7 +3562,7 @@ mod internal_round_trip_timeout_tests {
         let hit_body = &hit_body[..hit_end];
 
         assert!(
-            hit_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            hit_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "pooler_check_query cache-hit writes must use proxy_copy_data_timeout"
         );
         assert!(
@@ -3606,7 +3606,7 @@ mod internal_round_trip_timeout_tests {
             .find("self.client_pending_begin = Some(simple_begin_message())")
             .expect("deferred extended BEGIN must still set client_pending_begin");
         assert!(
-            extended_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            extended_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "deferred extended BEGIN writes must use proxy_copy_data_timeout"
         );
         assert!(
@@ -3628,7 +3628,7 @@ mod internal_round_trip_timeout_tests {
             .expect("pooler check handler should follow fast path");
         let fast_path_body = &fast_path_body[..fast_path_end];
         assert!(
-            fast_path_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            fast_path_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "synthetic DEALLOCATE writes must use proxy_copy_data_timeout"
         );
         let deallocate_write_idx = fast_path_body
@@ -3673,7 +3673,7 @@ mod internal_round_trip_timeout_tests {
             .find("self.client_pending_begin = Some(message)")
             .expect("simple deferred BEGIN must still store the pending BEGIN");
         assert!(
-            simple_begin_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            simple_begin_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "simple deferred BEGIN writes must use proxy_copy_data_timeout"
         );
         assert!(
@@ -3754,7 +3754,7 @@ mod internal_round_trip_timeout_tests {
             "ServerDead must evict/release the bad backend before writing the client error"
         );
         assert!(
-            body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "ServerDead client error write must use proxy_copy_data_timeout"
         );
         assert!(
@@ -3850,7 +3850,7 @@ mod internal_round_trip_timeout_tests {
             .expect("client handler should follow shutdown helper");
         let helper_body = &helper_body[..helper_end];
         assert!(
-            helper_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            helper_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "shutdown client error writes must use proxy_copy_data_timeout"
         );
         assert!(
@@ -3950,7 +3950,7 @@ mod internal_round_trip_timeout_tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "COPY completion client write must use proxy_copy_data_timeout"
         );
         assert!(
@@ -4066,7 +4066,7 @@ mod internal_round_trip_timeout_tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "synthetic ParseComplete writes must use proxy_copy_data_timeout"
         );
         assert!(
@@ -4237,7 +4237,7 @@ mod client_response_write_timeout_tests {
         let relay_body = &impl_src[relay_start..];
 
         assert!(
-            relay_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            relay_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "client response relay writes must use the configured proxy copy timeout"
         );
         assert!(
@@ -4269,7 +4269,7 @@ mod client_response_write_timeout_tests {
         let flush_body = &flush_body[..flush_end];
 
         assert!(
-            flush_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            flush_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "post-release fast-response flush must use proxy_copy_data_timeout"
         );
         assert!(
@@ -4823,7 +4823,7 @@ mod discard_response_tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "intercepted DISCARD ALL client write must use proxy_copy_data_timeout"
         );
         assert!(

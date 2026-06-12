@@ -4,7 +4,7 @@ use std::convert::TryInto;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::config::get_config;
+use crate::config::config_arc;
 use crate::errors::Error;
 use crate::messages::{error_response_timeout, Bind, Close, Describe, Parse};
 use crate::pool::ConnectionPool;
@@ -676,7 +676,7 @@ where
         message: &str,
         code: &str,
     ) -> Result<(), Error> {
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         error_response_timeout(&mut self.write, message, code, write_timeout).await
     }
 
@@ -1430,7 +1430,7 @@ mod discard_all_transaction_guard_tests {
             .expect("prepared lookup should follow error helper");
         let helper_body = &helper_body[..helper_end];
         assert!(
-            helper_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            helper_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "prepared synthetic errors must use proxy_copy_data_timeout"
         );
         assert!(

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::io::BufReader;
 
 use crate::client::buffer_pool::PooledBuffer;
-use crate::config::get_config;
+use crate::config::config_arc;
 use crate::messages::{error_response_timeout, Parse};
 use crate::pool::{get_pool_by_id, ClientServerMap, ConnectionPool, PoolIdentifier};
 use crate::server::cleanup::{ResetCleanupCommand, SetCleanupCommand};
@@ -1395,7 +1395,7 @@ where
             self.username,
             self.server_parameters.get_application_name(),
         ));
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         if let Err(write_err) =
             error_response_timeout(&mut self.write, &client_msg, "3D000", write_timeout).await
         {
@@ -1444,7 +1444,7 @@ mod no_pool_error_tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "missing-pool ErrorResponse must use proxy_copy_data_timeout"
         );
         assert!(
