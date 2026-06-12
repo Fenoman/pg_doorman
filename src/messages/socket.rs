@@ -576,15 +576,19 @@ where
     R: tokio::io::AsyncRead + std::marker::Unpin,
     W: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    const MAX_BUFFER_CHUNK: usize = 4096; // гарантия того что вызовы read из
-                                          // буфферизированного stream 8kb будет быстрым.
+    // 64 KiB chunk: a single >1MB frame streams to the client in far fewer
+    // read/write syscalls than the previous 4 KiB chunk.
+    const MAX_BUFFER_CHUNK: usize = 65536;
     let mut bytes_remained = len;
     let mut bytes_readed: usize;
     let mut buffer_size: usize = MAX_BUFFER_CHUNK;
     if buffer_size > len {
         buffer_size = len
     }
-    let mut buffer = [0; MAX_BUFFER_CHUNK];
+    // Heap buffer sized to the chunk so a 64 KiB array does not live in this
+    // future on the stack. buffer_size only shrinks below, so the allocation
+    // stays large enough for every later slice.
+    let mut buffer = vec![0u8; buffer_size];
     loop {
         // read.
         match read.read(&mut buffer[..buffer_size]).await {
