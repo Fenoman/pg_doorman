@@ -314,12 +314,31 @@ pub(crate) fn contains_untrusted_function_call(bytes: &[u8]) -> bool {
     false
 }
 
+/// ASCII case-insensitive substring test. Used as a cheap necessary-condition
+/// gate before the full quote- and comment-aware cleanup scanners: a body with
+/// no `set`/`reset` keyword cannot contain a SET/RESET cleanup statement.
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+}
+
 /// Return the reset-cleanup-relevant `RESET` statements from a SimpleQuery body
 /// in statement order. PostgreSQL emits the same `CommandComplete("RESET")` tag
 /// for `RESET ALL` and narrower `RESET foo` statements, so the server response
 /// path needs this client-side attribution to safely disarm SET cleanup only for
 /// proven `RESET ALL` statements.
 pub(crate) fn extract_reset_cleanup_commands(bytes: &[u8]) -> SmallVec<[ResetCleanupCommand; 2]> {
+    // A body with no `reset` keyword has no RESET statement to attribute.
+    if !contains_ascii_ci(bytes, b"reset") {
+        return SmallVec::new();
+    }
     let mut commands = SmallVec::new();
     let mut statement_start = 0usize;
     let mut idx = 0usize;
@@ -373,6 +392,10 @@ pub(crate) fn extract_reset_cleanup_commands(bytes: &[u8]) -> SmallVec<[ResetCle
 /// the response path needs this attribution to avoid treating `RESET ALL` as
 /// proof that role/session identity was restored.
 pub(crate) fn extract_set_cleanup_commands(bytes: &[u8]) -> SmallVec<[SetCleanupCommand; 2]> {
+    // A body with no `set` keyword has no SET statement to attribute.
+    if !contains_ascii_ci(bytes, b"set") {
+        return SmallVec::new();
+    }
     let mut commands = SmallVec::new();
     let mut statement_start = 0usize;
     let mut idx = 0usize;
