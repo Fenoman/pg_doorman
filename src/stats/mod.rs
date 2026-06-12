@@ -239,14 +239,29 @@ impl Collector {
                 // Print all collected statistics (reads percentiles from histograms)
                 print_all_stats();
 
-                // Now reset counters and histograms for the next period
-                for stats in &snapshot {
-                    stats.address_stats().reset_current_counts();
-                    stats.address_stats().reset_histograms();
-                    stats.set_address_stat_average_is_updated_status(false);
-                }
+                // Reset counters and histograms for the next period.
+                reset_period_stats(&snapshot);
             }
         });
+    }
+}
+
+/// Resets the period counters and histograms once per `AddressStats`.
+///
+/// Every server in a pool shares one `AddressStats`. `reset_histograms`
+/// caches the p50/p90/p95/p99 values into atomics and then empties the
+/// histogram, so resetting the same `AddressStats` a second time in one pass
+/// reads the now empty histogram and overwrites the cached percentiles with
+/// zeros. The `averages_updated` flag is shared per `AddressStats` and set
+/// true by the averages pass, so gating on it resets each `AddressStats`
+/// exactly once and clears the flag for the next cycle.
+fn reset_period_stats(snapshot: &[Arc<ServerStats>]) {
+    for stats in snapshot {
+        if stats.check_address_stat_average_is_updated_status() {
+            stats.address_stats().reset_current_counts();
+            stats.address_stats().reset_histograms();
+            stats.set_address_stat_average_is_updated_status(false);
+        }
     }
 }
 
@@ -296,4 +311,58 @@ pub fn get_server_stats() -> ServerStatesLookup {
 /// A clone of the global Reporter instance
 pub fn get_reporter() -> Reporter {
     (*(*REPORTER.load())).clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reset_period_stats, ServerStats};
+    use crate::config::Address;
+    use crate::stats::address::AddressStats;
+    use crate::utils::clock;
+    use std::sync::Arc;
+
+    fn server_sharing(address_stats: &Arc<AddressStats>) -> Arc<ServerStats> {
+        let address = Address {
+            stats: address_stats.clone(),
+            ..Address::default()
+        };
+        Arc::new(ServerStats::new(address, clock::now()))
+    }
+
+    #[test]
+    fn reset_period_stats_preserves_percentiles_for_multi_server_pool() {
+        // Three servers in one pool share a single AddressStats, exactly as
+        // the pool builds them.
+        let address_stats = Arc::new(AddressStats::default());
+        let snapshot = vec![
+            server_sharing(&address_stats),
+            server_sharing(&address_stats),
+            server_sharing(&address_stats),
+        ];
+
+        // Populate the histograms so the cached percentiles are non-zero.
+        for _ in 0..200 {
+            address_stats.xact_time_add(2000);
+            address_stats.query_time_add_microseconds(1000);
+            address_stats.wait_time_add(500);
+        }
+
+        // The averages pass marks the shared AddressStats updated.
+        snapshot[0].set_address_stat_average_is_updated_status(true);
+
+        reset_period_stats(&snapshot);
+
+        // reset_histograms ran once, so the cached percentiles hold the
+        // recorded latencies instead of being zeroed by the second and third
+        // server of the same pool.
+        let (_, _, _, p99_query) = address_stats.get_query_percentiles();
+        let (_, _, _, p99_xact) = address_stats.get_xact_percentiles();
+        let (_, _, _, p99_wait) = address_stats.get_wait_percentiles();
+        assert!(p99_query > 0, "query p99 cache zeroed by multi-server reset: {p99_query}");
+        assert!(p99_xact > 0, "xact p99 cache zeroed by multi-server reset: {p99_xact}");
+        assert!(p99_wait > 0, "wait p99 cache zeroed by multi-server reset: {p99_wait}");
+
+        // The shared flag is cleared so the next cycle's averages pass runs.
+        assert!(!snapshot[0].check_address_stat_average_is_updated_status());
+    }
 }
