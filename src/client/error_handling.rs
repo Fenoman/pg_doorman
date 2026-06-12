@@ -1,5 +1,5 @@
 use crate::client::core::Client;
-use crate::config::get_config;
+use crate::config::config_arc;
 use crate::errors::Error;
 use crate::messages::error_response_timeout;
 
@@ -15,7 +15,7 @@ where
         code: &str,
         err: Error,
     ) -> Result<(), Error> {
-        let write_timeout = get_config().general.proxy_copy_data_timeout.as_std();
+        let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         if let Err(write_err) =
             error_response_timeout(&mut self.write, message, code, write_timeout).await
         {
@@ -175,7 +175,7 @@ mod tests {
         let helper_body = &helper_body[..helper_end];
 
         assert!(
-            helper_body.contains("get_config().general.proxy_copy_data_timeout.as_std()"),
+            helper_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "generic client ErrorResponse writes must use proxy_copy_data_timeout"
         );
         assert!(
