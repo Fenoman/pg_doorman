@@ -3,7 +3,7 @@ use std::{
     fmt,
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Weak,
     },
     time::Duration,
@@ -62,13 +62,22 @@ impl Drop for Object {
                 // panics or is cancelled while holding a transaction, COPY
                 // stream, unread bytes, or dirty session state, close this
                 // backend instead of handing it to another client.
+                let bad_before_checkin = inner.obj.is_bad();
                 if let Some(reason) = inner.obj.recycle_safety_violation() {
-                    if !inner.obj.is_bad() {
+                    if !bad_before_checkin {
                         inner.obj.mark_bad(reason);
                     }
                 }
                 let must_evict = inner.obj.is_bad();
                 if must_evict {
+                    // A backend already bad before the recycle-safety check died
+                    // on a real transport/query error (e.g. PostgreSQL restart),
+                    // not a client recycle violation. Flag the pool so the next
+                    // sweep probes every idle backend and clears sibling zombies
+                    // before more clients reach them.
+                    if bad_before_checkin {
+                        pool.force_dead_sweep.store(true, Ordering::Relaxed);
+                    }
                     // Skip return_object so this connection never reaches the
                     // idle queue or a direct-handoff waiter. Update accounting
                     // in the same tick (decrement slots.size, restore or retire
@@ -268,6 +277,11 @@ struct PoolInner {
     /// `MAX_CONCURRENT_PRE_REPLACEMENTS` to prevent a burst of expiring
     /// connections from spawning too many background creates at once.
     pre_replacements_in_flight: AtomicUsize,
+    /// Set when a backend fails on a real transport error (e.g. PostgreSQL
+    /// restart) so the next `evict_dead_backends` pass probes every idle
+    /// backend, not only those idle past the skip-recent window. Cleared once
+    /// a full pass finds no dead backend.
+    force_dead_sweep: AtomicBool,
 }
 
 enum RecycleOutcome {
@@ -1450,6 +1464,7 @@ impl Pool {
                 create_done: Notify::new(),
                 scaling_stats: ScalingStats::default(),
                 pre_replacements_in_flight: AtomicUsize::new(0),
+                force_dead_sweep: AtomicBool::new(false),
             }),
         }
     }
@@ -1922,6 +1937,16 @@ impl Pool {
         }
 
         let checked = popped.len();
+        // A recent transport failure (set in Object::drop) means PostgreSQL
+        // likely bounced: probe every popped backend regardless of
+        // last_activity so sibling zombies are found in one pass instead of
+        // one client at a time.
+        let force_sweep = self.inner.force_dead_sweep.load(Ordering::Relaxed);
+        let effective_skip_threshold = if force_sweep {
+            Duration::ZERO
+        } else {
+            skip_recent_threshold
+        };
         // `EvictGuard` owns the worst-case bookkeeping should this scope
         // unwind during any `check_alive(...).await` below - cancellation,
         // panic, or a future `select!` wrapping the retain task. On
@@ -1967,7 +1992,7 @@ impl Pool {
             // Err on rare backwards-clock skew (NTP step); fall through
             // to a real check in that case, never skip it.
             if let Ok(elapsed) = inner.obj.last_activity.elapsed() {
-                if elapsed < skip_recent_threshold {
+                if elapsed < effective_skip_threshold {
                     survivors.push(inner);
                     continue;
                 }
@@ -1986,6 +2011,15 @@ impl Pool {
                     evicted += 1;
                 }
             }
+        }
+
+        // Keep the sweep armed across ticks until a full pass comes back
+        // clean, so a restart with more zombies than `max_per_cycle` drains
+        // over a few ticks instead of stalling.
+        if force_sweep {
+            self.inner
+                .force_dead_sweep
+                .store(evicted > 0, Ordering::Relaxed);
         }
 
         // 3. Happy-path commit: push survivors back, deduct evicted from
@@ -4406,6 +4440,50 @@ mod tests {
              bypass check_alive and survive the scan. evicted={evicted} \
              means the fast-path gate regressed and the scan re-probed \
              a connection the protocol_io layer just touched."
+        );
+    }
+
+    /// With the force-dead-sweep flag set (a sibling backend just failed on a
+    /// transport error), the scan must probe every popped backend regardless of
+    /// a fresh `last_activity`, so zombies from the same PostgreSQL restart are
+    /// evicted in one pass instead of one client at a time.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_dead_backends_force_sweep_probes_recent_backends() {
+        use crate::server::Server;
+
+        const ZOMBIES: usize = 4;
+        let pool = empty_test_pool();
+        {
+            let mut guard = pool.inner.slots.lock();
+            for _ in 0..ZOMBIES {
+                let server = Server::test_dead_socket();
+                guard.vec.push_back(ObjectInner {
+                    obj: server,
+                    metrics: Metrics::default(),
+                    coordinator_permit: None,
+                });
+                guard.size += 1;
+            }
+        }
+        // A recent transport failure armed the sweep.
+        pool.inner.force_dead_sweep.store(true, Ordering::Relaxed);
+
+        let (checked, evicted) = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, TEST_SKIP_RECENT_THRESHOLD)
+            .await;
+
+        assert_eq!(checked, ZOMBIES);
+        assert_eq!(
+            evicted, ZOMBIES,
+            "force_dead_sweep must override the skip-recent fast path and probe \
+             every backend, evicting the dead sockets; evicted={evicted}"
+        );
+        // Evictions still happened, so the sweep stays armed to keep draining
+        // on the next tick.
+        assert!(
+            pool.inner.force_dead_sweep.load(Ordering::Relaxed),
+            "sweep should remain armed while evictions are still happening"
         );
     }
 
