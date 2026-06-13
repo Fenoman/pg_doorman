@@ -131,7 +131,7 @@ pub struct General {
     /// given to a client. This helps detect dead connections caused by PostgreSQL
     /// restart, network issues, or server-side idle timeouts.
     /// 0 means disabled (no check).
-    /// Default: 30s
+    /// Default: 60s
     #[serde(default = "General::default_server_idle_check_timeout")]
     pub server_idle_check_timeout: Duration,
 
