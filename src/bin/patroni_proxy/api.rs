@@ -40,14 +40,34 @@ async fn read_http_request_with_timeout<S>(
 where
     S: AsyncRead + Unpin,
 {
-    match tokio::time::timeout(timeout, stream.read(buffer)).await {
-        Ok(Ok(0)) => Ok(None),
-        Ok(Ok(n)) => Ok(Some(n)),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out reading HTTP request",
-        )),
+    // Read until the HTTP header terminator (\r\n\r\n) is in view so a request
+    // whose headers (including the auth token) span multiple TCP segments is
+    // assembled before parsing. Bounded by the buffer length and one total
+    // deadline; an idle connection still times out.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut total = 0usize;
+    loop {
+        if total == buffer.len() {
+            // Headers did not terminate within the buffer; hand back what
+            // arrived so the request line and complete headers can be parsed.
+            return Ok(Some(total));
+        }
+        match tokio::time::timeout_at(deadline, stream.read(&mut buffer[total..])).await {
+            Ok(Ok(0)) => return Ok(if total == 0 { None } else { Some(total) }),
+            Ok(Ok(n)) => {
+                total += n;
+                if buffer[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    return Ok(Some(total));
+                }
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out reading HTTP request",
+                ))
+            }
+        }
     }
 }
 
@@ -376,6 +396,57 @@ mod tests {
                 .await;
 
         assert_eq!(result.unwrap_err().kind(), ErrorKind::TimedOut);
+    }
+
+    struct ChunkedReader {
+        chunks: Vec<Vec<u8>>,
+        pos: usize,
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.pos < this.chunks.len() {
+                let chunk = this.chunks[this.pos].clone();
+                this.pos += 1;
+                buf.put_slice(&chunk);
+            }
+            // Past the last chunk: fill nothing, which the reader sees as EOF.
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_http_request_is_assembled_across_reads() {
+        // Request line + Host in the first segment; the auth token header and
+        // the \r\n\r\n terminator only in a second segment.
+        let mut reader = ChunkedReader {
+            chunks: vec![
+                b"POST /update_clusters HTTP/1.1\r\nHost: x\r\n".to_vec(),
+                b"X-Patroni-Proxy-Token: secret\r\n\r\n".to_vec(),
+            ],
+            pos: 0,
+        };
+        let mut buffer = vec![0u8; 4096];
+
+        let n = read_http_request_with_timeout(&mut reader, &mut buffer, Duration::from_secs(1))
+            .await
+            .expect("read should succeed")
+            .expect("request should not be empty");
+
+        let request = String::from_utf8_lossy(&buffer[..n]);
+        assert!(
+            request.contains("X-Patroni-Proxy-Token: secret"),
+            "token header from the second segment must be assembled: {request:?}"
+        );
+        assert!(
+            request.contains("\r\n\r\n"),
+            "header terminator must be present after assembly"
+        );
     }
 
     #[tokio::test]
