@@ -89,6 +89,17 @@ pub fn is_set_forbidden(name: &str) -> bool {
     SET_FORBIDDEN_PARAMETERS.contains(name)
 }
 
+/// True when checkout sync MAY emit SET/RESET for this name. A curated,
+/// fork-agnostic allowlist: the tracked session GUCs plus planner keys.
+/// Backend `ParameterStatus` also stores read-only reported GUCs
+/// (`server_version`, and fork-specific ones such as PostgresPro/Tantor
+/// `pgpro_build` / `pgpro_edition` / `pgpro_version`); those are PGC_INTERNAL,
+/// so SETting them fails with SQLSTATE 55P02 and poisons the backend. An
+/// allowlist stays correct for every fork, where a read-only denylist cannot.
+pub fn is_syncable_param(name: &str) -> bool {
+    (TRACKED_PARAMETERS.contains(name) || is_planner_key(name)) && !is_set_forbidden(name)
+}
+
 /// Validate a client StartupMessage key before it can become
 /// `SET <key> TO ...` in checkout sync. The key must look like a GUC name,
 /// must be settable, and must not use PostgreSQL's `_pq_.` protocol prefix.
@@ -310,7 +321,9 @@ impl ServerParameters {
 
     /// Diff the backend snapshot (`self`) against the client's desired
     /// state and return the SET/RESET actions needed for checkout sync.
-    /// Forbidden names are skipped on both passes.
+    /// Only syncable params (tracked session GUCs + planner keys) are
+    /// considered; read-only reported GUCs (including fork-specific ones like
+    /// PostgresPro `pgpro_build`) are never SET/RESET — see `is_syncable_param`.
     #[inline(always)]
     pub(crate) fn compare_params(
         &self,
@@ -319,7 +332,7 @@ impl ServerParameters {
         let mut diff = HashMap::new();
 
         for (key, client_value) in &incoming_parameters.parameters {
-            if is_set_forbidden(key) {
+            if !is_syncable_param(key) {
                 continue;
             }
             match self.parameters.get(key) {
@@ -331,7 +344,7 @@ impl ServerParameters {
         }
 
         for key in self.parameters.keys() {
-            if is_set_forbidden(key) {
+            if !is_syncable_param(key) {
                 continue;
             }
             if !incoming_parameters.parameters.contains_key(key) {
@@ -632,6 +645,35 @@ mod tests {
         let diff = backend.compare_params(&client);
         assert!(!diff.contains_key("is_superuser"));
         assert!(!diff.contains_key("user"));
+    }
+
+    #[test]
+    fn compare_params_skips_backend_reported_fork_readonly_gucs() {
+        // PostgresPro/Tantor report PGC_INTERNAL GUCs (pgpro_build, pgpro_edition,
+        // pgpro_version) via ParameterStatus. They enter the map through the
+        // startup path but must NEVER be SET/RESET by checkout sync: the backend
+        // rejects them with SQLSTATE 55P02 and gets marked bad. An allowlist
+        // (tracked + planner keys) excludes any fork's read-only GUC without an
+        // ever-growing per-fork denylist.
+        let mut backend = ServerParameters::new();
+        let mut client = ServerParameters::new();
+        // Reported fork GUCs, differing between client and backend.
+        client.set_param("pgpro_build", "build-A", true);
+        backend.set_param("pgpro_build", "build-B", true);
+        client.set_param("pgpro_edition", "standard", true);
+        client.set_param("pgpro_version", "16.4", true);
+        // A legitimately syncable param must still flow through.
+        client.set_param("application_name", "svc:42", false);
+
+        let diff = backend.compare_params(&client);
+
+        assert!(!diff.contains_key("pgpro_build"), "read-only pgpro_build must not be SET");
+        assert!(!diff.contains_key("pgpro_edition"));
+        assert!(!diff.contains_key("pgpro_version"));
+        assert!(
+            matches!(diff.get("application_name"), Some(ParamAction::SetTo(v)) if v == "svc:42"),
+            "tracked application_name must still sync: {diff:?}"
+        );
     }
 
     #[test]
