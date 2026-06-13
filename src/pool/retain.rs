@@ -122,6 +122,9 @@ pub async fn retain_connections() {
     // the retain loop should not fire all backlog ticks at once and
     // re-acquire every pool's slots lock back-to-back.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Period the `interval` ticker was built with, so a live
+    // retain_connections_time change can rebuild it.
+    let mut current_retain_time = retain_time;
     let count = Arc::new(AtomicUsize::new(0));
 
     info!(
@@ -245,15 +248,30 @@ pub async fn retain_connections() {
         // Skipped per-pool when disabled, under_pressure, or paused - see
         // `Pool::evict_dead_backends` for the gating.
         //
-        // Re-fetch `dead_backend_check_*` from the current config on every
-        // tick so SIGHUP / admin RELOAD that adjusts these knobs takes
-        // effect immediately, without needing a process restart.
-        // (`retain_time` / `retain_max` are still read once at task start
-        // because changing them at runtime would also require rebuilding
-        // the `interval` ticker - a larger refactor.)
+        // Re-fetch the retain / dead-check knobs from the current config on
+        // every tick so a SIGHUP / admin RELOAD takes effect without a process
+        // restart. When retain_connections_time changes, rebuild the interval
+        // ticker; interval_at starts the next tick a full period out so the
+        // reload does not fire an extra immediate tick. A reload to zero is
+        // ignored to keep tokio::time::interval from panicking.
         let live_cfg = get_config();
         let dead_check_timeout = live_cfg.general.dead_backend_check_timeout.as_std();
         let dead_check_max = live_cfg.general.dead_backend_check_max_per_cycle;
+        let retain_time = live_cfg.general.retain_connections_time.as_std();
+        let retain_max = live_cfg.general.retain_connections_max;
+        if retain_time != current_retain_time && !retain_time.is_zero() {
+            info!(
+                "Retain interval updated {} -> {}",
+                format_elapsed(current_retain_time),
+                format_elapsed(retain_time)
+            );
+            current_retain_time = retain_time;
+            interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + retain_time,
+                retain_time,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        }
 
         // Pools are probed concurrently with a small fan-out cap so a
         // mass-PG-outage (every pool's backends timing out simultaneously)
