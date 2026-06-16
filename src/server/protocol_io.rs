@@ -41,17 +41,6 @@ fn sanitize_for_log(s: &str) -> String {
     }
 }
 
-fn is_streamable_large_message(code_u8: u8) -> bool {
-    matches!(code_u8, b'D' | b'd')
-}
-
-fn non_streamable_message_exceeds_config_cap(
-    code_u8: u8,
-    message_len: i32,
-    max_message_size: i32,
-) -> bool {
-    max_message_size > 0 && message_len > max_message_size && !is_streamable_large_message(code_u8)
-}
 use tokio::time::timeout;
 
 use crate::config::config_arc;
@@ -1222,8 +1211,7 @@ mod tests {
 
     use super::{
         classify_command_complete, classify_command_complete_with_reset_attribution,
-        handle_command_complete, handle_error_response, non_streamable_message_exceeds_config_cap,
-        CommandCompleteEffect,
+        handle_command_complete, handle_error_response, CommandCompleteEffect,
     };
     use crate::client::util::extract_set_cleanup_commands;
     use crate::server::cleanup::ResetCleanupCommand;
@@ -1694,15 +1682,6 @@ mod tests {
     }
 
     #[test]
-    fn non_streamable_backend_frames_are_capped_by_max_message_size() {
-        assert!(non_streamable_message_exceeds_config_cap(b'E', 1025, 1024));
-        assert!(!non_streamable_message_exceeds_config_cap(b'D', 1025, 1024));
-        assert!(!non_streamable_message_exceeds_config_cap(b'd', 1025, 1024));
-        assert!(!non_streamable_message_exceeds_config_cap(b'E', 1024, 1024));
-        assert!(!non_streamable_message_exceeds_config_cap(b'E', 1025, 0));
-    }
-
-    #[test]
     fn length_only_matches_do_not_confuse_classifier() {
         // Both DECLARE CURSOR and DEALLOCATE ALL are 15 bytes long with the
         // trailing NUL; the classifier must dispatch on content, not length.
@@ -1982,6 +1961,52 @@ mod tests {
         assert!(
             !server.is_data_available(),
             "unsupported COPY BOTH must not advertise buffered backend data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn large_non_streamable_frame_is_relayed_without_evicting_backend() {
+        // A non-DataRow backend frame larger than `message_size_to_be_stream`
+        // (1 KiB here) must be relayed to the client like any other frame and
+        // must NOT mark the backend bad. `message_size_to_be_stream` decides
+        // only whether a large DataRow/CopyData is streamed; it is not a hard
+        // reject ceiling for other frame types. A large PL/pgSQL
+        // NoticeResponse/ErrorResponse must pass through up to MAX_MESSAGE_SIZE
+        // (256 MiB), the only ceiling that rejects a non-streamable frame.
+        use super::Server;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.max_message_size = 1024;
+
+        // NoticeResponse 'N', message_len = 2000 (> 1 KiB cap, < 256 MiB):
+        // 1 type byte + 4-byte length field (value 2000) + 1996 body bytes.
+        let notice_len: i32 = 2000;
+        let mut notice = vec![b'N'];
+        notice.extend_from_slice(&notice_len.to_be_bytes());
+        notice.extend_from_slice(&vec![0u8; notice_len as usize - 4]);
+        peer.write_all(&notice)
+            .await
+            .expect("peer must write the large NoticeResponse");
+        // ReadyForQuery('I') terminates the relay loop.
+        peer.write_all(&[b'Z', 0, 0, 0, 5, b'I'])
+            .await
+            .expect("peer must write ReadyForQuery");
+
+        let response = server
+            .recv(tokio::io::sink(), None)
+            .await
+            .expect("large non-streamable NoticeResponse must be relayed, not rejected");
+
+        assert_eq!(
+            response.first(),
+            Some(&b'N'),
+            "the NoticeResponse must be forwarded to the client"
+        );
+        assert!(
+            !server.is_bad(),
+            "an oversize non-streamable frame must not evict a healthy backend"
         );
     }
 }
