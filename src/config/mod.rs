@@ -671,11 +671,12 @@ impl Config {
             ));
         }
         if default_admin_password_exposes_remote_tcp_admin(&self.general) {
-            return Err(Error::BadConfig(
-                "general.admin_password must not be a published default or generated placeholder when \
-                 general.host listens on a remote-capable TCP address and HBA allows remote TCP admin access"
-                    .to_string(),
-            ));
+            warn!(
+                "general.admin_password is a published default or generated placeholder while \
+                 general.host listens on a remote-capable TCP address and HBA allows remote TCP \
+                 admin access: the virtual admin console is reachable with a well-known password. \
+                 Set a unique general.admin_password."
+            );
         }
 
         // tokio_global_queue_interval / tokio_event_interval

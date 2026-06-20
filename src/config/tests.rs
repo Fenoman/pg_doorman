@@ -234,7 +234,7 @@ async fn test_validate_valid_config() {
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_wildcard_open_hba() {
+async fn test_validate_warns_but_allows_default_admin_password_on_wildcard_open_hba() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "0.0.0.0".to_string();
@@ -252,19 +252,20 @@ async fn test_validate_rejects_default_admin_password_on_wildcard_open_hba() {
     });
     config.pools.insert("test_pool".to_string(), pool);
 
-    let err = config
+    // The dangerous combination is still detected so the warning fires.
+    assert!(
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "published admin/admin on wildcard open HBA must be detected"
+    );
+    // But it no longer blocks startup: validate() succeeds (with a logged warning).
+    config
         .validate()
         .await
-        .expect_err("published admin/admin must be rejected on wildcard open HBA");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("general.admin_password") && msg.contains("admin"),
-        "unexpected error message: {msg}"
-    );
+        .expect("default admin password must warn, not reject");
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_wildcard_remote_pg_hba() {
+async fn test_default_admin_password_exposure_detected_on_wildcard_remote_pg_hba() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "0.0.0.0".to_string();
@@ -274,19 +275,14 @@ async fn test_validate_rejects_default_admin_password_on_wildcard_remote_pg_hba(
         "host all all 0.0.0.0/0 md5",
     ));
 
-    let err = config
-        .validate()
-        .await
-        .expect_err("remote admin/admin pg_hba must be rejected on wildcard listener");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("remote TCP admin access"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "remote admin/admin pg_hba on wildcard listener must be flagged"
     );
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_resolved_wildcard_host() {
+async fn test_default_admin_password_exposure_detected_on_resolved_wildcard_host() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "0".to_string();
@@ -295,19 +291,14 @@ async fn test_validate_rejects_default_admin_password_on_resolved_wildcard_host(
     config.general.hba.clear();
     config.general.pg_hba = None;
 
-    let err = config
-        .validate()
-        .await
-        .expect_err("host aliases resolving to wildcard must reject published admin/admin");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("remote TCP admin access"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "host aliases resolving to wildcard must be flagged for published admin/admin"
     );
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_non_loopback_ipv4_listener() {
+async fn test_default_admin_password_exposure_detected_on_non_loopback_ipv4_listener() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "192.0.2.10".to_string();
@@ -316,19 +307,14 @@ async fn test_validate_rejects_default_admin_password_on_non_loopback_ipv4_liste
     config.general.hba.clear();
     config.general.pg_hba = None;
 
-    let err = config
-        .validate()
-        .await
-        .expect_err("non-loopback listener plus open HBA must reject published admin/admin");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("remote TCP admin access"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "non-loopback listener plus open HBA must be flagged for published admin/admin"
     );
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_non_loopback_ipv6_listener() {
+async fn test_default_admin_password_exposure_detected_on_non_loopback_ipv6_listener() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "[2001:db8::10]".to_string();
@@ -337,19 +323,14 @@ async fn test_validate_rejects_default_admin_password_on_non_loopback_ipv6_liste
     config.general.hba.clear();
     config.general.pg_hba = None;
 
-    let err = config
-        .validate()
-        .await
-        .expect_err("non-loopback IPv6 listener plus open HBA must reject published admin/admin");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("remote TCP admin access"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "non-loopback IPv6 listener plus open HBA must be flagged for published admin/admin"
     );
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_private_admin_pg_hba() {
+async fn test_default_admin_password_exposure_detected_on_private_admin_pg_hba() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "0.0.0.0".to_string();
@@ -359,19 +340,14 @@ async fn test_validate_rejects_default_admin_password_on_private_admin_pg_hba() 
         "host pgdoorman admin 10.0.0.0/8 md5",
     ));
 
-    let err = config
-        .validate()
-        .await
-        .expect_err("private-CIDR admin/admin pg_hba must be rejected on wildcard listener");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("remote TCP admin access"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "private-CIDR admin/admin pg_hba on wildcard listener must be flagged"
     );
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_half_range_admin_pg_hba() {
+async fn test_default_admin_password_exposure_detected_on_half_range_admin_pg_hba() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "0.0.0.0".to_string();
@@ -381,19 +357,14 @@ async fn test_validate_rejects_default_admin_password_on_half_range_admin_pg_hba
         "host pgdoorman admin 0.0.0.0/1 md5",
     ));
 
-    let err = config
-        .validate()
-        .await
-        .expect_err("half-range admin pg_hba contains remote peers and must be rejected");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("remote TCP admin access"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "half-range admin pg_hba contains remote peers and must be flagged"
     );
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_private_legacy_hba() {
+async fn test_default_admin_password_exposure_detected_on_private_legacy_hba() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "0.0.0.0".to_string();
@@ -402,18 +373,14 @@ async fn test_validate_rejects_default_admin_password_on_private_legacy_hba() {
     config.general.hba = vec!["10.0.0.0/8".parse().unwrap()];
     config.general.pg_hba = None;
 
-    let err = config.validate().await.expect_err(
-        "private-CIDR legacy hba must reject published admin/admin on wildcard listener",
-    );
-    let msg = format!("{err}");
     assert!(
-        msg.contains("remote TCP admin access"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "private-CIDR legacy hba must be flagged for published admin/admin on wildcard listener"
     );
 }
 
 #[tokio::test]
-async fn test_validate_rejects_default_admin_password_on_half_range_legacy_hba() {
+async fn test_default_admin_password_exposure_detected_on_half_range_legacy_hba() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "0.0.0.0".to_string();
@@ -422,37 +389,27 @@ async fn test_validate_rejects_default_admin_password_on_half_range_legacy_hba()
     config.general.hba = vec!["0.0.0.0/1".parse().unwrap()];
     config.general.pg_hba = None;
 
-    let err = config
-        .validate()
-        .await
-        .expect_err("half-range legacy hba contains remote peers and must be rejected");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("remote TCP admin access"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "half-range legacy hba contains remote peers and must be flagged"
     );
 }
 
 #[tokio::test]
-async fn test_validate_rejects_generated_admin_placeholder_on_wildcard_open_hba() {
+async fn test_generated_admin_placeholder_exposure_detected_on_wildcard_open_hba() {
     let mut config = Config::default();
     config.general.host = "0.0.0.0".to_string();
     config.general.hba.clear();
     config.general.pg_hba = None;
 
-    let err = config
-        .validate()
-        .await
-        .expect_err("generated admin placeholder must be rejected on wildcard open HBA");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("general.admin_password") && msg.contains("published"),
-        "unexpected error message: {msg}"
+        default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "generated admin placeholder on wildcard open HBA must be flagged"
     );
 }
 
 #[tokio::test]
-async fn test_validate_allows_default_admin_password_on_wildcard_loopback_pg_hba() {
+async fn test_default_admin_password_not_flagged_on_wildcard_loopback_pg_hba() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);
     config.general.host = "0.0.0.0".to_string();
@@ -462,10 +419,16 @@ async fn test_validate_allows_default_admin_password_on_wildcard_loopback_pg_hba
         "host all all 127.0.0.1/32 trust\nhost all all ::1/128 trust",
     ));
 
+    // Loopback-only pg_hba keeps published admin/admin off remote TCP, so it is
+    // not flagged and validate() succeeds without a warning.
     assert!(
-        config.validate().await.is_ok(),
-        "loopback-only pg_hba keeps published admin/admin off remote TCP"
+        !default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "loopback-only pg_hba must not be flagged as remote-exposed"
     );
+    config
+        .validate()
+        .await
+        .expect("loopback-only pg_hba config must validate");
 }
 
 #[test]
