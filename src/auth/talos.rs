@@ -47,6 +47,24 @@ pub async fn load_talos_pub_key(key_filename: String) -> Result<(), Error> {
     Ok(())
 }
 
+/// Source used to choose a Talos pool user.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TalosUserSource {
+    /// Pool user equals the JWT `clientId`.
+    Personal,
+    /// Pool user is `srv-<clientId>`.
+    ServicePool,
+    /// Pool user is the max token role.
+    MaxRole,
+}
+
+/// Pool user selected for a Talos client.
+#[derive(Debug, Clone)]
+pub struct TalosResolution {
+    pub username: String,
+    pub source: TalosUserSource,
+}
+
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone)]
 pub enum Role {
     ReadOnly = 1,
@@ -76,6 +94,62 @@ pub fn talos_role_to_string(r: Role) -> String {
         Role::ReadWrite => "read_write".to_string(),
         Role::ReadOnly => "read_only".to_string(),
     }
+}
+
+/// Returns true when `client_id` can be used in pool lookup and logs.
+fn is_routable_client_id(client_id: &str) -> bool {
+    !client_id.is_empty() && client_id.bytes().all(|b| b >= 0x20 && b != 0x7F)
+}
+
+/// Selects a Talos pool user: `clientId`, `srv-<clientId>`, then max role.
+///
+/// Invalid `clientId` is ignored for routing, not for authentication.
+pub fn resolve_talos_user(
+    pool_name: &str,
+    client_id: &str,
+    max_role: Role,
+    pool_exists: impl Fn(&str, &str) -> bool,
+) -> TalosResolution {
+    if is_routable_client_id(client_id) {
+        if pool_exists(pool_name, client_id) {
+            return TalosResolution {
+                username: client_id.to_string(),
+                source: TalosUserSource::Personal,
+            };
+        }
+        let service_name = format!("srv-{client_id}");
+        if pool_exists(pool_name, &service_name) {
+            return TalosResolution {
+                username: service_name,
+                source: TalosUserSource::ServicePool,
+            };
+        }
+    } else if !client_id.is_empty() {
+        log::warn!(
+            "[talos] client_id {client_id:?} contains control characters; using max-role pool"
+        );
+    }
+    TalosResolution {
+        username: talos_role_to_string(max_role),
+        source: TalosUserSource::MaxRole,
+    }
+}
+
+/// Logs the Talos routing choice without token material.
+pub fn log_talos_routing(client_id: &str, pool_name: &str, role: Role, resolved: &TalosResolution) {
+    let route = match resolved.source {
+        TalosUserSource::Personal => "personal_pool",
+        TalosUserSource::ServicePool => "service_pool",
+        TalosUserSource::MaxRole => "max_role",
+    };
+    log::info!(
+        "[talos] auth: client_id={} pool={} role={} username={} route={}",
+        client_id,
+        pool_name,
+        talos_role_to_string(role),
+        resolved.username,
+        route,
+    );
 }
 
 fn get_max_role(roles: Vec<String>) -> Result<Role, Error> {
@@ -508,5 +582,109 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    // --- resolve_talos_user + log_talos_routing tests ---
+
+    #[test]
+    fn talos_resolution_struct_is_constructible() {
+        let resolved = TalosResolution {
+            username: "owner".to_string(),
+            source: TalosUserSource::MaxRole,
+        };
+        assert_eq!(resolved.source, TalosUserSource::MaxRole);
+        assert_eq!(resolved.username, "owner");
+    }
+
+    #[test]
+    fn resolve_personal_pool_wins() {
+        let resolved = resolve_talos_user("billing_db", "billing-api", Role::Owner, |db, user| {
+            db == "billing_db" && user == "billing-api"
+        });
+        assert_eq!(resolved.source, TalosUserSource::Personal);
+        assert_eq!(resolved.username, "billing-api");
+    }
+
+    #[test]
+    fn resolve_falls_through_to_service_pool() {
+        let resolved =
+            resolve_talos_user("billing_db", "billing-api", Role::ReadOnly, |_, user| {
+                user == "srv-billing-api"
+            });
+        assert_eq!(resolved.source, TalosUserSource::ServicePool);
+        assert_eq!(resolved.username, "srv-billing-api");
+    }
+
+    #[test]
+    fn resolve_falls_through_to_max_role() {
+        let resolved = resolve_talos_user("billing_db", "billing-api", Role::Owner, |_, _| false);
+        assert_eq!(resolved.source, TalosUserSource::MaxRole);
+        assert_eq!(resolved.username, "owner");
+    }
+
+    #[test]
+    fn resolve_max_role_variations() {
+        for (role, expected) in [
+            (Role::Owner, "owner"),
+            (Role::ReadWrite, "read_write"),
+            (Role::ReadOnly, "read_only"),
+        ] {
+            let resolved = resolve_talos_user("db", "billing-api", role, |_, _| false);
+            assert_eq!(resolved.source, TalosUserSource::MaxRole);
+            assert_eq!(resolved.username, expected);
+        }
+    }
+
+    #[test]
+    fn resolve_skips_personal_when_client_id_empty() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let resolved = resolve_talos_user("billing_db", "", Role::Owner, |_, _| {
+            calls.set(calls.get() + 1);
+            true
+        });
+        assert_eq!(resolved.source, TalosUserSource::MaxRole);
+        assert_eq!(
+            calls.get(),
+            0,
+            "pool_exists must not be called for empty client_id"
+        );
+    }
+
+    #[test]
+    fn resolve_skips_personal_when_client_id_has_null() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let resolved = resolve_talos_user("billing_db", "foo\0bar", Role::Owner, |_, _| {
+            calls.set(calls.get() + 1);
+            true
+        });
+        assert_eq!(resolved.source, TalosUserSource::MaxRole);
+        assert_eq!(
+            calls.get(),
+            0,
+            "pool_exists must not be called for control-char client_id"
+        );
+    }
+
+    #[test]
+    fn resolve_skips_personal_when_client_id_has_control_char() {
+        let resolved = resolve_talos_user("billing_db", "foo\u{0001}", Role::Owner, |_, _| true);
+        assert_eq!(resolved.source, TalosUserSource::MaxRole);
+    }
+
+    #[test]
+    fn log_talos_routing_does_not_panic_per_branch() {
+        for source in [
+            TalosUserSource::Personal,
+            TalosUserSource::ServicePool,
+            TalosUserSource::MaxRole,
+        ] {
+            let resolved = TalosResolution {
+                username: "user".to_string(),
+                source,
+            };
+            log_talos_routing("client", "db", Role::Owner, &resolved);
+        }
     }
 }

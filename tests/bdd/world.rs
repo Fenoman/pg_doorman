@@ -139,6 +139,10 @@ pub struct DoormanWorld {
     /// Acceptor tasks for TCP blackhole listeners started by
     /// `tests/bdd/blackhole_helper.rs`. Aborted when the world drops.
     pub blackhole_aborts: crate::blackhole_helper::BlackholeAbortHandles,
+    /// Temp directories for generated Talos public keys.
+    pub talos_pub_keys: Vec<tempfile::TempDir>,
+    /// Private keys paired with `talos_pub_keys`.
+    pub talos_priv_keys: Vec<tempfile::NamedTempFile>,
     /// Path to file capturing pg_doorman stderr (set by `pg_doorman log capture enabled`).
     /// When `Some`, `start_doorman_with_config` redirects the child's stderr there
     /// so scenarios can assert on log content via `pg_doorman log contains`.

@@ -1,5 +1,13 @@
 # Changelog
 
+### 3.11.0
+
+#### Talos can route through client-specific pools
+
+For `user=talos`, pg_doorman now selects the pool user in this order: `clientId`, `srv-<clientId>`, then the max token role (`owner`, `read_write`, `read_only`). Each Talos login logs the selected username and route.
+
+Backend `application_name` stays the Talos `clientId`, so `SHOW SERVERS` and `pg_stat_activity` still show the client service. Talos bypasses `pg_hba` for the resolved pool user; enforce per-service access in the token issuer policy or PostgreSQL grants.
+
 ### 3.10.8
 
 #### Cancelled backend startups clear their server stats row
