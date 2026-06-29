@@ -265,6 +265,61 @@ async fn test_validate_warns_but_allows_default_admin_password_on_wildcard_open_
 }
 
 #[tokio::test]
+async fn test_empty_admin_password_allowed_and_not_flagged_on_wildcard_open_hba() {
+    let mut config = Config::default();
+    use_strong_admin_password(&mut config);
+    config.general.host = "0.0.0.0".to_string();
+    config.general.admin_username = "admin".to_string();
+    config.general.admin_password = String::new();
+    config.general.hba.clear();
+    config.general.pg_hba = None;
+
+    let mut pool = Pool::default();
+    pool.users.push(User {
+        username: "test_user".to_string(),
+        password: "test_password".to_string(),
+        pool_size: 10,
+        ..User::default()
+    });
+    config.pools.insert("test_pool".to_string(), pool);
+
+    // An empty admin_password disables the admin console (auth::authenticate_admin
+    // rejects every login), so it is not a remote-exposure concern and is not
+    // flagged ...
+    assert!(
+        !default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "empty admin_password must not be flagged as remote-exposed (admin console is disabled)"
+    );
+    // ... and it no longer blocks startup.
+    config
+        .validate()
+        .await
+        .expect("empty admin password must not block startup");
+}
+
+#[tokio::test]
+async fn test_empty_admin_password_not_flagged_on_loopback_listener() {
+    let mut config = Config::default();
+    use_strong_admin_password(&mut config);
+    config.general.host = "127.0.0.1".to_string();
+    config.general.admin_username = "admin".to_string();
+    config.general.admin_password = String::new();
+    config.general.hba.clear();
+    config.general.pg_hba = None;
+
+    // Loopback-only listener keeps the empty-password admin console off remote
+    // TCP, so it is not flagged and validate() succeeds without a warning.
+    assert!(
+        !default_admin_password_exposes_remote_tcp_admin(&config.general),
+        "empty admin_password on loopback listener must not be flagged"
+    );
+    config
+        .validate()
+        .await
+        .expect("loopback empty admin password must validate");
+}
+
+#[tokio::test]
 async fn test_default_admin_password_exposure_detected_on_wildcard_remote_pg_hba() {
     let mut config = Config::default();
     use_strong_admin_password(&mut config);

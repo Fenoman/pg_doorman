@@ -161,6 +161,26 @@ fn test_admin_authentication() {
     });
 }
 
+// An empty admin_password disables the virtual admin console: the admin login
+// is rejected outright with a clear reason, instead of `md5_hash_password`
+// accepting a client that simply sends an empty password. The pooler itself
+// keeps running; only admin access is blocked.
+#[test]
+fn admin_authentication_rejected_when_admin_password_empty() {
+    futures::executor::block_on(run_test(|| async {
+        let mut reader = MockReader::new(vec![]);
+        let mut writer = MockWriter::new();
+
+        let result = authenticate_admin(&mut reader, &mut writer, "admin", "admin", "").await;
+
+        let err = result.expect_err("empty admin_password must disable the admin console");
+        assert!(
+            format!("{err}").contains("admin console disabled"),
+            "expected admin-console-disabled rejection, got: {err}"
+        );
+    }));
+}
+
 #[test]
 fn admin_hba_trust_rejects_wrong_startup_username() {
     futures::executor::block_on(run_test(|| async {
