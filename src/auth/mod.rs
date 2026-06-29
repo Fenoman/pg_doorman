@@ -187,6 +187,19 @@ where
     S: AsyncReadExt + Unpin,
     T: AsyncWriteExt + Unpin,
 {
+    // An empty configured admin_password disables the virtual admin console:
+    // reject every login attempt outright. Otherwise md5_hash_password would
+    // accept a client that simply sends an empty password. The pooler keeps
+    // serving normal users; only the admin console is unreachable.
+    if admin_password.is_empty() {
+        let error = Error::AuthError(format!(
+            "admin console disabled: general.admin_password is not set (user {username_from_parameters})"
+        ));
+        warn!("{error}");
+        wrong_password(write, username_from_parameters).await?;
+        return Err(error);
+    }
+
     // Authenticate admin user with md5.
     let salt = md5_challenge(write).await?;
     let password_response = read_password(read).await?;

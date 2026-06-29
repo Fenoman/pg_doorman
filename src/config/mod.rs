@@ -665,11 +665,6 @@ impl Config {
                 "general.admin_username must not be empty".to_string(),
             ));
         }
-        if self.general.admin_password.trim().is_empty() {
-            return Err(Error::BadConfig(
-                "general.admin_password must not be empty".to_string(),
-            ));
-        }
         if default_admin_password_exposes_remote_tcp_admin(&self.general) {
             warn!(
                 "general.admin_password is a published default or generated placeholder while \
