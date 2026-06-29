@@ -2,13 +2,34 @@
 
 use super::mocks::{run_test, MockReader, MockWriter};
 use super::*;
+use openssl::rsa::Rsa;
+use std::io::Write;
+use tempfile::NamedTempFile;
 
-// Mock for get_config and get_pool
-fn mock_get_config() -> crate::config::Config {
-    let mut config = crate::config::Config::default();
-    config.general.admin_username = "admin".to_string();
-    config.general.admin_password = "admin_password".to_string();
-    config
+// Generate a throwaway RSA key pair written to temp PEM files (private, public).
+fn generate_temp_rsa_keys() -> (NamedTempFile, NamedTempFile) {
+    let rsa = Rsa::generate(2048).unwrap();
+
+    let mut private_file = NamedTempFile::new().unwrap();
+    private_file.write_all(&rsa.private_key_to_pem().unwrap()).unwrap();
+    private_file.flush().unwrap();
+
+    let mut public_file = NamedTempFile::new().unwrap();
+    public_file.write_all(&rsa.public_key_to_pem().unwrap()).unwrap();
+    public_file.flush().unwrap();
+
+    (private_file, public_file)
+}
+
+// Frame `payload` as a PostgreSQL password message ('p') split into the exact
+// chunks `read_password` consumes (type byte, length, body) so MockReader feeds
+// it one read at a time.
+fn password_message(payload: &[u8]) -> Vec<Vec<u8>> {
+    // PostgreSQL password messages are NUL-terminated; vec_to_string relies on it.
+    let mut body = payload.to_vec();
+    body.push(0);
+    let len = (body.len() as i32 + 4).to_be_bytes().to_vec();
+    vec![vec![b'p'], len, body]
 }
 
 fn admin_client_identifier(username: &str) -> ClientIdentifier {
@@ -41,124 +62,161 @@ fn hba_trust_rejects_scram_passthrough_without_backend_secret() {
     ));
 }
 
-// Tests for JWT authentication
-#[test]
-fn test_jwt_authentication() {
-    let _result = run_test(|| async {
-        let mut reader = MockReader::new(vec![b"valid_token".to_vec()]);
-        let mut writer = MockWriter::new();
+// JWT wrapper happy path: a properly signed token is accepted end-to-end
+// (cleartext challenge -> read framed token -> validate against the loaded pub
+// key -> username matches). The validation internals are covered in jwt.rs; this
+// exercises the authenticate_with_jwt wrapper itself.
+#[tokio::test]
+async fn authenticate_with_jwt_accepts_valid_token() {
+    let (private_file, public_file) = generate_temp_rsa_keys();
+    let private_path = private_file.path().to_str().unwrap().to_string();
+    let public_path = public_file.path().to_str().unwrap().to_string();
 
-        let result = authenticate_with_jwt(
-            &mut reader,
-            &mut writer,
-            crate::auth::jwt::JwtVerifierConfig {
-                key_filename: "jwt_pub_key".to_string(),
-                issuer: "issuer".to_string(),
-                audience: "audience".to_string(),
-            },
-            "test_user",
-            "test_pool",
-            "127.0.0.1:5432",
-        )
-        .await;
+    crate::auth::jwt::load_jwt_pub_key(public_path.clone())
+        .await
+        .expect("pub key must load");
 
-        assert!(result.is_ok());
+    let claims = crate::auth::jwt::new_claims_with_scope(
+        "test_user".to_string(),
+        std::time::Duration::from_secs(3600),
+        "issuer".to_string(),
+        "audience".to_string(),
+    );
+    let token = crate::auth::jwt::sign_with_jwt_priv_key(claims, private_path)
+        .await
+        .expect("token must sign");
 
-        result
-    });
+    let mut reader = MockReader::new(password_message(token.as_bytes()));
+    let mut writer = MockWriter::new();
+
+    let result = authenticate_with_jwt(
+        &mut reader,
+        &mut writer,
+        crate::auth::jwt::JwtVerifierConfig {
+            key_filename: public_path,
+            issuer: "issuer".to_string(),
+            audience: "audience".to_string(),
+        },
+        "test_user",
+        "test_pool",
+        "127.0.0.1:5432",
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "a valid signed token must authenticate, got: {result:?}"
+    );
 }
 
-#[test]
-fn test_jwt_authentication_failure() {
-    let _result = run_test(|| async {
-        let mut reader = MockReader::new(vec![b"invalid_token".to_vec()]);
-        let mut writer = MockWriter::new();
+// JWT wrapper failure path: a token signed for a different audience than the
+// verifier expects is rejected with a JWTValidate error and the client receives
+// a 28P01 auth-failure response.
+#[tokio::test]
+async fn authenticate_with_jwt_rejects_wrong_audience_token() {
+    let (private_file, public_file) = generate_temp_rsa_keys();
+    let private_path = private_file.path().to_str().unwrap().to_string();
+    let public_path = public_file.path().to_str().unwrap().to_string();
 
-        let result = authenticate_with_jwt(
-            &mut reader,
-            &mut writer,
-            crate::auth::jwt::JwtVerifierConfig {
-                key_filename: "jwt_pub_key".to_string(),
-                issuer: "issuer".to_string(),
-                audience: "audience".to_string(),
-            },
-            "test_user",
-            "test_pool",
-            "127.0.0.1:5432",
-        )
-        .await;
+    crate::auth::jwt::load_jwt_pub_key(public_path.clone())
+        .await
+        .expect("pub key must load");
 
-        assert!(result.is_err());
-        if let Err(Error::JWTValidate(ref msg)) = result {
-            assert!(msg.contains("Invalid JWT token"));
-        } else {
-            panic!("Expected JWTValidate error");
-        }
+    // Signed correctly, but for an audience the verifier does not accept.
+    let claims = crate::auth::jwt::new_claims_with_scope(
+        "test_user".to_string(),
+        std::time::Duration::from_secs(3600),
+        "issuer".to_string(),
+        "wrong_audience".to_string(),
+    );
+    let token = crate::auth::jwt::sign_with_jwt_priv_key(claims, private_path)
+        .await
+        .expect("token must sign");
 
-        result
-    });
+    let mut reader = MockReader::new(password_message(token.as_bytes()));
+    let mut writer = MockWriter::new();
+
+    let result = authenticate_with_jwt(
+        &mut reader,
+        &mut writer,
+        crate::auth::jwt::JwtVerifierConfig {
+            key_filename: public_path,
+            issuer: "issuer".to_string(),
+            audience: "audience".to_string(),
+        },
+        "test_user",
+        "test_pool",
+        "127.0.0.1:5432",
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(Error::JWTValidate(_))),
+        "wrong-audience token must be rejected, got: {result:?}"
+    );
+    let written = writer.get_written().concat();
+    assert!(
+        String::from_utf8_lossy(&written).contains("28P01"),
+        "client must receive a 28P01 auth-failure response"
+    );
 }
 
-// Test for SCRAM authentication
-#[test]
-fn test_scram_authentication() {
-    let _result = run_test(|| async {
-        // For SCRAM authentication, we need to mock the client first message and final message
-        let client_first_message =
-            format!("{SCRAM_SHA_256}\\0\\0\\0\\0 n,,n=,r=5DAkMQDUZpG/3GcwewTYJZbD");
-        let client_final_message = "c=biws,r=5DAkMQDUZpG/3GcwewTYJZbDrandom,p=validproof";
+// SCRAM wrapper rejects a misconfigured pool password (not a valid SCRAM
+// verifier) before any handshake, returning an error instead of panicking or
+// hanging. The SCRAM parsing/crypto internals are covered in scram.rs; a full
+// successful handshake needs a real SCRAM client and is out of scope here (the
+// `full_test` in scram.rs is commented out for the same reason).
+#[tokio::test]
+async fn authenticate_with_scram_rejects_invalid_server_secret() {
+    let mut reader = MockReader::new(vec![]);
+    let mut writer = MockWriter::new();
 
-        let mut reader = MockReader::new(vec![
-            client_first_message.as_bytes().to_vec(),
-            client_final_message.as_bytes().to_vec(),
-        ]);
-        let mut writer = MockWriter::new();
+    let result = authenticate_with_scram(
+        &mut reader,
+        &mut writer,
+        "not-a-valid-scram-verifier",
+        "test_user",
+        "test_pool",
+        "127.0.0.1:5432",
+        false, // use_tls
+    )
+    .await;
 
-        let server_secret = format!("{SCRAM_SHA_256}$4096:salt$storedkey:serverkey");
-
-        let result = authenticate_with_scram(
-            &mut reader,
-            &mut writer,
-            &server_secret,
-            "test_user",
-            "test_pool",
-            "127.0.0.1:5432",
-            false, // use_tls: legacy plain-TCP scenario for this fixture
-        )
-        .await;
-        assert!(result.is_ok());
-    });
+    assert!(
+        result.is_err(),
+        "an invalid SCRAM server secret must be rejected, got: {result:?}"
+    );
 }
 
-// Test for admin authentication
+// Test for admin authentication credential check. The md5 challenge salt is
+// random inside authenticate_admin, so the verifiable, deterministic part is the
+// constant-time response check; admin_password_response_valid exposes it.
 #[test]
-fn test_admin_authentication() {
-    let _result = run_test(|| async {
-        // Mock the password response for admin authentication
-        let config = mock_get_config();
-        let salt = [1, 2, 3, 4];
-        let password_hash = md5_hash_password(
-            &config.general.admin_username,
-            &config.general.admin_password,
-            &salt,
-        );
+fn admin_password_response_valid_accepts_correct_and_rejects_wrong() {
+    let username = "admin";
+    let password = "admin_password";
+    let salt = [1u8, 2, 3, 4];
 
-        let mut reader = MockReader::new(vec![password_hash]);
-        let mut writer = MockWriter::new();
+    // The md5 response a client computes for the correct password under the salt.
+    let correct = md5_hash_password(username, password, &salt);
+    assert!(
+        admin_password_response_valid(username, password, &salt, &correct),
+        "correct md5 response must be accepted"
+    );
 
-        let result = authenticate_admin(
-            &mut reader,
-            &mut writer,
-            "admin",
-            &config.general.admin_username,
-            &config.general.admin_password,
-        )
-        .await;
+    // A response for a different password must be rejected.
+    let wrong_password = md5_hash_password(username, "not_the_password", &salt);
+    assert!(
+        !admin_password_response_valid(username, password, &salt, &wrong_password),
+        "md5 response for a different password must be rejected"
+    );
 
-        // This test might fail due to the need for more sophisticated mocking
-        // of the get_config function
-        assert!(result.is_ok());
-    });
+    // A response computed under a different salt must be rejected.
+    let wrong_salt = md5_hash_password(username, password, &[9u8, 9, 9, 9]);
+    assert!(
+        !admin_password_response_valid(username, password, &salt, &wrong_salt),
+        "md5 response computed under a different salt must be rejected"
+    );
 }
 
 // An empty admin_password disables the virtual admin console: the admin login

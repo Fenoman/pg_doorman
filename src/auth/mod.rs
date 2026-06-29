@@ -204,14 +204,9 @@ where
     let salt = md5_challenge(write).await?;
     let password_response = read_password(read).await?;
 
-    // Compare server and client hashes.
-    let password_hash = md5_hash_password(admin_username, admin_password, &salt);
-
-    // constant-time compare. `Vec::eq` short-circuits on first mismatching
-    // byte and leaks the matched prefix length through response timing, enabling
-    // a byte-by-byte brute-force of the admin MD5 hash. Especially load-bearing
-    // because old generated configs may still carry published admin credentials.
-    if !bool::from(password_hash.ct_eq(&password_response)) {
+    // Compare server and client hashes in constant time (see
+    // `admin_password_response_valid`).
+    if !admin_password_response_valid(admin_username, admin_password, &salt, &password_response) {
         let error = Error::AuthError(format!(
             "Invalid password for admin user: {username_from_parameters}"
         ));
@@ -223,6 +218,26 @@ where
     }
 
     Ok((false, ServerParameters::admin()))
+}
+
+/// Constant-time check that the client's md5 `response` matches the configured
+/// admin credentials for the challenge `salt`. Splitting this out of the
+/// `authenticate_admin` I/O makes the credential check unit-testable.
+///
+/// `Vec::eq` short-circuits on the first mismatching byte and leaks the matched
+/// prefix length through response timing, enabling a byte-by-byte brute-force of
+/// the admin MD5 hash; the constant-time compare avoids that. Especially
+/// load-bearing because old generated configs may still carry published admin
+/// credentials.
+fn admin_password_response_valid(
+    admin_username: &str,
+    admin_password: &str,
+    salt: &[u8],
+    response: &[u8],
+) -> bool {
+    md5_hash_password(admin_username, admin_password, salt)
+        .ct_eq(response)
+        .into()
 }
 
 fn md5_verifier_hash(password: &str) -> Option<&str> {
