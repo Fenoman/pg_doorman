@@ -358,9 +358,18 @@ mod tests {
         let (_, _, _, p99_query) = address_stats.get_query_percentiles();
         let (_, _, _, p99_xact) = address_stats.get_xact_percentiles();
         let (_, _, _, p99_wait) = address_stats.get_wait_percentiles();
-        assert!(p99_query > 0, "query p99 cache zeroed by multi-server reset: {p99_query}");
-        assert!(p99_xact > 0, "xact p99 cache zeroed by multi-server reset: {p99_xact}");
-        assert!(p99_wait > 0, "wait p99 cache zeroed by multi-server reset: {p99_wait}");
+        assert!(
+            p99_query > 0,
+            "query p99 cache zeroed by multi-server reset: {p99_query}"
+        );
+        assert!(
+            p99_xact > 0,
+            "xact p99 cache zeroed by multi-server reset: {p99_xact}"
+        );
+        assert!(
+            p99_wait > 0,
+            "wait p99 cache zeroed by multi-server reset: {p99_wait}"
+        );
 
         // The shared flag is cleared so the next cycle's averages pass runs.
         assert!(!snapshot[0].check_address_stat_average_is_updated_status());

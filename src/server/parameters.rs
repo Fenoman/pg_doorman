@@ -667,7 +667,10 @@ mod tests {
 
         let diff = backend.compare_params(&client);
 
-        assert!(!diff.contains_key("pgpro_build"), "read-only pgpro_build must not be SET");
+        assert!(
+            !diff.contains_key("pgpro_build"),
+            "read-only pgpro_build must not be SET"
+        );
         assert!(!diff.contains_key("pgpro_edition"));
         assert!(!diff.contains_key("pgpro_version"));
         assert!(
