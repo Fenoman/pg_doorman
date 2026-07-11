@@ -1616,7 +1616,7 @@ fields:
           SQL executed on every backend right before it returns to the pool, to clear
           session-scoped state PostgreSQL does not reset between transactions
           (advisory locks, `pg_variables` session vars, etc.).
-          * Omit  -> iServ-compatible default: `SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();`
+          * Omit  -> iServ-compatible default: `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`
             (requires the `pg_variables` extension to provide `pgv_free()`)
           * `""`  -> release-query disabled, nothing is executed at checkin
           * other -> exactly that SQL runs on every checkin
@@ -1627,7 +1627,7 @@ fields:
           возвратом в пул. Очищает session-scoped состояние, которое PostgreSQL сам
           между транзакциями не сбрасывает (advisory-локи, session-переменные
           расширения `pg_variables` и т.п.).
-          * не указано -> iServ-compatible default: `SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();`
+          * не указано -> iServ-compatible default: `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`
             (требуется расширение `pg_variables` для `pgv_free()`)
           * `""` -> release-query отключён, на checkin ничего не выполняется
           * иначе -> ровно эта SQL выполняется на каждом checkin

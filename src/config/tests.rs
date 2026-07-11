@@ -4004,6 +4004,18 @@ async fn validate_release_query_allows_exact_known_cleanup_function_targets() {
 }
 
 #[tokio::test]
+async fn validate_release_query_allows_combined_cleanup_select() {
+    // Both trusted cleanup functions in one SELECT target list (the iServ
+    // default form) must validate, not just one-function-per-statement.
+    let mut pool = release_query_pool(Some(
+        "SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free()".to_string(),
+    ));
+    pool.validate()
+        .await
+        .expect("combined trusted cleanup functions in one SELECT must be valid");
+}
+
+#[tokio::test]
 async fn validate_release_query_rejects_qualified_trusted_function_spoofs() {
     for query in [
         "SELECT attacker_schema.set_config('work_mem', '64MB', true)",
