@@ -33,87 +33,73 @@ Feature: Admin console client leak detection
   Scenario: Client leak detection via show clients after TCP abort
     # Connect stable driver connection to admin console
     When we create admin session "stable" to pg_doorman as "admin" with password "admin"
-    # Execute show clients - should see only our connection (1 row)
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    # Should see only our own connection (1 row) once it is registered
+    Then admin session "stable" eventually shows 1 clients
     # Connect raw session to admin console
     When we create admin session "raw" to pg_doorman as "admin" with password "admin"
-    # Execute show clients on raw session
+    # Execute show clients on raw session (smoke check it can query)
     And we execute "show clients" on admin session "raw" and store row count
     # In stable connection should see 2 clients now
-    When we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     # Abort TCP connection for raw session (simulate network failure)
     When we abort TCP connection for session "raw"
     # Wait for pg_doorman to detect the disconnection
     And we sleep 2000ms
     # In stable connection should see only 1 client again
-    When we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
 
   @admin-leak-aggressive-connect-disconnect
   Scenario: Aggressive connect/disconnect cycle - 5 connections
     # Connect stable driver connection to admin console
     When we create admin session "stable" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
     # Aggressively connect and disconnect 5 raw sessions
     When we create admin session "raw1" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     When we abort TCP connection for session "raw1"
     And we sleep 500ms
     When we create admin session "raw2" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     When we abort TCP connection for session "raw2"
     And we sleep 500ms
     When we create admin session "raw3" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     When we abort TCP connection for session "raw3"
     And we sleep 500ms
     When we create admin session "raw4" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     When we abort TCP connection for session "raw4"
     And we sleep 500ms
     When we create admin session "raw5" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     When we abort TCP connection for session "raw5"
     And we sleep 2000ms
     # After all aborts, should see only stable connection
-    When we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
 
   @admin-leak-multiple-simultaneous
   Scenario: Multiple simultaneous connections then all abort
     # Connect stable driver connection to admin console
     When we create admin session "stable" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
     # Connect multiple raw sessions simultaneously
     When we create admin session "raw1" to pg_doorman as "admin" with password "admin"
     And we create admin session "raw2" to pg_doorman as "admin" with password "admin"
     And we create admin session "raw3" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 4
+    Then admin session "stable" eventually shows 4 clients
     # Abort all raw connections
     When we abort TCP connection for session "raw1"
     And we abort TCP connection for session "raw2"
     And we abort TCP connection for session "raw3"
     And we sleep 2000ms
     # Should see only stable connection
-    When we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
 
   @admin-leak-rapid-fire
   Scenario: Rapid fire connect/abort without waiting
     # Connect stable driver connection to admin console
     When we create admin session "stable" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
     # Rapid fire: connect and immediately abort 10 times
     When we create admin session "rapid1" to pg_doorman as "admin" with password "admin"
     And we abort TCP connection for session "rapid1"
@@ -138,20 +124,17 @@ Feature: Admin console client leak detection
     # Wait for cleanup
     And we sleep 3000ms
     # Should see only stable connection - no leaked clients
-    When we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
 
   @admin-leak-interleaved-operations
   Scenario: Interleaved connect/query/abort operations
     # Connect stable driver connection to admin console
     When we create admin session "stable" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
     # Connect raw, execute query, then abort
     When we create admin session "raw1" to pg_doorman as "admin" with password "admin"
     And we execute "show clients" on admin session "raw1" and store row count
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     When we abort TCP connection for session "raw1"
     And we sleep 500ms
     # Connect another raw, execute multiple queries, then abort
@@ -159,16 +142,13 @@ Feature: Admin console client leak detection
     And we execute "show clients" on admin session "raw2" and store row count
     And we execute "show servers" on admin session "raw2" and store row count
     And we execute "show pools" on admin session "raw2" and store row count
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     When we abort TCP connection for session "raw2"
     And we sleep 500ms
     # Connect raw, don't execute any query, just abort
     When we create admin session "raw3" to pg_doorman as "admin" with password "admin"
-    And we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 2
+    Then admin session "stable" eventually shows 2 clients
     When we abort TCP connection for session "raw3"
     And we sleep 2000ms
     # Final check - should see only stable connection
-    When we execute "show clients" on admin session "stable" and store row count
-    Then admin session "stable" row count should be 1
+    Then admin session "stable" eventually shows 1 clients
