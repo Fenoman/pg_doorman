@@ -710,6 +710,24 @@ impl PgConnection {
         drop(self.stream);
     }
 
+    /// Shrink the kernel receive buffer (SO_RCVBUF) of the client socket so
+    /// the peer's writes start blocking after a few kilobytes of unread
+    /// responses. Plain TCP connections only.
+    pub fn shrink_recv_buffer(&self, bytes: usize) -> tokio::io::Result<()> {
+        match &self.stream {
+            StreamKind::Plain(s) => {
+                use std::os::unix::io::AsRawFd;
+                let fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(s.as_raw_fd()) };
+                let sock = socket2::SockRef::from(&fd);
+                sock.set_recv_buffer_size(bytes)?;
+                Ok(())
+            }
+            _ => Err(tokio::io::Error::other(
+                "shrink_recv_buffer supports plain TCP streams only",
+            )),
+        }
+    }
+
     /// Send TCP RST instead of FIN. SO_LINGER with timeout=0 makes the kernel
     /// send RST on close, which triggers BrokenPipe/ConnectionReset on the peer.
     pub async fn abort_connection_with_rst(self) {
