@@ -307,7 +307,7 @@ pub struct Pool {
     /// between transactions (advisory locks, session variables, etc.).
     ///
     /// * `None` (omitted) - the iServ-compatible default is used:
-    ///   `SELECT pg_advisory_unlock_all(); SELECT public.pgv_free();`.
+    ///   `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`.
     ///   Requires the `pg_variables` extension to provide `pgv_free()`.
     /// * `Some("")` - release-query is disabled, nothing is executed.
     /// * `Some("custom SQL")` - exactly that SQL runs on every checkin.

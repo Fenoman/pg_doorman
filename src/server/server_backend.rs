@@ -141,7 +141,8 @@ pub(crate) const HOUSEKEEPING_TIMEOUT: Duration = Duration::from_secs(30);
 /// extension. Used when `release_query` is omitted from the pool config; if
 /// `pgv_free()` is not available on the target database the operator must
 /// either install `pg_variables` or set `release_query = ""` to disable.
-const RELEASE_SESSION_QUERY: &str = "SELECT pg_advisory_unlock_all();\nSELECT public.pgv_free();\n";
+const RELEASE_SESSION_QUERY: &str =
+    "SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();";
 
 async fn finish_graceful_terminate<W>(
     mut stream: W,
