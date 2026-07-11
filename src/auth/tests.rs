@@ -11,11 +11,15 @@ fn generate_temp_rsa_keys() -> (NamedTempFile, NamedTempFile) {
     let rsa = Rsa::generate(2048).unwrap();
 
     let mut private_file = NamedTempFile::new().unwrap();
-    private_file.write_all(&rsa.private_key_to_pem().unwrap()).unwrap();
+    private_file
+        .write_all(&rsa.private_key_to_pem().unwrap())
+        .unwrap();
     private_file.flush().unwrap();
 
     let mut public_file = NamedTempFile::new().unwrap();
-    public_file.write_all(&rsa.public_key_to_pem().unwrap()).unwrap();
+    public_file
+        .write_all(&rsa.public_key_to_pem().unwrap())
+        .unwrap();
     public_file.flush().unwrap();
 
     (private_file, public_file)

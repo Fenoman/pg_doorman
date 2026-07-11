@@ -266,10 +266,8 @@ pub async fn retain_connections() {
                 format_elapsed(retain_time)
             );
             current_retain_time = retain_time;
-            interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + retain_time,
-                retain_time,
-            );
+            interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + retain_time, retain_time);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
 
