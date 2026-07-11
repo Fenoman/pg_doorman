@@ -1,6 +1,7 @@
 use crate::pg_connection::PgConnection;
 use crate::world::DoormanWorld;
 use cucumber::{then, when};
+use std::time::{Duration, Instant};
 
 #[when(
     regex = r#"^we create admin session "([^"]+)" to pg_doorman as "([^"]+)" with password "([^"]*)"$"#
@@ -50,6 +51,37 @@ pub async fn execute_admin_command(world: &mut DoormanWorld, query: String, sess
     }
 }
 
+/// Send `query` on an admin session and count the DataRow messages in the
+/// response, reading until ReadyForQuery. Panics on an ErrorResponse.
+///
+/// Shared by the `store row count` step and the polling
+/// `eventually shows N clients` step so both count DataRows identically.
+async fn query_admin_row_count(conn: &mut PgConnection, query: &str, session_name: &str) -> i32 {
+    conn.send_simple_query(query)
+        .await
+        .expect("Failed to send query");
+
+    // Read messages and count DataRow messages
+    let mut row_count = 0;
+    loop {
+        let (msg_type, data) = conn.read_message().await.expect("Failed to read message");
+
+        match msg_type {
+            // DataRow - count it
+            'D' => row_count += 1,
+            // ReadyForQuery - done
+            'Z' => break,
+            'E' => {
+                panic!("Error received from admin session '{session_name}': {data:?}");
+            }
+            // RowDescription / CommandComplete / other - skip
+            _ => {}
+        }
+    }
+
+    row_count
+}
+
 #[when(regex = r#"^we execute "([^"]+)" on admin session "([^"]+)" and store row count$"#)]
 pub async fn execute_admin_query_and_store_row_count(
     world: &mut DoormanWorld,
@@ -57,39 +89,7 @@ pub async fn execute_admin_query_and_store_row_count(
     session_name: String,
 ) {
     let conn = super::helpers::get_session(&mut world.named_sessions, &session_name);
-
-    conn.send_simple_query(&query)
-        .await
-        .expect("Failed to send query");
-
-    // Read messages and count DataRow messages
-    let mut row_count = 0;
-    loop {
-        let (msg_type, _data) = conn.read_message().await.expect("Failed to read message");
-
-        match msg_type {
-            'T' => {
-                // RowDescription - skip
-            }
-            'D' => {
-                // DataRow - count it
-                row_count += 1;
-            }
-            'C' => {
-                // CommandComplete - skip
-            }
-            'Z' => {
-                // ReadyForQuery - done
-                break;
-            }
-            'E' => {
-                panic!("Error received from admin session '{session_name}': {_data:?}");
-            }
-            _ => {
-                // Other messages - skip
-            }
-        }
-    }
+    let row_count = query_admin_row_count(conn, &query, &session_name).await;
 
     // Store row count in session_backend_pids (reusing existing field for simplicity)
     world
@@ -267,6 +267,39 @@ pub async fn verify_admin_row_count(
         *actual_count, expected_count,
         "Admin session '{session_name}': expected {expected_count} rows, got {actual_count}"
     );
+}
+
+/// Poll `SHOW CLIENTS` on an admin session until the DataRow count equals
+/// `expected_count`, panicking after a ~5s timeout with the last count seen.
+///
+/// Client (de)registration in pg_doorman's stats is eventually consistent:
+/// there is a small lag between a client connecting to (or being evicted
+/// from) the admin console and it appearing in / disappearing from
+/// `SHOW CLIENTS`. A single snapshot can therefore race the registration and
+/// observe a stale count. Polling for the *exact* expected count keeps the
+/// leak-detection semantics intact — the scenario still verifies that a
+/// connect adds exactly one visible session and an abort removes it (a real
+/// leak would keep the count too high and make this step time out) — while
+/// removing the flake under full-suite load.
+#[then(regex = r#"^admin session "([^"]+)" eventually shows (\d+) clients$"#)]
+pub async fn verify_admin_eventually_shows_clients(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected_count: i32,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let conn = super::helpers::get_session(&mut world.named_sessions, &session_name);
+        let count = query_admin_row_count(conn, "show clients", &session_name).await;
+        if count == expected_count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Admin session '{session_name}': SHOW CLIENTS did not reach {expected_count} rows within 5s (last saw {count})"
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
 }
 
 #[then(regex = r#"^admin session "([^"]+)" row count should be greater than (\d+)$"#)]
