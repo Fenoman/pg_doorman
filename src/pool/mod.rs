@@ -1511,7 +1511,7 @@ impl ConnectionPool {
         let params = cell
             .get_or_try_init(|| async move {
                 info!("[{username}@{pool_name}] fetching server parameters");
-                let conn = match database.get().await {
+                let mut conn = match database.get().await {
                     Ok(conn) => conn,
                     // Forward the PG-side rejection verbatim so the
                     // cold auth path returns the original sqlstate +
@@ -1524,6 +1524,12 @@ impl ConnectionPool {
                 let hashmap = conn.server_parameters_as_hashmap();
                 let mut sp = ServerParameters::new();
                 sp.set_from_hashmap(&hashmap, true);
+                // Finish this cold-path internal checkout like a regular
+                // one so the release-cleanup obligation armed at checkout
+                // is discharged and the fresh backend returns to the pool
+                // instead of being closed by the recycle-safety check.
+                // Runs once per pool generation.
+                conn.finalize_checkin().await?;
                 Ok::<ServerParameters, Error>(sp)
             })
             .await?;

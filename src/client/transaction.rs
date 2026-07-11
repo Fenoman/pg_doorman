@@ -1096,6 +1096,12 @@ where
         }
         conn.max_message_size = original_max_message_size;
         conn.finish_internal_round_trip();
+        // This internal checkout must end like a regular one: run the
+        // checkin cleanup plus the release query so the release-cleanup
+        // obligation armed at checkout is discharged before the Object
+        // drops - otherwise the recycle-safety check would close a
+        // perfectly healthy backend after every uncached probe.
+        conn.finalize_checkin().await?;
         drop(conn);
 
         let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
@@ -3066,6 +3072,23 @@ where
                     );
                 } else if !server.is_bad() {
                     server.wait_available().await;
+                    // The backend produced a complete response and is parked
+                    // at ReadyForQuery - only the client write failed. Run
+                    // the checkin cleanup (including the release query) so
+                    // the healthy backend can be reused instead of being
+                    // closed by the recycle-safety check for an unconfirmed
+                    // release round trip. A cleanup failure marks the
+                    // backend bad; a cancellation mid-cleanup leaves the
+                    // pending flag armed so Object::drop closes the backend.
+                    if !server.is_bad() {
+                        if let Err(cleanup_err) = server.finalize_checkin().await {
+                            warn!(
+                                "finalize_checkin after client write failure failed pid={}: {}",
+                                server.get_process_id(),
+                                cleanup_err
+                            );
+                        }
+                    }
                 }
                 return Err(err_write);
             }
@@ -5248,7 +5271,9 @@ mod app_name_set_discard_all_clears_pending_set_tests {
 
         let edge_idx = lines
             .iter()
-            .position(|l| l.contains("Deferred-SET preflush: a non-simple-query first message after checkout"))
+            .position(|l| {
+                l.contains("Deferred-SET preflush: a non-simple-query first message after checkout")
+            })
             .expect("deferred-SET preflush branch not found");
         let edge_small_query_idx = edge_idx
             + lines[edge_idx..]
@@ -5421,6 +5446,173 @@ mod app_name_set_discard_all_clears_pending_set_tests {
             marker_rel < cancel_rel,
             "the quarantine marker (should_forward_cancel) must be set BEFORE the async \
              Server::cancel is awaited"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod relay_response_client_write_failure_tests {
+    use super::*;
+    use crate::client::buffer_pool::PooledBuffer;
+    use crate::client::core::PreparedStatementState;
+    use crate::pool::PoolIdentifier;
+    use crate::server::ServerParameters;
+    use crate::stats::ClientStats;
+    use dashmap::DashMap;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::Context;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
+
+    /// Client read half that never yields data or EOF, modelling a live
+    /// client that stays silent for the duration of the exchange. An
+    /// `Empty` reader is unsuitable here: its instant EOF makes
+    /// `recv_server_response_or_client_disconnect` treat the client as
+    /// disconnected before the backend socket readiness is delivered.
+    struct SilentReader;
+
+    impl tokio::io::AsyncRead for SilentReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Pending
+        }
+    }
+
+    /// Client write half that fails every write with `BrokenPipe`,
+    /// modelling a client socket after an RST arrived.
+    struct BrokenPipeWriter;
+
+    impl tokio::io::AsyncWrite for BrokenPipeWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "client connection reset",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "client connection reset",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn test_client_with_broken_pipe_writer() -> Client<SilentReader, BrokenPipeWriter> {
+        let addr = "127.0.0.1:6543".parse().unwrap();
+        Client {
+            read: BufReader::new(SilentReader),
+            write: BrokenPipeWriter,
+            buffer: PooledBuffer::new(),
+            addr,
+            addr_str: addr.to_string(),
+            read_buf: BytesMut::new(),
+            connection_id: 1,
+            cancel_mode: false,
+            transaction_mode: false,
+            sql_prepare_session_pinned: false,
+            secret_key: 0,
+            client_server_map: Arc::new(DashMap::new()),
+            stats: Arc::new(ClientStats::default()),
+            admin: false,
+            last_server_stats: None,
+            connected_to_server: false,
+            session_xact_start: None,
+            pool_name: "db".to_string(),
+            username: "user".to_string(),
+            cached_pool_id: PoolIdentifier::new("db", "user"),
+            migration_pool: None,
+            migration_pool_is_dynamic: false,
+            server_parameters: ServerParameters::default(),
+            prepared: PreparedStatementState::new(true, 0),
+            max_memory_usage: u64::MAX,
+            client_last_messages_in_tx: PooledBuffer::new(),
+            client_pending_begin: None,
+            pending_app_name_set: None,
+            #[cfg(unix)]
+            raw_fd: None,
+            #[cfg(all(unix, feature = "tls-migration"))]
+            ssl_ptr: None,
+        }
+    }
+
+    const COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE: &[u8] = &[
+        b'C', 0, 0, 0, 13, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0, b'Z', 0, 0, 0, 5,
+        b'I',
+    ];
+
+    #[tokio::test]
+    async fn client_write_failure_after_ready_for_query_runs_release_cleanup() {
+        let mut client = test_client_with_broken_pipe_writer();
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.set_release_query(Some("SELECT pg_advisory_unlock_all()"));
+        server.arm_release_cleanup();
+
+        // The backend already produced the complete response for the
+        // in-flight client query: CommandComplete + ReadyForQuery(I).
+        peer.write_all(COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE)
+            .await
+            .expect("peer must write the buffered backend response");
+
+        // Serve the release-cleanup Query triggered by the failed client
+        // write. The timeout only bounds the failure mode where the
+        // cleanup is never sent to the backend.
+        let cleanup_peer = tokio::spawn(async move {
+            let mut header = [0_u8; 5];
+            let read =
+                tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut header)).await;
+            let Ok(Ok(_)) = read else {
+                return false;
+            };
+            assert_eq!(header[0], b'Q');
+            let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+            let mut body = vec![0_u8; (len - 4) as usize];
+            peer.read_exact(&mut body)
+                .await
+                .expect("peer must receive the cleanup Query body");
+            assert_eq!(&body, b"SELECT pg_advisory_unlock_all();\0");
+            peer.write_all(COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE)
+                .await
+                .expect("peer must confirm the cleanup with ReadyForQuery(I)");
+            true
+        });
+
+        let result = client.relay_response(&mut server).await;
+        let cleanup_served = cleanup_peer.await.expect("cleanup peer task must finish");
+
+        assert!(
+            result.is_err(),
+            "the original client write error must be propagated"
+        );
+        assert!(
+            cleanup_served,
+            "the backend must receive the release cleanup query after the client write failure"
+        );
+        assert!(
+            !server.is_bad(),
+            "a backend that finished its response and its release cleanup stays healthy"
+        );
+        assert!(
+            !server.test_release_cleanup_pending(),
+            "the confirmed release round trip must disarm the pending flag"
         );
     }
 }

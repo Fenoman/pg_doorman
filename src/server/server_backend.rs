@@ -458,6 +458,19 @@ pub struct Server {
     /// backend in the pool uses the same statement.
     release_query: Option<Arc<str>>,
 
+    /// True while the current checkout still owes a successful
+    /// `release_query` round trip. Armed by [`Server::arm_release_cleanup`]
+    /// on every checkout when `release_query` is configured; cleared only
+    /// after `send_checkin_cleanup` confirms the release statement finished
+    /// with a clean ReadyForQuery. `Object::drop` refuses to recycle a
+    /// backend with this flag set, so a checkout that never reached
+    /// `finalize_checkin` (client RST mid-response, panic, cancellation)
+    /// closes the backend instead of leaking session-local state (advisory
+    /// locks, pg_variables) into the idle pool. Not part of `is_bad()`: an
+    /// active backend with the flag set is healthy, it just has not passed
+    /// its checkin cleanup yet.
+    release_cleanup_pending: bool,
+
     /// Whether the DISCARD ALL synthetic-response fast path is allowed for
     /// this backend. Mirrors `Pool.intercept_discard_all`. Installed by
     /// `ServerPool::create` right after startup; queried from
@@ -1018,6 +1031,15 @@ impl Server {
         if !self.pending_set_cleanup_commands.is_empty() {
             return Some("returned with pending set attribution");
         }
+        // Checked last so the more specific COPY / transaction / unread-data
+        // / protocol-state reasons above keep their diagnostics. An armed
+        // flag on an otherwise clean backend means the checkout ended
+        // without a confirmed release-query round trip (client RST after
+        // ReadyForQuery, panic, cancellation), so session-local state such
+        // as advisory locks or pg_variables may still be present.
+        if self.release_cleanup_pending {
+            return Some("returned without successful release cleanup");
+        }
         None
     }
 
@@ -1341,6 +1363,14 @@ impl Server {
             self.server_parameters
                 .remove_startup_only_params_after_session_reset();
         }
+        if release_query_appended.is_some() {
+            // Only a fully confirmed release round trip may disarm the
+            // pending flag: transport errors, SQL errors, dirty cleanup
+            // state and a non-idle transaction status all returned early
+            // above. The plain checkin_cleanup path passes `None` here and
+            // therefore never disarms the obligation.
+            self.release_cleanup_pending = false;
+        }
         Ok(())
     }
 
@@ -1349,6 +1379,17 @@ impl Server {
     /// so every backend in the pool shares the same `Arc<str>`.
     pub(crate) fn set_release_query(&mut self, configured: Option<&str>) {
         self.release_query = resolve_release_query(configured);
+    }
+
+    /// Record that the checkout being handed out owes a `release_query`
+    /// round trip before this backend may be reused. Called from
+    /// `Pool::wrap_checkout`, which every checkout path funnels through.
+    /// No-op when the release query is disabled; never disarms an
+    /// already-armed flag.
+    pub(crate) fn arm_release_cleanup(&mut self) {
+        if self.release_query.is_some() {
+            self.release_cleanup_pending = true;
+        }
     }
 
     /// Setter for the DISCARD ALL interception switch. Invoked by
@@ -1399,6 +1440,10 @@ impl Server {
         }
 
         if stmts.is_empty() {
+            // Empty statements imply `release_query` is disabled, and the
+            // pending flag is only ever armed with a configured release
+            // query - so nothing can be owed on this branch.
+            debug_assert!(!self.release_cleanup_pending);
             // Even on the empty-stmts short-circuit, defensively reset the
             // async-mode / expected-responses fields. The `if !stmts.is_empty()`
             // arm below does this BEFORE sending; the symmetric behaviour
@@ -2396,6 +2441,7 @@ impl Server {
                         operator_managed_startup_keys,
                         last_sql_error: None,
                         release_query: None,
+                        release_cleanup_pending: false,
                         intercept_discard_all: true,
                         internal_round_trip_in_flight: false,
                     };
@@ -2613,6 +2659,13 @@ impl Server {
         self.process_id = pid;
     }
 
+    /// Test-only accessor for `release_cleanup_pending`, used by tests in
+    /// other modules (the field itself is private to this file).
+    #[cfg(test)]
+    pub(crate) fn test_release_cleanup_pending(&self) -> bool {
+        self.release_cleanup_pending
+    }
+
     /// Test-only variant of `test_zombie_marked_bad` with `bad = false`.
     /// Intended for concurrency tests that want `evict_dead_backends` to
     /// actually call `check_alive(...).await` (which then errors out and
@@ -2705,6 +2758,7 @@ impl Server {
             operator_managed_startup_keys: Arc::new(HashSet::new()),
             last_sql_error: None,
             release_query: None,
+            release_cleanup_pending: false,
             intercept_discard_all: true,
         };
         (server, b)
@@ -2937,6 +2991,124 @@ mod tests {
             server.is_bad(),
             "dirty release_query must make the backend non-reusable"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_finalize_clears_release_cleanup_pending() {
+        use super::Server;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.set_release_query(Some("SELECT pg_advisory_unlock_all()"));
+        server.arm_release_cleanup();
+        assert!(server.release_cleanup_pending);
+
+        let peer_task = tokio::spawn(async move {
+            let mut header = [0_u8; 5];
+            peer.read_exact(&mut header)
+                .await
+                .expect("peer must receive simple Query header");
+            assert_eq!(header[0], b'Q');
+            let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+            let mut body = vec![0_u8; (len - 4) as usize];
+            peer.read_exact(&mut body)
+                .await
+                .expect("peer must receive simple Query body");
+            assert_eq!(&body, b"SELECT pg_advisory_unlock_all();\0");
+
+            peer.write_all(&[
+                b'C', 0, 0, 0, 13, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0, b'Z', 0, 0,
+                0, 5, b'I',
+            ])
+            .await
+            .expect("peer must write CommandComplete + ReadyForQuery(I)");
+        });
+
+        server
+            .finalize_checkin()
+            .await
+            .expect("release query round trip should succeed");
+        peer_task.await.expect("peer task must finish");
+
+        assert!(
+            !server.release_cleanup_pending,
+            "a confirmed release round trip must disarm the pending flag"
+        );
+        assert!(!server.is_bad());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_finalize_keeps_release_cleanup_pending() {
+        use super::Server;
+
+        // Dead peer: sending the release query fails with a transport error.
+        let mut server = Server::test_dead_socket();
+        server.set_release_query(Some("SELECT pg_advisory_unlock_all()"));
+        server.arm_release_cleanup();
+
+        let result = server.finalize_checkin().await;
+
+        assert!(
+            result.is_err(),
+            "release query over a dead socket must surface as Err"
+        );
+        assert!(
+            server.release_cleanup_pending,
+            "an unconfirmed release round trip must keep the pending flag armed"
+        );
+        assert!(
+            server.is_bad(),
+            "the failed release round trip must make the backend non-reusable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plain_checkin_cleanup_does_not_clear_release_cleanup_pending() {
+        use super::Server;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.cleanup_connections = true;
+        server.cleanup_state.needs_cleanup_set = true;
+        server.set_release_query(Some("SELECT pg_advisory_unlock_all()"));
+        server.arm_release_cleanup();
+
+        let peer_task = tokio::spawn(async move {
+            let mut header = [0_u8; 5];
+            peer.read_exact(&mut header)
+                .await
+                .expect("peer must receive simple Query header");
+            assert_eq!(header[0], b'Q');
+            let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+            let mut body = vec![0_u8; (len - 4) as usize];
+            peer.read_exact(&mut body)
+                .await
+                .expect("peer must receive simple Query body");
+            // The checkout-side cleanup never appends the release query.
+            assert_eq!(&body, b"RESET ROLE;\nRESET ALL;\0");
+
+            peer.write_all(&[
+                b'C', 0, 0, 0, 10, b'R', b'E', b'S', b'E', b'T', 0, b'C', 0, 0, 0, 10, b'R', b'E',
+                b'S', b'E', b'T', 0, b'Z', 0, 0, 0, 5, b'I',
+            ])
+            .await
+            .expect("peer must write cleanup RESETs + ReadyForQuery");
+        });
+
+        server
+            .checkin_cleanup()
+            .await
+            .expect("internal cleanup should succeed");
+        peer_task.await.expect("peer task must finish");
+
+        assert!(
+            server.release_cleanup_pending,
+            "checkout-side checkin_cleanup must not disarm the release obligation"
+        );
+        assert!(!server.is_bad());
     }
 
     #[cfg(unix)]
@@ -3351,6 +3523,14 @@ mod tests {
                         .push_back(ResetCleanupCommand::PerGucReset)
                 },
                 "returned with pending reset attribution",
+            ),
+            (
+                "pending release cleanup",
+                |s| {
+                    s.set_release_query(None);
+                    s.arm_release_cleanup();
+                },
+                "returned without successful release cleanup",
             ),
         ];
 
