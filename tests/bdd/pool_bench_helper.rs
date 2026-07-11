@@ -77,7 +77,11 @@ async fn setup_internal_pool(world: &mut DoormanWorld, size: usize, _mode: Strin
         None,                    // fallback_state
         std::sync::Arc::new(std::collections::BTreeMap::new()),
         std::sync::Arc::new(std::collections::BTreeMap::new()),
-    );
+    )
+    // The bench loops call Pool::get() directly and drop the Object
+    // without finalize_checkin, so the release query must be disabled
+    // explicitly or every drop would evict the backend.
+    .with_release_query(Some(String::new()));
 
     // Create Pool with configuration
     let config = PoolConfig {
@@ -428,7 +432,10 @@ async fn setup_internal_pool_with_lifetimes(
         None,
         std::sync::Arc::new(std::collections::BTreeMap::new()),
         std::sync::Arc::new(std::collections::BTreeMap::new()),
-    );
+    )
+    // Same as setup_internal_pool: direct Pool::get() + drop requires the
+    // release query to be disabled explicitly.
+    .with_release_query(Some(String::new()));
 
     let config = PoolConfig {
         max_size: size,

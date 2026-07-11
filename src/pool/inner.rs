@@ -1004,7 +1004,14 @@ impl Pool {
     /// the semaphore permit. The permit is restored by `return_object`
     /// (via `add_permits(1)`) when the Object is dropped.
     #[inline(always)]
-    fn wrap_checkout(&self, inner: ObjectInner, permit: SemaphorePermit<'_>) -> Object {
+    fn wrap_checkout(&self, mut inner: ObjectInner, permit: SemaphorePermit<'_>) -> Object {
+        // Every checkout path funnels through here (idle reuse, fresh
+        // create, direct handoff, anticipation, burst gate, recycled
+        // backend), so arming the release-cleanup obligation here covers
+        // them all. The flag is cleared only by a confirmed release-query
+        // round trip in `finalize_checkin`; a checkout that drops the
+        // Object without it fails the recycle-safety check and is closed.
+        inner.obj.arm_release_cleanup();
         permit.forget();
         Object {
             inner: Some(inner),
@@ -4241,6 +4248,129 @@ mod tests {
             pool.semaphore().available_permits(),
             1,
             "evicting the dirty backend must release the checked-out slot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn object_drop_evicts_backend_with_pending_release_cleanup() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(1);
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = 1;
+        }
+
+        // Clean backend with a configured release query: no COPY, no
+        // transaction, no dirty cleanup flags. Its only outstanding
+        // obligation is the release-query round trip armed by
+        // wrap_checkout, which never ran before the drop.
+        let mut server = Server::test_dead_socket();
+        server.set_release_query(Some("SELECT pg_advisory_unlock_all()"));
+
+        let permit = pool.semaphore().try_acquire().unwrap();
+        let object = pool.wrap_checkout(pool.inner.new_object_inner(server, None), permit);
+
+        drop(object);
+
+        assert_eq!(
+            pool.status().size,
+            0,
+            "a checked-out backend dropped without a confirmed release-query \
+             round trip must close instead of re-entering the idle pool"
+        );
+        assert_eq!(
+            pool.inner.slots.lock().vec.len(),
+            0,
+            "a backend owing release cleanup must not become available for reuse"
+        );
+        assert_eq!(
+            pool.semaphore().available_permits(),
+            1,
+            "evicting the pending backend must release the checked-out slot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn object_drop_recycles_backend_when_release_query_disabled() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(1);
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = 1;
+        }
+
+        // release_query = "" disables the release statement entirely, so a
+        // clean drop keeps returning the backend to the idle queue.
+        let mut server = Server::test_dead_socket();
+        server.set_release_query(Some(""));
+
+        let permit = pool.semaphore().try_acquire().unwrap();
+        let object = pool.wrap_checkout(pool.inner.new_object_inner(server, None), permit);
+
+        drop(object);
+
+        assert_eq!(
+            pool.status().size,
+            1,
+            "with the release query disabled a clean backend must stay pooled"
+        );
+        assert_eq!(
+            pool.inner.slots.lock().vec.len(),
+            1,
+            "the recycled backend must land in the idle queue"
+        );
+        assert_eq!(pool.semaphore().available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn object_drop_with_pending_release_cleanup_wakes_waiter_without_handoff() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(1);
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = 1;
+        }
+
+        // Default (omitted) release_query resolves to the non-empty
+        // iServ-compatible statement, so the checkout below is armed.
+        let mut server = Server::test_dead_socket();
+        server.set_release_query(None);
+
+        let permit = pool.semaphore().try_acquire().unwrap();
+        let object = pool.wrap_checkout(pool.inner.new_object_inner(server, None), permit);
+
+        // A second client is parked as a direct-handoff waiter.
+        let (tx, rx) = oneshot::channel();
+        pool.inner.slots.lock().waiters.push_back(tx);
+
+        drop(object);
+
+        // The pending backend must never be delivered to the waiter; the
+        // dropped sender wakes it (Closed) so it retries a fresh checkout.
+        assert!(
+            rx.await.is_err(),
+            "a backend owing release cleanup must not be handed to a waiter"
+        );
+        assert_eq!(
+            pool.status().size,
+            0,
+            "the pending backend must be closed, not handed off"
+        );
+        assert_eq!(
+            pool.inner.slots.lock().vec.len(),
+            0,
+            "no idle object may remain after the eviction"
+        );
+        assert_eq!(
+            pool.semaphore().available_permits(),
+            1,
+            "the woken waiter must find a free slot for a fresh checkout"
         );
     }
 
