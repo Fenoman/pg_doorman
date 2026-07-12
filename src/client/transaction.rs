@@ -30,7 +30,9 @@ use crate::messages::{
     read_message_reuse_cancel_safe, simple_query, write_all_flush_timeout, Parse,
 };
 use crate::pool::{canceled_pids_consume, CancelMarker};
-use crate::server::{AsyncExpectedResponse, Server, SyncPlan, HOUSEKEEPING_TIMEOUT};
+use crate::server::{
+    AsyncExpectedResponse, Server, SetResponseOutcome, SyncPlan, HOUSEKEEPING_TIMEOUT,
+};
 use crate::utils::buffering_writer::BufferingWriter;
 use crate::utils::debug_messages::{log_client_to_server, log_server_to_client};
 use crate::web::metrics::{
@@ -1269,15 +1271,47 @@ where
 
             log_client_to_server(&self.addr_str, server.get_process_id(), &combined);
 
-            // Consume the SET's fixed CommandComplete + ReadyForQuery
-            // (timeout-bounded). On error the helper has already marked the
-            // backend bad; propagate. `pending_app_name_set` is already
-            // take()n, so there is no stale carry even on this error path.
-            server.swallow_set_response().await?;
+            // Consume the SET response through its ReadyForQuery. Transport
+            // failures still invalidate the backend; a complete SQL rejection
+            // leaves the following client query intact on the same stream.
+            let set_outcome = server.swallow_set_response().await?;
             server.clear_internal_set_cleanup_state();
 
-            crate::web::metrics::inc_sync_params_applied();
-            crate::web::metrics::observe_sync_params_rtt_seconds(started.elapsed().as_secs_f64());
+            match set_outcome {
+                SetResponseOutcome::Applied => {
+                    crate::web::metrics::inc_sync_params_applied();
+                    crate::web::metrics::observe_sync_params_rtt_seconds(
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
+                SetResponseOutcome::Rejected { sqlstate, .. } => {
+                    let (reason, action) = if sqlstate == "57014" {
+                        match server.reissue_cancel_if_marked().await {
+                            Some(Ok(())) => ("query_canceled", "cancel_reissued"),
+                            Some(Err(err)) => {
+                                warn!(
+                                    "[{}@{} #c{}] failed to reissue cancel after piggybacked \
+                                     SET was canceled, backend pid={}: {err}",
+                                    self.username,
+                                    self.pool_name,
+                                    self.connection_id,
+                                    server.get_process_id(),
+                                );
+                                ("query_canceled", "cancel_reissue_failed")
+                            }
+                            None => ("query_canceled", "relay"),
+                        }
+                    } else {
+                        ("sql_error", "relay")
+                    };
+                    crate::web::metrics::inc_sync_params_piggyback_rejection(reason, action);
+                    warn!(
+                        "[{}@{} #c{}] piggybacked SET application_name was rejected with \
+                         SQLSTATE {sqlstate}; relaying the following client response",
+                        self.username, self.pool_name, self.connection_id,
+                    );
+                }
+            }
 
             // The backend `server_parameters` mirror is ALREADY correct here:
             // swallow_set_response calls recv(.., None), whose ParameterStatus
@@ -5196,7 +5230,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         let swallow_idx = piggy_idx
             + lines[piggy_idx..]
                 .iter()
-                .position(|l| l.contains("server.swallow_set_response().await?"))
+                .position(|l| l.contains("swallow_set_response().await?"))
                 .expect("piggyback branch must swallow the internal SET response");
         let track_set_idx = piggy_idx
             + lines[piggy_idx..]
@@ -5248,7 +5282,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         let swallow_idx = piggy_idx
             + lines[piggy_idx..]
                 .iter()
-                .position(|l| l.contains("server.swallow_set_response().await?"))
+                .position(|l| l.contains("swallow_set_response().await?"))
                 .expect("piggyback branch must swallow internal SET response");
         let track_set_idx = piggy_idx
             + lines[piggy_idx..]

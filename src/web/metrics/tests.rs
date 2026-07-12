@@ -211,6 +211,40 @@ fn sync_params_plan_metric_registers_plan_and_path_labels() {
 
 #[test]
 #[serial]
+fn sync_params_piggyback_rejection_metric_has_bounded_labels() {
+    use crate::web::metrics::{
+        inc_sync_params_piggyback_rejection, SYNC_PARAMS_PIGGYBACK_REJECTIONS_TOTAL,
+    };
+    use prometheus::Encoder;
+
+    let labels = ["query_canceled", "cancel_reissued"];
+    let before = SYNC_PARAMS_PIGGYBACK_REJECTIONS_TOTAL
+        .with_label_values(&labels)
+        .get();
+
+    inc_sync_params_piggyback_rejection(labels[0], labels[1]);
+
+    assert_eq!(
+        SYNC_PARAMS_PIGGYBACK_REJECTIONS_TOTAL
+            .with_label_values(&labels)
+            .get(),
+        before + 1
+    );
+
+    let families = crate::web::metrics::REGISTRY.gather();
+    let mut buffer = Vec::new();
+    prometheus::TextEncoder::new()
+        .encode(&families, &mut buffer)
+        .unwrap();
+    let exported = String::from_utf8(buffer).unwrap();
+
+    assert!(exported.contains("pg_doorman_sync_params_piggyback_rejections_total"));
+    assert!(exported.contains(r#"reason="query_canceled""#));
+    assert!(exported.contains(r#"action="cancel_reissued""#));
+}
+
+#[test]
+#[serial]
 fn checkin_cleanup_metric_registers_pool_path_and_result() {
     use crate::web::metrics::{observe_checkin_cleanup, CHECKIN_CLEANUP_SECONDS};
     use prometheus::Encoder;

@@ -21,10 +21,10 @@ mod tests;
 // Re-exports
 pub(crate) use handler::write_metrics_response;
 pub use metrics::{
-    forget_fallback_host_label, inc_sync_params_applied, inc_sync_params_plan,
-    inc_sync_params_skipped, observe_anonymous_eviction, observe_backend_create_phase,
-    observe_backend_startup_parameter_error, observe_checkin_cleanup, observe_named_eviction,
-    observe_pool_query_microseconds, observe_pool_transaction_microseconds,
+    forget_fallback_host_label, inc_sync_params_applied, inc_sync_params_piggyback_rejection,
+    inc_sync_params_plan, inc_sync_params_skipped, observe_anonymous_eviction,
+    observe_backend_create_phase, observe_backend_startup_parameter_error, observe_checkin_cleanup,
+    observe_named_eviction, observe_pool_query_microseconds, observe_pool_transaction_microseconds,
     observe_pool_wait_microseconds, observe_startup_parameters_dropped, observe_streaming_bytes,
     observe_streaming_event, observe_sync_params_rtt_seconds, record_fallback_host_label,
     record_interner_gc, record_listener_rejection, record_migration_client_dropped,
@@ -849,6 +849,22 @@ pub(crate) static SYNC_PARAMS_PLAN_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
             "Checkouts by parameter-sync plan and execution path.",
         ),
         &["plan", "path"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// SQL-level rejections of a piggybacked application_name update. Both labels
+/// use a fixed vocabulary: `reason` is query_canceled/sql_error and `action`
+/// is relay/cancel_reissued/cancel_reissue_failed.
+pub(crate) static SYNC_PARAMS_PIGGYBACK_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "pg_doorman_sync_params_piggyback_rejections_total",
+            "Rejected piggybacked application_name updates by reason and recovery action.",
+        ),
+        &["reason", "action"],
     )
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
