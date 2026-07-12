@@ -502,6 +502,11 @@ pub struct Server {
     /// both the configured SQL and its pre-encoded release-only Query frame.
     release_query: Option<ResolvedReleaseQuery>,
 
+    /// Pre-bound observer for the common release-only successful check-in.
+    /// Binding once per backend avoids a four-label MetricVec lookup on every
+    /// transaction while keeping uncommon path/result combinations dynamic.
+    release_only_ok_cleanup_metric: Option<prometheus::Histogram>,
+
     /// True while the current checkout still owes a successful
     /// `release_query` round trip. Armed by [`Server::arm_release_cleanup`]
     /// on every checkout when `release_query` is configured; cleared only
@@ -1492,13 +1497,21 @@ impl Server {
     /// Resolve a release query directly for isolated server tests.
     #[cfg(test)]
     pub(crate) fn set_release_query(&mut self, configured: Option<&str>) {
-        self.release_query = resolve_release_query(configured);
+        self.set_resolved_release_query(resolve_release_query(configured));
     }
 
     pub(crate) fn set_resolved_release_query(
         &mut self,
         release_query: Option<ResolvedReleaseQuery>,
     ) {
+        self.release_only_ok_cleanup_metric = release_query.as_ref().map(|_| {
+            crate::web::metrics::CHECKIN_CLEANUP_SECONDS.with_label_values(&[
+                self.address.username.as_str(),
+                self.address.database.as_str(),
+                "release_only",
+                "ok",
+            ])
+        });
         self.release_query = release_query;
     }
 
@@ -1565,6 +1578,28 @@ impl Server {
         }
     }
 
+    #[inline]
+    fn record_checkin_cleanup_metric(
+        &self,
+        path: &'static str,
+        result: &'static str,
+        seconds: f64,
+    ) {
+        if path == "release_only" && result == "ok" {
+            if let Some(metric) = self.release_only_ok_cleanup_metric.as_ref() {
+                metric.observe(seconds);
+                return;
+            }
+        }
+        crate::web::metrics::observe_checkin_cleanup(
+            self.address.username.as_str(),
+            self.address.database.as_str(),
+            path,
+            result,
+            seconds,
+        );
+    }
+
     /// Run the regular `checkin_cleanup` and, if configured, the per-pool
     /// `release_query` before this backend goes back into the pool.
     ///
@@ -1576,9 +1611,7 @@ impl Server {
         let path = self.checkin_cleanup_metric_path();
         let started = quanta::Instant::now();
         let result = self.finalize_checkin_inner().await;
-        crate::web::metrics::observe_checkin_cleanup(
-            self.address.username.as_str(),
-            self.address.database.as_str(),
+        self.record_checkin_cleanup_metric(
             path,
             Self::checkin_cleanup_metric_result(&result),
             started.elapsed().as_secs_f64(),
@@ -2582,6 +2615,7 @@ impl Server {
                         operator_managed_startup_keys,
                         last_sql_error: None,
                         release_query: None,
+                        release_only_ok_cleanup_metric: None,
                         release_cleanup_pending: false,
                         intercept_discard_all: true,
                         internal_round_trip_in_flight: false,
@@ -2901,6 +2935,7 @@ impl Server {
             operator_managed_startup_keys: Arc::new(HashSet::new()),
             last_sql_error: None,
             release_query: None,
+            release_only_ok_cleanup_metric: None,
             release_cleanup_pending: false,
             intercept_discard_all: true,
         };
@@ -2950,6 +2985,27 @@ mod tests {
             resolved.frame(),
             &crate::messages::simple_query("SELECT 1;")[..]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_query_prebinds_common_cleanup_metric() {
+        let mut server = super::Server::test_zombie_marked_bad();
+        assert!(server.release_only_ok_cleanup_metric.is_none());
+
+        server.set_release_query(None);
+        let metric = server
+            .release_only_ok_cleanup_metric
+            .as_ref()
+            .expect("default release query should bind the common metric")
+            .clone();
+        let before = metric.get_sample_count();
+
+        server.record_checkin_cleanup_metric("release_only", "ok", 0.000_025);
+
+        assert_eq!(metric.get_sample_count(), before + 1);
+        server.set_release_query(Some(""));
+        assert!(server.release_only_ok_cleanup_metric.is_none());
     }
 
     #[test]
