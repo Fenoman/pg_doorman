@@ -2980,18 +2980,28 @@ mod tests {
     #[test]
     fn backend_startup_body_reads_use_memory_budget() {
         let src = include_str!("server_backend.rs");
-        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let startup_start = src
+            .find("pub async fn startup(")
+            .expect("backend startup function not found");
+        let startup = &src[startup_start..];
+        let startup_end = startup
+            .find("\nimpl Drop for Server")
+            .expect("backend startup implementation end not found");
+        let startup = &startup[..startup_end];
 
         assert!(
-            !impl_src.contains("read_message_data(&mut stream"),
+            !startup.contains("read_message_data(&mut stream"),
             "backend startup must not read direct message bodies without memory-budget reservation"
         );
         assert!(
-            impl_src.contains("let max_memory_usage = config.general.max_memory_usage.as_bytes()"),
+            startup.contains("let max_memory_usage = config.general.max_memory_usage.as_bytes()"),
             "backend startup must capture the configured message memory budget"
         );
         assert!(
-            impl_src.matches("read_message_data_with_memory_limit(").count() >= 4,
+            startup
+                .matches("read_message_data_with_memory_limit(")
+                .count()
+                >= 4,
             "startup ErrorResponse/Notice/ParameterStatus/ReadyForQuery bodies must use budgeted reads"
         );
     }
