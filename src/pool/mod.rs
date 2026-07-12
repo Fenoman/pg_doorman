@@ -517,6 +517,9 @@ pub struct PoolSettings {
     /// Синхронизируем серверные параметры установленные клиентом через SET. (False).
     pub sync_server_parameters: bool,
 
+    /// Whether standalone DISCARD ALL may be acknowledged without a backend.
+    pub intercept_discard_all: bool,
+
     idle_timeout_ms: u64,
     life_time_ms: u64,
 
@@ -534,6 +537,7 @@ impl Default for PoolSettings {
             idle_timeout_ms: General::default_idle_timeout().as_millis(),
             life_time_ms: General::default_server_lifetime().as_millis(),
             sync_server_parameters: General::default_sync_server_parameters(),
+            intercept_discard_all: ConfigPool::default_intercept_discard_all(),
             min_guaranteed_pool_size: 0,
         }
     }
@@ -946,6 +950,7 @@ impl ConnectionPool {
                             .or(pool_config.server_lifetime)
                             .unwrap_or(config.general.server_lifetime.as_millis()),
                         sync_server_parameters: config.general.sync_server_parameters,
+                        intercept_discard_all: pool_config.intercept_discard_all,
                         min_guaranteed_pool_size: pool_config.min_guaranteed_pool_size.unwrap_or(0),
                     },
                     prepared_statement_cache: match config.general.prepared_statements {
@@ -1186,6 +1191,7 @@ impl ConnectionPool {
                                     .server_lifetime
                                     .unwrap_or(config.general.server_lifetime.as_millis()),
                                 sync_server_parameters: config.general.sync_server_parameters,
+                                intercept_discard_all: pool_config.intercept_discard_all,
                                 min_guaranteed_pool_size: pool_config
                                     .min_guaranteed_pool_size
                                     .unwrap_or(0),
@@ -1758,6 +1764,7 @@ mod tests {
                 idle_timeout_ms: 60_000,
                 life_time_ms: 60_000,
                 sync_server_parameters: false,
+                intercept_discard_all: true,
                 min_guaranteed_pool_size: 0,
             },
             config_hash: 0,

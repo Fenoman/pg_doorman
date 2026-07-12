@@ -281,6 +281,7 @@ pub fn create_dynamic_pool(
                 .server_lifetime
                 .unwrap_or(config.general.server_lifetime.as_millis()),
             sync_server_parameters: config.general.sync_server_parameters,
+            intercept_discard_all: pool_config.intercept_discard_all,
             min_guaranteed_pool_size: pool_config.min_guaranteed_pool_size.unwrap_or(0),
         },
         prepared_statement_cache: match config.general.prepared_statements {

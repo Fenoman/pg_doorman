@@ -811,7 +811,8 @@ where
         }
     }
 
-    /// Check for pooler health check and DEALLOCATE queries, handle them without server.
+    /// Handle pooler health checks, standalone DISCARD ALL and eligible
+    /// DEALLOCATE queries before checking out a backend.
     /// Returns `Ok(true)` if query was handled (caller should continue to next iteration),
     /// `Ok(false)` if query needs normal processing.
     #[inline]
@@ -819,6 +820,7 @@ where
         &mut self,
         message: &BytesMut,
         pool: &crate::pool::ConnectionPool,
+        query_start_at: quanta::Instant,
     ) -> Result<bool, Error> {
         if message[0] != b'Q' {
             return Ok(false);
@@ -843,6 +845,36 @@ where
         {
             self.handle_pooler_check_query(message, pool, &snapshot)
                 .await?;
+            return Ok(true);
+        }
+
+        if self.transaction_mode
+            && !self.sql_prepare_session_pinned
+            && pool.settings.intercept_discard_all
+            && contains_discard_all(simple_query_body(message))
+        {
+            self.stats.active_idle();
+            self.respond_to_simple_discard(false).await?;
+
+            let elapsed_us = query_start_at.elapsed().as_micros() as u64;
+            self.stats.query();
+            self.stats.transaction();
+            pool.address.stats.query_count_add();
+            pool.address.stats.query_time_add_microseconds(elapsed_us);
+            pool.address.stats.xact_count_add();
+            pool.address.stats.xact_time_add(elapsed_us);
+            crate::web::metrics::observe_pool_query_microseconds(
+                &pool.address.username,
+                &pool.address.pool_name,
+                elapsed_us,
+            );
+            crate::web::metrics::observe_pool_transaction_microseconds(
+                &pool.address.username,
+                &pool.address.pool_name,
+                elapsed_us,
+            );
+            pool.address.stats.discard_all_intercepted();
+            self.stats.idle_read();
             return Ok(true);
         }
 
@@ -1123,7 +1155,6 @@ where
         message: &BytesMut,
         server: &mut Server,
         query_start_at: quanta::Instant,
-        pool: &crate::pool::ConnectionPool,
     ) -> Result<TransactionAction, Error> {
         // Simple query always ends with ReadyForQuery, so disable async mode
         // to wait for 'Z' instead of using expected_responses counter
@@ -1135,95 +1166,6 @@ where
         // held was from a prior extended batch and would otherwise leak its
         // hash into the next Sync.
         self.prepared.last_bound_for_top = None;
-
-        // ------------------------------------------------------------------
-        // iServ DISCARD ALL fast path.
-        //
-        // In transaction pooling a `DISCARD ALL` outside of an open
-        // transaction is functionally a no-op for the application: the
-        // backend would clear state that the next checkout's session
-        // sees fresh anyway, and *we* would lose the prepared-statement
-        // cache plus any deliberately-shared per-backend state (long-lived
-        // `CREATE TEMP TABLE`s used to skip catalog bloat and invalidation
-        // storms, planner cache hydration, etc.). The upstream
-        // `protocol_io.rs` already classifies the `DISCARD ALL`
-        // CommandComplete tag to refresh cleanup flags, but that only
-        // fires AFTER the query reached PostgreSQL - too late to keep
-        // the backend's caches.
-        //
-        // Skip the round-trip when:
-        //   * pool runs in transaction mode (session mode must let the
-        //     backend clear its real per-connection state),
-        //   * server is not currently inside a transaction (otherwise
-        //     `DISCARD ALL` is an actual PG error and the backend must
-        //     surface it),
-        //   * server is not in COPY mode (mid-protocol),
-        //   * `Pool.intercept_discard_all` is `true` (the default - the
-        //     iServ contract is that a standalone DISCARD ALL never
-        //     reaches PostgreSQL in transaction pooling). Operators whose
-        //     application **relies on** real DISCARD ALL semantics
-        //     (`UNLISTEN *`, dropping session-temp tables, `PREPARE
-        //     TRANSACTION` cleanup) can opt out per pool by setting
-        //     `intercept_discard_all = false`, in which case the query
-        //     is forwarded to the backend like any other simple query.
-        //   * the query body parses as `DISCARD ALL` modulo surrounding
-        //     whitespace, leading/trailing line (`--`) or block (`/* */`,
-        //     including nested) comments, and trailing semicolons. The
-        //     parser intentionally does NOT intercept multi-statement
-        //     batches (`SELECT 1; DISCARD ALL`), comments embedded
-        //     between the `DISCARD` and `ALL` keywords, or the extended-
-        //     protocol Parse/Bind/Execute path - see
-        //     `client::util::contains_discard_all` for the full contract.
-        //
-        // Synthesise `CommandComplete("DISCARD ALL")` + `ReadyForQuery('I')`
-        // straight back to the client and break out so the outer loop
-        // releases the backend.
-        if self.transaction_mode
-            && !server.in_transaction()
-            && !server.in_copy_mode()
-            && !self.sql_prepare_session_pinned
-            && server.intercept_discard_all()
-            && contains_discard_all(simple_query_body(message))
-        {
-            // The backend is about to be released WITHOUT this
-            // checkout's client app_name ever reaching it (we synthesise the
-            // DISCARD ALL response and Break). A `pending_app_name_set` deferred
-            // at checkout must therefore be dropped here, not carried: it is
-            // bound to THIS checkout, and leaving it set would let it leak into
-            // the next checkout's first query (a double / wrong-backend SET).
-            // The backend mirror (`server.server_parameters`) still reflects the
-            // real backend app_name, so the next checkout's `compute_sync_plan`
-            // re-diffs correctly and re-defers the SET on whichever backend it
-            // gets - no accuracy loss, only this stale slot must be cleared.
-            if self.pending_app_name_set.take().is_some() {
-                crate::web::metrics::inc_sync_params_plan(
-                    "app_name_only",
-                    "discard_all_intercept_dropped",
-                );
-            }
-            self.respond_to_simple_discard(false).await?;
-            self.stats.query();
-            self.stats.transaction();
-            server.stats.query(
-                query_start_at.elapsed().as_micros() as u64,
-                self.server_parameters.get_application_name(),
-            );
-            // Symmetry with the forwarded `complete_transaction_if_needed`
-            // path: in PostgreSQL semantics, an out-of-transaction DISCARD
-            // ALL is itself one implicit transaction. Without this the
-            // per-server `xact_count` undercounts in proportion to the
-            // intercepted DISCARD ALL volume, skewing dashboards that
-            // ratio pool-side vs server-side transaction rate.
-            server
-                .stats
-                .transaction(self.server_parameters.get_application_name());
-            // Dedicated counter so operators can verify the iServ
-            // contract is firing. A flat value while users complain about
-            // temp-table loss is the canonical regression signature.
-            pool.address.stats.discard_all_intercepted();
-            self.stats.idle_read();
-            return Ok(TransactionAction::Break);
-        }
 
         self.track_forwarded_simple_deallocate_cache_state(message);
 
@@ -1362,7 +1304,7 @@ where
 
     /// Synthesize the wire response for a fast-path `DISCARD ALL`:
     /// `CommandComplete("DISCARD ALL")` followed by `ReadyForQuery`. Used by
-    /// the iServ-style interception in `handle_simple_query` to avoid a
+    /// the transaction-pool interception in `try_handle_without_server` to avoid a
     /// backend round-trip whose only side effect would be clearing the
     /// backend's prepared-statement cache and temp-table state - both of
     /// which transaction pooling already isolates per-client.
@@ -1975,10 +1917,10 @@ where
             query_start_at = now();
             let current_pool = pool.as_ref().unwrap();
 
-            // Handle fast queries (pooler check, DEALLOCATE) without server
+            // Handle serverless fast paths before backend checkout.
             if self.client_pending_begin.is_none()
                 && self
-                    .try_handle_without_server(&message, current_pool)
+                    .try_handle_without_server(&message, current_pool, query_start_at)
                     .await?
             {
                 continue;
@@ -2543,14 +2485,7 @@ where
                                         .to_string(),
                                 ))
                             } else {
-                                // `pool` is `Some` on every non-admin codepath that
-                                // reaches this loop (a server was successfully
-                                // checked out above); the admin handler returns
-                                // before getting here.
-                                let pool_ref = pool
-                                    .as_ref()
-                                    .expect("simple-query handling requires a non-admin pool");
-                                self.handle_simple_query(&message, server, query_start_at, pool_ref)
+                                self.handle_simple_query(&message, server, query_start_at)
                                     .await
                             }
                         }
@@ -4679,7 +4614,7 @@ mod deallocate_fast_path_tests {
              outer idle loop); a second call site could run with a server held"
         );
         let call_pos = impl_src
-            .find(".try_handle_without_server(&message, current_pool)")
+            .find(".try_handle_without_server(&message, current_pool, query_start_at)")
             .expect("the single call site should exist");
         let preamble = &impl_src[call_pos.saturating_sub(120)..call_pos];
         assert!(
@@ -5035,50 +4970,50 @@ mod v4_h3_function_call_tests {
 
 #[cfg(test)]
 mod app_name_set_discard_all_clears_pending_set_tests {
-    /// Regression lock for pending application_name cleanup.
-    ///
-    /// The DISCARD-ALL interception fast path in `handle_simple_query`
-    /// releases the backend (returns `TransactionAction::Break`) WITHOUT
-    /// forwarding this checkout's client `application_name`. A
-    /// `pending_app_name_set` deferred at checkout is bound to THIS checkout;
-    /// if the intercept does not clear it, the stale SET leaks into the next
-    /// checkout's first query (double / wrong-backend `SET application_name`).
-    ///
-    /// `handle_simple_query` needs a live backend + client socket, so this is
-    /// a source-structure guard (same approach as the prepared-cache
-    /// stats-refresh invariant earlier in this file). The end-to-end behaviour
-    /// is covered by the `setapp-piggyback.feature` BDD scenario; this test
-    /// fails fast in `cargo test` if a future refactor drops the clear.
     #[test]
-    fn discard_all_intercept_clears_pending_app_name_set() {
+    fn discard_all_intercept_precedes_backend_checkout() {
         let src = include_str!("transaction.rs");
-        let lines: Vec<&str> = src.lines().collect();
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
 
-        // Locate the interception predicate (the `contains_discard_all` guard).
-        let guard_idx = lines
-            .iter()
-            .position(|l| l.contains("contains_discard_all(simple_query_body(message))"))
-            .expect("DISCARD-ALL interception guard not found in handle_simple_query");
-
-        // The first `return Ok(TransactionAction::Break)` after the guard ends
-        // the interception block.
-        let break_rel = lines[guard_idx..]
-            .iter()
-            .position(|l| l.contains("return Ok(TransactionAction::Break)"))
-            .expect("interception block has no Break return");
-        let break_idx = guard_idx + break_rel;
-
-        let cleared = lines[guard_idx..=break_idx]
-            .iter()
-            .any(|l| l.contains("self.pending_app_name_set.take().is_some()"));
-
+        let fast_path_start = impl_src
+            .find("async fn try_handle_without_server(")
+            .expect("no-server fast path not found");
+        let fast_path_end = fast_path_start
+            + impl_src[fast_path_start..]
+                .find("\n    fn track_forwarded_simple_deallocate_cache_state")
+                .expect("no-server fast path end not found");
+        let fast_path = &impl_src[fast_path_start..fast_path_end];
         assert!(
-            cleared,
-            "DISCARD-ALL interception (lines {}..={}) must clear \
-             `self.pending_app_name_set` before releasing the backend, else a \
-             deferred SET application_name leaks into the next checkout",
-            guard_idx + 1,
-            break_idx + 1,
+            fast_path.contains("contains_discard_all(simple_query_body(message))")
+                && fast_path.contains("pool.settings.intercept_discard_all"),
+            "standalone DISCARD ALL must be handled by the no-server path"
+        );
+
+        let simple_start = impl_src
+            .find("async fn handle_simple_query(")
+            .expect("simple-query handler not found");
+        let simple_end = simple_start
+            + impl_src[simple_start..]
+                .find("\n    /// Synthesize the wire response")
+                .expect("simple-query handler end not found");
+        assert!(
+            !impl_src[simple_start..simple_end].contains("contains_discard_all"),
+            "server-held simple-query path must not duplicate DISCARD ALL interception"
+        );
+
+        let handle_start = impl_src
+            .find("pub async fn handle(&mut self)")
+            .expect("client handle loop not found");
+        let handle = &impl_src[handle_start..];
+        let intercept_call = handle
+            .find(".try_handle_without_server(&message, current_pool, query_start_at)")
+            .expect("no-server fast-path call not found");
+        let checkout = handle
+            .find("match current_pool.database.get().await")
+            .expect("backend checkout not found");
+        assert!(
+            intercept_call < checkout,
+            "DISCARD ALL interception must run before backend checkout"
         );
     }
 
@@ -5111,7 +5046,6 @@ mod app_name_set_discard_all_clears_pending_set_tests {
             ("app_name_only", "simple_query_piggyback"),
             ("app_name_only", "deferred_begin_preflush"),
             ("app_name_only", "non_simple_preflush"),
-            ("app_name_only", "discard_all_intercept_dropped"),
         ] {
             assert!(
                 has_plan_path_call(src, plan, path),
