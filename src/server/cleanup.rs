@@ -28,6 +28,21 @@ pub(crate) enum SetCleanupCommand {
     SetSessionAuthorizationDefault,
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct PendingCleanupDisarms {
+    pub(crate) set: bool,
+    pub(crate) role: bool,
+    pub(crate) session_authorization: bool,
+    pub(crate) startup_parameter_mirror: bool,
+}
+
+impl PendingCleanupDisarms {
+    #[inline(always)]
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct CleanupState {
     /// If server connection requires RESET ALL before checkin because of set statement

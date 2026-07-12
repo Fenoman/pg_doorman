@@ -100,7 +100,7 @@ use crate::pool::{CancelTarget, ClientServerMap, CANCELED_PIDS};
 use crate::stats::ServerStats;
 
 use super::authentication::handle_authentication;
-use super::cleanup::{CleanupState, ResetCleanupCommand, SetCleanupCommand};
+use super::cleanup::{CleanupState, PendingCleanupDisarms, ResetCleanupCommand, SetCleanupCommand};
 use super::parameters::ServerParameters;
 use super::stream::{create_tcp_stream_inner, create_unix_stream_inner, StreamInner};
 use super::{prepared_statements, protocol_io, startup_cancel};
@@ -349,6 +349,14 @@ pub struct Server {
     /// so simple-query forwarding records only the reset statements, in order,
     /// before the response path decides whether a tag may disarm SET cleanup.
     pub(crate) pending_reset_cleanup_commands: VecDeque<ResetCleanupCommand>,
+
+    /// Cleanup disarms observed in the current implicit transaction. They are
+    /// committed only by an error-free idle ReadyForQuery.
+    pub(crate) pending_cleanup_disarms: PendingCleanupDisarms,
+
+    /// Whether the response cycle since the previous ReadyForQuery contained
+    /// an ErrorResponse and therefore rolled back implicit transaction effects.
+    pub(crate) response_cycle_had_error: bool,
 
     /// Shared mapping of client-to-server connections for query cancellation support.
     /// Allows canceling queries by mapping client process IDs to server process IDs.
@@ -2490,6 +2498,8 @@ impl Server {
                         cleanup_state: CleanupState::new(),
                         pending_set_cleanup_commands: VecDeque::new(),
                         pending_reset_cleanup_commands: VecDeque::new(),
+                        pending_cleanup_disarms: PendingCleanupDisarms::default(),
+                        response_cycle_had_error: false,
                         client_server_map,
                         connected_at: chrono::offset::Utc::now().naive_utc(),
                         stats,
@@ -2816,6 +2826,8 @@ impl Server {
             cleanup_state: CleanupState::new(),
             pending_set_cleanup_commands: VecDeque::new(),
             pending_reset_cleanup_commands: VecDeque::new(),
+            pending_cleanup_disarms: PendingCleanupDisarms::default(),
+            response_cycle_had_error: false,
             client_server_map: Arc::new(DashMap::new()),
             connected_at: chrono::Utc::now().naive_utc(),
             stats: Arc::new(ServerStats::default()),
