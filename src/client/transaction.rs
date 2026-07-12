@@ -18,9 +18,8 @@ use crate::app::server::{
 use crate::client::batch_handling::PARSE_COMPLETE_MSG;
 use crate::client::core::{BatchOperation, Client, PreparedStatementKey, SkippedParse};
 use crate::client::util::{
-    contains_discard_all, extract_deallocate_target, extract_reset_cleanup_commands,
-    extract_set_cleanup_commands, is_standalone_begin, simple_query_body,
-    simple_query_starts_with_prepare, QUERY_DEALLOCATE,
+    contains_discard_all, extract_deallocate_target, extract_set_and_reset_cleanup_commands,
+    is_standalone_begin, simple_query_body, simple_query_starts_with_prepare, QUERY_DEALLOCATE,
 };
 use crate::config::config_arc;
 use crate::errors::Error;
@@ -1169,12 +1168,13 @@ where
 
         self.track_forwarded_simple_deallocate_cache_state(message);
 
-        let starts_sql_prepare = simple_query_starts_with_prepare(simple_query_body(message));
+        let query_body = simple_query_body(message);
+        let starts_sql_prepare = simple_query_starts_with_prepare(query_body);
         if self.transaction_mode && starts_sql_prepare {
             self.sql_prepare_session_pinned = true;
         }
-        let set_cleanup_commands = extract_set_cleanup_commands(simple_query_body(message));
-        let reset_cleanup_commands = extract_reset_cleanup_commands(simple_query_body(message));
+        let (set_cleanup_commands, reset_cleanup_commands) =
+            extract_set_and_reset_cleanup_commands(query_body);
 
         // piggyback a deferred `SET application_name` onto this
         // simple-query first message. At checkout the SyncPlan::AppNameOnly arm
@@ -2183,9 +2183,8 @@ where
                     //                    guard below). This removes the
                     //                    standalone SET round-trip on the
                     //                    common app_name-only checkout.
-                    //   - Complex     -> proven standalone `sync_parameters`
-                    //                    round-trip (search_path, TimeZone,
-                    //                    RESET, multi-key) - untouched.
+                    //   - Complex     -> standalone round-trip using the diff
+                    //                    already computed by the classifier.
                     // after server.claim()
                     // the cancel-routing entry is live; every prep error path
                     // must release_after_inner_handler_error() before
@@ -2209,10 +2208,9 @@ where
                             // first client message (success AND error paths).
                             self.pending_app_name_set = Some(sql);
                         }
-                        SyncPlan::Complex => {
+                        SyncPlan::Complex(parameter_diff) => {
                             crate::web::metrics::inc_sync_params_plan("complex", "standalone");
-                            if let Err(err) = server.sync_parameters(&self.server_parameters).await
-                            {
+                            if let Err(err) = server.sync_parameter_diff(parameter_diff).await {
                                 self.release_after_inner_handler_error();
                                 return Err(err);
                             }
@@ -5054,6 +5052,28 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         }
     }
 
+    #[test]
+    fn simple_query_cleanup_attribution_uses_one_combined_scan() {
+        let src = include_str!("transaction.rs");
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let start = impl_src
+            .find("async fn handle_simple_query(")
+            .expect("simple-query handler not found");
+        let body = &impl_src[start..];
+        let end = body
+            .find("\n    /// Synthesize the wire response")
+            .expect("simple-query handler end not found");
+        let body = &body[..end];
+
+        assert_eq!(
+            body.matches("extract_set_and_reset_cleanup_commands(")
+                .count(),
+            1
+        );
+        assert!(!body.contains("extract_set_cleanup_commands("));
+        assert!(!body.contains("extract_reset_cleanup_commands("));
+    }
+
     /// Deferred-BEGIN ordering regression lock.
     ///
     /// `application_name` is a non-LOCAL GUC: a `SET application_name` issued
@@ -5269,6 +5289,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         for needle in [
             "server.compute_sync_plan(&self.server_parameters)?",
             "server.sync_parameters(&self.server_parameters).await?",
+            "server.sync_parameter_diff(parameter_diff).await?",
             "server.small_simple_query(&set_sql).await?",
         ] {
             assert!(

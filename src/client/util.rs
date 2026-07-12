@@ -329,20 +329,24 @@ fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|w| w.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b)))
 }
 
-/// Return the reset-cleanup-relevant `RESET` statements from a SimpleQuery body
-/// in statement order. PostgreSQL emits the same `CommandComplete("RESET")` tag
-/// for `RESET ALL` and narrower `RESET foo` statements, so the server response
-/// path needs this client-side attribution to safely disarm SET cleanup only for
-/// proven `RESET ALL` statements.
-pub(crate) fn extract_reset_cleanup_commands(bytes: &[u8]) -> SmallVec<[ResetCleanupCommand; 2]> {
-    // A body with no `reset` keyword has no RESET statement to attribute.
-    if !contains_ascii_ci(bytes, b"reset") {
-        return SmallVec::new();
+fn extract_cleanup_commands(
+    bytes: &[u8],
+    include_set: bool,
+    include_reset: bool,
+) -> (
+    SmallVec<[SetCleanupCommand; 2]>,
+    SmallVec<[ResetCleanupCommand; 2]>,
+) {
+    let scan_set = include_set && contains_ascii_ci(bytes, b"set");
+    let scan_reset = include_reset && contains_ascii_ci(bytes, b"reset");
+    let mut set_commands = SmallVec::new();
+    let mut reset_commands = SmallVec::new();
+    if !scan_set && !scan_reset {
+        return (set_commands, reset_commands);
     }
-    let mut commands = SmallVec::new();
+
     let mut statement_start = 0usize;
     let mut idx = 0usize;
-
     while idx < bytes.len() {
         match bytes[idx] {
             b'E' | b'e' if is_escape_string_prefix(bytes, idx) => {
@@ -367,8 +371,16 @@ pub(crate) fn extract_reset_cleanup_commands(bytes: &[u8]) -> SmallVec<[ResetCle
                 idx = next_idx;
             }
             b';' => {
-                if let Some(command) = parse_reset_cleanup_command(&bytes[statement_start..idx]) {
-                    commands.push(command);
+                let statement = &bytes[statement_start..idx];
+                if scan_set {
+                    if let Some(command) = parse_set_cleanup_command(statement) {
+                        set_commands.push(command);
+                    }
+                }
+                if scan_reset {
+                    if let Some(command) = parse_reset_cleanup_command(statement) {
+                        reset_commands.push(command);
+                    }
                 }
                 idx += 1;
                 statement_start = idx;
@@ -378,12 +390,38 @@ pub(crate) fn extract_reset_cleanup_commands(bytes: &[u8]) -> SmallVec<[ResetCle
     }
 
     if statement_start < bytes.len() {
-        if let Some(command) = parse_reset_cleanup_command(&bytes[statement_start..]) {
-            commands.push(command);
+        let statement = &bytes[statement_start..];
+        if scan_set {
+            if let Some(command) = parse_set_cleanup_command(statement) {
+                set_commands.push(command);
+            }
+        }
+        if scan_reset {
+            if let Some(command) = parse_reset_cleanup_command(statement) {
+                reset_commands.push(command);
+            }
         }
     }
 
-    commands
+    (set_commands, reset_commands)
+}
+
+pub(crate) fn extract_set_and_reset_cleanup_commands(
+    bytes: &[u8],
+) -> (
+    SmallVec<[SetCleanupCommand; 2]>,
+    SmallVec<[ResetCleanupCommand; 2]>,
+) {
+    extract_cleanup_commands(bytes, true, true)
+}
+
+/// Return the reset-cleanup-relevant `RESET` statements from a SimpleQuery body
+/// in statement order. PostgreSQL emits the same `CommandComplete("RESET")` tag
+/// for `RESET ALL` and narrower `RESET foo` statements, so the server response
+/// path needs this client-side attribution to safely disarm SET cleanup only for
+/// proven `RESET ALL` statements.
+pub(crate) fn extract_reset_cleanup_commands(bytes: &[u8]) -> SmallVec<[ResetCleanupCommand; 2]> {
+    extract_cleanup_commands(bytes, false, true).1
 }
 
 /// Return the session-cleanup-relevant `SET` statements from a SimpleQuery body
@@ -392,55 +430,7 @@ pub(crate) fn extract_reset_cleanup_commands(bytes: &[u8]) -> SmallVec<[ResetCle
 /// the response path needs this attribution to avoid treating `RESET ALL` as
 /// proof that role/session identity was restored.
 pub(crate) fn extract_set_cleanup_commands(bytes: &[u8]) -> SmallVec<[SetCleanupCommand; 2]> {
-    // A body with no `set` keyword has no SET statement to attribute.
-    if !contains_ascii_ci(bytes, b"set") {
-        return SmallVec::new();
-    }
-    let mut commands = SmallVec::new();
-    let mut statement_start = 0usize;
-    let mut idx = 0usize;
-
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'E' | b'e' if is_escape_string_prefix(bytes, idx) => {
-                idx = skip_escape_single_quoted_literal(bytes, idx + 1)
-            }
-            b'\'' => idx = skip_single_quoted_literal(bytes, idx),
-            b'"' => idx = skip_double_quoted_identifier(bytes, idx),
-            b'$' => {
-                if let Some(next_idx) = skip_dollar_quoted_literal(bytes, idx) {
-                    idx = next_idx;
-                } else {
-                    idx += 1;
-                }
-            }
-            b'-' if idx + 1 < bytes.len() && bytes[idx + 1] == b'-' => {
-                idx = skip_line_comment(bytes, idx);
-            }
-            b'/' if idx + 1 < bytes.len() && bytes[idx + 1] == b'*' => {
-                let Some(next_idx) = skip_block_comment(bytes, idx) else {
-                    break;
-                };
-                idx = next_idx;
-            }
-            b';' => {
-                if let Some(command) = parse_set_cleanup_command(&bytes[statement_start..idx]) {
-                    commands.push(command);
-                }
-                idx += 1;
-                statement_start = idx;
-            }
-            _ => idx += 1,
-        }
-    }
-
-    if statement_start < bytes.len() {
-        if let Some(command) = parse_set_cleanup_command(&bytes[statement_start..]) {
-            commands.push(command);
-        }
-    }
-
-    commands
+    extract_cleanup_commands(bytes, true, false).0
 }
 
 /// Return true when a query contains a `set_config(...)` call whose scope is
@@ -1742,6 +1732,31 @@ mod tests {
                 ResetCleanupCommand::PerGucReset,
                 ResetCleanupCommand::ResetAll,
             ],
+        );
+    }
+
+    #[test]
+    fn combined_cleanup_extractor_preserves_set_and_reset_order() {
+        use crate::server::cleanup::{ResetCleanupCommand, SetCleanupCommand};
+
+        let (set_commands, reset_commands) = extract_set_and_reset_cleanup_commands(
+            b"SET ROLE audit_reader; RESET statement_timeout; \
+              SET SESSION AUTHORIZATION app_user; RESET ALL",
+        );
+
+        assert_eq!(
+            set_commands.as_slice(),
+            &[
+                SetCleanupCommand::SetRole,
+                SetCleanupCommand::SetSessionAuthorization,
+            ]
+        );
+        assert_eq!(
+            reset_commands.as_slice(),
+            &[
+                ResetCleanupCommand::PerGucReset,
+                ResetCleanupCommand::ResetAll,
+            ]
         );
     }
 
