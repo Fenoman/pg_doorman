@@ -430,6 +430,7 @@ mod tests {
                 idle_timeout_ms: 60_000,
                 life_time_ms: 1, // tiny: any connection would be "expired"
                 sync_server_parameters: false,
+                intercept_discard_all: true,
                 min_guaranteed_pool_size: 0,
             },
             config_hash: 0,

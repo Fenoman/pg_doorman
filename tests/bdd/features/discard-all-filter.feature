@@ -59,6 +59,17 @@ Feature: DISCARD ALL fast-path in transaction pooling
       username = "example_user_1"
       password = ""
       pool_size = 2
+
+      [pools.discard_precheckout]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      server_database = "example_db"
+      pool_mode = "transaction"
+
+      [[pools.discard_precheckout.users]]
+      username = "example_user_1"
+      password = ""
+      pool_size = 1
       """
 
   Scenario: transaction-mode DISCARD ALL is intercepted (not forwarded)
@@ -70,6 +81,16 @@ Feature: DISCARD ALL fast-path in transaction pooling
     And we sleep 300ms
     # Backend must NOT see the DISCARD ALL - pg_doorman synthesised the reply.
     Then PostgreSQL log should not contain "DISCARD ALL"
+
+  @discard-all-precheckout
+  Scenario: standalone DISCARD ALL does not check out a backend
+    When we create session "precheckout" to pg_doorman as "example_user_1" with password "" and database "discard_precheckout"
+    And we truncate PostgreSQL log
+    And we send SimpleQuery "DISCARD ALL" to session "precheckout"
+    And we sleep 300ms
+    Then PostgreSQL log should not contain "DISCARD ALL"
+    And PostgreSQL log should not contain "pg_advisory_unlock_all"
+    And PostgreSQL log should not contain "pgv_free"
 
   Scenario: transaction-mode DISCARD ALL with whitespace and semicolon is intercepted
     When we create session "txws" to pg_doorman as "example_user_1" with password "" and database "discard_tx"
