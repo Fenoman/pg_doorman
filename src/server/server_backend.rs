@@ -1408,6 +1408,43 @@ impl Server {
         self.intercept_discard_all
     }
 
+    #[inline]
+    fn checkin_cleanup_metric_path(&self) -> &'static str {
+        let has_release = self.release_query.is_some();
+        let has_cleanup = self.in_transaction()
+            || (self.cleanup_connections
+                && (self.cleanup_state.needs_cleanup()
+                    || self.has_pending_cache_entries
+                    || !self.deferred_eviction_closes.is_empty()));
+        match (has_release, has_cleanup) {
+            (true, true) => "combined",
+            (true, false) => "release_only",
+            (false, true) => "cleanup_only",
+            (false, false) => "empty",
+        }
+    }
+
+    #[inline]
+    fn checkin_cleanup_metric_result(result: &Result<(), Error>) -> &'static str {
+        match result {
+            Ok(()) => "ok",
+            Err(Error::QueryError(_)) => "sql_error",
+            Err(
+                Error::SocketError(_)
+                | Error::ConnectError(_)
+                | Error::ConnectResourceExhausted(_)
+                | Error::FlushTimeout
+                | Error::ProxyTimeout,
+            ) => "transport_error",
+            Err(
+                Error::ProtocolSyncError(_)
+                | Error::ServerMessageParserError(_)
+                | Error::ParseBytesError(_),
+            ) => "protocol_error",
+            Err(_) => "error",
+        }
+    }
+
     /// Run the regular `checkin_cleanup` and, if configured, the per-pool
     /// `release_query` before this backend goes back into the pool.
     ///
@@ -1416,6 +1453,20 @@ impl Server {
     /// is forced off before the housekeeping statement, otherwise `small_simple_query`'s
     /// recv loop would not match the synchronous Sync/ReadyForQuery exchange.
     pub async fn finalize_checkin(&mut self) -> Result<(), Error> {
+        let path = self.checkin_cleanup_metric_path();
+        let started = quanta::Instant::now();
+        let result = self.finalize_checkin_inner().await;
+        crate::web::metrics::observe_checkin_cleanup(
+            self.address.username.as_str(),
+            self.address.database.as_str(),
+            path,
+            Self::checkin_cleanup_metric_result(&result),
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+
+    async fn finalize_checkin_inner(&mut self) -> Result<(), Error> {
         // Collect the cleanup statements without sending them, then
         // append the per-pool `release_query` (if configured) so the
         // entire checkin path is one network round-trip instead of two
@@ -2998,12 +3049,24 @@ mod tests {
     #[tokio::test]
     async fn successful_finalize_clears_release_cleanup_pending() {
         use super::Server;
+        use crate::web::metrics::CHECKIN_CLEANUP_SECONDS;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut server, mut peer) = Server::test_silent_socket();
         server.set_release_query(Some("SELECT pg_advisory_unlock_all()"));
         server.arm_release_cleanup();
         assert!(server.release_cleanup_pending);
+        let metric_user = server.address.username.clone();
+        let metric_database = server.address.database.clone();
+        let labels = [
+            metric_user.as_str(),
+            metric_database.as_str(),
+            "release_only",
+            "ok",
+        ];
+        let metric_before = CHECKIN_CLEANUP_SECONDS
+            .with_label_values(&labels)
+            .get_sample_count();
 
         let peer_task = tokio::spawn(async move {
             let mut header = [0_u8; 5];
@@ -3037,6 +3100,13 @@ mod tests {
             "a confirmed release round trip must disarm the pending flag"
         );
         assert!(!server.is_bad());
+        assert_eq!(
+            CHECKIN_CLEANUP_SECONDS
+                .with_label_values(&labels)
+                .get_sample_count(),
+            metric_before + 1,
+            "successful release-only check-in must be observable"
+        );
     }
 
     #[cfg(unix)]

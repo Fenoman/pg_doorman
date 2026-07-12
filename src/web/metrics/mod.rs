@@ -23,7 +23,7 @@ pub(crate) use handler::write_metrics_response;
 pub use metrics::{
     forget_fallback_host_label, inc_sync_params_applied, inc_sync_params_plan,
     inc_sync_params_skipped, observe_anonymous_eviction, observe_backend_create_phase,
-    observe_backend_startup_parameter_error, observe_named_eviction,
+    observe_backend_startup_parameter_error, observe_checkin_cleanup, observe_named_eviction,
     observe_pool_query_microseconds, observe_pool_transaction_microseconds,
     observe_pool_wait_microseconds, observe_startup_parameters_dropped, observe_streaming_bytes,
     observe_streaming_event, observe_sync_params_rtt_seconds, record_fallback_host_label,
@@ -865,6 +865,27 @@ pub(crate) static SYNC_PARAMS_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
         0.010, 0.025, 0.050,
     ]);
     let histogram = Histogram::with_opts(opts).unwrap();
+    REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
+/// Duration and outcome of the backend check-in exchange after a client
+/// transaction has reached ReadyForQuery. Both labels have a fixed vocabulary:
+/// `path` is empty/release_only/cleanup_only/combined and `result` is
+/// ok/sql_error/transport_error/protocol_error/error.
+pub(crate) static CHECKIN_CLEANUP_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "pg_doorman_checkin_cleanup_seconds",
+            "Wall-clock duration of backend check-in cleanup by path and outcome.",
+        )
+        .buckets(vec![
+            0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.002_5,
+            0.005, 0.010, 0.025, 0.050, 0.100, 0.500, 1.0, 5.0, 30.0,
+        ]),
+        &["user", "database", "path", "result"],
+    )
+    .unwrap();
     REGISTRY.register(Box::new(histogram.clone())).unwrap();
     histogram
 });

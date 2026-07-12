@@ -34,6 +34,9 @@ alter system set log_connections to on;
 alter system set log_disconnections to on;
 alter system set log_min_messages to debug1;
 
+create table release_failure_control(denominator integer not null);
+insert into release_failure_control values (1);
+
 select pg_reload_conf();
 -- unix socket.
 -- alter system set unix_socket_directories to '/tmp';

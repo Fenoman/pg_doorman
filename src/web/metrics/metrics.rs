@@ -21,8 +21,8 @@ use super::SHOW_SOCKETS;
 use super::{
     AUTH_QUERY_AUTH, AUTH_QUERY_AUTH_TOTAL, AUTH_QUERY_CACHE, AUTH_QUERY_CACHE_TOTAL,
     AUTH_QUERY_DYNAMIC_POOLS, AUTH_QUERY_DYNAMIC_POOLS_TOTAL, AUTH_QUERY_EXECUTOR,
-    AUTH_QUERY_EXECUTOR_TOTAL, BACKEND_STARTUP_PARAMETER_ERRORS_TOTAL, COORDINATOR,
-    COORDINATOR_TOTALS, FALLBACK_ACTIVE, FALLBACK_CACHE_HITS_TOTAL,
+    AUTH_QUERY_EXECUTOR_TOTAL, BACKEND_STARTUP_PARAMETER_ERRORS_TOTAL, CHECKIN_CLEANUP_SECONDS,
+    COORDINATOR, COORDINATOR_TOTALS, FALLBACK_ACTIVE, FALLBACK_CACHE_HITS_TOTAL,
     FALLBACK_CANDIDATE_FAILURES_TOTAL, FALLBACK_CONNECTIONS_TOTAL, FALLBACK_HOST,
     PATRONI_API_DURATION, PATRONI_API_ERRORS_TOTAL, PATRONI_API_REQUESTS_TOTAL, POOL_SCALING_GAUGE,
     POOL_SCALING_TOTALS, SHOW_ASYNC_CLIENTS_COUNT, SHOW_CLIENT_CACHE_BYTES,
@@ -1668,6 +1668,21 @@ pub fn inc_sync_params_plan(plan: &'static str, path: &'static str) {
 #[inline]
 pub fn observe_sync_params_rtt_seconds(seconds: f64) {
     SYNC_PARAMS_RTT_SECONDS.observe(seconds);
+}
+
+/// Record one completed backend check-in exchange. Callers provide only the
+/// fixed path/result values documented on `CHECKIN_CLEANUP_SECONDS`.
+#[inline]
+pub fn observe_checkin_cleanup(
+    user: &str,
+    database: &str,
+    path: &'static str,
+    result: &'static str,
+    seconds: f64,
+) {
+    CHECKIN_CLEANUP_SECONDS
+        .with_label_values(&[user, database, path, result])
+        .observe(seconds);
 }
 
 /// Observes one transaction duration in the per-pool transaction
