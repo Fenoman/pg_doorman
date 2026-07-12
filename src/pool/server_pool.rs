@@ -16,7 +16,7 @@ use crate::config::startup_parameters as sp;
 use crate::config::{Address, User};
 use crate::errors::Error;
 use crate::patroni::types::Role;
-use crate::server::Server;
+use crate::server::{resolve_release_query, ResolvedReleaseQuery, Server};
 use crate::stats::{AddressStats, ServerStats};
 use crate::utils::format_duration_ms;
 
@@ -295,13 +295,9 @@ pub struct ServerPool {
     /// walk on every backend create.
     resolved_startup_decision: BudgetDecision,
 
-    /// Pool-level `release_query` config snapshot. `None` => use the
-    /// iServ-compatible default (`RELEASE_SESSION_QUERY`); `Some("")` => disable the
-    /// release query entirely; `Some(custom)` => execute exactly that SQL.
-    /// Installed via `ServerPool::with_release_query` from `mod.rs` /
-    /// `dynamic.rs`; consumed in `create()` and `create_fallback_connection_inner()`
-    /// to call `Server::set_release_query` right after startup.
-    release_query: Option<String>,
+    /// Pool-shared resolved SQL and pre-encoded release-only Query frame.
+    /// `None` means the release query was explicitly disabled.
+    release_query: Option<ResolvedReleaseQuery>,
 
     /// Effective `prewarm_query` for this pool - already resolved against the
     /// per-user override at construction time. Empty string disables the
@@ -408,7 +404,7 @@ impl ServerPool {
             operator_managed_startup_keys,
             resolved_startup_map,
             resolved_startup_decision,
-            release_query: None,
+            release_query: resolve_release_query(None),
             prewarm_query: String::new(),
             // Default-safe: honour the iServ contract even when nobody
             // calls `with_intercept_discard_all` (test helpers, GC paths).
@@ -416,14 +412,9 @@ impl ServerPool {
         }
     }
 
-    /// Builder-style override for the resolved release-query of this pool.
-    /// Called by the static (`pool/mod.rs`) and dynamic (`pool/dynamic.rs`)
-    /// pool init paths to forward `pool_config.release_query`. The default
-    /// (constructed in `ServerPool::new`) is `None`, which means
-    /// `resolve_release_query` will materialise the iServ-compatible default
-    /// when the backend is created.
+    /// Resolve and pre-encode the pool release query once during pool creation.
     pub fn with_release_query(mut self, release_query: Option<String>) -> ServerPool {
-        self.release_query = release_query;
+        self.release_query = resolve_release_query(release_query.as_deref());
         self
     }
 
@@ -680,10 +671,8 @@ impl ServerPool {
         match result {
             Ok(mut conn) => {
                 active_stats_guard.disarm();
-                // Forward the pool-level release_query onto this backend before
-                // it joins the idle set. Empty / None / custom are all decided
-                // by `resolve_release_query`.
-                conn.set_release_query(self.release_query.as_deref());
+                // Share the pool-level resolved release query with this backend.
+                conn.set_resolved_release_query(self.release_query.clone());
                 conn.set_intercept_discard_all(self.intercept_discard_all);
                 // Run prewarm_query (if configured). On failure the backend is
                 // marked bad inside the helper; we surface the error so the
@@ -1312,10 +1301,8 @@ impl ServerPool {
         match result {
             Ok(mut conn) => {
                 active_stats_guard.disarm();
-                // Same release_query / prewarm_query installation as the main
-                // `create()` path so fallback backends honour the operator
-                // config too.
-                conn.set_release_query(self.release_query.as_deref());
+                // Same release-query and prewarm setup as the main create path.
+                conn.set_resolved_release_query(self.release_query.clone());
                 conn.set_intercept_discard_all(self.intercept_discard_all);
                 self.run_prewarm_query(&mut conn).await?;
                 conn.stats.idle(0);

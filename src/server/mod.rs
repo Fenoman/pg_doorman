@@ -36,6 +36,7 @@ pub use server_backend::BUF_STREAM_CAPACITY;
 /// into the private `server_backend` module. `SyncPlan` is `pub(crate)`, so
 /// the re-export matches that visibility (a `pub use` would be E0365).
 pub(crate) use server_backend::{
-    AsyncExpectedResponse, SetResponseOutcome, SyncPlan, HOUSEKEEPING_TIMEOUT,
+    resolve_release_query, AsyncExpectedResponse, ResolvedReleaseQuery, SetResponseOutcome,
+    SyncPlan, HOUSEKEEPING_TIMEOUT,
 };
 pub use stream::StreamInner;
