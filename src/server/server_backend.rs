@@ -232,10 +232,10 @@ fn combined_sql_preview(combined: &str, max_bytes: usize) -> String {
 }
 
 /// Wrap a GUC value in a PostgreSQL dollar-quoted string literal that is safe
-/// to splice into `SET key TO <literal>`. Single-quote escaping (`''`) breaks
-/// for backend-controlled values containing apostrophes inside SCRAM salts,
-/// `application_name` strings with quotes, search_path entries with embedded
-/// quotes, and so on - dollar-quoting is the only delimiter PostgreSQL
+/// to splice into parameter synchronization SQL. Single-quote escaping (`''`)
+/// breaks for backend-controlled values containing apostrophes inside SCRAM
+/// salts, `application_name` strings with quotes, search_path entries with
+/// embedded quotes, and so on - dollar-quoting is the only delimiter PostgreSQL
 /// guarantees never to interpret.
 ///
 /// Picks the shortest `$pgdoorman<N>$` tag that produces a syntactically valid
@@ -597,6 +597,39 @@ fn classify_sync_plan(
     }
 
     Ok(SyncPlan::Complex(diff))
+}
+
+/// Build checkout synchronization SQL in deterministic key order.
+/// `search_path` uses `set_config` because its canonical value is a
+/// comma-separated list; passing the whole value as one `SET` literal would
+/// select a single schema whose name contains the comma.
+fn build_parameter_sync_query(
+    parameter_diff: &HashMap<String, crate::server::parameters::ParamAction>,
+) -> Result<String, Error> {
+    let mut diff_sorted: Vec<_> = parameter_diff.iter().collect();
+    diff_sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+    use std::fmt::Write as _;
+    let mut query = String::new();
+    for (key, action) in diff_sorted {
+        match action {
+            crate::server::parameters::ParamAction::SetTo(value) => {
+                let literal = sql_string_literal(value)?;
+                if key == "search_path" {
+                    let _ = write!(
+                        query,
+                        "SELECT pg_catalog.set_config('search_path', {literal}, false) IS NOT NULL;"
+                    );
+                } else {
+                    let _ = write!(query, "SET {key} TO {literal};");
+                }
+            }
+            crate::server::parameters::ParamAction::Reset => {
+                let _ = write!(query, "RESET {key};");
+            }
+        }
+    }
+    Ok(query)
 }
 
 impl Server {
@@ -2032,38 +2065,7 @@ impl Server {
             return Ok(());
         }
 
-        // deterministic SET/RESET ordering.
-        // `compare_params` returns a HashMap whose iteration order
-        // is randomised per process (Rust's default SipHash). Two
-        // backends with identical client-side parameter diff
-        // emitted the same housekeeping SQL in different
-        // orders -> `pg_stat_statements` recorded distinct queryid
-        // entries for what is logically the same query, fragmenting
-        // the planner cache and polluting p99 dashboards. Sort by
-        // key before iteration for stable text.
-        let mut diff_sorted: Vec<_> = parameter_diff.iter().collect();
-        diff_sorted.sort_by(|a, b| a.0.cmp(b.0));
-
-        use std::fmt::Write as _;
-        let mut query = String::new();
-        for (key, action) in &diff_sorted {
-            match action {
-                crate::server::parameters::ParamAction::SetTo(value) => {
-                    // GUC keys come from a canonicalised whitelist, so they
-                    // never need quoting. Values may contain apostrophes,
-                    // backslashes, or anything else a client put in
-                    // application_name / search_path - dollar-quoting is the
-                    // only literal form PostgreSQL leaves untouched.
-                    // propagate fail-closed Err from
-                    // exhaust-cap path.
-                    let literal = sql_string_literal(value)?;
-                    let _ = write!(query, "SET {key} TO {literal};");
-                }
-                crate::server::parameters::ParamAction::Reset => {
-                    let _ = write!(query, "RESET {key};");
-                }
-            }
-        }
+        let query = build_parameter_sync_query(&parameter_diff)?;
 
         let sync_started = Instant::now();
         let res = self.small_simple_query(&query).await;
@@ -4378,9 +4380,9 @@ mod tests {
     // Pure SyncPlan classifier coverage. These exercise the factored-out
     // `classify_sync_plan` so we do not need to build a full `Server`.
     mod compute_sync_plan_tests {
-        use super::super::{classify_sync_plan, SyncPlan};
+        use super::super::{build_parameter_sync_query, classify_sync_plan, SyncPlan};
         use crate::server::parameters::{ParamAction, ServerParameters};
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
 
         /// Build an empty backend snapshot, then set each param so the diff
         /// stays focused on exactly what each test wants.
@@ -4511,6 +4513,40 @@ mod tests {
             assert!(
                 matches!(plan, SyncPlan::Empty),
                 "expected Empty (app_name operator-managed), got {plan:?}"
+            );
+        }
+
+        #[test]
+        fn sync_query_preserves_list_valued_search_path() {
+            let diff = HashMap::from([(
+                "search_path".to_string(),
+                ParamAction::SetTo("\"$user\", public".to_string()),
+            )]);
+
+            let query = build_parameter_sync_query(&diff).expect("sync SQL must be generated");
+
+            assert_eq!(
+                query,
+                "SELECT pg_catalog.set_config('search_path', \
+                 $pgdoorman0$\"$user\", public$pgdoorman0$, false) IS NOT NULL;"
+            );
+        }
+
+        #[test]
+        fn sync_query_keeps_scalar_set_reset_and_key_order() {
+            let diff = HashMap::from([
+                (
+                    "application_name".to_string(),
+                    ParamAction::SetTo("svc".to_string()),
+                ),
+                ("TimeZone".to_string(), ParamAction::Reset),
+            ]);
+
+            let query = build_parameter_sync_query(&diff).expect("sync SQL must be generated");
+
+            assert_eq!(
+                query,
+                "RESET TimeZone;SET application_name TO $pgdoorman0$svc$pgdoorman0$;"
             );
         }
     }
