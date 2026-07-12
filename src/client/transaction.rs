@@ -2805,50 +2805,69 @@ where
                         TransactionAction::Break => break,
                     }
                 }
-                // Check if shutdown is in progress - if so, mark server as bad to release PG connection
-                // and prepare to send error to client on next query
+                // Once the client query reached ReadyForQuery, cancellation must
+                // no longer target this backend: the next exchange is internal
+                // check-in cleanup.
                 let shutdown_in_progress = SHUTDOWN_IN_PROGRESS.load(Ordering::Relaxed);
-                // capture the finalize_checkin result but defer the `?`
-                // until AFTER release(), so cancel-map cleanup runs even when
-                // the release-query SQL fails. Otherwise the orphan window
-                // could mis-route a parallel CancelRequest.
-                let finalize_res: Result<(), Error> = if shutdown_in_progress {
-                    server.mark_bad("graceful shutdown - releasing server connection");
-                    Ok(())
-                } else if !server.is_async() {
-                    server.finalize_checkin().await
-                } else {
-                    Ok(())
+                self.connected_to_server = false;
+                self.release();
+
+                let has_buffered_response = !self.client_last_messages_in_tx.is_empty();
+                if has_buffered_response {
+                    self.stats.idle_write();
+                }
+                let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
+                let buffered_response = &self.client_last_messages_in_tx;
+                let client_write = &mut self.write;
+
+                // Client delivery and backend cleanup are independent after
+                // ReadyForQuery and use different sockets. Running them together
+                // keeps release-query latency out of the client-visible result.
+                let flush_response = async {
+                    if has_buffered_response {
+                        write_all_flush_timeout(client_write, buffered_response, write_timeout)
+                            .await
+                    } else {
+                        Ok(())
+                    }
                 };
+                let finalize_backend = async {
+                    if shutdown_in_progress {
+                        server.mark_bad("graceful shutdown - releasing server connection");
+                        Ok(())
+                    } else if !server.is_async() {
+                        server.finalize_checkin().await
+                    } else {
+                        Ok(())
+                    }
+                };
+                let (flush_res, finalize_res) = tokio::join!(flush_response, finalize_backend);
+
                 if self.transaction_mode {
                     server
                         .stats
                         .add_xact_time_and_idle(server_active_at.elapsed().as_micros() as u64);
                 }
-                // The server is no longer bound to us, we can't cancel it's queries anymore.
-                self.release();
-                finalize_res?;
+
+                if let Err(err) = finalize_res {
+                    if !server.is_bad() {
+                        server.mark_bad(&format!("check-in cleanup failed: {err}"));
+                    }
+                    warn!(
+                        "[{}@{} #c{}] check-in cleanup failed for backend pid={}: {err}",
+                        self.username,
+                        self.pool_name,
+                        self.connection_id,
+                        server.get_process_id(),
+                    );
+                }
                 server.stats.wait_idle();
-                shutdown_in_progress
-            }; // release server.
 
-            // Backend was finalized and released above. Any buffered fast-release
-            // response write below is client-only and must not keep cancel/drop
-            // state pretending a backend is still attached.
-            self.connected_to_server = false;
-
-            if !self.client_last_messages_in_tx.is_empty() {
-                self.stats.idle_write(); // go to idle_read if success.
-                let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
-                match write_all_flush_timeout(
-                    &mut self.write,
-                    &self.client_last_messages_in_tx,
-                    write_timeout,
-                )
-                .await
-                {
+                match flush_res {
                     Ok(()) => {
-                        self.client_last_messages_in_tx.clear();
+                        if has_buffered_response {
+                            self.client_last_messages_in_tx.clear();
+                        }
                     }
                     Err(err) => {
                         warn!(
@@ -2859,7 +2878,9 @@ where
                         return Err(err);
                     }
                 }
-            }
+
+                shutdown_in_progress
+            }; // release server.
 
             // TransactionGuard dropped at end of block above, counter already decremented.
 

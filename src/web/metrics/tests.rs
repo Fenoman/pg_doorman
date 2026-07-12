@@ -211,6 +211,38 @@ fn sync_params_plan_metric_registers_plan_and_path_labels() {
 
 #[test]
 #[serial]
+fn checkin_cleanup_metric_registers_pool_path_and_result() {
+    use crate::web::metrics::{observe_checkin_cleanup, CHECKIN_CLEANUP_SECONDS};
+    use prometheus::Encoder;
+
+    let labels = ["cleanup_user", "cleanup_db", "release_only", "ok"];
+    let before = CHECKIN_CLEANUP_SECONDS
+        .with_label_values(&labels)
+        .get_sample_count();
+
+    observe_checkin_cleanup(labels[0], labels[1], labels[2], labels[3], 0.000_025);
+
+    assert_eq!(
+        CHECKIN_CLEANUP_SECONDS
+            .with_label_values(&labels)
+            .get_sample_count(),
+        before + 1
+    );
+
+    let families = crate::web::metrics::REGISTRY.gather();
+    let mut buffer = Vec::new();
+    prometheus::TextEncoder::new()
+        .encode(&families, &mut buffer)
+        .unwrap();
+    let exported = String::from_utf8(buffer).unwrap();
+
+    assert!(exported.contains("pg_doorman_checkin_cleanup_seconds"));
+    assert!(exported.contains(r#"path="release_only""#));
+    assert!(exported.contains(r#"result="ok""#));
+}
+
+#[test]
+#[serial]
 fn migration_clients_dropped_metric_registers_and_increments() {
     use crate::web::metrics::{record_migration_client_dropped, MIGRATION_CLIENTS_DROPPED_TOTAL};
     use prometheus::Encoder;
