@@ -98,7 +98,7 @@ const BUFFER_FLUSH_THRESHOLD: usize = 8192;
 /// Flushes messages within `duration`; timeout marks the server bad.
 pub(crate) async fn send_and_flush_timeout(
     server: &mut Server,
-    messages: &BytesMut,
+    messages: &[u8],
     duration: Duration,
 ) -> Result<(), Error> {
     match timeout(duration, send_and_flush(server, messages)).await {
@@ -117,7 +117,7 @@ pub(crate) async fn send_and_flush_timeout(
 }
 
 /// Flushes messages and records write stats/activity.
-pub(crate) async fn send_and_flush(server: &mut Server, messages: &BytesMut) -> Result<(), Error> {
+pub(crate) async fn send_and_flush(server: &mut Server, messages: &[u8]) -> Result<(), Error> {
     server.stats.data_sent(messages.len());
     server.stats.wait_writing();
 

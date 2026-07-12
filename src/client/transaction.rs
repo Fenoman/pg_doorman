@@ -4310,7 +4310,7 @@ mod client_response_write_timeout_tests {
             &src[..tests_start]
         };
         let flush_start = impl_src
-            .find("if !self.client_last_messages_in_tx.is_empty()")
+            .find("let has_buffered_response = !self.client_last_messages_in_tx.is_empty()")
             .expect("post-release fast-response flush should exist");
         let flush_body = &impl_src[flush_start..];
         let flush_end = flush_body
@@ -4324,7 +4324,7 @@ mod client_response_write_timeout_tests {
         );
         assert!(
             flush_body.contains("write_all_flush_timeout(")
-                && flush_body.contains("&self.client_last_messages_in_tx")
+                && flush_body.contains("buffered_response")
                 && flush_body.contains("write_timeout"),
             "post-release fast-response flush must not wait forever on a slow client"
         );

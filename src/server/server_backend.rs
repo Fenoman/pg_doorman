@@ -84,7 +84,7 @@ impl Drop for TerminateTaskGuard<'_> {
     }
 }
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{debug, error, info, warn};
 use lru::LruCache;
 use tokio::io::{AsyncReadExt, AsyncWrite, BufStream};
@@ -174,20 +174,52 @@ where
     .is_ok()
 }
 
-/// Translate a pool-level `release_query` config value into the resolved
-/// statement that `Server::finalize_checkin` will execute on every checkin:
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedReleaseQuery {
+    sql: Arc<str>,
+    frame: Bytes,
+}
+
+impl ResolvedReleaseQuery {
+    #[inline]
+    pub(crate) fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    #[inline]
+    pub(crate) fn frame(&self) -> &[u8] {
+        &self.frame
+    }
+}
+
+impl std::ops::Deref for ResolvedReleaseQuery {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.sql()
+    }
+}
+
+/// Translate a pool-level `release_query` config value into the SQL and
+/// pre-encoded simple-query frame used on every check-in:
 ///
 /// * `None` => iServ-compatible default (`RELEASE_SESSION_QUERY`).
 /// * `Some("")` => disabled, nothing runs at checkin.
 /// * `Some(custom)` => exactly the operator-provided SQL.
 ///
-/// Returned as `Arc<str>` so every backend in the pool shares one allocation.
-pub(crate) fn resolve_release_query(configured: Option<&str>) -> Option<Arc<str>> {
-    match configured {
-        None => Some(Arc::from(RELEASE_SESSION_QUERY)),
-        Some("") => None,
-        Some(query) => Some(Arc::from(query)),
-    }
+/// The SQL and frame use reference-counted storage so every backend in the
+/// pool can reuse them without rebuilding or copying either representation.
+pub(crate) fn resolve_release_query(configured: Option<&str>) -> Option<ResolvedReleaseQuery> {
+    let sql: Arc<str> = match configured {
+        None => Arc::from(RELEASE_SESSION_QUERY),
+        Some("") => return None,
+        Some(query) => Arc::from(query),
+    };
+    let mut wire_sql = String::with_capacity(sql.len() + 1);
+    wire_sql.push_str(&sql);
+    wire_sql.push(';');
+    let frame = simple_query(&wire_sql).freeze();
+    Some(ResolvedReleaseQuery { sql, frame })
 }
 
 fn combined_sql_preview(combined: &str, max_bytes: usize) -> String {
@@ -466,12 +498,9 @@ pub struct Server {
     /// into the backend snapshot.
     pub(crate) last_sql_error: Option<(String, String)>,
 
-    /// Resolved release-query for this backend, installed by `ServerPool::create`
-    /// right after startup. `None` means "do not run anything at checkin"; the
-    /// iServ-compatible default is materialised here when the operator omits
-    /// `release_query` from the pool config. Shared as `Arc<str>` because every
-    /// backend in the pool uses the same statement.
-    release_query: Option<Arc<str>>,
+    /// Resolved release query shared by every backend in this pool. It carries
+    /// both the configured SQL and its pre-encoded release-only Query frame.
+    release_query: Option<ResolvedReleaseQuery>,
 
     /// True while the current checkout still owes a successful
     /// `release_query` round trip. Armed by [`Server::arm_release_cleanup`]
@@ -603,7 +632,10 @@ impl Server {
     /// the connection.
     pub async fn small_simple_query(&mut self, query: &str) -> Result<(), Error> {
         let query = simple_query(query);
+        self.small_simple_query_frame(&query).await
+    }
 
+    async fn small_simple_query_frame(&mut self, query: &[u8]) -> Result<(), Error> {
         // Reset SQL-error capture for this round trip before reading a
         // new ReadyForQuery.
         self.last_sql_error = None;
@@ -611,7 +643,7 @@ impl Server {
         let deadline = tokio::time::Instant::now() + HOUSEKEEPING_TIMEOUT;
         self.begin_internal_round_trip();
 
-        match tokio::time::timeout_at(deadline, self.send_and_flush(&query)).await {
+        match tokio::time::timeout_at(deadline, self.send_and_flush(query)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => return Err(err),
             Err(_) => {
@@ -977,13 +1009,13 @@ impl Server {
 
     pub async fn send_and_flush_timeout(
         &mut self,
-        messages: &BytesMut,
+        messages: &[u8],
         duration: Duration,
     ) -> Result<(), Error> {
         protocol_io::send_and_flush_timeout(self, messages, duration).await
     }
 
-    pub async fn send_and_flush(&mut self, messages: &BytesMut) -> Result<(), Error> {
+    pub async fn send_and_flush(&mut self, messages: &[u8]) -> Result<(), Error> {
         protocol_io::send_and_flush(self, messages).await
     }
 
@@ -1252,16 +1284,56 @@ impl Server {
         Ok(stmts)
     }
 
-    /// Send the combined housekeeping statements as a single
-    /// `small_simple_query` (one network round-trip), then run the
-    /// post-send local cache cleanup if a DEALLOCATE ALL was issued.
-    /// `release_query_appended` is `Some(rq)` when called from
-    /// `finalize_checkin` with a per-pool release query attached, `None`
-    /// when called from the plain `checkin_cleanup` path; the value
-    /// shapes the `mark_bad` reason so an operator can tell from the
-    /// log which path failed AND captures the failing SQLSTATE +
-    /// message + statement preview so they know WHICH statement in the
-    /// combined query exploded.
+    /// Execute the pool-shared pre-encoded frame when no session cleanup
+    /// statements need to be combined with the release query.
+    async fn send_release_query_only(
+        &mut self,
+        release_query: &ResolvedReleaseQuery,
+    ) -> Result<(), Error> {
+        if let Err(err) = self.small_simple_query_frame(release_query.frame()).await {
+            const PREVIEW_CAP: usize = 200;
+            let preview = combined_sql_preview(release_query.sql(), PREVIEW_CAP);
+            let reason = format!("finalize_checkin release_query error: {err} on query: {preview}");
+            warn!(
+                "[{}@{}] finalize_checkin backend pid={} marked bad: {}",
+                self.address.username, self.address.pool_name, self.process_id, reason
+            );
+            self.mark_bad(&reason);
+            return Err(err);
+        }
+
+        if self.cleanup_state.needs_cleanup() {
+            let reason = format!(
+                "finalize_checkin release_query left backend cleanup state dirty: {}",
+                self.cleanup_state
+            );
+            warn!(
+                "[{}@{}] finalize_checkin backend pid={} marked bad: {}",
+                self.address.username, self.address.pool_name, self.process_id, reason
+            );
+            self.mark_bad(&reason);
+            return Err(Error::ProtocolSyncError(reason));
+        }
+        if self.in_transaction || self.in_copy_mode {
+            let reason = format!(
+                "finalize_checkin (release_query) left backend non-idle: \
+                 in_transaction={}, in_copy={}",
+                self.in_transaction, self.in_copy_mode
+            );
+            warn!(
+                "[{}@{}] finalize_checkin backend pid={} marked bad: {}",
+                self.address.username, self.address.pool_name, self.process_id, reason
+            );
+            self.mark_bad(&reason);
+            return Err(Error::ProtocolSyncError(reason));
+        }
+
+        self.release_cleanup_pending = false;
+        Ok(())
+    }
+
+    /// Send combined housekeeping statements in one round trip and update
+    /// local cleanup and prepared-statement state after PostgreSQL confirms it.
     async fn send_checkin_cleanup(
         &mut self,
         stmts: Vec<String>,
@@ -1389,11 +1461,17 @@ impl Server {
         Ok(())
     }
 
-    /// Install the resolved release-query on this backend. Called by
-    /// `ServerPool::create` (and the fallback path) right after `Server::startup`
-    /// so every backend in the pool shares the same `Arc<str>`.
+    /// Resolve a release query directly for isolated server tests.
+    #[cfg(test)]
     pub(crate) fn set_release_query(&mut self, configured: Option<&str>) {
         self.release_query = resolve_release_query(configured);
+    }
+
+    pub(crate) fn set_resolved_release_query(
+        &mut self,
+        release_query: Option<ResolvedReleaseQuery>,
+    ) {
+        self.release_query = release_query;
     }
 
     /// Record that the checkout being handed out owes a `release_query`
@@ -1481,47 +1559,27 @@ impl Server {
     }
 
     async fn finalize_checkin_inner(&mut self) -> Result<(), Error> {
-        // Collect the cleanup statements without sending them, then
-        // append the per-pool `release_query` (if configured) so the
-        // entire checkin path is one network round-trip instead of two
-        // or three. The previous implementation called `checkin_cleanup`
-        // (which itself sent ROLLBACK and the RESET batch as separate
-        // round-trips) and then sent `release_query` as a third - at
-        // transaction-pool latency budgets that doubled or tripled the
-        // server-side checkin latency for every transaction.
-        //
-        // Failure semantics are preserved: any non-Ok result from the
-        // combined `small_simple_query` marks the backend bad with a
-        // reason that names the appended release_query path so the
-        // operator can tell from the log which side failed.
+        // A release-only check-in sends the pool-shared frame directly.
+        // Dirty sessions append release_query to the cleanup statements and
+        // execute the combined SQL in one round trip.
         let mut stmts = self.collect_checkin_cleanup_sqls()?;
-
         let release_query = self.release_query.clone();
-        if let Some(ref rq) = release_query {
-            // `release_query` is an arbitrary operator-configured SQL
-            // string. It is sent verbatim - operators are responsible
-            // for shaping it (the iServ-compatible default is
-            // `pg_advisory_unlock_all(); pgv_free();`).
-            stmts.push(rq.to_string());
-        }
-
         if stmts.is_empty() {
-            // Empty statements imply `release_query` is disabled, and the
-            // pending flag is only ever armed with a configured release
-            // query - so nothing can be owed on this branch.
-            debug_assert!(!self.release_cleanup_pending);
-            // Even on the empty-stmts short-circuit, defensively reset the
-            // async-mode / expected-responses fields. The `if !stmts.is_empty()`
-            // arm below does this BEFORE sending; the symmetric behaviour
-            // keeps the next checkout's view of the backend consistent
-            // regardless of whether housekeeping fired. No known path leaves
-            // async_mode=true with no cleanup_state, but resetting on both arms
-            // removes the latent asymmetry.
             self.set_async_mode(false);
             self.set_expected_responses(0);
             self.in_transaction = false;
             self.in_copy_mode = false;
-            return Ok(());
+            return match release_query.as_ref() {
+                Some(release_query) => self.send_release_query_only(release_query).await,
+                None => {
+                    debug_assert!(!self.release_cleanup_pending);
+                    Ok(())
+                }
+            };
+        }
+
+        if let Some(ref release_query) = release_query {
+            stmts.push(release_query.sql().to_string());
         }
 
         // Housekeeping queries must travel through the synchronous Sync /
@@ -1530,7 +1588,7 @@ impl Server {
         self.set_expected_responses(0);
 
         if let Err(err) = self
-            .send_checkin_cleanup(stmts, release_query.as_deref())
+            .send_checkin_cleanup(stmts, release_query.as_ref().map(ResolvedReleaseQuery::sql))
             .await
         {
             warn!(
@@ -2890,6 +2948,45 @@ mod tests {
     }
 
     #[test]
+    fn release_query_preencodes_the_release_only_wire_frame() {
+        let resolved =
+            resolve_release_query(Some("SELECT 1")).expect("custom release query should resolve");
+
+        assert_eq!(resolved.sql(), "SELECT 1");
+        assert_eq!(
+            resolved.frame(),
+            &crate::messages::simple_query("SELECT 1;")[..]
+        );
+    }
+
+    #[test]
+    fn release_only_checkin_uses_the_preencoded_frame() {
+        let src = include_str!("server_backend.rs");
+        let impl_src = src;
+
+        let finalize_start = impl_src
+            .find("async fn finalize_checkin_inner")
+            .expect("finalize_checkin_inner not found");
+        let finalize = &impl_src[finalize_start..];
+        let release_only_call = finalize
+            .find("self.send_release_query_only(release_query).await")
+            .expect("release-only fast path not found");
+        let combined_push = finalize
+            .find("stmts.push(release_query.sql().to_string())")
+            .expect("combined cleanup path not found");
+        assert!(release_only_call < combined_push);
+
+        let helper_start = impl_src
+            .find("async fn send_release_query_only")
+            .expect("release-only helper not found");
+        let helper = &impl_src[helper_start..];
+        assert!(
+            helper.contains("small_simple_query_frame(release_query.frame())"),
+            "release-only check-in must send the pool-shared frame directly"
+        );
+    }
+
+    #[test]
     fn backend_startup_body_reads_use_memory_budget() {
         let src = include_str!("server_backend.rs");
         let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
@@ -3220,6 +3317,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut server, mut peer) = Server::test_silent_socket();
+        server.address.username = "release_metric_user".to_string();
+        server.address.database = "release_metric_database".to_string();
         server.set_release_query(Some("SELECT pg_advisory_unlock_all()"));
         server.arm_release_cleanup();
         assert!(server.release_cleanup_pending);
