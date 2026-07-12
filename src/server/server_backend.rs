@@ -24,6 +24,12 @@ pub(crate) enum AsyncExpectedResponse {
     Describe,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SetResponseOutcome {
+    Applied,
+    Rejected { sqlstate: String, message: String },
+}
+
 /// Wait (with bounded timeout) for all in-flight graceful Terminate
 /// tasks to finish. Returns the number of tasks still running when
 /// the timeout fires.
@@ -665,8 +671,10 @@ impl Server {
     /// `CommandComplete` but never the `ReadyForQuery` would block the client
     /// task forever (we are draining the SET's response before relaying the
     /// client's own query). On timeout the backend is marked bad and a
-    /// `SocketError` is returned so the pool drops the connection.
-    pub(crate) async fn swallow_set_response(&mut self) -> Result<(), Error> {
+    /// `SocketError` is returned so the pool drops the connection. A complete
+    /// SQL-level rejection is returned separately because the following
+    /// client query is still valid and already executing on the same stream.
+    pub(crate) async fn swallow_set_response(&mut self) -> Result<SetResponseOutcome, Error> {
         self.last_sql_error = None;
         let deadline = tokio::time::Instant::now() + HOUSEKEEPING_TIMEOUT;
         self.begin_internal_round_trip();
@@ -696,15 +704,13 @@ impl Server {
         }
         self.finish_internal_round_trip();
 
-        // Transport success is not SQL success: ErrorResponse is captured
-        // by the read loop and surfaced here.
+        // Transport success is not SQL success: ErrorResponse is captured by
+        // the read loop, but it does not desynchronize the pipelined client
+        // query that follows this ReadyForQuery.
         if let Some((sqlstate, message)) = self.last_sql_error.take() {
-            self.mark_bad("SET application_name failed in swallow_set_response");
-            return Err(Error::QueryError(format!(
-                "backend rejected query (SQLSTATE {sqlstate}): {message}"
-            )));
+            return Ok(SetResponseOutcome::Rejected { sqlstate, message });
         }
-        Ok(())
+        Ok(SetResponseOutcome::Applied)
     }
 
     /// Check if the connection is alive by sending a minimal query (`;`).
@@ -2074,6 +2080,28 @@ impl Server {
         .await
     }
 
+    /// Reissue a cancel against this backend only while the original client
+    /// cancel marker is still present. The marker keeps the backend quarantined
+    /// until check-in, so a second cancel cannot be routed to another client.
+    pub(crate) async fn reissue_cancel_if_marked(&self) -> Option<Result<(), Error>> {
+        if !CANCELED_PIDS.contains_key(&self.process_id) {
+            return None;
+        }
+
+        Some(
+            Self::cancel(
+                &self.address.host,
+                self.address.port,
+                self.process_id,
+                self.secret_key,
+                &self.address.server_tls,
+                self.connected_with_tls,
+                &self.address.pool_name,
+            )
+            .await,
+        )
+    }
+
     // Marks a connection as needing cleanup at checkin
     pub fn mark_dirty(&mut self) {
         self.cleanup_state.set_true();
@@ -2819,7 +2847,9 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_release_query, HOUSEKEEPING_TIMEOUT, RELEASE_SESSION_QUERY};
+    use super::{
+        resolve_release_query, SetResponseOutcome, HOUSEKEEPING_TIMEOUT, RELEASE_SESSION_QUERY,
+    };
     use lru::LruCache;
     use std::num::NonZeroUsize;
     use std::time::Duration;
@@ -2931,6 +2961,131 @@ mod tests {
             .await
             .expect("second response");
         assert!(second.ends_with(&[b'Z', 0, 0, 0, 5, b'I']));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_piggyback_set_preserves_following_client_response() {
+        use super::Server;
+        use bytes::{BufMut, BytesMut};
+        use tokio::io::AsyncWriteExt;
+
+        fn error_response(sqlstate: &str, message: &str) -> BytesMut {
+            let mut body = BytesMut::new();
+            body.put_u8(b'S');
+            body.put_slice(b"ERROR\0");
+            body.put_u8(b'C');
+            body.put_slice(sqlstate.as_bytes());
+            body.put_u8(0);
+            body.put_u8(b'M');
+            body.put_slice(message.as_bytes());
+            body.put_u8(0);
+            body.put_u8(0);
+
+            let mut frame = BytesMut::new();
+            frame.put_u8(b'E');
+            frame.put_i32(4 + body.len() as i32);
+            frame.put(body);
+            frame
+        }
+
+        fn command_complete(tag: &str) -> BytesMut {
+            let mut frame = BytesMut::new();
+            frame.put_u8(b'C');
+            frame.put_i32(4 + tag.len() as i32 + 1);
+            frame.put_slice(tag.as_bytes());
+            frame.put_u8(0);
+            frame
+        }
+
+        fn ready_for_query() -> BytesMut {
+            let mut frame = BytesMut::new();
+            frame.put_u8(b'Z');
+            frame.put_i32(5);
+            frame.put_u8(b'I');
+            frame
+        }
+
+        let (mut server, mut peer) = Server::test_silent_socket();
+        let mut frames = BytesMut::new();
+        frames.put(&error_response("57014", "canceling statement due to user request")[..]);
+        frames.put(&ready_for_query()[..]);
+        frames.put(&command_complete("SELECT 1")[..]);
+        frames.put(&ready_for_query()[..]);
+        peer.write_all(&frames).await.expect("peer write");
+        peer.flush().await.expect("peer flush");
+
+        let outcome = server
+            .swallow_set_response()
+            .await
+            .expect("SQL rejection is a protocol-complete response");
+        assert_eq!(
+            outcome,
+            SetResponseOutcome::Rejected {
+                sqlstate: "57014".to_string(),
+                message: "canceling statement due to user request".to_string(),
+            }
+        );
+        assert!(!server.is_bad());
+
+        let client_response = server
+            .recv(&mut tokio::io::sink(), None)
+            .await
+            .expect("following client response");
+        assert!(client_response.starts_with(b"C"));
+        assert!(client_response.ends_with(&[b'Z', 0, 0, 0, 5, b'I']));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reissues_cancel_only_for_a_quarantined_backend() {
+        use super::Server;
+        use crate::pool::CANCELED_PIDS;
+        use std::time::Instant;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cancel listener");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let (mut server, _peer) = Server::test_silent_socket();
+        server.address.host = "127.0.0.1".to_string();
+        server.address.port = port;
+        server.process_id = -901_221;
+        server.secret_key = 0x1020_3040;
+
+        assert!(server.reissue_cancel_if_marked().await.is_none());
+
+        CANCELED_PIDS.insert(server.process_id, Instant::now());
+        let receive = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept cancel connection");
+            let mut frame = [0_u8; 16];
+            socket
+                .read_exact(&mut frame)
+                .await
+                .expect("read cancel frame");
+            frame
+        });
+
+        server
+            .reissue_cancel_if_marked()
+            .await
+            .expect("cancel marker")
+            .expect("reissued cancel");
+        let frame = receive.await.expect("cancel receiver task");
+        assert_eq!(i32::from_be_bytes(frame[0..4].try_into().unwrap()), 16);
+        assert_eq!(
+            i32::from_be_bytes(frame[8..12].try_into().unwrap()),
+            server.process_id
+        );
+        assert_eq!(
+            i32::from_be_bytes(frame[12..16].try_into().unwrap()),
+            server.secret_key
+        );
+        CANCELED_PIDS.remove(&server.process_id);
     }
 
     #[cfg(unix)]

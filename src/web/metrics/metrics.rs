@@ -39,8 +39,8 @@ use super::{
     SHOW_SERVERS_PREPARED_HITS_TOTAL, SHOW_SERVERS_PREPARED_MISSES,
     SHOW_SERVERS_PREPARED_MISSES_TOTAL, SHOW_SERVER_TLS_CONNECTIONS,
     SHOW_SERVER_TLS_HANDSHAKE_DURATION, SHOW_SERVER_TLS_HANDSHAKE_ERRORS,
-    STARTUP_PARAMETERS_DROPPED_TOTAL, SYNC_PARAMS_APPLIED, SYNC_PARAMS_PLAN_TOTAL,
-    SYNC_PARAMS_RTT_SECONDS, SYNC_PARAMS_SKIPPED, TOTAL_MEMORY,
+    STARTUP_PARAMETERS_DROPPED_TOTAL, SYNC_PARAMS_APPLIED, SYNC_PARAMS_PIGGYBACK_REJECTIONS_TOTAL,
+    SYNC_PARAMS_PLAN_TOTAL, SYNC_PARAMS_RTT_SECONDS, SYNC_PARAMS_SKIPPED, TOTAL_MEMORY,
 };
 
 /// Updates all metrics before they are exposed via the Prometheus endpoint.
@@ -1661,6 +1661,14 @@ pub fn inc_sync_params_applied() {
 pub fn inc_sync_params_plan(plan: &'static str, path: &'static str) {
     SYNC_PARAMS_PLAN_TOTAL
         .with_label_values(&[plan, path])
+        .inc();
+}
+
+/// Record a SQL-level piggyback rejection and the bounded recovery action.
+#[inline]
+pub fn inc_sync_params_piggyback_rejection(reason: &'static str, action: &'static str) {
+    SYNC_PARAMS_PIGGYBACK_REJECTIONS_TOTAL
+        .with_label_values(&[reason, action])
         .inc();
 }
 
