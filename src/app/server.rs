@@ -2472,7 +2472,6 @@ async fn binary_upgrade_and_shutdown(
                 libc::close(daemon_identity_write_fd);
             }
 
-            let mut buf: [u8; 1] = [0];
             let wrapper_pid = child.id() as libc::pid_t;
             let successor_identity_capture = DaemonSuccessorIdentityCapture::start_from_fd(
                 daemon_identity_read_fd,
@@ -2482,10 +2481,7 @@ async fn binary_upgrade_and_shutdown(
             let ready = wait_for_pipe_readiness(pipe_read_fd, 10_000);
             let successor_identity = successor_identity_capture.finish();
             if ready {
-                unsafe {
-                    libc::read(pipe_read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1);
-                    libc::close(pipe_read_fd);
-                }
+                unsafe { libc::close(pipe_read_fd) };
                 info!("New daemon process signaled readiness");
                 SHUTDOWN_IN_PROGRESS.store(true, Ordering::SeqCst);
             } else {
@@ -2629,13 +2625,9 @@ async fn binary_upgrade_and_shutdown(
                             }
                         }
 
-                        let mut buf: [u8; 1] = [0];
                         let ready = wait_for_pipe_readiness(pipe_read_fd, 10_000);
 
                         if ready {
-                            unsafe {
-                                libc::read(pipe_read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1);
-                            }
                             info!("New process signaled readiness");
 
                             // Hand systemd tracking over to the ready child.
@@ -2797,15 +2789,12 @@ async fn binary_upgrade_and_shutdown(
     migration_handles
 }
 
-/// Wait for the child readiness byte using `poll(2)`.
+/// Wait for and consume the child readiness byte using `poll(2)`.
 ///
-/// `poll` handles fds above `FD_SETSIZE`; requiring `POLLIN` rejects
-/// EOF-only readiness from a child that exited before writing.
+/// `poll` handles fds above `FD_SETSIZE`. Reading the byte distinguishes real
+/// readiness from EOF, which some platforms report as `POLLIN | POLLHUP`.
 ///
-/// retry on EINTR. A signal landing during the 10 s wait
-/// (SIGCHLD from another reaper, an unrelated SIGUSR2) used to make
-/// `poll` return `-1` with `errno == EINTR` - indistinguishable from
-/// a real timeout - and the parent killed a still-coming-up child.
+/// Interrupted polls are retried within the original timeout budget.
 #[cfg(not(windows))]
 fn wait_for_pipe_readiness(pipe_read_fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
     use std::time::Instant;
@@ -2840,7 +2829,24 @@ fn wait_for_pipe_readiness(pipe_read_fd: libc::c_int, timeout_ms: libc::c_int) -
             }
             return false;
         }
-        return result > 0 && (pfd.revents & libc::POLLIN) != 0;
+        if result == 0 || (pfd.revents & libc::POLLIN) == 0 {
+            return false;
+        }
+
+        let mut byte = 0u8;
+        loop {
+            let read =
+                unsafe { libc::read(pipe_read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+            if read == 1 {
+                return true;
+            }
+            if read == 0 {
+                return false;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return false;
+            }
+        }
     }
 }
 
@@ -4948,6 +4954,19 @@ mod wait_for_pipe_readiness_tests {
         let written =
             unsafe { libc::write(pipe.write, &byte as *const u8 as *const libc::c_void, 1) };
         assert_eq!(written, 1, "write to pipe failed");
+        assert!(wait_for_pipe_readiness(pipe.read, 1_000));
+    }
+
+    #[test]
+    fn returns_true_when_writer_closes_after_writing_byte() {
+        let mut pipe = Pipe::new();
+        let byte: u8 = 1;
+        let written =
+            unsafe { libc::write(pipe.write, &byte as *const u8 as *const libc::c_void, 1) };
+        assert_eq!(written, 1, "write to pipe failed");
+        unsafe { libc::close(pipe.write) };
+        pipe.write = -1;
+
         assert!(wait_for_pipe_readiness(pipe.read, 1_000));
     }
 
