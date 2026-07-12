@@ -64,7 +64,7 @@ async fn test_prometheus_server_basic() {
     };
 
     // Send a simple HTTP request
-    let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     stream.write_all(request.as_bytes()).await.unwrap();
 
     // Read the response
@@ -78,10 +78,6 @@ async fn test_prometheus_server_basic() {
                 Ok(0) => break, // EOF
                 Ok(n) => {
                     response.extend_from_slice(&buf[..n]);
-                    if response.len() > 100 {
-                        // Just need enough to verify headers
-                        break;
-                    }
                 }
                 Err(e) => {
                     panic!("Failed to read from socket: {e}");

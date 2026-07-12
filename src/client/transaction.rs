@@ -3635,7 +3635,7 @@ mod internal_round_trip_timeout_tests {
             .expect("deferred extended BEGIN handler not found");
         let extended_body = &impl_src[extended_start..];
         let extended_end = extended_body
-            .find("\n    /// Check for pooler health check")
+            .find("\n    async fn try_handle_without_server(")
             .expect("without-server handler should follow deferred extended BEGIN");
         let extended_body = &extended_body[..extended_end];
         let extended_write_idx = extended_body
