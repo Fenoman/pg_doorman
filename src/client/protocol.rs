@@ -82,7 +82,7 @@ fn first_reset_cleanup_command(
     extract_reset_cleanup_commands(query).first().copied()
 }
 
-fn disabled_parse_name_and_query(message: &BytesMut) -> Option<(String, &[u8])> {
+fn disabled_parse_name_and_query(message: &BytesMut) -> Option<(String, &[u8], usize)> {
     if message.len() < 9 || message.first().copied() != Some(b'P') {
         return None;
     }
@@ -115,7 +115,11 @@ fn disabled_parse_name_and_query(message: &BytesMut) -> Option<(String, &[u8])> 
         return None;
     }
 
-    Some((statement_name, &message[query_start..query_nul]))
+    Some((
+        statement_name,
+        &message[query_start..query_nul],
+        num_params as usize,
+    ))
 }
 
 fn execute_portal_name(message: &BytesMut) -> Option<&str> {
@@ -291,25 +295,68 @@ where
             message.len(),
             "Parse",
         )?;
-        // Avoid parsing if prepared statements not enabled
+        // In disabled-cache mode, inspect the raw Parse fields without
+        // allocating the query text. Only DISCARD ALL takes the full Parse
+        // decode and reserialization path.
         if !self.prepared.enabled {
             debug!(
-                "[{}@{} #c{}] prepared statements disabled, forwarding Parse as-is",
+                "[{}@{} #c{}] prepared statements disabled, forwarding Parse",
                 self.username, self.pool_name, self.connection_id,
             );
             let first_char_in_name = *message.get(5).unwrap_or(&0);
+            let (intercepted_discard_all, cleanup_attribution) =
+                match disabled_parse_name_and_query(&message) {
+                    Some((statement_name, query, num_params)) => {
+                        let intercepted = self.transaction_mode
+                            && server.intercept_discard_all()
+                            && !server.in_transaction()
+                            && !server.in_copy_mode()
+                            && num_params == 0
+                            && contains_discard_all(query);
+                        let set_command = first_set_cleanup_command(query);
+                        let reset_command = if set_command.is_none() {
+                            first_reset_cleanup_command(query)
+                        } else {
+                            None
+                        };
+                        (
+                            intercepted,
+                            Some((statement_name, set_command, reset_command)),
+                        )
+                    }
+                    None => (false, None),
+                };
+
+            let message = if intercepted_discard_all {
+                let parse: Parse = (&message).try_into()?;
+                debug!(
+                    "[{}@{} #c{}] extended-protocol DISCARD ALL intercepted (name=`{}`): \
+                     rewriting Parse query to {:?}",
+                    self.username,
+                    self.pool_name,
+                    self.connection_id,
+                    parse.name,
+                    EXT_DISCARD_ALL_NOOP,
+                );
+                pool.address.stats.discard_all_intercepted();
+                let rewritten = parse.with_replaced_query(EXT_DISCARD_ALL_NOOP);
+                rewritten.to_bytes_with_name(&rewritten.name)?
+            } else {
+                message
+            };
+
             if first_char_in_name != 0 {
                 // This is a named prepared statement while prepared statements are disabled
                 // Server connection state will need to be cleared at checkin
                 server.mark_dirty();
             }
-            if let Some((statement_name, query)) = disabled_parse_name_and_query(&message) {
-                if let Some(command) = first_set_cleanup_command(query) {
+            if let Some((statement_name, set_command, reset_command)) = cleanup_attribution {
+                if let Some(command) = set_command {
                     self.prepared.track_disabled_statement_set_cleanup_command(
                         statement_name.clone(),
                         command,
                     )?;
-                } else if let Some(command) = first_reset_cleanup_command(query) {
+                } else if let Some(command) = reset_command {
                     self.prepared
                         .track_disabled_statement_reset_cleanup_command(
                             statement_name.clone(),
@@ -1770,6 +1817,29 @@ mod anonymous_close_tests {
             Some(SetCleanupCommand::SetSessionAuthorization),
             "prepared_statements=false must still attribute unnamed extended SET SESSION AUTHORIZATION"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_prepared_rewrites_extended_discard_all_before_forwarding() {
+        let mut client = test_client();
+        client.transaction_mode = true;
+        client.prepared.enabled = false;
+        let pool = ConnectionPool::test_for_protocol();
+        let (mut server, _peer) = crate::server::Server::test_silent_socket();
+
+        client
+            .process_parse_immediate(
+                make_parse("discard_stmt", "DISCARD ALL", &[]),
+                &pool,
+                &mut server,
+            )
+            .await
+            .expect("disabled prepared Parse should be rewritten");
+
+        let forwarded = BytesMut::from(&client.buffer[..]);
+        let parse = Parse::try_from(&forwarded).expect("forwarded Parse frame");
+        assert_eq!(parse.name, "discard_stmt");
+        assert_eq!(parse.query(), EXT_DISCARD_ALL_NOOP);
     }
 
     #[tokio::test]
