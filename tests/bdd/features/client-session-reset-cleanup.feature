@@ -41,6 +41,7 @@ Feature: Client session reset batch suppresses doorman-side cleanup
       pg_hba.content = "host all all 127.0.0.1/32 trust"
       prepared_statements = true
       prepared_statements_cache_size = 100
+      sync_server_parameters = true
 
       [pools.example_db]
       server_host = "127.0.0.1"
@@ -62,6 +63,18 @@ Feature: Client session reset batch suppresses doorman-side cleanup
       username = "example_user_1"
       password = ""
       pool_size = 2
+
+      [pools.reset_rollback]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      server_database = "example_db"
+      pool_mode = "transaction"
+      release_query = ""
+
+      [[pools.reset_rollback.users]]
+      username = "example_user_1"
+      password = ""
+      pool_size = 1
       """
 
   @client-session-reset-cleanup-pgx-batch
@@ -215,3 +228,30 @@ Feature: Client session reset batch suppresses doorman-side cleanup
     # Neither the client nor pg_doorman issued DEALLOCATE ALL.
     And PostgreSQL log should contain exactly 0 occurrences of "DEALLOCATE ALL"
     And PostgreSQL log should not contain "RESET ROLE"
+
+  @client-session-reset-cleanup-simple-reset-rollback
+  Scenario: failed simple-query batch does not commit RESET ALL tracking
+    When we create session "simple_dirty" to pg_doorman as "example_user_1" with password "" and database "reset_rollback" and startup parameters "search_path=pg_catalog"
+    And we send SimpleQuery "SELECT current_setting('search_path') = 'pg_catalog'" to session "simple_dirty" and store response
+    Then session "simple_dirty" should receive DataRow with "t"
+    When we send SimpleQuery "RESET ALL; SELECT 1/0" to session "simple_dirty" expecting error
+    And we create session "simple_clean" to pg_doorman as "example_user_1" with password "" and database "reset_rollback"
+    And we send SimpleQuery "SELECT current_setting('search_path') = 'pg_catalog'" to session "simple_clean" and store response
+    Then session "simple_clean" should receive DataRow with "f"
+
+  @client-session-reset-cleanup-extended-reset-rollback
+  Scenario: failed extended-protocol batch does not commit RESET ALL tracking
+    When we create session "extended_dirty" to pg_doorman as "example_user_1" with password "" and database "reset_rollback" and startup parameters "search_path=pg_catalog"
+    And we send SimpleQuery "SELECT current_setting('search_path') = 'pg_catalog'" to session "extended_dirty" and store response
+    Then session "extended_dirty" should receive DataRow with "t"
+    When we send Parse "reset_stmt" with query "RESET ALL" to session "extended_dirty"
+    And we send Bind "reset_portal" to "reset_stmt" with params "" to session "extended_dirty"
+    And we send Execute "reset_portal" to session "extended_dirty"
+    And we send Parse "error_stmt" with query "SELECT 1/0" to session "extended_dirty"
+    And we send Bind "error_portal" to "error_stmt" with params "" to session "extended_dirty"
+    And we send Execute "error_portal" to session "extended_dirty"
+    And we send Sync to session "extended_dirty"
+    Then session "extended_dirty" should receive ErrorResponse with SQLSTATE "22012"
+    When we create session "extended_clean" to pg_doorman as "example_user_1" with password "" and database "reset_rollback"
+    And we send SimpleQuery "SELECT current_setting('search_path') = 'pg_catalog'" to session "extended_clean" and store response
+    Then session "extended_clean" should receive DataRow with "f"

@@ -425,6 +425,25 @@ fn handle_ready_for_query(server: &mut Server, message: &mut BytesMut) -> Result
         }
     };
 
+    if transaction_state == 'I' && !server.response_cycle_had_error {
+        if server.pending_cleanup_disarms.set {
+            server.cleanup_state.needs_cleanup_set = false;
+        }
+        if server.pending_cleanup_disarms.startup_parameter_mirror {
+            server
+                .server_parameters
+                .remove_startup_only_params_after_session_reset();
+        }
+        if server.pending_cleanup_disarms.role {
+            server.cleanup_state.needs_cleanup_role = false;
+        }
+        if server.pending_cleanup_disarms.session_authorization {
+            server.cleanup_state.needs_cleanup_session_authorization = false;
+        }
+    }
+    server.pending_cleanup_disarms.clear();
+    server.response_cycle_had_error = false;
+
     // No more data available from the server after ReadyForQuery
     server.data_available = false;
     server.clear_set_cleanup_commands();
@@ -445,6 +464,7 @@ fn track_command_complete_transaction_state(server: &mut Server, message: &[u8])
 /// Handles ErrorResponse ('E') message from the server.
 /// Logs the error and updates server state accordingly.
 fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
+    server.response_cycle_had_error = true;
     if let Ok(msg) = PgErrorMsg::parse(message) {
         let mut details = format!(
             "[{}@{}] server error pid={}: severity={}, code={}, message=\"{}\", in_transaction={}, in_copy={}",
@@ -651,29 +671,27 @@ fn drop_prepared_statement_cache_on_reset(server: &mut Server, reason: &'static 
     }
 }
 
-fn disarm_set_cleanup_if_transactionally_safe(server: &mut Server) {
+fn defer_set_cleanup_disarm_if_transactionally_safe(server: &mut Server) {
     if server.in_transaction() || server.command_complete_in_transaction {
         return;
     }
-    server.cleanup_state.needs_cleanup_set = false;
-    server
-        .server_parameters
-        .remove_startup_only_params_after_session_reset();
+    server.pending_cleanup_disarms.set = true;
+    server.pending_cleanup_disarms.startup_parameter_mirror = true;
 }
 
-fn disarm_role_cleanup_if_transactionally_safe(server: &mut Server) {
+fn defer_role_cleanup_disarm_if_transactionally_safe(server: &mut Server) {
     if server.in_transaction() || server.command_complete_in_transaction {
         return;
     }
-    server.cleanup_state.needs_cleanup_role = false;
+    server.pending_cleanup_disarms.role = true;
 }
 
-fn disarm_session_authorization_cleanup_if_transactionally_safe(server: &mut Server) {
+fn defer_session_authorization_cleanup_disarm_if_transactionally_safe(server: &mut Server) {
     if server.in_transaction() || server.command_complete_in_transaction {
         return;
     }
-    server.cleanup_state.needs_cleanup_session_authorization = false;
-    server.cleanup_state.needs_cleanup_role = false;
+    server.pending_cleanup_disarms.session_authorization = true;
+    server.pending_cleanup_disarms.role = true;
 }
 
 /// Handles CommandComplete ('C') message - indicates successful completion of a command.
@@ -704,19 +722,23 @@ fn handle_command_complete(server: &mut Server, message: &BytesMut) {
         CommandCompleteEffect::None => {}
         CommandCompleteEffect::ArmSet => {
             server.cleanup_state.needs_cleanup_set = true;
+            server.pending_cleanup_disarms.set = false;
         }
         CommandCompleteEffect::ArmRole => {
             server.cleanup_state.needs_cleanup_role = true;
+            server.pending_cleanup_disarms.role = false;
         }
         CommandCompleteEffect::ArmSessionAuthorization => {
             server.cleanup_state.needs_cleanup_session_authorization = true;
             server.cleanup_state.needs_cleanup_role = true;
+            server.pending_cleanup_disarms.session_authorization = false;
+            server.pending_cleanup_disarms.role = false;
         }
         CommandCompleteEffect::DisarmRole => {
-            disarm_role_cleanup_if_transactionally_safe(server);
+            defer_role_cleanup_disarm_if_transactionally_safe(server);
         }
         CommandCompleteEffect::DisarmSessionAuthorization => {
-            disarm_session_authorization_cleanup_if_transactionally_safe(server);
+            defer_session_authorization_cleanup_disarm_if_transactionally_safe(server);
         }
         CommandCompleteEffect::ArmDeclare => {
             server.cleanup_state.needs_cleanup_declare = true;
@@ -725,7 +747,7 @@ fn handle_command_complete(server: &mut Server, message: &BytesMut) {
             server.cleanup_state.needs_cleanup_prepare = true;
         }
         CommandCompleteEffect::DisarmSet => {
-            disarm_set_cleanup_if_transactionally_safe(server);
+            defer_set_cleanup_disarm_if_transactionally_safe(server);
         }
         CommandCompleteEffect::DisarmDeclare => {
             server.cleanup_state.needs_cleanup_declare = false;
@@ -1211,7 +1233,8 @@ mod tests {
 
     use super::{
         classify_command_complete, classify_command_complete_with_reset_attribution,
-        handle_command_complete, handle_error_response, CommandCompleteEffect,
+        handle_command_complete, handle_error_response, handle_ready_for_query,
+        CommandCompleteEffect,
     };
     use crate::client::util::extract_set_cleanup_commands;
     use crate::server::cleanup::ResetCleanupCommand;
@@ -1319,23 +1342,166 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reset_all_does_not_disarm_session_authorization_cleanup() {
+    async fn reset_all_disarms_only_after_successful_idle_ready_for_query() {
         use crate::server::Server;
 
         let mut server = Server::test_dead_socket();
         server.cleanup_state.needs_cleanup_set = true;
         server.cleanup_state.needs_cleanup_session_authorization = true;
+        server
+            .server_parameters
+            .set_param("client.app_user", "alice", true);
         server.track_reset_cleanup_commands([ResetCleanupCommand::ResetAll]);
 
         handle_command_complete(&mut server, &BytesMut::from(&b"RESET\0"[..]));
 
         assert!(
-            !server.cleanup_state.needs_cleanup_set,
-            "RESET ALL should still disarm ordinary GUC cleanup"
+            server.cleanup_state.needs_cleanup_set,
+            "RESET ALL must remain pending until ReadyForQuery confirms the implicit transaction"
+        );
+        assert!(
+            server
+                .server_parameters
+                .as_hashmap()
+                .contains_key("client.app_user"),
+            "startup-only mirrors must remain intact before transaction outcome"
         );
         assert!(
             server.cleanup_state.needs_cleanup_session_authorization,
             "RESET ALL must not prove that SET SESSION AUTHORIZATION was reset"
+        );
+
+        handle_ready_for_query(&mut server, &mut BytesMut::from(&b"I"[..]))
+            .expect("valid idle ReadyForQuery");
+
+        assert!(
+            !server.cleanup_state.needs_cleanup_set,
+            "successful implicit transaction should commit RESET ALL disarm"
+        );
+        assert!(
+            !server
+                .server_parameters
+                .as_hashmap()
+                .contains_key("client.app_user"),
+            "committed RESET ALL should invalidate startup-only mirrors"
+        );
+        assert!(server.cleanup_state.needs_cleanup_session_authorization);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn error_after_reset_all_keeps_cleanup_and_parameter_mirror() {
+        use crate::server::Server;
+
+        let mut server = Server::test_dead_socket();
+        server.cleanup_state.needs_cleanup_set = true;
+        server
+            .server_parameters
+            .set_param("client.app_user", "alice", true);
+        server.track_reset_cleanup_commands([ResetCleanupCommand::ResetAll]);
+
+        handle_command_complete(&mut server, &BytesMut::from(&b"RESET\0"[..]));
+        handle_error_response(
+            &mut server,
+            &mut BytesMut::from(&b"SERROR\0C22012\0Mdivision by zero\0\0"[..]),
+        );
+        handle_ready_for_query(&mut server, &mut BytesMut::from(&b"I"[..]))
+            .expect("valid idle ReadyForQuery");
+
+        assert!(
+            server.cleanup_state.needs_cleanup_set,
+            "a later error rolls back RESET ALL and must keep cleanup armed"
+        );
+        assert!(
+            server
+                .server_parameters
+                .as_hashmap()
+                .contains_key("client.app_user"),
+            "a rolled-back RESET ALL must not invalidate the backend mirror"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_after_reset_all_keeps_cleanup_but_invalidates_old_startup_mirror() {
+        use crate::server::Server;
+
+        let mut server = Server::test_dead_socket();
+        server.cleanup_state.needs_cleanup_set = true;
+        server
+            .server_parameters
+            .set_param("search_path", "tenant_a", true);
+        server.track_reset_cleanup_commands([ResetCleanupCommand::ResetAll]);
+        handle_command_complete(&mut server, &BytesMut::from(&b"RESET\0"[..]));
+
+        server.track_set_cleanup_commands(extract_set_cleanup_commands(
+            b"SET statement_timeout = 1000",
+        ));
+        handle_command_complete(&mut server, &BytesMut::from(&b"SET\0"[..]));
+        handle_ready_for_query(&mut server, &mut BytesMut::from(&b"I"[..]))
+            .expect("valid idle ReadyForQuery");
+
+        assert!(
+            server.cleanup_state.needs_cleanup_set,
+            "a SET after RESET ALL must keep check-in cleanup armed"
+        );
+        assert!(
+            !server
+                .server_parameters
+                .as_hashmap()
+                .contains_key("search_path"),
+            "committed RESET ALL must invalidate mirrors that predate a later SET"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_disarms_follow_ready_for_query_outcome_and_command_order() {
+        use crate::server::Server;
+
+        let mut committed = Server::test_dead_socket();
+        committed.cleanup_state.needs_cleanup_role = true;
+        committed.cleanup_state.needs_cleanup_session_authorization = true;
+        committed.track_reset_cleanup_commands([ResetCleanupCommand::ResetSessionAuthorization]);
+        handle_command_complete(&mut committed, &BytesMut::from(&b"RESET\0"[..]));
+
+        assert!(committed.cleanup_state.needs_cleanup_role);
+        assert!(committed.cleanup_state.needs_cleanup_session_authorization);
+
+        committed
+            .track_set_cleanup_commands(extract_set_cleanup_commands(b"SET ROLE audit_reader"));
+        handle_command_complete(&mut committed, &BytesMut::from(&b"SET\0"[..]));
+        handle_ready_for_query(&mut committed, &mut BytesMut::from(&b"I"[..]))
+            .expect("valid idle ReadyForQuery");
+
+        assert!(
+            committed.cleanup_state.needs_cleanup_role,
+            "SET ROLE after identity reset must keep role cleanup armed"
+        );
+        assert!(
+            !committed.cleanup_state.needs_cleanup_session_authorization,
+            "successful identity reset should disarm session authorization cleanup"
+        );
+
+        let mut rolled_back = Server::test_dead_socket();
+        rolled_back.cleanup_state.needs_cleanup_role = true;
+        rolled_back
+            .cleanup_state
+            .needs_cleanup_session_authorization = true;
+        rolled_back.track_reset_cleanup_commands([ResetCleanupCommand::ResetSessionAuthorization]);
+        handle_command_complete(&mut rolled_back, &BytesMut::from(&b"RESET\0"[..]));
+        handle_error_response(
+            &mut rolled_back,
+            &mut BytesMut::from(&b"SERROR\0C22012\0Mdivision by zero\0\0"[..]),
+        );
+        handle_ready_for_query(&mut rolled_back, &mut BytesMut::from(&b"I"[..]))
+            .expect("valid idle ReadyForQuery");
+
+        assert!(rolled_back.cleanup_state.needs_cleanup_role);
+        assert!(
+            rolled_back
+                .cleanup_state
+                .needs_cleanup_session_authorization
         );
     }
 
@@ -1481,6 +1647,8 @@ mod tests {
         server.track_reset_cleanup_commands([ResetCleanupCommand::ResetAll]);
 
         handle_command_complete(&mut server, &BytesMut::from(&b"RESET\0"[..]));
+        handle_ready_for_query(&mut server, &mut BytesMut::from(&b"I"[..]))
+            .expect("valid idle ReadyForQuery");
 
         let params = server.server_parameters.as_hashmap();
         assert!(
