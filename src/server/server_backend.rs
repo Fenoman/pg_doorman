@@ -544,12 +544,9 @@ impl std::fmt::Display for Server {
 /// Outcome of classifying the checkout parameter sync WITHOUT touching the
 /// wire. Produced by [`Server::compute_sync_plan`] / [`classify_sync_plan`].
 ///
-/// The classifier mirrors [`Server::sync_parameters`]' diff computation
-/// exactly (same `compare_params`, same `operator_managed_startup_keys`
-/// retain, same `sql_string_literal` quoting) so the `AppNameOnly` SET text
-/// is byte-identical to what `sync_parameters` would emit - minus the
-/// trailing `;`, which only exists in `sync_parameters` because it
-/// concatenates multiple statements into one simple-query string.
+/// The classifier computes and filters the diff once. AppNameOnly carries its
+/// ready-to-send SET, while Complex carries the same diff into the standalone
+/// synchronization path.
 #[derive(Debug)]
 pub(crate) enum SyncPlan {
     /// Diff empty - no SET/RESET needed.
@@ -557,9 +554,9 @@ pub(crate) enum SyncPlan {
     /// Only `application_name` differs - ready-to-send standalone SET
     /// (no trailing `;`).
     AppNameOnly(String),
-    /// Anything else (search_path, TimeZone, RESET, multiple keys) - caller
-    /// must fall back to the proven `sync_parameters()` round-trip.
-    Complex,
+    /// Anything else (search_path, TimeZone, RESET, multiple keys), carrying
+    /// the filtered diff that the standalone synchronization will execute.
+    Complex(HashMap<String, crate::server::parameters::ParamAction>),
 }
 
 /// Pure core of [`Server::compute_sync_plan`], factored out so it can be unit
@@ -577,7 +574,7 @@ fn classify_sync_plan(
     let mut diff = backend_parameters.compare_params(incoming_parameters);
 
     // Configured startup_parameters win over client StartupMessage values -
-    // identical retain to sync_parameters.
+    // Operator-managed startup parameters are not overwritten by clients.
     if !operator_managed_startup_keys.is_empty() {
         diff.retain(|k, _| !operator_managed_startup_keys.contains(k));
     }
@@ -591,8 +588,7 @@ fn classify_sync_plan(
         if let Some(crate::server::parameters::ParamAction::SetTo(value)) =
             diff.get("application_name")
         {
-            // Same quoting sync_parameters uses, so the SET text matches
-            // byte-for-byte (minus the trailing ';').
+            // Use the same quoting as the standalone diff executor.
             let literal = sql_string_literal(value)?;
             return Ok(SyncPlan::AppNameOnly(format!(
                 "SET application_name TO {literal}"
@@ -600,15 +596,14 @@ fn classify_sync_plan(
         }
     }
 
-    Ok(SyncPlan::Complex)
+    Ok(SyncPlan::Complex(diff))
 }
 
 impl Server {
     /// Classify what parameter sync this checkout needs WITHOUT sending
     /// anything on the wire. Pure thin wrapper over [`classify_sync_plan`];
-    /// mirrors [`Server::sync_parameters`]' diff computation exactly so the
-    /// `AppNameOnly` SET text is byte-identical to what `sync_parameters`
-    /// would emit (minus the trailing `;`).
+    /// returns either a ready AppNameOnly statement or the filtered Complex
+    /// diff without recomputing it later.
     pub(crate) fn compute_sync_plan(
         &self,
         parameters: &ServerParameters,
@@ -2028,14 +2023,10 @@ impl Server {
         Ok(())
     }
 
-    pub async fn sync_parameters(&mut self, parameters: &ServerParameters) -> Result<(), Error> {
-        let mut parameter_diff = self.server_parameters.compare_params(parameters);
-
-        // Configured startup_parameters win over client StartupMessage values.
-        if !self.operator_managed_startup_keys.is_empty() {
-            parameter_diff.retain(|k, _| !self.operator_managed_startup_keys.contains(k));
-        }
-
+    pub async fn sync_parameter_diff(
+        &mut self,
+        parameter_diff: HashMap<String, crate::server::parameters::ParamAction>,
+    ) -> Result<(), Error> {
         if parameter_diff.is_empty() {
             crate::web::metrics::inc_sync_params_skipped();
             return Ok(());
@@ -2097,16 +2088,16 @@ impl Server {
                 }
             }
             Err(err) => {
-                // A failed sync_parameters leaves the backend in a half-applied
+                // Failed synchronization leaves the backend in a half-applied
                 // GUC state (some SETs may have landed before the rejected one),
                 // and the snapshot in `self.server_parameters` is stale. Reusing
                 // this backend for another client would silently expose the
                 // wrong session settings. Mark it bad so the pool drops it.
                 warn!(
-                    "[{}@{}] sync_parameters failed pid={}: {err}",
+                    "[{}@{}] parameter synchronization failed pid={}: {err}",
                     self.address.username, self.address.pool_name, self.process_id
                 );
-                self.mark_bad("sync_parameters error");
+                self.mark_bad("parameter synchronization error");
                 // do NOT reset cleanup_state on the
                 // failure path. If a future refactor demotes
                 // `mark_bad` to a softer signal, the cleared flags
@@ -4378,7 +4369,7 @@ mod tests {
     // `classify_sync_plan` so we do not need to build a full `Server`.
     mod compute_sync_plan_tests {
         use super::super::{classify_sync_plan, SyncPlan};
-        use crate::server::parameters::ServerParameters;
+        use crate::server::parameters::{ParamAction, ServerParameters};
         use std::collections::HashSet;
 
         /// Build an empty backend snapshot, then set each param so the diff
@@ -4454,10 +4445,18 @@ mod tests {
             ]);
             let plan = classify_sync_plan(&backend, &HashSet::new(), &incoming)
                 .expect("classify must succeed");
-            assert!(
-                matches!(plan, SyncPlan::Complex),
-                "expected Complex, got {plan:?}"
-            );
+            let SyncPlan::Complex(diff) = plan else {
+                panic!("expected Complex, got {plan:?}");
+            };
+            assert_eq!(diff.len(), 2);
+            assert!(matches!(
+                diff.get("application_name"),
+                Some(ParamAction::SetTo(value)) if value == "svc-new"
+            ));
+            assert!(matches!(
+                diff.get("search_path"),
+                Some(ParamAction::SetTo(value)) if value == "app, public"
+            ));
         }
 
         #[test]
@@ -4468,7 +4467,7 @@ mod tests {
             let plan = classify_sync_plan(&backend, &HashSet::new(), &incoming)
                 .expect("classify must succeed");
             assert!(
-                matches!(plan, SyncPlan::Complex),
+                matches!(plan, SyncPlan::Complex(_)),
                 "expected Complex, got {plan:?}"
             );
         }
@@ -4484,7 +4483,7 @@ mod tests {
             let plan = classify_sync_plan(&backend, &HashSet::new(), &incoming)
                 .expect("classify must succeed");
             assert!(
-                matches!(plan, SyncPlan::Complex),
+                matches!(plan, SyncPlan::Complex(_)),
                 "expected Complex for a Reset of application_name, got {plan:?}"
             );
         }
