@@ -9,6 +9,15 @@
 client-sent session parameters (e.g. `search_path`, `work_mem`,
 `statement_timeout`) are applied via `SET` queries on checkout for that pool only. When omitted at pool level, the global setting is used.
 
+Enabling `sync_server_parameters` adds a round-trip to PostgreSQL on every
+checkout where client parameters differ from the backend defaults. This
+increases total query count and can affect TPS under high concurrency.
+Enable it only for pools that really need per-client session parameters.
+
+Changing `sync_server_parameters` via RELOAD takes effect immediately for new checkouts. 
+Pool connections are recreated with the updated setting. In-flight transactions are not affected - they continue with the server they were
+assigned at checkout time.
+
 ```toml
 [general]
 sync_server_parameters = false  # global default

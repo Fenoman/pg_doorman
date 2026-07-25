@@ -40,11 +40,11 @@ Feature: Pool-level sync_server_parameters override
       """
     When I run shell command:
       """
-      export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParameters ./sync-parameters
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
+      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should succeed
-    And the command output should contain "PASS: Test_SyncServerParameters"
+    And the command output should contain "PASS: Test_SyncServerParametersWithSearchPath"
 
   Scenario: Pool with sync_server_parameters=false ignores client search_path
     Given pg_doorman started with config:
@@ -70,8 +70,8 @@ Feature: Pool-level sync_server_parameters override
       """
     When I run shell command:
       """
-      export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParameters ./sync-parameters
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
+      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
 
@@ -98,11 +98,11 @@ Feature: Pool-level sync_server_parameters override
       """
     When I run shell command:
       """
-      export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParameters ./sync-parameters
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
+      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should succeed
-    And the command output should contain "PASS: Test_SyncServerParameters"
+    And the command output should contain "PASS: Test_SyncServerParametersWithSearchPath"
 
   Scenario: sync_server_parameters is empty in general and declared for one database
     Given pg_doorman started with config:
@@ -127,11 +127,11 @@ Feature: Pool-level sync_server_parameters override
       """
     When I run shell command:
       """
-      export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParameters ./sync-parameters
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
+      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should succeed
-    And the command output should contain "PASS: Test_SyncServerParameters"
+    And the command output should contain "PASS: Test_SyncServerParametersWithSearchPath"
 
   Scenario: sync_server_parameters is empty in general and declared for two databases
     Given pg_doorman started with config:
@@ -177,25 +177,55 @@ Feature: Pool-level sync_server_parameters override
       """
     When I run shell command:
       """
-      export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParameters ./sync-parameters
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
+      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should succeed
-    And the command output should contain "PASS: Test_SyncServerParameters"
+    And the command output should contain "PASS: Test_SyncServerParametersWithSearchPath"
 
     When I run shell command:
       """
-      export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/another_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParameters ./sync-parameters
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/another_db?sslmode=disable&search_path=bucket_0"
+      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
 
     When I run shell command:
       """
-      export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/other_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParameters ./sync-parameters
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/other_db?sslmode=disable&search_path=bucket_0"
+      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
+
+  Scenario: Different clients send different search_path to the same pool
+    Given pg_doorman started with config:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+      sync_server_parameters = false
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      pool_mode = "transaction"
+      sync_server_parameters = true
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = "md58a67a0c805a5ee0384ea28e0dea557b6"
+      pool_size = 10
+      """
+    When I run shell command:
+      """
+      export DATABASE_URL_BASE="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
+      cd tests/go && go test -v -run Test_DifferentSearchPathsInSamePool ./sync-parameters
+      """
+    Then the command should succeed
+    And the command output should contain "PASS: Test_DifferentSearchPathsInSamePool"
 
   Scenario: sync_server_parameters is not declared
     Given pg_doorman started with config:
@@ -219,7 +249,7 @@ Feature: Pool-level sync_server_parameters override
       """
     When I run shell command:
       """
-      export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParameters ./sync-parameters
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
+      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
