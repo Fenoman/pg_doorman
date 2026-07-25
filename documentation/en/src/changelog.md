@@ -1,5 +1,22 @@
 # Changelog
 
+### 3.11.1
+
+#### Pool-level `sync_server_parameters` override
+
+`sync_server_parameters` can now be set per pool in addition to the global
+`[general]` section. When a pool defines `sync_server_parameters = true`,
+client-sent session parameters (e.g. `search_path`, `work_mem`,
+`statement_timeout`) are applied via `SET` queries on checkout for that pool only. When omitted at pool level, the global setting is used.
+
+```toml
+[general]
+sync_server_parameters = false  # global default
+
+[pools.synced_db]
+sync_server_parameters = true   # override for this pool
+```
+
 ### 3.11.0
 
 #### Talos can route through client-specific pools
