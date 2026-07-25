@@ -55,10 +55,6 @@ func setupBucketTables(t *testing.T, dsn string) {
 
 func Test_ExtendedProtocolPreparedStatementDifferentSchemas(t *testing.T) {
 	doormanDSN := os.Getenv("DATABASE_URL_BASE")
-	if doormanDSN == "" {
-		t.Skip("DATABASE_URL_BASE not set")
-	}
-
 	setupTestSchemas(t, doormanDSN)
 
 	ctx := context.Background()
@@ -97,17 +93,12 @@ func Test_ExtendedProtocolPreparedStatementDifferentSchemas(t *testing.T) {
 }
 
 func Test_PreparedInsertTargetsCorrectSchemaAfterReload(t *testing.T) {
-	doormanDSN := os.Getenv("DATABASE_URL_BASE")
+	dsnWithSearchPath := os.Getenv("DATABASE_URL_WITH_SEARCH_PATH")
 	adminPort := os.Getenv("DOORMAN_PORT")
-	if doormanDSN == "" || adminPort == "" {
-		t.Skip("DATABASE_URL_BASE or DOORMAN_PORT not set")
-	}
-
 	ctx := context.Background()
 
-	setupBucketTables(t, doormanDSN)
+	setupBucketTables(t, dsnWithSearchPath)
 
-	dsnWithSearchPath := doormanDSN + "&search_path=bucket_0"
 	conn, err := pgx.Connect(ctx, dsnWithSearchPath)
 	require.NoError(t, err)
 	defer conn.Close(ctx)

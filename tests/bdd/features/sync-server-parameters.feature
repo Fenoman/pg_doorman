@@ -271,7 +271,7 @@ Feature: Pool-level sync_server_parameters override
     # Go test: prepare INSERT → RELOAD → execute → verify bucket_0 → new connection → verify public.
     When I run shell command:
       """
-      export DATABASE_URL_BASE="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
       export DOORMAN_PORT="${DOORMAN_PORT}"
       cd tests/go && go test -v -run Test_PreparedInsertTargetsCorrectSchemaAfterReload ./sync-parameters
       """
