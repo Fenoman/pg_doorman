@@ -18,6 +18,13 @@ Changing `sync_server_parameters` via RELOAD takes effect immediately for new ch
 Pool connections are recreated with the updated setting. In-flight transactions are not affected - they continue with the server they were
 assigned at checkout time.
 
+Prepared statements compiled before a RELOAD retain their original schema
+resolution. When `sync_server_parameters` is enabled, a `PREPARE` resolves
+table references against the client's `search_path` at prepare time. If the
+configuration is subsequently reloaded and `sync_server_parameters` is
+disabled, the prepared statement still targets the original schema — the
+query tree is fixed at compile time by PostgreSQL.
+
 ```toml
 [general]
 sync_server_parameters = false  # global default

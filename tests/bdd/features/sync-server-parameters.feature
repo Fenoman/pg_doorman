@@ -197,6 +197,87 @@ Feature: Pool-level sync_server_parameters override
       """
     Then the command should fail
 
+  Scenario: Extended protocol prepared statements resolve correct schema with different search_path
+    Given pg_doorman started with config:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+      sync_server_parameters = false
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      pool_mode = "transaction"
+      sync_server_parameters = true
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = "md58a67a0c805a5ee0384ea28e0dea557b6"
+      pool_size = 10
+      """
+    When I run shell command:
+      """
+      export DATABASE_URL_BASE="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
+      cd tests/go && go test -v -run Test_ExtendedProtocolPreparedStatementDifferentSchemas ./sync-parameters
+      """
+    Then the command should succeed
+    And the command output should contain "PASS: Test_ExtendedProtocolPreparedStatementDifferentSchemas"
+
+  Scenario: Prepared INSERT targets bucket_0 before RELOAD, stays in bucket_0 after RELOAD
+    Given pg_doorman started with config:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      pool_mode = "transaction"
+      sync_server_parameters = true
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = "md58a67a0c805a5ee0384ea28e0dea557b6"
+      pool_size = 10
+      """
+    # Overwrite config: remove sync_server_parameters (defaults to false).
+    When we overwrite pg_doorman config file with:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      pool_mode = "transaction"
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = "md58a67a0c805a5ee0384ea28e0dea557b6"
+      pool_size = 10
+      """
+    # Go test: prepare INSERT → RELOAD → execute → verify bucket_0 → new connection → verify public.
+    When I run shell command:
+      """
+      export DATABASE_URL_BASE="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
+      export DOORMAN_PORT="${DOORMAN_PORT}"
+      cd tests/go && go test -v -run Test_PreparedInsertTargetsCorrectSchemaAfterReload ./sync-parameters
+      """
+    Then the command should succeed
+    And the command output should contain "PASS: Test_PreparedInsertTargetsCorrectSchemaAfterReload"
+
   Scenario: Different clients send different search_path to the same pool
     Given pg_doorman started with config:
       """
