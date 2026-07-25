@@ -1370,6 +1370,13 @@ fields:
       doc: "Close server connections in this pool that have been opened for longer than this value, in milliseconds. Only applied to idle connections. If not specified, the global server_lifetime setting is used."
       default: "None (uses global setting)"
 
+    sync_server_parameters:
+      config:
+        en: "Override global sync_server_parameters for this pool."
+        ru: "Переопределить глобальный sync_server_parameters для этого пула."
+      doc: "Override global sync_server_parameters for this pool. When enabled, client-sent session parameters (e.g. search_path, work_mem) are applied via SET queries on checkout. If not specified, the global setting is used."
+      default: "None (uses global setting)"
+
     cleanup_server_connections:
       config:
         en: |

@@ -176,6 +176,9 @@ pub struct Pool {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_query: Option<AuthQueryConfig>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_server_parameters: Option<bool>,
+
     /// Pool-level PostgreSQL configuration parameters added to backend
     /// `StartupMessage`s. These values override general settings per key;
     /// passthrough `auth_query` rows can override them per user. Config
@@ -471,6 +474,7 @@ impl Default for Pool {
             server_tls_certificate: None,
             server_tls_private_key: None,
             auth_query: None,
+            sync_server_parameters: None,
             startup_parameters: std::collections::BTreeMap::new(),
         }
     }

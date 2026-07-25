@@ -86,6 +86,7 @@ pub fn generate_config_with_client<
                         server_tls_certificate: None,
                         server_tls_private_key: None,
                         auth_query: None,
+                        sync_server_parameters: None,
                         patroni_api_urls: None,
                         fallback_cooldown: None,
                         patroni_api_timeout: None,
