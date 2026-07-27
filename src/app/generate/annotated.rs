@@ -1386,6 +1386,14 @@ fn write_single_pool(w: &mut ConfigWriter, pool_name: &str, pool: &Pool) {
     );
     w.blank();
 
+    write_field_comment(w, fi, "pool", "sync_server_parameters");
+    if let Some(val) = pool.sync_server_parameters {
+        w.kv(fi, "sync_server_parameters", &w.bool_val(val));
+    } else {
+        w.commented_kv(fi, "sync_server_parameters", "false");
+    }
+    w.blank();
+
     write_field_desc(w, fi, "pool", "prepared_statements_cache_size");
     if let Some(val) = pool.prepared_statements_cache_size {
         w.kv(fi, "prepared_statements_cache_size", &w.num_val(val));

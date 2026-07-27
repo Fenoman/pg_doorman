@@ -278,6 +278,57 @@ Feature: Pool-level sync_server_parameters override
     Then the command should succeed
     And the command output should contain "PASS: Test_PreparedInsertTargetsCorrectSchemaAfterReload"
 
+  Scenario: Pool-level sync_server_parameters RELOAD removes search_path from in-flight backend
+    Given pg_doorman started with config:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      pool_mode = "transaction"
+      sync_server_parameters = true
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = "md58a67a0c805a5ee0384ea28e0dea557b6"
+      pool_size = 10
+      """
+    # Overwrite config: remove pool-level sync_server_parameters (defaults to false).
+    When we overwrite pg_doorman config file with:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      pool_mode = "transaction"
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = "md58a67a0c805a5ee0384ea28e0dea557b6"
+      pool_size = 10
+      """
+    # Go test: prepare INSERT → RELOAD → execute → verify bucket_0 → new connection → verify public.
+    When I run shell command:
+      """
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
+      export DOORMAN_PORT="${DOORMAN_PORT}"
+      cd tests/go && go test -v -run Test_PreparedInsertTargetsCorrectSchemaAfterPoolLevelReload ./sync-parameters
+      """
+    Then the command should succeed
+    And the command output should contain "PASS: Test_PreparedInsertTargetsCorrectSchemaAfterPoolLevelReload"
+
   Scenario: Different clients send different search_path to the same pool
     Given pg_doorman started with config:
       """
@@ -334,3 +385,54 @@ Feature: Pool-level sync_server_parameters override
       cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
+
+  Scenario: Enabling general.sync_server_parameters via RELOAD activates parameter syncing
+    Given pg_doorman started with config:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      pool_mode = "transaction"
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = "md58a67a0c805a5ee0384ea28e0dea557b6"
+      pool_size = 10
+      """
+    # Overwrite config: add sync_server_parameters = true in [general].
+    When we overwrite pg_doorman config file with:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba = {path = "${DOORMAN_HBA_FILE}"}
+      sync_server_parameters = true
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      pool_mode = "transaction"
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = "md58a67a0c805a5ee0384ea28e0dea557b6"
+      pool_size = 10
+      """
+    # Go test: INSERT before RELOAD → public; RELOAD enables sync; INSERT after → bucket_0.
+    When I run shell command:
+      """
+      export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
+      export DOORMAN_PORT="${DOORMAN_PORT}"
+      cd tests/go && go test -v -run Test_SyncServerParametersActivatedAfterReload ./sync-parameters
+      """
+    Then the command should succeed
+    And the command output should contain "PASS: Test_SyncServerParametersActivatedAfterReload"

@@ -564,6 +564,10 @@ pool_mode = "transaction"
 # Default: true
 cleanup_server_connections = true
 
+# Override global sync_server_parameters for this pool.
+# Default: None (uses global setting)
+# sync_server_parameters = false
+
 # Override global prepared_statements_cache_size for this pool.
 # prepared_statements_cache_size = 8192
 

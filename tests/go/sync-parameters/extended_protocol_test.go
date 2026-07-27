@@ -120,10 +120,8 @@ func Test_PreparedInsertTargetsCorrectSchemaAfterReload(t *testing.T) {
 	require.NoError(t, err)
 	adminDB.Close()
 
-	// Execute the prepared INSERT.
-	// The statement was compiled BEFORE RELOAD with search_path = bucket_0,
-	// so it targets bucket_0.items regardless of sync_server_parameters being off now
-	_, err = conn.Exec(ctx, "INSERT INTO items (id, val) VALUES ($1, $2)", 1, "test")
+	// Execute the prepared statement.
+	_, err = conn.Exec(ctx, "insert_item", 1, "test")
 	require.NoError(t, err)
 
 	// Verify: row in bucket_0.items, public.items is empty.
@@ -137,6 +135,79 @@ func Test_PreparedInsertTargetsCorrectSchemaAfterReload(t *testing.T) {
 	assert.Equal(t, 0, count, "public.items should be empty")
 
 	// New connection after RELOAD: sync_server_parameters is off,
+	// search_path is NOT synced, so INSERT goes to default (public).
+	afterReloadConn, err := pgx.Connect(ctx, dsnWithSearchPath)
+	require.NoError(t, err)
+	defer afterReloadConn.Close(ctx)
+
+	_, err = afterReloadConn.Exec(ctx, "INSERT INTO items (id, val) VALUES ($1, $2)", 2, "test2")
+	require.NoError(t, err)
+
+	err = afterReloadConn.QueryRow(ctx, "SELECT count(*) FROM public.items").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "new row should be in public.items")
+
+	err = afterReloadConn.QueryRow(ctx, "SELECT count(*) FROM bucket_0.items").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "bucket_0.items should still have 1 row")
+}
+
+// Test_PreparedInsertTargetsCorrectSchemaAfterPoolLevelReload verifies that
+// when sync_server_parameters is enabled at the pool level, a PREPARE binds
+// to the client's search_path. After RELOAD removes the pool-level override
+// (effective value becomes false), the in-flight backend still carries the
+// old search_path, so the named prepared statement resolves to the same
+// bucket_0 target. A new connection after RELOAD gets the default search_path
+// and INSERT goes to public.
+func Test_PreparedInsertTargetsCorrectSchemaAfterPoolLevelReload(t *testing.T) {
+	dsnWithSearchPath := os.Getenv("DATABASE_URL_WITH_SEARCH_PATH")
+	adminPort := os.Getenv("DOORMAN_PORT")
+	ctx := context.Background()
+
+	setupBucketTables(t, dsnWithSearchPath)
+
+	conn, err := pgx.Connect(ctx, dsnWithSearchPath)
+	require.NoError(t, err)
+	defer conn.Close(ctx)
+
+	// Prepare INSERT via extended protocol.
+	// Pool-level sync_server_parameters = true, search_path = bucket_0 is
+	// synced, so the statement binds to schema bucket_0.
+	PreparedStatement, err := conn.Prepare(ctx, "insert_item", "INSERT INTO items (id, val) VALUES ($1, $2)")
+	require.NoError(t, err)
+	assert.Equal(t, "insert_item", PreparedStatement.Name)
+
+	// RELOAD: config now has pool-level sync_server_parameters removed
+	// (defaults to false). The pool is rebuilt, but the in-flight backend
+	// connection still carries search_path = bucket_0.
+	adminAddr := fmt.Sprintf("127.0.0.1:%s", adminPort)
+	adminDB, err := sql.Open("postgres", fmt.Sprintf("postgresql://admin:admin@%s/pgbouncer?sslmode=disable", adminAddr))
+	require.NoError(t, err)
+	defer adminDB.Close()
+
+	_, err = adminDB.Exec("RELOAD")
+	require.NoError(t, err)
+	adminDB.Close()
+
+	// Execute the prepared INSERT by name.
+	// The in-flight backend retains search_path = bucket_0 from checkout,
+	// so even though pool-level sync_server_parameters is now off, the
+	// backend's search_path has not changed and the re-plan resolves to
+	// the same bucket_0 target.
+	_, err = conn.Exec(ctx, "insert_item", 1, "test")
+	require.NoError(t, err)
+
+	// Verify: row in bucket_0.items, public.items is empty.
+	var count int
+	err = conn.QueryRow(ctx, "SELECT count(*) FROM bucket_0.items").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "row should be in bucket_0.items (in-flight backend retains search_path)")
+
+	err = conn.QueryRow(ctx, "SELECT count(*) FROM public.items").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "public.items should be empty")
+
+	// New connection after RELOAD: pool-level sync_server_parameters is off,
 	// search_path is NOT synced, so INSERT goes to default (public).
 	afterReloadConn, err := pgx.Connect(ctx, dsnWithSearchPath)
 	require.NoError(t, err)

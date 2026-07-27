@@ -13,17 +13,19 @@ Enabling `sync_server_parameters` adds a round-trip to PostgreSQL on every
 checkout where client parameters differ from the backend defaults. This
 increases total query count and can affect TPS under high concurrency.
 Enable it only for pools that really need per-client session parameters.
+Note that parameters sent via libpq `options=-c ...` (`lock_timeout`, `statement_timeout`,
+`idle_in_transaction_session_timeout`, etc.) are not applied on the
+backend when `sync_server_parameters` is disabled.
 
 Changing `sync_server_parameters` via RELOAD takes effect immediately for new checkouts. 
-Pool connections are recreated with the updated setting. In-flight transactions are not affected - they continue with the server they were
-assigned at checkout time.
+Pool connections are recreated with the updated setting. In-flight transactions are not affected -
+they continue with the server they were assigned at checkout time.
 
-Prepared statements compiled before a RELOAD retain their original schema
-resolution. When `sync_server_parameters` is enabled, a `PREPARE` resolves
-table references against the client's `search_path` at prepare time. If the
-configuration is subsequently reloaded and `sync_server_parameters` is
-disabled, the prepared statement still targets the original schema — the
-query tree is fixed at compile time by PostgreSQL.
+In-flight backend connections retain the `search_path` that was SET at
+checkout, so a prepared statement compiled before RELOAD continues to
+target the same schema. New connections that checkout after RELOAD may
+have a different `search_path`, which causes PostgreSQL to re-plan the
+prepared statement against the new schema resolution.
 
 ```toml
 [general]
