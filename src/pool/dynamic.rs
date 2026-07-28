@@ -255,7 +255,7 @@ pub fn create_dynamic_pool(
             life_time_ms: pool_config
                 .server_lifetime
                 .unwrap_or(config.general.server_lifetime.as_millis()),
-            sync_server_parameters: config.general.sync_server_parameters,
+            sync_server_parameters: pool_config.effective_sync_server_parameters(&config.general),
             min_guaranteed_pool_size: pool_config.min_guaranteed_pool_size.unwrap_or(0),
         },
         prepared_statement_cache: match config.general.prepared_statements {

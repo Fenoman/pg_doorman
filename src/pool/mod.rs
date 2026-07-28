@@ -406,10 +406,11 @@ impl ConnectionPool {
         }
 
         // Hashing each pool's effective config against (Pool, general
-        // startup_parameters baseline) folds general-level GUC changes into
-        // the same reuse decision pg_doorman already uses for pool-level
-        // changes. Without this, a SIGHUP that only edits
-        // `general.startup_parameters` would leave every idle backend
+        // startup_parameters baseline + sync_server_parameters) folds
+        // general-level GUC changes into the same reuse decision pg_doorman
+        // already uses for pool-level changes. Without this, a SIGHUP that
+        // only edits `general.startup_parameters` or
+        // `general.sync_server_parameters` would leave every idle backend
         // pinned to the previous `reset_val` until the connection rotates
         // through `lifetime_ms`, so clients would see mixed defaults from
         // the same pool depending on which backend they got.
@@ -417,6 +418,7 @@ impl ConnectionPool {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             config.general.startup_parameters.hash(&mut hasher);
+            config.general.sync_server_parameters.hash(&mut hasher);
             hasher.finish()
         };
         // Load only; the hash is not advanced until the new pool map has
@@ -627,7 +629,7 @@ impl ConnectionPool {
                         life_time_ms: pool_config
                             .server_lifetime
                             .unwrap_or(config.general.server_lifetime.as_millis()),
-                        sync_server_parameters: config.general.sync_server_parameters,
+                        sync_server_parameters: pool_config.effective_sync_server_parameters(&config.general),
                         min_guaranteed_pool_size: pool_config.min_guaranteed_pool_size.unwrap_or(0),
                     },
                     prepared_statement_cache: match config.general.prepared_statements {
@@ -827,7 +829,13 @@ impl ConnectionPool {
                             })
                             .build();
 
-                        let new_pool_hash_value = pool_config.hash_value();
+                        let new_pool_hash_value = {
+                            use std::hash::Hasher;
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            hasher.write_u64(pool_config.hash_value());
+                            hasher.write_u64(general_startup_hash);
+                            hasher.finish()
+                        };
                         let conn_pool = ConnectionPool {
                             database: pool,
                             address,
@@ -850,7 +858,7 @@ impl ConnectionPool {
                                 life_time_ms: pool_config
                                     .server_lifetime
                                     .unwrap_or(config.general.server_lifetime.as_millis()),
-                                sync_server_parameters: config.general.sync_server_parameters,
+                                sync_server_parameters: pool_config.effective_sync_server_parameters(&config.general),
                                 min_guaranteed_pool_size: pool_config
                                     .min_guaranteed_pool_size
                                     .unwrap_or(0),
@@ -1247,6 +1255,7 @@ pub fn get_coordinator(db: &str) -> Option<Arc<pool_coordinator::PoolCoordinator
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Pool as ConfigPool;
 
     #[test]
     fn pool_exists_returns_false_for_missing_entry() {
@@ -1459,5 +1468,179 @@ mod tests {
     fn anon_cache_explicit_zero_disables_lru_regardless_of_pool() {
         let g = General::test_with_cache_sizes(8192, Some(0));
         assert_eq!(resolve_client_anon_cache_size_inner(&g, Some(1024)), 0);
+    }
+
+    // --- sync_server_parameters reload tests ---
+
+    #[test]
+    fn effective_sync_server_parameters_uses_pool_override_when_set() {
+        let general = General::default();
+        let pool = ConfigPool {
+            sync_server_parameters: Some(true),
+            ..Default::default()
+        };
+        assert!(pool.effective_sync_server_parameters(&general));
+    }
+
+    #[test]
+    fn effective_sync_server_parameters_falls_back_to_general_when_none() {
+        let mut general = General::default();
+        general.sync_server_parameters = true;
+        let pool = ConfigPool {
+            sync_server_parameters: None,
+            ..Default::default()
+        };
+        assert!(pool.effective_sync_server_parameters(&general));
+    }
+
+    #[test]
+    fn effective_sync_server_parameters_false_general_false_pool_none() {
+        let general = General::default(); // sync_server_parameters defaults to false
+        let pool = ConfigPool {
+            sync_server_parameters: None,
+            ..Default::default()
+        };
+        assert!(!pool.effective_sync_server_parameters(&general));
+    }
+
+    #[test]
+    fn effective_sync_server_parameters_pool_override_wins_over_general() {
+        let mut general = General::default();
+        general.sync_server_parameters = true;
+        let pool = ConfigPool {
+            sync_server_parameters: Some(false),
+            ..Default::default()
+        };
+        // Pool override (false) wins over general (true)
+        assert!(!pool.effective_sync_server_parameters(&general));
+    }
+
+    fn compute_general_startup_hash(general: &General) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        general.startup_parameters.hash(&mut hasher);
+        general.sync_server_parameters.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn compute_pool_fingerprint(pool: &ConfigPool, general: &General) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write_u64(pool.hash_value());
+        hasher.write_u64(compute_general_startup_hash(general));
+        hasher.finish()
+    }
+
+    #[test]
+    fn reload_sync_server_parameters_false_to_true_changes_general_startup_hash() {
+        let mut general_before = General::default();
+        general_before.sync_server_parameters = false;
+        let mut general_after = General::default();
+        general_after.sync_server_parameters = true;
+        assert_ne!(
+            compute_general_startup_hash(&general_before),
+            compute_general_startup_hash(&general_after),
+            "Changing general.sync_server_parameters must change the general_startup_hash"
+        );
+    }
+
+    #[test]
+    fn reload_sync_server_parameters_true_to_false_changes_general_startup_hash() {
+        let mut general_before = General::default();
+        general_before.sync_server_parameters = true;
+        let mut general_after = General::default();
+        general_after.sync_server_parameters = false;
+        assert_ne!(
+            compute_general_startup_hash(&general_before),
+            compute_general_startup_hash(&general_after),
+            "Changing general.sync_server_parameters must change the general_startup_hash"
+        );
+    }
+
+    #[test]
+    fn reload_general_sync_server_parameters_changes_static_pool_fingerprint() {
+        let pool = ConfigPool::default();
+        let mut general_before = General::default();
+        general_before.sync_server_parameters = false;
+        let mut general_after = General::default();
+        general_after.sync_server_parameters = true;
+        assert_ne!(
+            compute_pool_fingerprint(&pool, &general_before),
+            compute_pool_fingerprint(&pool, &general_after),
+            "Changing general.sync_server_parameters must invalidate static pool fingerprint"
+        );
+    }
+
+    #[test]
+    fn reload_general_sync_server_parameters_changes_auth_query_parent_fingerprint() {
+        let pool = ConfigPool::default();
+        let mut general_before = General::default();
+        general_before.sync_server_parameters = false;
+        let mut general_after = General::default();
+        general_after.sync_server_parameters = true;
+        // parent_fingerprint = pool_config.hash_value() ^ general_startup_hash
+        let fp_before = pool.hash_value() ^ compute_general_startup_hash(&general_before);
+        let fp_after = pool.hash_value() ^ compute_general_startup_hash(&general_after);
+        assert_ne!(
+            fp_before, fp_after,
+            "Changing general.sync_server_parameters must invalidate auth_query parent_fingerprint"
+        );
+    }
+
+    #[test]
+    fn reload_pool_sync_server_parameters_none_to_true_changes_fingerprint() {
+        let mut general = General::default();
+        general.sync_server_parameters = false;
+        let pool_before = ConfigPool {
+            sync_server_parameters: None,
+            ..Default::default()
+        };
+        let pool_after = ConfigPool {
+            sync_server_parameters: Some(true),
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_pool_fingerprint(&pool_before, &general),
+            compute_pool_fingerprint(&pool_after, &general),
+            "Setting pool.sync_server_parameters must change fingerprint"
+        );
+    }
+
+    #[test]
+    fn reload_no_change_preserves_fingerprint() {
+        let general = General::default();
+        let pool = ConfigPool::default();
+        assert_eq!(
+            compute_pool_fingerprint(&pool, &general),
+            compute_pool_fingerprint(&pool, &general),
+            "Same config must produce identical fingerprint"
+        );
+    }
+
+    #[test]
+    fn reload_unchanged_sync_server_parameters_preserves_fingerprint() {
+        let mut general = General::default();
+        general.sync_server_parameters = true;
+        let pool = ConfigPool {
+            sync_server_parameters: Some(true),
+            ..Default::default()
+        };
+        // Pool-level override is set; general value is different but
+        // pool override wins, so effective value is the same.
+        let mut general2 = General::default();
+        general2.sync_server_parameters = false;
+        let pool2 = ConfigPool {
+            sync_server_parameters: Some(true),
+            ..Default::default()
+        };
+        // general changed, but pool override is the same → fingerprint
+        // still changes because general_startup_hash is part of it.
+        // This is expected: the fingerprint detects ANY general change,
+        // even if the effective value is unchanged. This is a safe
+        // over-rebuild rather than under-rebuild.
+        assert_ne!(
+            compute_pool_fingerprint(&pool, &general),
+            compute_pool_fingerprint(&pool2, &general2),
+        );
     }
 }

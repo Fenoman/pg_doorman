@@ -174,6 +174,9 @@ pub struct Pool {
     pub server_tls_private_key: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_server_parameters: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_query: Option<AuthQueryConfig>,
 
     /// Pool-level PostgreSQL configuration parameters added to backend
@@ -200,6 +203,13 @@ impl Pool {
         let mut s = DefaultHasher::new();
         self.hash(&mut s);
         s.finish()
+    }
+
+    /// Return the effective `sync_server_parameters` flag by falling back
+    /// to the global default when the pool-level override is `None`.
+    pub fn effective_sync_server_parameters(&self, general: &super::General) -> bool {
+        self.sync_server_parameters
+            .unwrap_or(general.sync_server_parameters)
     }
 
     pub fn default_pool_mode() -> PoolMode {
@@ -471,6 +481,7 @@ impl Default for Pool {
             server_tls_certificate: None,
             server_tls_private_key: None,
             auth_query: None,
+            sync_server_parameters: None,
             startup_parameters: std::collections::BTreeMap::new(),
         }
     }

@@ -175,6 +175,7 @@ pub fn generate_reference_config(format: ConfigFormat, russian: bool) -> String 
         server_tls_certificate: None,
         server_tls_private_key: None,
         auth_query: None,
+        sync_server_parameters: None,
         startup_parameters: std::collections::BTreeMap::new(),
         users: vec![User {
             username: "app_user".to_string(),
@@ -1383,6 +1384,14 @@ fn write_single_pool(w: &mut ConfigWriter, pool_name: &str, pool: &Pool) {
         "cleanup_server_connections",
         &w.bool_val(pool.cleanup_server_connections),
     );
+    w.blank();
+
+    write_field_comment(w, fi, "pool", "sync_server_parameters");
+    if let Some(val) = pool.sync_server_parameters {
+        w.kv(fi, "sync_server_parameters", &w.bool_val(val));
+    } else {
+        w.commented_kv(fi, "sync_server_parameters", "false");
+    }
     w.blank();
 
     write_field_desc(w, fi, "pool", "prepared_statements_cache_size");

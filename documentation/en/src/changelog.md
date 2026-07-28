@@ -1,5 +1,40 @@
 # Changelog
 
+### 3.11.1
+
+#### Pool-level `sync_server_parameters` override
+
+`sync_server_parameters` can now be set per pool in addition to the global
+`[general]` section. When a pool defines `sync_server_parameters = true`,
+client-sent session parameters (e.g. `search_path`, `work_mem`,
+`statement_timeout`) are applied via `SET` queries on checkout for that pool only. When omitted at pool level, the global setting is used.
+
+Enabling `sync_server_parameters` adds a round-trip to PostgreSQL on every
+checkout where client parameters differ from the backend defaults. This
+increases total query count and can affect TPS under high concurrency.
+Enable it only for pools that really need per-client session parameters.
+Note that parameters sent via libpq `options=-c ...` (`lock_timeout`, `statement_timeout`,
+`idle_in_transaction_session_timeout`, etc.) are not applied on the
+backend when `sync_server_parameters` is disabled.
+
+Changing `sync_server_parameters` via RELOAD takes effect immediately for new checkouts. 
+Pool connections are recreated with the updated setting. In-flight transactions are not affected -
+they continue with the server they were assigned at checkout time.
+
+In-flight backend connections retain the `search_path` that was SET at
+checkout, so a prepared statement compiled before RELOAD continues to
+target the same schema. New connections that checkout after RELOAD may
+have a different `search_path`, which causes PostgreSQL to re-plan the
+prepared statement against the new schema resolution.
+
+```toml
+[general]
+sync_server_parameters = false  # global default
+
+[pools.synced_db]
+sync_server_parameters = true   # override for this pool
+```
+
 ### 3.11.0
 
 #### Talos can route through client-specific pools

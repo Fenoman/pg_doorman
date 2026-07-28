@@ -4,7 +4,7 @@
 
 use super::*;
 use serial_test::serial;
-use std::io::Write;
+use std::{assert_eq, io::Write};
 use tempfile::NamedTempFile;
 
 // Helper function to create a temporary config file for testing
@@ -2101,4 +2101,104 @@ async fn reject_merged_general_pool_startup_parameters_overflow() {
         ),
         other => panic!("expected BadConfig, got {other:?}"),
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sync_server_parameters_pool_override_true() {
+    let config_content = r#"
+[general]
+host = "127.0.0.1"
+port = 6432
+admin_username = "admin"
+admin_password = "admin_password"
+sync_server_parameters = false
+
+[pools.mydb]
+server_host = "localhost"
+server_port = 5432
+sync_server_parameters = true
+
+[[pools.mydb.users]]
+username = "user1"
+password = "pass1"
+pool_size = 10
+"#;
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(config_content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let file_path = temp_file.path().to_str().unwrap();
+    parse(file_path).await.unwrap();
+
+    let config = get_config();
+    assert!(!config.general.sync_server_parameters);
+    let pool = &config.pools["mydb"];
+    assert_eq!(pool.sync_server_parameters, Some(true));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sync_server_parameters_pool_declared_only_for_pool() {
+    let config_content = r#"
+[general]
+host = "127.0.0.1"
+port = 6432
+admin_username = "admin"
+admin_password = "admin_password"
+
+[pools.mydb]
+server_host = "localhost"
+server_port = 5432
+sync_server_parameters = true
+
+[[pools.mydb.users]]
+username = "user1"
+password = "pass1"
+pool_size = 10
+"#;
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(config_content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let file_path = temp_file.path().to_str().unwrap();
+    parse(file_path).await.unwrap();
+
+    let config = get_config();
+    assert!(!config.general.sync_server_parameters);
+    let pool = &config.pools["mydb"];
+    assert_eq!(pool.sync_server_parameters, Some(true));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sync_server_parameters_pool_declared_only_for_general() {
+    let config_content = r#"
+[general]
+host = "127.0.0.1"
+port = 6432
+admin_username = "admin"
+admin_password = "admin_password"
+sync_server_parameters = true
+
+[pools.mydb]
+server_host = "localhost"
+server_port = 5432
+
+[[pools.mydb.users]]
+username = "user1"
+password = "pass1"
+pool_size = 10
+"#;
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(config_content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let file_path = temp_file.path().to_str().unwrap();
+    parse(file_path).await.unwrap();
+
+    let config = get_config();
+    assert!(config.general.sync_server_parameters);
+    let pool = &config.pools["mydb"];
+    assert_eq!(pool.sync_server_parameters, None);
 }

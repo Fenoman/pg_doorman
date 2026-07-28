@@ -293,6 +293,7 @@ fn write_pool_fields(out: &mut String, f: &FieldsData) {
         "reserve_pool_size",
         "reserve_pool_timeout",
         "min_guaranteed_pool_size",
+        "sync_server_parameters",
         "startup_parameters",
     ];
 
