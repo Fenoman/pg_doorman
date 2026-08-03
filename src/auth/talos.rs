@@ -117,10 +117,18 @@ pub fn resolve_talos_user(
                 source: TalosUserSource::Personal,
             };
         }
-        let service_name = format!("srv-{client_id}");
-        if pool_exists(pool_name, &service_name) {
+        let service_name_by_client_id = format!("srv-{client_id}");
+        if pool_exists(pool_name, &service_name_by_client_id) {
             return TalosResolution {
-                username: service_name,
+                username: service_name_by_client_id,
+                source: TalosUserSource::ServicePool,
+            };
+        }
+        let parsed_service_name = client_id.split("|").nth(1).unwrap_or(client_id);
+        let service_account = format!("srv-{parsed_service_name}");
+        if pool_exists(pool_name, &service_account) {
+            return TalosResolution {
+                username: service_account,
                 source: TalosUserSource::ServicePool,
             };
         }
@@ -613,6 +621,38 @@ mod tests {
             });
         assert_eq!(resolved.source, TalosUserSource::ServicePool);
         assert_eq!(resolved.username, "srv-billing-api");
+    }
+
+    #[test]
+    fn resolve_service_pool_from_prefixed_client_id() {
+        let resolved =
+            resolve_talos_user("billing_db", "s2i|test-service", Role::Owner, |db, user| {
+                db == "billing_db" && user == "srv-test-service"
+            });
+        assert_eq!(resolved.source, TalosUserSource::ServicePool);
+        assert_eq!(resolved.username, "srv-test-service");
+    }
+
+    #[test]
+    fn resolve_service_pool_from_prefixed_client_id_respects_max_role() {
+        let resolved = resolve_talos_user(
+            "billing_db",
+            "s2i|test-service",
+            Role::ReadWrite,
+            |db, user| db == "billing_db" && user == "srv-test-service",
+        );
+        assert_eq!(resolved.source, TalosUserSource::ServicePool);
+        assert_eq!(resolved.username, "srv-test-service");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_max_role_when_service_account_missing() {
+        let resolved =
+            resolve_talos_user("billing_db", "s2i|test-service", Role::ReadWrite, |_, _| {
+                false
+            });
+        assert_eq!(resolved.source, TalosUserSource::MaxRole);
+        assert_eq!(resolved.username, "read_write");
     }
 
     #[test]
