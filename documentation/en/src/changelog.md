@@ -1,5 +1,19 @@
 # Changelog
 
+### 3.11.2
+
+#### Talos routes `s2i|`-prefixed clients through a service pool
+
+For `user=talos`, the pool-user selection now also understands
+`s2i|`-prefixed `clientId`s. In addition to `clientId`, `srv-<clientId>`
+and the max token role (`owner`, `read_write`, `read_only`), pg_doorman
+checks a pool user named `srv-<service-name>` where `service-name` is
+the part of the `clientId` after the `|` separator. For a `clientId` of
+`s2i|test-service` the pool user checked is `srv-test-service`.
+
+Selection order: `clientId`, `srv-<clientId>`, `srv-<service-name>`
+(for `s2i|`-prefixed `clientId`), then the max token role. 
+
 ### 3.11.1
 
 #### Pool-level `sync_server_parameters` override
