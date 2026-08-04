@@ -3,7 +3,7 @@ edition = "2021"
 license = "MIT"
 name = "pg_doorman"
 rust-version = "1.87.0"
-version = "3.11.1"
+version = "3.11.2"
 
 [profile.release]
 codegen-units = 1
