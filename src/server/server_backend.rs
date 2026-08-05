@@ -881,6 +881,13 @@ impl Server {
         self.internal_round_trip_in_flight = true;
     }
 
+    /// True while the pooler is running one of its own housekeeping round
+    /// trips (checkin cleanup, liveness probe) rather than relaying client
+    /// traffic.
+    pub(crate) fn internal_round_trip_in_flight(&self) -> bool {
+        self.internal_round_trip_in_flight
+    }
+
     pub(crate) fn finish_internal_round_trip(&mut self) {
         self.internal_round_trip_in_flight = false;
     }
@@ -3317,6 +3324,68 @@ mod tests {
         assert!(
             server.is_bad(),
             "non-idle backend must be marked bad before it can return to the pool"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finalize_checkin_keeps_backend_after_rollback_leading_cleanup_batch() {
+        // A client that dies (or sends Terminate) inside an open transaction is
+        // the ONLY way a backend is still checked out in transaction pooling,
+        // so this batch shape covers every abnormal client exit. The pooler
+        // prepends ROLLBACK, and the RESETs that follow it therefore execute
+        // outside a transaction: their cleanup disarms are final and the
+        // backend must survive the checkin.
+        use super::Server;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.cleanup_connections = true;
+        server.in_transaction = true;
+        server.command_complete_in_transaction = true;
+        server.cleanup_state.needs_cleanup_set = true;
+        server.set_release_query(None); // iServ default, as in production
+
+        let peer_task = tokio::spawn(async move {
+            let mut header = [0_u8; 5];
+            peer.read_exact(&mut header)
+                .await
+                .expect("peer must receive simple Query header");
+            assert_eq!(header[0], b'Q');
+            let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+            let mut body = vec![0_u8; (len - 4) as usize];
+            peer.read_exact(&mut body)
+                .await
+                .expect("peer must receive simple Query body");
+            let sql = String::from_utf8_lossy(&body);
+            assert!(
+                sql.starts_with("ROLLBACK;"),
+                "an in-transaction checkin must roll back first, got: {sql}"
+            );
+
+            // CommandComplete("ROLLBACK"), two CommandComplete("RESET"),
+            // CommandComplete("SELECT 1") for the release query, then idle.
+            peer.write_all(&[
+                b'C', 0, 0, 0, 13, b'R', b'O', b'L', b'L', b'B', b'A', b'C', b'K', 0, //
+                b'C', 0, 0, 0, 10, b'R', b'E', b'S', b'E', b'T', 0, //
+                b'C', 0, 0, 0, 10, b'R', b'E', b'S', b'E', b'T', 0, //
+                b'C', 0, 0, 0, 13, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0, //
+                b'Z', 0, 0, 0, 5, b'I',
+            ])
+            .await
+            .expect("peer must write the cleanup batch responses");
+        });
+
+        let result = server.finalize_checkin().await;
+        peer_task.await.expect("peer task must finish");
+
+        assert!(
+            result.is_ok(),
+            "a clean ROLLBACK-led cleanup batch must not fail the checkin: {result:?}"
+        );
+        assert!(
+            !server.is_bad(),
+            "a healthy backend must survive an abnormal client exit inside a transaction"
         );
     }
 

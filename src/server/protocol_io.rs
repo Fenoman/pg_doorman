@@ -673,8 +673,29 @@ fn drop_prepared_statement_cache_on_reset(server: &mut Server, reason: &'static 
     }
 }
 
+/// A disarm may be recorded once the statement that produced it can no longer
+/// be rolled back.
+///
+/// Client traffic is gated on the transaction mirrors: a `RESET` inside an open
+/// transaction is undone if that transaction aborts, so its disarm must wait for
+/// the idle `ReadyForQuery` that commits it.
+///
+/// The pooler's own housekeeping round trip is different. When a backend is
+/// checked in while still in a transaction (the only way a client can abandon
+/// one in transaction pooling), `collect_checkin_cleanup_sqls` prepends
+/// `ROLLBACK`, so every following `RESET` in that batch runs outside a
+/// transaction and its effect is already final. The mirrors, however, are only
+/// refreshed by `ReadyForQuery`, which arrives at the very END of the batch —
+/// gating on them here would drop every disarm the batch produced and make
+/// `finalize_checkin` conclude that the release query left the session dirty,
+/// destroying a healthy backend on every abnormal client exit.
+fn cleanup_disarm_is_transactionally_safe(server: &Server) -> bool {
+    server.internal_round_trip_in_flight()
+        || (!server.in_transaction() && !server.command_complete_in_transaction)
+}
+
 fn defer_set_cleanup_disarm_if_transactionally_safe(server: &mut Server) {
-    if server.in_transaction() || server.command_complete_in_transaction {
+    if !cleanup_disarm_is_transactionally_safe(server) {
         return;
     }
     server.pending_cleanup_disarms.set = true;
@@ -682,14 +703,14 @@ fn defer_set_cleanup_disarm_if_transactionally_safe(server: &mut Server) {
 }
 
 fn defer_role_cleanup_disarm_if_transactionally_safe(server: &mut Server) {
-    if server.in_transaction() || server.command_complete_in_transaction {
+    if !cleanup_disarm_is_transactionally_safe(server) {
         return;
     }
     server.pending_cleanup_disarms.role = true;
 }
 
 fn defer_session_authorization_cleanup_disarm_if_transactionally_safe(server: &mut Server) {
-    if server.in_transaction() || server.command_complete_in_transaction {
+    if !cleanup_disarm_is_transactionally_safe(server) {
         return;
     }
     server.pending_cleanup_disarms.session_authorization = true;
