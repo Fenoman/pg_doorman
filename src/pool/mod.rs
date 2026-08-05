@@ -1119,21 +1119,14 @@ impl ConnectionPool {
 
         for (pool_name, pool_config) in &config.pools {
             if let Some(ref aq_config) = pool_config.auth_query {
-                let pool_startup_hash = {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    pool_config.startup_parameters.hash(&mut hasher);
-                    hasher.finish()
-                };
+                let pool_startup_hash = pool_startup_parameters_hash(pool_config);
                 // Parent fingerprint folds every other parent input the
-                // dedicated shared pool depends on into one hash:
-                // `pool_config.hash_value()` covers host/port/TLS/
-                // timeouts/fallback/app_name/users; the general
-                // startup hash covers the operator-wide baseline that
-                // also flows into the shared pool's reset_val. A SIGHUP
-                // that changes any of these without touching the
-                // auth_query config still rebuilds the shared pool.
-                let parent_fingerprint = pool_config.hash_value() ^ general_startup_hash;
+                // dedicated shared pool depends on into one hash - see
+                // `auth_query_parent_fingerprint`. A SIGHUP that changes
+                // any of them without touching the auth_query config
+                // still rebuilds the shared pool.
+                let parent_fingerprint =
+                    auth_query_parent_fingerprint(pool_config, general_startup_hash);
                 // RELOAD: reuse state when the auth_query config AND
                 // the pool-level startup_parameters AND the parent
                 // fingerprint are unchanged. Any other parent edit
@@ -1401,14 +1394,9 @@ impl ConnectionPool {
                 None => true,                          // auth_query removed
                 Some(new) => *new != old_state.config, // config changed
             };
-            let new_pool_startup_hash = new_pool_config.map(|p| {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                p.startup_parameters.hash(&mut hasher);
-                hasher.finish()
-            });
+            let new_pool_startup_hash = new_pool_config.map(pool_startup_parameters_hash);
             let new_parent_fingerprint =
-                new_pool_config.map(|p| p.hash_value() ^ general_startup_hash);
+                new_pool_config.map(|p| auth_query_parent_fingerprint(p, general_startup_hash));
             let pool_startup_changed = new_pool_startup_hash
                 .map(|h| h != old_state.pool_startup_hash)
                 .unwrap_or(false);
@@ -1820,6 +1808,100 @@ pub(crate) fn static_pool_fingerprint(pool_config: &ConfigPool, general: &Genera
     hasher.write_u64(compute_general_startup_hash(general));
     hasher.write_u64(frozen_general_pool_inputs_hash(pool_config, general));
     hasher.finish()
+}
+
+/// Hash of one pool's own `startup_parameters` map.
+///
+/// Extracted so the `AuthQueryState` construction and the reload comparison
+/// cannot drift: two copies of the same hasher setup are two chances to
+/// forget a field on one side and reuse a state that should have been
+/// rebuilt.
+fn pool_startup_parameters_hash(pool_config: &ConfigPool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pool_config.startup_parameters.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Reuse fingerprint of the parent inputs an `AuthQueryState` — and with it
+/// the dedicated-mode shared pool and every passthrough dynamic pool — was
+/// built from.
+///
+/// `pool_config.hash_value()` covers host/port/TLS/fallback/app_name/users
+/// and the pool's own `startup_parameters` and timeout overrides; the
+/// general startup hash covers the operator-wide baseline that also flows
+/// into those pools' `reset_val`. Deliberately does NOT fold in
+/// [`frozen_general_pool_inputs_hash`] — see
+/// [`auth_query_pools_pinned_to_old_lifecycle_timeouts`] for why the
+/// lifecycle timeouts are reported instead of applied here.
+fn auth_query_parent_fingerprint(pool_config: &ConfigPool, general_startup_hash: u64) -> u64 {
+    pool_config.hash_value() ^ general_startup_hash
+}
+
+/// Pools whose auth_query children keep the OLD connection-lifecycle
+/// timeouts across this reload — the dedicated-mode shared pool and every
+/// passthrough dynamic pool of that pool name.
+///
+/// A static pool applies an edited `general.idle_timeout` and friends by
+/// being rebuilt ([`static_pool_fingerprint`] folds
+/// [`frozen_general_pool_inputs_hash`] in, and the replaced generation is
+/// handed to the retirement registry so live sessions keep the pool they
+/// already hold). The auth_query children cannot use that mechanism:
+/// replacing a dynamic pool DISCONNECTS its sessions, because
+/// `Client::get_pool` requires the live `POOLS` entry to be the very
+/// generation the client authenticated against and errors out with
+/// "No pool configured for database" otherwise (a deliberate fail-closed
+/// rule — an auth_query refetch that revokes credentials or changes the
+/// per-user overlay drops the pool exactly the same way). Rebuilding them
+/// for a timeout edit would therefore trade a silently ignored setting for
+/// a mass disconnect, so the reload leaves them alone and this list tells
+/// the operator a restart is what applies the new value there.
+///
+/// Reports only the pools that a reload would in fact reuse: when the
+/// auth_query config, the pool-level `startup_parameters` or any other
+/// parent input moved as well, the state and its children are rebuilt
+/// anyway and pick the new timeouts up on the way.
+///
+/// Like the other reload reports this compares the two configs of THIS
+/// reload, so it names a drift at the moment it is introduced; a later
+/// SIGHUP that changes something unrelated does not repeat the warning.
+pub(crate) fn auth_query_pools_pinned_to_old_lifecycle_timeouts(
+    old_config: &Config,
+    new_config: &Config,
+) -> Vec<String> {
+    let old_startup_hash = compute_general_startup_hash(&old_config.general);
+    let new_startup_hash = compute_general_startup_hash(&new_config.general);
+
+    let mut pinned: Vec<String> = new_config
+        .pools
+        .iter()
+        .filter(|(pool_name, new_pool)| {
+            let Some(old_pool) = old_config.pools.get(*pool_name) else {
+                return false; // brand new pool: built with the new values
+            };
+            let (Some(new_aq), Some(old_aq)) =
+                (new_pool.auth_query.as_ref(), old_pool.auth_query.as_ref())
+            else {
+                return false; // no auth_query children on at least one side
+            };
+            // Mirrors the reuse gate in `from_config`: anything else moving
+            // rebuilds the state and its children.
+            if new_aq != old_aq
+                || pool_startup_parameters_hash(new_pool) != pool_startup_parameters_hash(old_pool)
+                || auth_query_parent_fingerprint(new_pool, new_startup_hash)
+                    != auth_query_parent_fingerprint(old_pool, old_startup_hash)
+            {
+                return false;
+            }
+            frozen_general_pool_inputs_hash(new_pool, &new_config.general)
+                != frozen_general_pool_inputs_hash(old_pool, &old_config.general)
+        })
+        .map(|(pool_name, _)| pool_name.clone())
+        .collect();
+    // `config.pools` is a HashMap: sort so the operator-facing line is
+    // stable across reloads and across processes.
+    pinned.sort();
+    pinned
 }
 
 /// Build Patroni-assisted fallback state. Returns None when no `patroni_api_urls`
@@ -2631,6 +2713,207 @@ mod tests {
             static_pool_fingerprint(&pool, &after),
             "a pool that overrides connect_timeout must not be recreated when the \
              general default it does not use changes"
+        );
+    }
+
+    // --- auth_query pools and the lifecycle timeouts they freeze ---
+    //
+    // A static pool applies an edited lifecycle timeout by being rebuilt
+    // (its replaced generation drains through the retirement registry).
+    // The auth_query children cannot: replacing a dynamic pool disconnects
+    // its sessions, because `Client::get_pool` only hands a passthrough
+    // client the generation it authenticated against. So the reload leaves
+    // them alone and reports them instead — these tests pin what gets
+    // reported.
+
+    fn test_auth_query_config() -> crate::config::AuthQueryConfig {
+        use crate::config::Duration as ConfigDuration;
+        crate::config::AuthQueryConfig {
+            query: "SELECT usename, passwd FROM pg_shadow WHERE usename = $1".to_string(),
+            user: "auth_user".to_string(),
+            password: "secret".to_string(),
+            database: None,
+            workers: 1,
+            server_user: None,
+            server_password: None,
+            pool_size: 40,
+            min_pool_size: 0,
+            cache_ttl: ConfigDuration::from_millis(3_600_000),
+            cache_failure_ttl: ConfigDuration::from_millis(30_000),
+            min_interval: ConfigDuration::from_millis(1_000),
+        }
+    }
+
+    /// One-pool config; `auth_query` present unless the caller drops it.
+    fn config_with_pool(pool: ConfigPool, general: General) -> Config {
+        Config {
+            general,
+            pools: HashMap::from([("app_db".to_string(), pool)]),
+            ..Config::default()
+        }
+    }
+
+    fn auth_query_pool() -> ConfigPool {
+        ConfigPool {
+            auth_query: Some(test_auth_query_config()),
+            ..ConfigPool::default()
+        }
+    }
+
+    #[test]
+    fn auth_query_pools_are_reported_when_a_general_lifecycle_timeout_moves() {
+        let base = general_with_fallback_urls();
+        let old = config_with_pool(auth_query_pool(), base.clone());
+
+        let mut unreported = Vec::new();
+        for (field, mutate) in pool_rebuild_general_knobs() {
+            let mut edited_general = base.clone();
+            mutate(&mut edited_general);
+            let new = config_with_pool(auth_query_pool(), edited_general);
+            if auth_query_pools_pinned_to_old_lifecycle_timeouts(&old, &new)
+                != vec!["app_db".to_string()]
+            {
+                unreported.push(field);
+            }
+        }
+
+        assert!(
+            unreported.is_empty(),
+            "the reload keeps the auth_query shared/dynamic pools alive, so they go \
+             on serving the previous value of these timeouts: {unreported:?}. The \
+             operator has to be told a restart is what applies them there — this is \
+             the 'config unchanged' trap one level down."
+        );
+    }
+
+    #[test]
+    fn auth_query_pool_with_its_own_timeout_override_is_not_reported() {
+        // The general defaults never reach this pool, so nothing is pinned
+        // to a stale value and there is nothing to warn about.
+        let pool = ConfigPool {
+            idle_timeout: Some(5_000),
+            server_lifetime: Some(7_000),
+            connect_timeout: Some(250),
+            ..auth_query_pool()
+        };
+        let base = general_with_fallback_urls();
+        let old = config_with_pool(pool.clone(), base.clone());
+        let new = config_with_pool(
+            pool,
+            General {
+                idle_timeout: crate::config::Duration::from_millis(30_000),
+                server_lifetime: crate::config::Duration::from_millis(90_000),
+                connect_timeout: crate::config::Duration::from_millis(9_000),
+                ..base
+            },
+        );
+
+        assert!(
+            auth_query_pools_pinned_to_old_lifecycle_timeouts(&old, &new).is_empty(),
+            "a pool that pins its own timeouts is not affected by the general \
+             defaults moving, so warning about it would be noise"
+        );
+    }
+
+    #[test]
+    fn auth_query_pool_rebuilt_for_another_reason_is_not_reported() {
+        // The reload replaces this pool's auth_query state and its children
+        // anyway (the backend moved), so they DO pick the new timeouts up.
+        let base = general_with_fallback_urls();
+        let old = config_with_pool(auth_query_pool(), base.clone());
+        let moved = ConfigPool {
+            server_host: "10.0.0.9".to_string(),
+            ..auth_query_pool()
+        };
+        let mut retimed = base.clone();
+        retimed.idle_timeout =
+            crate::config::Duration::from_millis(base.idle_timeout.as_millis() + 1_000);
+        let new = config_with_pool(moved, retimed);
+
+        assert!(
+            auth_query_pools_pinned_to_old_lifecycle_timeouts(&old, &new).is_empty(),
+            "children that are rebuilt for another reason are built with the new \
+             timeouts, so telling the operator to restart would be wrong"
+        );
+    }
+
+    #[test]
+    fn auth_query_credential_change_is_not_reported_as_pinned() {
+        let base = general_with_fallback_urls();
+        let old = config_with_pool(auth_query_pool(), base.clone());
+        let rotated = ConfigPool {
+            auth_query: Some(crate::config::AuthQueryConfig {
+                password: "rotated".to_string(),
+                ..test_auth_query_config()
+            }),
+            ..auth_query_pool()
+        };
+        let mut retimed = base.clone();
+        retimed.idle_timeout =
+            crate::config::Duration::from_millis(base.idle_timeout.as_millis() + 1_000);
+
+        assert!(
+            auth_query_pools_pinned_to_old_lifecycle_timeouts(
+                &old,
+                &config_with_pool(rotated, retimed)
+            )
+            .is_empty(),
+            "an auth_query edit rebuilds the state and drops the children, so the \
+             new timeouts take effect without a restart"
+        );
+    }
+
+    #[test]
+    fn pools_without_auth_query_are_not_reported() {
+        // Static pools DO apply the edit — `static_pool_fingerprint` folds
+        // the timeouts in and the replaced generation drains.
+        let base = general_with_fallback_urls();
+        let old = config_with_pool(ConfigPool::default(), base.clone());
+        let mut retimed = base.clone();
+        retimed.idle_timeout =
+            crate::config::Duration::from_millis(base.idle_timeout.as_millis() + 1_000);
+        let new = config_with_pool(ConfigPool::default(), retimed);
+
+        assert!(
+            auth_query_pools_pinned_to_old_lifecycle_timeouts(&old, &new).is_empty(),
+            "a pool without auth_query has no shared/dynamic children to pin"
+        );
+    }
+
+    #[test]
+    fn unchanged_config_reports_no_pinned_auth_query_pools() {
+        let base = general_with_fallback_urls();
+        let config = config_with_pool(auth_query_pool(), base);
+        assert!(
+            auth_query_pools_pinned_to_old_lifecycle_timeouts(&config, &config).is_empty(),
+            "a reload that changes nothing must stay silent"
+        );
+    }
+
+    #[test]
+    fn reload_reports_auth_query_pools_pinned_to_old_timeouts() {
+        // Source contract: the report has to reach the operator from the
+        // same place that announces the pool rebuild, or the helper is dead
+        // code and the trap is back.
+        let src = include_str!("../config/mod.rs");
+        let start = src
+            .find("let rebuild_fields =")
+            .expect("reload must compute the rebuilt-field list");
+        let end = src[start..]
+            .find("let restart_only_pool_fields =")
+            .map(|offset| start + offset)
+            .expect("reload must compute the restart-only field list");
+        let block = &src[start..end];
+
+        assert!(
+            block.contains("auth_query_pools_pinned_to_old_lifecycle_timeouts"),
+            "a lifecycle-timeout edit that does not reach the auth_query pools must \
+             be reported next to the rebuild announcement"
+        );
+        assert!(
+            block.contains("warn!"),
+            "the auth_query pools keeping the old value is a warning, not an info: \
+             the operator has to restart to apply the edit there"
         );
     }
 

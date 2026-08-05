@@ -1519,6 +1519,28 @@ pub async fn reload_config(client_server_map: ClientServerMap) -> Result<bool, E
                  until they disconnect, so it drains in the background instead of \
                  being closed under them."
             );
+
+            // ... every pool EXCEPT the auth_query ones. Their shared and
+            // dynamic pools are reused across the reload and froze the old
+            // timeouts, so the operator has to be told the edit did not
+            // reach them - this is the `config unchanged` trap again, one
+            // level down.
+            let pinned = crate::pool::auth_query_pools_pinned_to_old_lifecycle_timeouts(
+                &old_config,
+                &new_config,
+            );
+            if !pinned.is_empty() {
+                let pools = pinned.join(", ");
+                warn!(
+                    "RELOAD: {fields} changed but the auth_query pools ({pools}) keep \
+                     the OLD values - their dedicated shared pool and their passthrough \
+                     dynamic pools survive the reload and froze the timeouts when they \
+                     were built. Restart pg_doorman to apply the new values there. They \
+                     are deliberately not recreated: a passthrough session cannot \
+                     survive its dynamic pool being replaced, so applying a timeout \
+                     edit this way would disconnect every client of those pools."
+                );
+            }
         }
 
         // The rest of what a pool freezes is deliberately NOT applied: a
