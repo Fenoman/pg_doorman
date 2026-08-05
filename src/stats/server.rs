@@ -39,7 +39,7 @@ iota! {
 /// and to track server activity for monitoring and diagnostics.
 #[derive(Debug)]
 pub struct ServerStats {
-    /// A random integer assigned to the server and used by stats to track the server
+    /// Monotonic id assigned at construction and used by stats to track the server
     server_id: i32,
     /// PostgreSQL backend process ID
     process_id: AtomicI32,
@@ -115,8 +115,8 @@ const NEVER_ACTIVE: u64 = 0;
 /// and lets `Server::drop` remove the row later. If startup times out, fails,
 /// or retries through TLS, dropping this guard removes the transient row.
 ///
-/// Drop takes the global `SERVER_STATS` write lock. Keep `stats::Collector`
-/// read sections short so mass timeouts do not block on long snapshots.
+/// Drop removes the row from the sharded `SERVER_STATS` map, so it contends
+/// only with writers touching the same shard.
 #[must_use = "the registration is the only handle that keeps the SERVER_STATS row alive; drop it explicitly only when the row should disappear"]
 pub(crate) struct ServerStatsRegistration {
     server_id: i32,
@@ -760,7 +760,7 @@ mod tests {
         // Test that ServerStats::new initializes with the provided values
         let stats = ServerStats::new(address.clone(), now);
 
-        // Check that server_id is random (not 0)
+        // Check that server_id is assigned (monotonic counter starts at 1)
         assert_ne!(stats.server_id(), 0);
 
         // Check that connect_time is set correctly
