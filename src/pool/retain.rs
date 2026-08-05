@@ -7,7 +7,7 @@ use rand::seq::SliceRandom;
 use crate::config::get_config;
 use crate::utils::{format_duration_ms, format_elapsed};
 
-use super::{get_all_pools, ConnectionPool};
+use super::{get_all_pools, get_retired_pools, release_unreferenced_retired_pools, ConnectionPool};
 
 impl ConnectionPool {
     /// Retain pool connections based on idle timeout and lifetime settings.
@@ -363,7 +363,126 @@ pub async fn retain_connections() {
                 }
             }
         }
+
+        // Generations that a RELOAD replaced are not in `POOLS`, so every
+        // phase above skipped them — while their semaphores stay open so
+        // they keep serving (and creating) backends for the sessions that
+        // still hold them. Sweep them last: live pools have priority, and
+        // the retired ones only need to shrink and eventually disappear.
+        housekeep_retired_generations(dead_check_timeout, dead_check_max, retain_time, retain_max)
+            .await;
     }
+}
+
+/// What one retired-generation housekeeping pass did.
+///
+/// Returned (and logged) so the contract is observable: a RELOAD-replaced
+/// generation is visited by the same trim and dead-backend scan as a live
+/// pool, and is released once no session holds it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredSweepReport {
+    /// Generations handed to the idle/lifetime trim.
+    pub trim_visited: usize,
+    /// Generations handed to the dead-backend liveness scan (0 when the
+    /// scan is disabled by config).
+    pub scan_visited: usize,
+    /// Idle server connections closed by the trim.
+    pub closed_connections: usize,
+    /// Dead backends evicted by the scan.
+    pub evicted_backends: usize,
+    /// Generations closed and dropped from the registry.
+    pub released_generations: usize,
+}
+
+/// Housekeeping for pool generations that a RELOAD replaced while sessions
+/// were still holding them (see `pool::RETIRED_POOLS`).
+///
+/// Same trim and same dead-backend scan as a live pool, deliberately WITHOUT
+/// replenish: a retired generation is unreachable for new sessions, so
+/// refilling it to `min_pool_size` would recreate exactly the surplus
+/// backends this sweep exists to remove. The pass ends by closing the
+/// generations no session references any more.
+pub(crate) async fn housekeep_retired_generations(
+    dead_check_timeout: std::time::Duration,
+    dead_check_max: usize,
+    retain_time: std::time::Duration,
+    retain_max: usize,
+) -> RetiredSweepReport {
+    let mut report = RetiredSweepReport::default();
+
+    {
+        let retired = get_retired_pools();
+        if retired.is_empty() {
+            return report;
+        }
+
+        // Dead-backend liveness scan, mirroring the live-pool phase
+        // (including the bounded fan-out, so a mass-PG-outage cannot make
+        // this exceed one retain tick).
+        if !dead_check_timeout.is_zero() && dead_check_max > 0 {
+            use futures::stream::{self, StreamExt};
+            const SCAN_CONCURRENCY: usize = 8;
+            let evicted_total = Arc::new(AtomicUsize::new(0));
+            stream::iter(retired.iter())
+                .for_each_concurrent(SCAN_CONCURRENCY, |pool| {
+                    let evicted_total = Arc::clone(&evicted_total);
+                    async move {
+                        let (checked, evicted) = pool
+                            .database
+                            .evict_dead_backends(dead_check_timeout, dead_check_max, retain_time)
+                            .await;
+                        if evicted > 0 {
+                            evicted_total.fetch_add(evicted, Ordering::Relaxed);
+                            info!(
+                                "[{}@{}] retired generation: evicted {} dead backend{} \
+                                 (checked {} idle)",
+                                pool.address.username,
+                                pool.address.pool_name,
+                                evicted,
+                                if evicted == 1 { "" } else { "s" },
+                                checked,
+                            );
+                        }
+                    }
+                })
+                .await;
+            report.scan_visited = retired.len();
+            report.evicted_backends = evicted_total.load(Ordering::Relaxed);
+        }
+
+        // Idle / lifetime trimming. Retired generations get their own
+        // `retain_connections_max` budget so they never eat into the quota
+        // of the pools actually serving new sessions.
+        let count = Arc::new(AtomicUsize::new(0));
+        for pool in retired.iter() {
+            report.closed_connections += pool.retain_pool_connections(count.clone(), retain_max);
+            report.trim_visited += 1;
+        }
+
+        // No replenish phase here, on purpose — see the doc comment.
+    } // The registry snapshot is scoped on purpose: entries are
+      // `Arc<ConnectionPool>` so holding it cannot inflate the liveness
+      // probe, but dropping it here lets a released generation be freed as
+      // soon as it is closed instead of at the end of the sweep.
+
+    report.released_generations = release_unreferenced_retired_pools();
+
+    if report.closed_connections > 0
+        || report.evicted_backends > 0
+        || report.released_generations > 0
+    {
+        info!(
+            "Retired generations swept: {} trimmed, {} scanned, {} idle server(s) closed, \
+             {} dead backend(s) evicted, {} generation(s) released",
+            report.trim_visited,
+            report.scan_visited,
+            report.closed_connections,
+            report.evicted_backends,
+            report.released_generations,
+        );
+    }
+
+    report
 }
 
 /// Drain all idle connections from all pools during graceful shutdown.
@@ -441,6 +560,193 @@ mod tests {
             replenish_failures: Arc::new(AtomicU32::new(0)),
             init_complete: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// A generation that a RELOAD replaced is no longer in `POOLS`, so every
+    /// phase of the retain loop skips it. It must instead be reached through
+    /// the retirement registry: same idle/lifetime trim, same dead-backend
+    /// scan, and — once no session holds it any more — closed and dropped
+    /// from the registry.
+    #[tokio::test]
+    #[serial_test::serial(retired_pools)]
+    async fn retired_generation_is_swept_and_released() {
+        crate::pool::clear_retired_pools_for_test();
+
+        let pool = build_test_connection_pool();
+        let database = pool.database.clone();
+        crate::pool::retire_pool_generations(vec![pool]);
+
+        let report = housekeep_retired_generations(
+            Duration::from_millis(500),
+            8,
+            Duration::from_secs(30),
+            0,
+        )
+        .await;
+
+        assert_eq!(
+            report.trim_visited, 1,
+            "a retired generation must go through idle/lifetime trimming"
+        );
+        assert_eq!(
+            report.scan_visited, 1,
+            "a retired generation must go through the dead-backend scan"
+        );
+        assert_eq!(
+            report.released_generations, 1,
+            "an unreferenced retired generation must be released"
+        );
+        assert!(
+            crate::pool::get_retired_pools().is_empty(),
+            "the registry must not keep released generations"
+        );
+        assert!(
+            database.is_closed(),
+            "a released generation must be closed so its backends go away"
+        );
+    }
+
+    /// The drain guarantee: while a session still holds the old generation,
+    /// housekeeping visits it (so its idle backends expire) but must not
+    /// close it — closing would fail the in-flight session with 53300.
+    #[tokio::test]
+    #[serial_test::serial(retired_pools)]
+    async fn retired_generation_in_use_is_swept_but_kept_open() {
+        crate::pool::clear_retired_pools_for_test();
+
+        let pool = build_test_connection_pool();
+        let database = pool.database.clone();
+        let inflight_client = pool.clone();
+        crate::pool::retire_pool_generations(vec![pool]);
+
+        let report = housekeep_retired_generations(
+            Duration::from_millis(500),
+            8,
+            Duration::from_secs(30),
+            0,
+        )
+        .await;
+
+        assert_eq!(report.trim_visited, 1);
+        assert_eq!(report.scan_visited, 1);
+        assert_eq!(
+            report.released_generations, 0,
+            "a generation an in-flight session still holds must not be released"
+        );
+        assert_eq!(crate::pool::get_retired_pools().len(), 1);
+        assert!(
+            !database.is_closed(),
+            "housekeeping must never close a generation an in-flight session holds"
+        );
+
+        // Session disconnects → the next sweep reaps the generation.
+        drop(inflight_client);
+        let report = housekeep_retired_generations(
+            Duration::from_millis(500),
+            8,
+            Duration::from_secs(30),
+            0,
+        )
+        .await;
+        assert_eq!(report.released_generations, 1);
+        assert!(crate::pool::get_retired_pools().is_empty());
+        assert!(database.is_closed());
+    }
+
+    /// The dead-backend scan honours the same operator kill switch on
+    /// retired generations as on live pools.
+    #[tokio::test]
+    #[serial_test::serial(retired_pools)]
+    async fn retired_generation_scan_respects_disabled_dead_check() {
+        crate::pool::clear_retired_pools_for_test();
+
+        let pool = build_test_connection_pool();
+        let inflight_client = pool.clone();
+        crate::pool::retire_pool_generations(vec![pool]);
+
+        let report =
+            housekeep_retired_generations(Duration::ZERO, 8, Duration::from_secs(30), 0).await;
+        assert_eq!(
+            report.scan_visited, 0,
+            "dead_backend_check_timeout = 0 must disable the scan for retired generations too"
+        );
+        assert_eq!(
+            report.trim_visited, 1,
+            "the idle/lifetime trim is independent of the dead-backend scan"
+        );
+
+        drop(inflight_client);
+        crate::pool::release_unreferenced_retired_pools();
+    }
+
+    /// An empty registry is the steady state; it must cost nothing and
+    /// report nothing.
+    #[tokio::test]
+    #[serial_test::serial(retired_pools)]
+    async fn empty_registry_sweep_is_a_no_op() {
+        crate::pool::clear_retired_pools_for_test();
+        let report = housekeep_retired_generations(
+            Duration::from_millis(500),
+            8,
+            Duration::from_secs(30),
+            0,
+        )
+        .await;
+        assert_eq!(report, RetiredSweepReport::default());
+    }
+
+    /// Retired generations must never be replenished: refilling a pool that
+    /// no new session can reach is exactly the backend duplication this
+    /// registry exists to remove.
+    #[test]
+    fn retired_housekeeping_never_replenishes() {
+        let src = include_str!("retain.rs");
+        let start = src
+            .find("pub(crate) async fn housekeep_retired_generations")
+            .expect("retired housekeeping entry point must exist");
+        let end = src[start..]
+            .find("\n/// Drain all idle connections from all pools")
+            .map(|offset| start + offset)
+            .expect("retired housekeeping tail marker must exist");
+        let body = &src[start..end];
+
+        assert!(
+            !body.contains(".replenish("),
+            "retired generations must not be replenished"
+        );
+        assert!(
+            body.contains("retain_pool_connections"),
+            "retired generations must go through idle/lifetime trimming"
+        );
+        assert!(
+            body.contains("evict_dead_backends"),
+            "retired generations must go through the dead-backend scan"
+        );
+        assert!(
+            body.contains("release_unreferenced_retired_pools"),
+            "the sweep must release generations nobody holds any more"
+        );
+    }
+
+    /// The retain loop must actually call the retired-generation sweep;
+    /// otherwise the registry grows without ever being housekept.
+    #[test]
+    fn retain_loop_sweeps_retired_generations() {
+        let src = include_str!("retain.rs");
+        let start = src
+            .find("pub async fn retain_connections()")
+            .expect("retain task entry point must exist");
+        let end = src[start..]
+            .find("\n/// Drain all idle connections from all pools")
+            .map(|offset| start + offset)
+            .expect("retain task tail marker must exist");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("housekeep_retired_generations("),
+            "the retain loop must sweep RELOAD-replaced generations, otherwise they \
+             keep their backends open until process restart"
+        );
     }
 
     /// Pools serving live traffic must not lose idle connections to retain

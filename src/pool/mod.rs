@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use log::{debug, info};
+use log::{debug, info, warn};
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -465,6 +465,148 @@ pub(crate) fn drop_dynamic_pool_if_init_guard_matches(
         pool.database.close();
     }
     removed_pool.is_some()
+}
+
+/// Static pool generations that a RELOAD REPLACED while sessions were still
+/// holding them.
+///
+/// A client captures its `ConnectionPool` once, on entry to `Client::handle`,
+/// and keeps it until it disconnects. A RELOAD that rebuilds a pool therefore
+/// cannot close the old generation — doing so failed every in-flight session
+/// with SQLSTATE 53300 on its next checkout — so `from_config` leaves it open
+/// and lets it drain naturally. But the replaced generation also disappears
+/// from `POOLS`, and every housekeeping phase (`retain.rs`) iterates
+/// `get_all_pools()`: the old generation stopped getting idle/lifetime
+/// trimming and dead-backend eviction, while its semaphore stayed open so it
+/// could still create backends up to `max_size`. With long-lived application
+/// sessions the result was a permanent doubling of the backend count on
+/// PostgreSQL after each reload, invisible in `SHOW POOLS` and in the metrics.
+///
+/// This registry keeps the replaced generation reachable for housekeeping
+/// only. It is deliberately NOT part of `POOLS`, so it stays out of
+/// `SHOW POOLS`, `/metrics` and every other consumer of `get_all_pools()` —
+/// a retired generation is not a live pool.
+///
+/// Entries are `Arc<ConnectionPool>` rather than plain clones on purpose: the
+/// release decision is `Arc::strong_count(init_complete) > 1` (the same
+/// liveness probe `pool::gc` uses for dynamic pools), and with a plain
+/// `Vec<ConnectionPool>` every copy-on-write rebuild of the registry would
+/// bump that count for the entries already there — so a reader holding a
+/// registry snapshot across a concurrent reload would make a generation that
+/// nobody uses look like it is still serving a session, and the sweep would
+/// skip it. The `Arc` indirection makes the refcount depend only on real
+/// holders (the registry entry itself plus in-flight sessions).
+static RETIRED_POOLS: Lazy<ArcSwap<Vec<Arc<ConnectionPool>>>> =
+    Lazy::new(|| ArcSwap::from_pointee(Vec::new()));
+
+/// Soft ceiling used for an operator warning only. Each reload that rebuilds
+/// a pool while a session still holds the previous generation stacks one
+/// entry; reaching this many live generations means sessions are outliving
+/// many reloads and the backend count on PostgreSQL is inflated accordingly.
+const RETIRED_POOLS_WARN_LEN: usize = 32;
+
+/// Hand replaced pool generations to the retirement registry.
+///
+/// Called by `from_config` AFTER the reload commit guard is dropped: this
+/// takes `pool_write_lock()` itself (`parking_lot::Mutex` is not reentrant).
+/// The gap between the `POOLS` publish and this call is harmless — the
+/// generation is simply not swept for one retain tick; nothing can close it
+/// in the meantime.
+pub(crate) fn retire_pool_generations(generations: Vec<ConnectionPool>) {
+    if generations.is_empty() {
+        return;
+    }
+    let total = {
+        let _guard = pool_write_lock();
+        let current = RETIRED_POOLS.load();
+        let mut new_registry = Vec::with_capacity(current.len() + generations.len());
+        new_registry.extend(current.iter().cloned());
+        for pool in generations {
+            info!(
+                "[{}@{}] pool generation replaced by RELOAD: retired for drain \
+                 (in-flight sessions keep using it, no new session can reach it)",
+                pool.address.username, pool.address.pool_name,
+            );
+            new_registry.push(Arc::new(pool));
+        }
+        let total = new_registry.len();
+        RETIRED_POOLS.store(Arc::new(new_registry));
+        total
+    };
+    if total >= RETIRED_POOLS_WARN_LEN {
+        warn!(
+            "{total} replaced pool generation(s) are still draining: long-lived \
+             sessions are holding pools across reloads, so PostgreSQL carries \
+             their backends in addition to the current generation's",
+        );
+    }
+}
+
+/// Snapshot of the retirement registry for the retain task.
+///
+/// Returns the shared vector, not per-pool clones, so reading the registry
+/// never perturbs the `Arc::strong_count` liveness probe — a snapshot held
+/// across `release_unreferenced_retired_pools()` cannot make a free
+/// generation look busy. Callers should still drop it promptly so a released
+/// generation is freed as soon as it is closed.
+pub(crate) fn get_retired_pools() -> Arc<Vec<Arc<ConnectionPool>>> {
+    RETIRED_POOLS.load_full()
+}
+
+/// True while somebody other than the registry itself still holds this
+/// generation — an in-flight session that captured it in `Client::handle`,
+/// or a `POOLS` snapshot a reader has not dropped yet. Same probe as
+/// `pool::gc::should_gc_idle_pool`: `init_complete` is cloned with the
+/// `ConnectionPool`, so its strong count is the number of live holders.
+fn retired_generation_in_use(pool: &ConnectionPool) -> bool {
+    Arc::strong_count(&pool.init_complete) > 1
+}
+
+/// Close and forget every retired generation nobody references any more.
+/// Returns how many generations were released.
+///
+/// This is the only place a retired generation is closed. It runs after the
+/// liveness probe reports a single holder (the registry entry itself), so no
+/// session can be failed with 53300 by the close: a generation is unreachable
+/// from `POOLS`, meaning nobody can acquire a new reference to it.
+pub(crate) fn release_unreferenced_retired_pools() -> usize {
+    if RETIRED_POOLS.load().is_empty() {
+        return 0;
+    }
+    let released = {
+        let _guard = pool_write_lock();
+        let current = RETIRED_POOLS.load();
+        let mut kept = Vec::with_capacity(current.len());
+        let mut released = Vec::new();
+        for pool in current.iter() {
+            if retired_generation_in_use(pool) {
+                kept.push(Arc::clone(pool));
+            } else {
+                released.push(Arc::clone(pool));
+            }
+        }
+        if released.is_empty() {
+            return 0;
+        }
+        RETIRED_POOLS.store(Arc::new(kept));
+        released
+    };
+    // Closing is IO-ish (drops backends) — do it outside the write lock, the
+    // same way `from_config` and the dynamic-pool GC drain removed pools.
+    for pool in &released {
+        info!(
+            "[{}@{}] retired pool generation drained: no session holds it, closing",
+            pool.address.username, pool.address.pool_name,
+        );
+        pool.database.close();
+    }
+    released.len()
+}
+
+#[cfg(test)]
+pub(crate) fn clear_retired_pools_for_test() {
+    let _guard = pool_write_lock();
+    RETIRED_POOLS.store(Arc::new(Vec::new()));
 }
 
 /// Get auth_query state for a database pool.
@@ -1348,6 +1490,7 @@ impl ConnectionPool {
             }
         }
         let mut removed_static_pools = Vec::new();
+        let mut retired_static_pools = Vec::new();
         for (id, pool) in old_pools.iter() {
             if old_dynamic_pools.contains(id) {
                 continue;
@@ -1366,6 +1509,16 @@ impl ConnectionPool {
                     // failed every in-flight session with 53300 on the next
                     // checkout after a RELOAD that rebuilt the pool (e.g. a
                     // sync_server_parameters change).
+                    //
+                    // Draining is not the same as being forgotten: the old
+                    // generation is gone from POOLS, so every housekeeping
+                    // phase in `retain.rs` (which walks `get_all_pools()`)
+                    // would skip it — no idle/lifetime trim, no dead-backend
+                    // eviction — while its semaphore stays open and lets it
+                    // grow to `max_size`. Hand it to the retirement registry
+                    // instead; the retain task trims it (never replenishes
+                    // it) and closes it once the last session lets go.
+                    retired_static_pools.push(pool.clone());
                     continue;
                 }
                 // The id is gone from the new config entirely: fail closed so
@@ -1456,6 +1609,11 @@ impl ConnectionPool {
         // sees the old value and re-evaluates the change correctly.
         PREVIOUS_GENERAL_STARTUP_HASH.store(general_startup_hash, Ordering::Relaxed);
         drop(_commit_guard);
+        // Replaced generations stay OPEN (in-flight sessions still use them)
+        // but must remain reachable for housekeeping. Published after the
+        // commit guard is dropped because the registry takes the same
+        // non-reentrant write lock.
+        retire_pool_generations(retired_static_pools);
         for pool in removed_dynamic_pools {
             pool.database.close();
         }
@@ -2538,6 +2696,181 @@ mod tests {
         assert!(
             pools_store_idx < drop_guard_idx && drop_guard_idx < close_idx,
             "reload must close removed static generations after publishing and releasing pool_write_lock"
+        );
+    }
+
+    // --- retired (RELOAD-replaced) pool generations ---
+
+    /// A generation that a RELOAD replaced must land in the retirement
+    /// registry OPEN: sessions that captured it in `handle()` keep checking
+    /// out from it until they disconnect, and closing it under them is the
+    /// SQLSTATE 53300 regression the `replaced` branch exists to prevent.
+    /// The registry entry is dropped (and the generation closed) only once
+    /// nobody references it any more — the same `Arc::strong_count` liveness
+    /// probe the dynamic-pool GC uses.
+    #[test]
+    #[serial_test::serial(retired_pools)]
+    fn retired_generation_is_released_only_when_unreferenced() {
+        clear_retired_pools_for_test();
+
+        let pool = test_connection_pool_with_init_flag(Arc::new(AtomicBool::new(true)));
+        // `Pool` is a separate Arc handle: holding it lets the test observe
+        // the close state without inflating the `init_complete` refcount
+        // the registry sweep reads.
+        let database = pool.database.clone();
+        // Models a client that captured the pool before the RELOAD.
+        let inflight_client = pool.clone();
+
+        retire_pool_generations(vec![pool]);
+        assert_eq!(
+            get_retired_pools().len(),
+            1,
+            "a replaced generation must be tracked so housekeeping can still reach it"
+        );
+        assert!(
+            !database.is_closed(),
+            "retiring a generation must not close it — in-flight sessions still use it"
+        );
+
+        assert_eq!(
+            release_unreferenced_retired_pools(),
+            0,
+            "a generation an in-flight session still holds must not be released"
+        );
+        assert_eq!(get_retired_pools().len(), 1);
+        assert!(
+            !database.is_closed(),
+            "releasing must never close a generation an in-flight session still holds"
+        );
+
+        drop(inflight_client);
+        assert_eq!(
+            release_unreferenced_retired_pools(),
+            1,
+            "once the last session is gone the generation must be released"
+        );
+        assert!(
+            get_retired_pools().is_empty(),
+            "released generations must leave the registry"
+        );
+        assert!(
+            database.is_closed(),
+            "a released generation must be closed so its backends go away"
+        );
+    }
+
+    /// Retiring must accumulate: two RELOADs in a row while the same
+    /// session stays connected stack two generations, and both have to stay
+    /// reachable for housekeeping.
+    #[test]
+    #[serial_test::serial(retired_pools)]
+    fn retiring_accumulates_generations_and_sweep_releases_only_free_ones() {
+        clear_retired_pools_for_test();
+
+        let first = test_connection_pool_with_init_flag(Arc::new(AtomicBool::new(true)));
+        let second = test_connection_pool_with_init_flag(Arc::new(AtomicBool::new(true)));
+        let first_db = first.database.clone();
+        let second_db = second.database.clone();
+        let held_second = second.clone();
+
+        retire_pool_generations(vec![first]);
+        retire_pool_generations(vec![second]);
+        assert_eq!(get_retired_pools().len(), 2);
+
+        assert_eq!(
+            release_unreferenced_retired_pools(),
+            1,
+            "only the generation nobody holds may be released"
+        );
+        assert_eq!(get_retired_pools().len(), 1);
+        assert!(first_db.is_closed());
+        assert!(!second_db.is_closed());
+
+        drop(held_second);
+        assert_eq!(release_unreferenced_retired_pools(), 1);
+        assert!(get_retired_pools().is_empty());
+        assert!(second_db.is_closed());
+    }
+
+    /// The registry copy-on-write must not make a free generation look
+    /// referenced. The hazard is a reader (the retain sweep) holding a
+    /// registry snapshot while a concurrent RELOAD rebuilds the vector: if
+    /// the entries were plain `ConnectionPool` clones the snapshot and the
+    /// rebuilt vector would each hold one, pushing
+    /// `Arc::strong_count(init_complete)` to 2 and making a generation
+    /// nobody uses look like it is still serving a session. Storing
+    /// `Arc<ConnectionPool>` keeps the count tied to real holders only.
+    #[test]
+    #[serial_test::serial(retired_pools)]
+    fn live_registry_snapshot_does_not_pin_free_generations() {
+        clear_retired_pools_for_test();
+
+        let old = test_connection_pool_with_init_flag(Arc::new(AtomicBool::new(true)));
+        let old_db = old.database.clone();
+        retire_pool_generations(vec![old]);
+
+        // Reader holds a snapshot ...
+        let snapshot = get_retired_pools();
+        assert_eq!(snapshot.len(), 1);
+        // ... while a second RELOAD rebuilds the registry vector.
+        let newer = test_connection_pool_with_init_flag(Arc::new(AtomicBool::new(true)));
+        retire_pool_generations(vec![newer]);
+
+        assert_eq!(
+            release_unreferenced_retired_pools(),
+            2,
+            "a registry rebuild must not inflate the liveness refcount of \
+             generations already in the registry"
+        );
+        assert!(old_db.is_closed());
+        drop(snapshot);
+        clear_retired_pools_for_test();
+    }
+
+    /// Source contract: the `replaced` branch must hand the old generation
+    /// to the retirement registry instead of dropping it on the floor, and
+    /// must still NOT fail it closed (`close_new_checkouts`) — that is the
+    /// 53300 regression. The registry publish happens after the commit
+    /// guard is released, like every other post-publish drain step.
+    #[test]
+    fn reload_retires_replaced_static_generations() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("// 3. Carry over surviving dynamic pools")
+            .expect("reload pool reconciliation marker must exist");
+        let end = src[start..]
+            .find("\n        Ok(())")
+            .map(|offset| start + offset)
+            .expect("reload publish tail marker must exist");
+        let block = &src[start..end];
+
+        let replaced_gate_idx = block
+            .find("let replaced = new_pools.contains_key(id);")
+            .expect("reload must distinguish REPLACED from REMOVED static generations");
+        let branch = &block[replaced_gate_idx..];
+        let retire_idx = branch
+            .find("retired_static_pools.push(")
+            .expect("a replaced generation must be collected for retirement");
+        let close_new_idx = branch
+            .find("close_new_checkouts()")
+            .expect("removed static generations must still fail closed");
+        assert!(
+            retire_idx < close_new_idx,
+            "the replaced branch must retire the old generation, not close it: \
+             in-flight sessions holding it would fail with SQLSTATE 53300"
+        );
+
+        let drop_guard_idx = block
+            .find("drop(_commit_guard)")
+            .expect("reload must release pool_write_lock before draining old generations");
+        let publish_idx = block[drop_guard_idx..]
+            .find("retire_pool_generations(retired_static_pools)")
+            .map(|offset| drop_guard_idx + offset)
+            .expect("retired generations must be published to the registry");
+        assert!(
+            drop_guard_idx < publish_idx,
+            "the registry publish takes pool_write_lock itself, so it must run \
+             after the reload commit guard is dropped"
         );
     }
 
