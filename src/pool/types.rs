@@ -133,7 +133,20 @@ pub struct Metrics {
     /// The instant when this object was created.
     pub created: quanta::Instant,
     /// The instant when this object was last used.
+    ///
+    /// Written on check-in only. It is the sole basis for idle aging
+    /// (`idle_timeout`), so no housekeeping path may refresh it - doing so
+    /// would keep an actually-idle backend alive forever.
     pub recycled: Option<quanta::Instant>,
+    /// The instant when a liveness probe last proved this backend answers.
+    ///
+    /// Written only by the background dead-backend scan
+    /// (`Pool::evict_dead_backends`) after a successful `check_alive`.
+    /// Deliberately separate from `recycled`: this field records "somebody
+    /// already paid for the round-trip on this socket" so the checkout path
+    /// does not repeat the very same probe inside client latency, while
+    /// `recycled` keeps meaning "last handed back by a client" for aging.
+    pub last_verified: Option<quanta::Instant>,
     /// The number of times the object was recycled.
     pub recycle_count: usize,
     /// Individual lifetime for this connection in milliseconds (with jitter applied).
@@ -169,6 +182,7 @@ impl Metrics {
         Self {
             created: clock::now(),
             recycled: None,
+            last_verified: None,
             recycle_count: 0,
             lifetime_ms: Self::apply_jitter(base_lifetime_ms),
             idle_timeout_ms: Self::apply_jitter(base_idle_timeout_ms),
@@ -192,6 +206,7 @@ impl Default for Metrics {
         Self {
             created: clock::now(),
             recycled: None,
+            last_verified: None,
             recycle_count: 0,
             lifetime_ms: 0,
             idle_timeout_ms: 0,

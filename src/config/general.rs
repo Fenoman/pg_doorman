@@ -145,6 +145,10 @@ pub struct General {
     /// Time after which an idle server connection should be checked before being
     /// given to a client. This helps detect dead connections caused by PostgreSQL
     /// restart, network issues, or server-side idle timeouts.
+    /// Measured from the freshest evidence that the socket still works - either
+    /// the client check-in or a successful probe by the background
+    /// `dead_backend_check_timeout` scan - so a backend that scan just verified
+    /// is not probed again inside client latency.
     /// 0 means disabled (no check).
     /// Default: 60s
     #[serde(default = "General::default_server_idle_check_timeout")]

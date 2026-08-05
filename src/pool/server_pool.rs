@@ -1399,21 +1399,16 @@ impl ServerPool {
         }
 
         // Probe long-idle connections before reuse.
-        if self.idle_check_timeout_ms > 0 {
-            if let Some(recycled) = metrics.recycled {
-                let idle_time_ms = recycled.elapsed().as_millis() as u64;
-                if idle_time_ms > self.idle_check_timeout_ms {
-                    debug!("Connection {conn} idle for {idle_time_ms}ms, checking alive...");
-                    if conn.check_alive(self.connect_timeout).await.is_err() {
-                        conn.close_reason = Some(format!(
-                            "failed alive check after {} idle",
-                            format_duration_ms(idle_time_ms),
-                        ));
-                        return Err(RecycleError::StaticMessage("Connection failed alive check"));
-                    }
-                    debug!("Connection {conn} passed alive check");
-                }
+        if let Some(idle_time_ms) = inline_alive_check_needed(metrics, self.idle_check_timeout_ms) {
+            debug!("Connection {conn} idle for {idle_time_ms}ms, checking alive...");
+            if conn.check_alive(self.connect_timeout).await.is_err() {
+                conn.close_reason = Some(format!(
+                    "failed alive check after {} idle",
+                    format_duration_ms(idle_time_ms),
+                ));
+                return Err(RecycleError::StaticMessage("Connection failed alive check"));
             }
+            debug!("Connection {conn} passed alive check");
         }
 
         Ok(())
@@ -1586,6 +1581,47 @@ where
     }
 }
 
+/// Decide whether a checkout must pay for an inline `check_alive`
+/// round-trip, and report the connection's idle time for the log line
+/// and the close reason.
+///
+/// The budget is spent against the freshest evidence that the socket
+/// still works, which is the newer of:
+///
+///   * `recycled` - a client finished real traffic on it and handed it
+///     back, and
+///   * `last_verified` - the background dead-backend scan
+///     (`Pool::evict_dead_backends`) probed it with `check_alive`.
+///
+/// Taking only `recycled` (the previous behaviour) made every backend the
+/// scan had just verified pay for a second, identical probe on the
+/// checkout path - a PostgreSQL round-trip charged to client latency
+/// moments after the same round-trip was made off the hot path.
+///
+/// `idle_check_timeout_ms == 0` disables the probe entirely; a connection
+/// that has never been checked in (`recycled == None`) has no idle period
+/// to reason about and is never probed here. The returned value is always
+/// the idle time since check-in, so operator-facing messages keep their
+/// meaning.
+fn inline_alive_check_needed(metrics: &Metrics, idle_check_timeout_ms: u64) -> Option<u64> {
+    if idle_check_timeout_ms == 0 {
+        return None;
+    }
+    let idle = metrics.recycled?.elapsed();
+    // Smallest elapsed == newest timestamp. A `last_verified` older than
+    // `recycled` cannot cover the idle period that followed it, so it
+    // loses here and the decision falls back to idle time alone.
+    let unverified = match metrics.last_verified {
+        Some(verified) => verified.elapsed().min(idle),
+        None => idle,
+    };
+    if (unverified.as_millis() as u64) > idle_check_timeout_ms {
+        Some(idle.as_millis() as u64)
+    } else {
+        None
+    }
+}
+
 /// Return age when per-connection lifetime is exceeded and not skipped.
 fn lifetime_exceeded(metrics: &Metrics, skip_lifetime: bool) -> Option<u64> {
     if skip_lifetime || metrics.lifetime_ms == 0 {
@@ -1629,6 +1665,135 @@ mod tests {
 
     fn metrics_with_lifetime(lifetime_ms: u64) -> Metrics {
         Metrics::new(lifetime_ms, 0, 0)
+    }
+
+    /// Metrics for a connection checked back in `idle` ago and never
+    /// touched by the background liveness scan. Timestamps are fabricated
+    /// instead of slept for, so the probe decision is deterministic.
+    fn metrics_idle_for(idle: Duration) -> Metrics {
+        Metrics {
+            recycled: Some(instant_ago(idle)),
+            ..Metrics::default()
+        }
+    }
+
+    /// Record a successful background `check_alive` that happened `ago`.
+    fn verified_ago(metrics: &mut Metrics, ago: Duration) {
+        metrics.last_verified = Some(instant_ago(ago));
+    }
+
+    fn instant_ago(ago: Duration) -> quanta::Instant {
+        crate::utils::clock::now()
+            .checked_sub(ago)
+            .expect("test instant must stay inside the clock epoch")
+    }
+
+    /// The defect: the background dead-backend scan already proved this
+    /// backend answers *after* it went idle, yet the checkout path used to
+    /// look at `recycled` alone and burned a second `check_alive` inside
+    /// client latency. Fresh evidence of liveness must suppress the inline
+    /// probe.
+    #[test]
+    fn inline_alive_check_skipped_when_scan_verified_after_checkin() {
+        let mut metrics = metrics_idle_for(Duration::from_secs(600));
+        verified_ago(&mut metrics, Duration::from_secs(1));
+
+        assert!(
+            inline_alive_check_needed(&metrics, 30_000).is_none(),
+            "a backend the background scan verified 1s ago must not be \
+             re-probed on the checkout hot path"
+        );
+    }
+
+    /// The scan never reached this backend (disabled, capped by
+    /// `dead_backend_check_max_per_cycle`, or skipped under pressure), so
+    /// the inline probe stays the only safety net and must still fire.
+    #[test]
+    fn inline_alive_check_fires_when_scan_never_verified() {
+        let metrics = metrics_idle_for(Duration::from_secs(600));
+
+        let idle_ms = inline_alive_check_needed(&metrics, 30_000)
+            .expect("an unverified long-idle backend must be probed");
+        assert!(
+            idle_ms >= 600_000,
+            "reported idle time {idle_ms}ms must be measured from check-in"
+        );
+    }
+
+    /// A verification older than the idle-check budget is no evidence at
+    /// all: PostgreSQL may have died in the meantime. Do not let a stale
+    /// `last_verified` mask a long-idle socket.
+    #[test]
+    fn inline_alive_check_fires_when_verification_is_stale() {
+        let mut metrics = metrics_idle_for(Duration::from_secs(600));
+        verified_ago(&mut metrics, Duration::from_secs(300));
+
+        assert!(
+            inline_alive_check_needed(&metrics, 30_000).is_some(),
+            "a verification 300s old is past the 30s budget and must not \
+             suppress the inline probe"
+        );
+    }
+
+    /// `last_verified` may predate the last check-in (scan probed the
+    /// backend, a client then used and returned it). The newer of the two
+    /// timestamps decides, so this case behaves exactly like the
+    /// never-verified one.
+    #[test]
+    fn inline_alive_check_fires_when_verification_predates_checkin() {
+        let mut metrics = metrics_idle_for(Duration::from_secs(600));
+        verified_ago(&mut metrics, Duration::from_secs(900));
+
+        assert!(
+            inline_alive_check_needed(&metrics, 30_000).is_some(),
+            "verification older than the check-in cannot cover the idle \
+             period that followed it"
+        );
+    }
+
+    /// `idle_check_timeout_ms = 0` is the operator kill switch; nothing,
+    /// including a missing verification, may resurrect the probe.
+    #[test]
+    fn inline_alive_check_disabled_by_zero_timeout() {
+        let metrics = metrics_idle_for(Duration::from_secs(600));
+        assert!(inline_alive_check_needed(&metrics, 0).is_none());
+    }
+
+    /// A connection that never returned from a client has no idle period;
+    /// the pre-existing contract skips it and must keep doing so even
+    /// though a scan verification may exist.
+    #[test]
+    fn inline_alive_check_skipped_when_never_checked_in() {
+        let mut metrics = Metrics::default();
+        assert!(metrics.recycled.is_none(), "test precondition");
+        assert!(inline_alive_check_needed(&metrics, 30_000).is_none());
+
+        verified_ago(&mut metrics, Duration::from_secs(900));
+        assert!(
+            inline_alive_check_needed(&metrics, 30_000).is_none(),
+            "a stale verification must not invent an idle period"
+        );
+    }
+
+    /// Idle aging is `recycled`'s job alone: a background verification
+    /// must not push the connection's idle age back, or `idle_timeout`
+    /// trimming in `retain_pool_connections` would never fire for a pool
+    /// the scan keeps visiting.
+    #[test]
+    fn background_verification_does_not_reset_idle_aging() {
+        let mut metrics = metrics_idle_for(Duration::from_secs(600));
+        let recycled_before = metrics.recycled;
+        verified_ago(&mut metrics, Duration::ZERO);
+
+        assert_eq!(
+            metrics.recycled, recycled_before,
+            "verification must never move the check-in timestamp"
+        );
+        assert!(
+            metrics.last_used() >= Duration::from_secs(600),
+            "idle age must still be measured from check-in, got {:?}",
+            metrics.last_used()
+        );
     }
 
     fn test_server_pool_with_prewarm(prewarm_query: &str) -> ServerPool {

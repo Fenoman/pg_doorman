@@ -2006,9 +2006,15 @@ impl Pool {
             }
             match inner.obj.check_alive(timeout).await {
                 Ok(()) => {
-                    // Backend is alive - return it to the idle set unchanged.
+                    // Backend is alive - return it to the idle set.
+                    //
                     // Do NOT touch `metrics.recycled`; an actually-idle
                     // connection still needs to age out via `idle_timeout`.
+                    // Record the proof separately instead: `recycle()` on
+                    // the checkout path would otherwise repeat this exact
+                    // round-trip inside client latency for a connection
+                    // this scan just verified off the hot path.
+                    inner.metrics.last_verified = Some(clock::now());
                     survivors.push(inner);
                 }
                 Err(_) => {
@@ -4654,6 +4660,91 @@ mod tests {
             "dead sockets older than the retain recent-window must be \
              probed and evicted, not kept as fresh survivors."
         );
+    }
+
+    /// A backend the scan just proved alive must carry that proof forward
+    /// in `metrics.last_verified`. Without it the very next checkout pays
+    /// for a second `check_alive` inside client latency
+    /// (`ServerPool::recycle`), duplicating the round-trip the scan just
+    /// made off the hot path.
+    ///
+    /// The same scan must leave `metrics.recycled` untouched: that
+    /// timestamp is the sole basis for `idle_timeout` trimming, and
+    /// refreshing it here would make a genuinely idle backend immortal.
+    ///
+    /// A live peer primed with a ReadyForQuery frame is all `check_alive`
+    /// needs to return `Ok` - the same fake-backend trick the protocol_io
+    /// relay tests use, so the positive path is reachable without a
+    /// PostgreSQL container.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evict_dead_backends_records_verification_on_survivors() {
+        use crate::server::Server;
+        use tokio::io::AsyncWriteExt;
+
+        let pool = empty_test_pool();
+        let checked_in_at = clock::now()
+            .checked_sub(Duration::from_secs(600))
+            .expect("test instant must stay inside the clock epoch");
+
+        let (mut server, mut peer) = Server::test_silent_socket();
+        // Past the skip-recent window, so the scan really probes instead
+        // of taking the recently-active fast path.
+        server.last_activity = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        // ReadyForQuery('I') is a complete answer to check_alive's `;`.
+        peer.write_all(&[b'Z', 0, 0, 0, 5, b'I'])
+            .await
+            .expect("peer must prime the ReadyForQuery response");
+
+        {
+            let mut guard = pool.inner.slots.lock();
+            guard.vec.push_back(ObjectInner {
+                obj: server,
+                metrics: Metrics {
+                    recycled: Some(checked_in_at),
+                    ..Metrics::default()
+                },
+                coordinator_permit: None,
+            });
+            guard.size += 1;
+        }
+
+        let (checked, evicted) = pool
+            .evict_dead_backends(Duration::from_secs(2), 32, Duration::from_secs(2))
+            .await;
+        assert_eq!(
+            (checked, evicted),
+            (1, 0),
+            "test precondition: the responding backend must pass the probe \
+             and survive the scan"
+        );
+
+        let metrics = {
+            let guard = pool.inner.slots.lock();
+            guard
+                .vec
+                .front()
+                .expect("the survivor must be back in the idle queue")
+                .metrics
+        };
+
+        let verified = metrics.last_verified.expect(
+            "a successful background check_alive must be recorded, otherwise \
+             the next checkout repeats the same probe in client latency",
+        );
+        assert!(
+            verified.elapsed() < Duration::from_secs(60),
+            "the verification timestamp must come from this scan, elapsed={:?}",
+            verified.elapsed(),
+        );
+        assert_eq!(
+            metrics.recycled,
+            Some(checked_in_at),
+            "the scan must not refresh the check-in timestamp - idle_timeout \
+             aging is keyed on it and would never fire again"
+        );
+
+        drop(peer);
     }
 
     #[tokio::test]
