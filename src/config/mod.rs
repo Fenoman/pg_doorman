@@ -1286,6 +1286,100 @@ pub(crate) fn client_facing_tls_fields_differ(old: &General, new: &General) -> b
         || old.tls_rate_limit_per_second != new.tls_rate_limit_per_second
 }
 
+/// Connection-lifecycle timeouts a pool freezes at construction time and
+/// that a reload DOES apply, by rebuilding every pool that inherits them.
+///
+/// These are folded into the reload reuse fingerprint
+/// (`pool::static_pool_fingerprint`), so a changed value here means the
+/// running pool is replaced instead of reused. Naming them in the log is
+/// what tells the operator why the pools were recreated. The two lists are
+/// kept in sync by
+/// `pool::tests::pool_rebuild_general_fields_changed_matches_the_fingerprint`.
+pub(crate) fn pool_rebuild_general_fields_changed(
+    old: &General,
+    new: &General,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if old.idle_timeout != new.idle_timeout {
+        fields.push("general.idle_timeout");
+    }
+    if old.server_lifetime != new.server_lifetime {
+        fields.push("general.server_lifetime");
+    }
+    if old.server_idle_check_timeout != new.server_idle_check_timeout {
+        fields.push("general.server_idle_check_timeout");
+    }
+    if old.query_wait_timeout != new.query_wait_timeout {
+        fields.push("general.query_wait_timeout");
+    }
+    if old.connect_timeout != new.connect_timeout {
+        fields.push("general.connect_timeout");
+    }
+    fields
+}
+
+/// `general` values a pool ALSO freezes at construction time, but which a
+/// reload deliberately does NOT apply.
+///
+/// Applying them would mean rebuilding every pool, and a rebuild costs a
+/// cold prepared-statement cache plus a burst of re-`Parse` against
+/// PostgreSQL. That price is accepted for the connection-lifecycle timeouts
+/// above (rarely and deliberately edited, and not applying them is an
+/// operational trap), and refused for cache sizing and failover tuning.
+///
+/// A pool therefore keeps serving the old value until the process restarts,
+/// which is exactly what the historical `config unchanged` line hid from
+/// operators: this list is logged as a warning instead. Kept disjoint from
+/// [`pool_rebuild_general_fields_changed`] and pinned against the
+/// fingerprint by
+/// `pool::tests::restart_only_general_pool_fields_do_not_rebuild_pools`.
+pub(crate) fn restart_only_general_pool_fields_changed(
+    old: &General,
+    new: &General,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if old.max_concurrent_creates != new.max_concurrent_creates {
+        fields.push("general.max_concurrent_creates");
+    }
+    if old.server_round_robin != new.server_round_robin {
+        fields.push("general.server_round_robin");
+    }
+    if old.scaling_warm_pool_ratio != new.scaling_warm_pool_ratio {
+        fields.push("general.scaling_warm_pool_ratio");
+    }
+    if old.scaling_fast_retries != new.scaling_fast_retries {
+        fields.push("general.scaling_fast_retries");
+    }
+    if old.scaling_max_parallel_creates != new.scaling_max_parallel_creates {
+        fields.push("general.scaling_max_parallel_creates");
+    }
+    if old.prepared_statements != new.prepared_statements {
+        fields.push("general.prepared_statements");
+    }
+    if old.prepared_statements_cache_size != new.prepared_statements_cache_size {
+        fields.push("general.prepared_statements_cache_size");
+    }
+    if old.server_prepared_statements_cache_size != new.server_prepared_statements_cache_size {
+        fields.push("general.server_prepared_statements_cache_size");
+    }
+    if old.patroni_api_urls != new.patroni_api_urls {
+        fields.push("general.patroni_api_urls");
+    }
+    if old.fallback_cooldown != new.fallback_cooldown {
+        fields.push("general.fallback_cooldown");
+    }
+    if old.patroni_api_timeout != new.patroni_api_timeout {
+        fields.push("general.patroni_api_timeout");
+    }
+    if old.fallback_connect_timeout != new.fallback_connect_timeout {
+        fields.push("general.fallback_connect_timeout");
+    }
+    if old.fallback_lifetime != new.fallback_lifetime {
+        fields.push("general.fallback_lifetime");
+    }
+    fields
+}
+
 pub(crate) fn restart_only_listener_fields_changed(
     old: &Config,
     new: &Config,
@@ -1406,6 +1500,40 @@ pub async fn reload_config(client_server_map: ClientServerMap) -> Result<bool, E
                  certificate/key/CA/mode/rate. Restart the process to pick up the \
                  new values. (tls_certificate, tls_private_key, tls_ca_cert, \
                  tls_mode, tls_rate_limit_per_second)"
+            );
+        }
+
+        // A pool freezes its connection-lifecycle timeouts when it is built,
+        // so the reload recreates every pool that inherits an edited one -
+        // silently reusing the running pool would keep the old value while
+        // logging `config unchanged`. Name the fields so the operator can
+        // tell why the pools were rebuilt (and why PostgreSQL carries two
+        // generations of backends until the old sessions disconnect).
+        let rebuild_fields =
+            pool_rebuild_general_fields_changed(&old_config.general, &new_config.general);
+        if !rebuild_fields.is_empty() {
+            let fields = rebuild_fields.join(", ");
+            info!(
+                "RELOAD: {fields} changed - recreating every pool that inherits \
+                 them. Sessions still holding the previous generation keep it \
+                 until they disconnect, so it drains in the background instead of \
+                 being closed under them."
+            );
+        }
+
+        // The rest of what a pool freezes is deliberately NOT applied: a
+        // rebuild would cost a cold prepared-statement cache and a burst of
+        // re-Parse on a live workload. Say so out loud - this is the case
+        // the old `config unchanged` line hid, leaving operators believing
+        // the whole file had taken effect.
+        let restart_only_pool_fields =
+            restart_only_general_pool_fields_changed(&old_config.general, &new_config.general);
+        if !restart_only_pool_fields.is_empty() {
+            let fields = restart_only_pool_fields.join(", ");
+            warn!(
+                "RELOAD: {fields} changed but are NOT applied by a reload - every \
+                 pool froze them when it was built and keeps serving the old \
+                 values. Restart pg_doorman to pick them up."
             );
         }
 

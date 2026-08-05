@@ -867,13 +867,7 @@ impl ConnectionPool {
         // pinned to the previous `reset_val` until the connection rotates
         // through `lifetime_ms`, so clients would see mixed defaults from
         // the same pool depending on which backend they got.
-        let general_startup_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            config.general.startup_parameters.hash(&mut hasher);
-            config.general.sync_server_parameters.hash(&mut hasher);
-            hasher.finish()
-        };
+        let general_startup_hash = compute_general_startup_hash(&config.general);
         // Load only; the hash is not advanced until the new pool map has
         // been committed at the bottom of from_config. Otherwise a reload
         // that fails halfway poisons the hash, and the next reload of the
@@ -886,13 +880,7 @@ impl ConnectionPool {
         let general_startup_parameters_changed = previous_general_startup_hash != 0
             && previous_general_startup_hash != general_startup_hash;
         for (pool_name, pool_config) in &config.pools {
-            let new_pool_hash_value = {
-                use std::hash::Hasher;
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                hasher.write_u64(pool_config.hash_value());
-                hasher.write_u64(general_startup_hash);
-                hasher.finish()
-            };
+            let new_pool_hash_value = static_pool_fingerprint(pool_config, &config.general);
             let server_tls_config = build_server_tls_for_pool(pool_config, &config.general)?;
 
             // There is one pool per database/user pair.
@@ -1313,13 +1301,8 @@ impl ConnectionPool {
                             })
                             .build();
 
-                        let new_pool_hash_value = {
-                            use std::hash::Hasher;
-                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                            hasher.write_u64(pool_config.hash_value());
-                            hasher.write_u64(general_startup_hash);
-                            hasher.finish()
-                        };
+                        let new_pool_hash_value =
+                            static_pool_fingerprint(pool_config, &config.general);
                         let conn_pool = ConnectionPool {
                             database: pool,
                             address,
@@ -1744,6 +1727,99 @@ fn compute_spare(
     let pool_min = pool_min_guaranteed as usize;
     let effective_min = user_min.max(pool_min);
     current_pool_size.saturating_sub(effective_min)
+}
+
+/// Hash of the `general` layer that every backend of a pool bakes into its
+/// startup baseline: the operator-wide `startup_parameters` and the
+/// `sync_server_parameters` default they are reset to.
+///
+/// Kept separate from the rest of the reload fingerprint because the
+/// auth_query machinery reuses exactly this value as the parent fingerprint
+/// that decides when dynamic pools must be drained.
+pub(crate) fn compute_general_startup_hash(general: &General) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    general.startup_parameters.hash(&mut hasher);
+    general.sync_server_parameters.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Hash of the connection-lifecycle timeouts a pool FREEZES into itself at
+/// construction time, already resolved through the `pool -> general`
+/// fallback chain.
+///
+/// A running pool never re-reads them: they are copied into `ServerPool`
+/// (per-backend idle/lifetime/idle-check/connect timers, plus the wait
+/// deadline), into the pool builder (`PoolConfig::timeouts`) and into
+/// `PoolSettings` when the pool object is built. Reusing a pool across a
+/// reload therefore keeps serving the OLD value, which used to make an edit
+/// of e.g. `general.idle_timeout` a no-op until the process restarted -
+/// while the reload logged `config unchanged`. Folding them into the reuse
+/// fingerprint turns such an edit into a pool rebuild.
+///
+/// Deliberately hashes the EFFECTIVE value rather than the raw `general`
+/// field: a pool that pins its own `idle_timeout` does not inherit the
+/// general default, so moving that default must not churn the pool.
+/// `resolve_pool_connect_timeout` is called rather than restated, so the
+/// hash cannot drift from what the build path actually uses.
+///
+/// Scope is deliberately these five timeouts and nothing else. Every other
+/// `general` value a pool freezes (`max_concurrent_creates`,
+/// `server_round_robin`, the `scaling_*` trio, the prepared-statement
+/// switch and its two cache sizes, and the Patroni/fallback block) is
+/// ALSO ignored by a reload, but rebuilding a pool costs a cold
+/// prepared-statement cache and a burst of re-`Parse` on a live workload -
+/// a price worth paying for lifecycle timeouts, which are edited rarely and
+/// deliberately, and not worth paying for cache sizing or failover tuning.
+/// Those are reported to the operator as restart-required instead, by
+/// `config::restart_only_general_pool_fields_changed`.
+///
+/// Excluded for other reasons:
+/// * `startup_parameters` / `sync_server_parameters` - already covered by
+///   [`compute_general_startup_hash`];
+/// * TLS material - compared directly by `from_config` through
+///   `address.server_tls`;
+/// * `worker_threads` and the other runtime-construction fields - a reload
+///   that changes them is rejected outright by
+///   `config::restart_only_listener_fields_changed`.
+fn frozen_general_pool_inputs_hash(pool_config: &ConfigPool, general: &General) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    pool_config
+        .idle_timeout
+        .unwrap_or(general.idle_timeout.as_millis())
+        .hash(&mut hasher);
+    // Per-user `server_lifetime` overrides sit in `users`, which
+    // `pool_config.hash_value()` already covers; the fingerprint is
+    // per-pool, so the pool-level resolution is the right granularity.
+    pool_config
+        .server_lifetime
+        .unwrap_or(general.server_lifetime.as_millis())
+        .hash(&mut hasher);
+    general
+        .server_idle_check_timeout
+        .as_millis()
+        .hash(&mut hasher);
+    general.query_wait_timeout.as_millis().hash(&mut hasher);
+    resolve_pool_connect_timeout(pool_config, general).hash(&mut hasher);
+
+    hasher.finish()
+}
+
+/// Reload reuse fingerprint of a static (config-declared) pool.
+///
+/// `from_config` recreates a pool when this value changes and reuses the
+/// running one when it does not, so it has to cover every config input the
+/// pool freezes at construction time - both the pool's own section and the
+/// `general` values it inherits.
+pub(crate) fn static_pool_fingerprint(pool_config: &ConfigPool, general: &General) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write_u64(pool_config.hash_value());
+    hasher.write_u64(compute_general_startup_hash(general));
+    hasher.write_u64(frozen_general_pool_inputs_hash(pool_config, general));
+    hasher.finish()
 }
 
 /// Build Patroni-assisted fallback state. Returns None when no `patroni_api_urls`
@@ -2227,20 +2303,11 @@ mod tests {
         assert!(!pool.effective_sync_server_parameters(&general));
     }
 
-    fn compute_general_startup_hash(general: &General) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        general.startup_parameters.hash(&mut hasher);
-        general.sync_server_parameters.hash(&mut hasher);
-        hasher.finish()
-    }
-
+    /// The reuse decision under test is the production one: both helpers
+    /// forward to the functions `from_config` itself calls, so a fingerprint
+    /// that stops covering an input fails here instead of only in production.
     fn compute_pool_fingerprint(pool: &ConfigPool, general: &General) -> u64 {
-        use std::hash::Hasher;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        hasher.write_u64(pool.hash_value());
-        hasher.write_u64(compute_general_startup_hash(general));
-        hasher.finish()
+        static_pool_fingerprint(pool, general)
     }
 
     #[test]
@@ -2333,6 +2400,271 @@ mod tests {
             compute_pool_fingerprint(&pool_before, &general),
             compute_pool_fingerprint(&pool_after, &general),
             "Setting pool.sync_server_parameters must change fingerprint"
+        );
+    }
+
+    /// Base snapshot for the knob tables: Patroni fallback is wired up so
+    /// the fallback knobs are live inputs (with no `patroni_api_urls` the
+    /// whole fallback state is `None` and editing a fallback timeout
+    /// legitimately changes nothing anywhere).
+    fn general_with_fallback_urls() -> General {
+        General {
+            patroni_api_urls: Some(vec!["http://127.0.0.1:8008".to_string()]),
+            ..General::default()
+        }
+    }
+
+    /// Connection-lifecycle timeouts a pool freezes at construction time
+    /// and that a RELOAD must apply by rebuilding the pool.
+    #[allow(clippy::type_complexity)]
+    fn pool_rebuild_general_knobs() -> Vec<(&'static str, fn(&mut General))> {
+        use crate::config::Duration as ConfigDuration;
+        vec![
+            ("idle_timeout", |g| {
+                g.idle_timeout = ConfigDuration::from_millis(g.idle_timeout.as_millis() + 1_000)
+            }),
+            ("server_lifetime", |g| {
+                g.server_lifetime =
+                    ConfigDuration::from_millis(g.server_lifetime.as_millis() + 1_000)
+            }),
+            ("server_idle_check_timeout", |g| {
+                g.server_idle_check_timeout =
+                    ConfigDuration::from_millis(g.server_idle_check_timeout.as_millis() + 1_000)
+            }),
+            ("query_wait_timeout", |g| {
+                g.query_wait_timeout =
+                    ConfigDuration::from_millis(g.query_wait_timeout.as_millis() + 1_000)
+            }),
+            ("connect_timeout", |g| {
+                g.connect_timeout = ConfigDuration::from_millis(g.connect_timeout.as_millis() + 1)
+            }),
+        ]
+    }
+
+    /// `general` values a pool ALSO freezes, but which a RELOAD must NOT
+    /// act on: rebuilding every pool for them costs a cold
+    /// prepared-statement cache and a re-`Parse` burst on a live workload.
+    /// They have to reach the operator as a restart-required warning
+    /// instead.
+    #[allow(clippy::type_complexity)]
+    fn restart_only_general_pool_knobs() -> Vec<(&'static str, fn(&mut General))> {
+        use crate::config::Duration as ConfigDuration;
+        vec![
+            ("max_concurrent_creates", |g| g.max_concurrent_creates += 1),
+            // Pool builder: queue discipline and scaling
+            ("server_round_robin", |g| {
+                g.server_round_robin = !g.server_round_robin
+            }),
+            ("scaling_warm_pool_ratio", |g| {
+                g.scaling_warm_pool_ratio += 5
+            }),
+            ("scaling_fast_retries", |g| g.scaling_fast_retries += 1),
+            ("scaling_max_parallel_creates", |g| {
+                g.scaling_max_parallel_creates += 1
+            }),
+            // Prepared statement caches
+            ("prepared_statements", |g| {
+                g.prepared_statements = !g.prepared_statements
+            }),
+            ("prepared_statements_cache_size", |g| {
+                g.prepared_statements_cache_size += 1
+            }),
+            ("server_prepared_statements_cache_size", |g| {
+                g.server_prepared_statements_cache_size = Some(3)
+            }),
+            // Patroni-assisted fallback
+            ("patroni_api_urls", |g| {
+                g.patroni_api_urls = Some(vec!["http://127.0.0.1:8009".to_string()])
+            }),
+            ("fallback_cooldown", |g| {
+                g.fallback_cooldown = Some(ConfigDuration::from_millis(1_234))
+            }),
+            ("patroni_api_timeout", |g| {
+                g.patroni_api_timeout = Some(ConfigDuration::from_millis(1_234))
+            }),
+            ("fallback_connect_timeout", |g| {
+                g.fallback_connect_timeout = Some(ConfigDuration::from_millis(1_234))
+            }),
+            ("fallback_lifetime", |g| {
+                g.fallback_lifetime = Some(ConfigDuration::from_millis(1_234))
+            }),
+        ]
+    }
+
+    #[test]
+    fn reload_lifecycle_timeouts_invalidate_static_pool_fingerprint() {
+        let pool = ConfigPool::default();
+        let base = general_with_fallback_urls();
+        let baseline = static_pool_fingerprint(&pool, &base);
+
+        let mut silently_ignored = Vec::new();
+        for (field, mutate) in pool_rebuild_general_knobs() {
+            let mut edited = base.clone();
+            mutate(&mut edited);
+            if static_pool_fingerprint(&pool, &edited) == baseline {
+                silently_ignored.push(field);
+            }
+        }
+
+        assert!(
+            silently_ignored.is_empty(),
+            "RELOAD reuses the running pool for these lifecycle timeouts, but the \
+             pool froze them at construction: {silently_ignored:?}. The edit is \
+             silently ignored until the process restarts, while the log still says \
+             'config unchanged'."
+        );
+    }
+
+    #[test]
+    fn restart_only_general_pool_fields_do_not_rebuild_pools() {
+        let pool = ConfigPool::default();
+        let base = general_with_fallback_urls();
+        let baseline = static_pool_fingerprint(&pool, &base);
+
+        let mut rebuilt = Vec::new();
+        let mut unreported = Vec::new();
+        for (field, mutate) in restart_only_general_pool_knobs() {
+            let mut edited = base.clone();
+            mutate(&mut edited);
+            if static_pool_fingerprint(&pool, &edited) != baseline {
+                rebuilt.push(field);
+            }
+            let reported = crate::config::restart_only_general_pool_fields_changed(&base, &edited);
+            if !reported.contains(&format!("general.{field}").as_str()) {
+                unreported.push(field);
+            }
+        }
+
+        assert!(
+            rebuilt.is_empty(),
+            "these knobs must not recreate pools - a rebuild costs a cold \
+             prepared-statement cache and a re-Parse burst on a live workload: \
+             {rebuilt:?}"
+        );
+        assert!(
+            unreported.is_empty(),
+            "these knobs are not applied by RELOAD and are not reported either, so \
+             the operator has no way to learn a restart is needed: {unreported:?}"
+        );
+    }
+
+    #[test]
+    fn rebuild_and_restart_only_general_field_lists_are_disjoint() {
+        // One knob must land in exactly one bucket: a field that is both
+        // rebuilt and reported as restart-required would tell the operator
+        // to restart for a change that already took effect.
+        let base = general_with_fallback_urls();
+        for (field, mutate) in pool_rebuild_general_knobs() {
+            let mut edited = base.clone();
+            mutate(&mut edited);
+            let restart_only =
+                crate::config::restart_only_general_pool_fields_changed(&base, &edited);
+            assert!(
+                restart_only.is_empty(),
+                "general.{field} is applied by the reload, it must not be reported \
+                 as restart-required: {restart_only:?}"
+            );
+        }
+        for (field, mutate) in restart_only_general_pool_knobs() {
+            let mut edited = base.clone();
+            mutate(&mut edited);
+            let rebuild = crate::config::pool_rebuild_general_fields_changed(&base, &edited);
+            assert!(
+                rebuild.is_empty(),
+                "general.{field} does not rebuild pools, it must not be announced \
+                 as applied: {rebuild:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_general_idle_timeout_change_recreates_static_pool() {
+        let pool = ConfigPool::default();
+        let before = General::default();
+        let after = General {
+            idle_timeout: crate::config::Duration::from_millis(30_000),
+            ..General::default()
+        };
+        assert_ne!(
+            static_pool_fingerprint(&pool, &before),
+            static_pool_fingerprint(&pool, &after),
+            "general.idle_timeout is frozen into PoolSettings.idle_timeout_ms and \
+             ServerPool.idle_timeout_ms, so the pool must be recreated on change"
+        );
+    }
+
+    #[test]
+    fn reload_general_idle_timeout_change_keeps_pool_with_own_override() {
+        // The pool pins its own idle_timeout, so the general default never
+        // reaches it: recreating this pool (and dropping its warm backends)
+        // would be pure churn.
+        let pool = ConfigPool {
+            idle_timeout: Some(5_000),
+            ..ConfigPool::default()
+        };
+        let before = General::default();
+        let after = General {
+            idle_timeout: crate::config::Duration::from_millis(30_000),
+            ..General::default()
+        };
+        assert_eq!(
+            static_pool_fingerprint(&pool, &before),
+            static_pool_fingerprint(&pool, &after),
+            "a pool that overrides idle_timeout must not be recreated when the \
+             general default it does not use changes"
+        );
+    }
+
+    #[test]
+    fn reload_general_connect_timeout_change_keeps_pool_with_own_override() {
+        let pool = ConfigPool {
+            connect_timeout: Some(250),
+            ..ConfigPool::default()
+        };
+        let before = General::default();
+        let after = General {
+            connect_timeout: crate::config::Duration::from_millis(9_000),
+            ..General::default()
+        };
+        assert_eq!(
+            static_pool_fingerprint(&pool, &before),
+            static_pool_fingerprint(&pool, &after),
+            "a pool that overrides connect_timeout must not be recreated when the \
+             general default it does not use changes"
+        );
+    }
+
+    #[test]
+    fn pool_rebuild_general_fields_changed_matches_the_fingerprint() {
+        // The operator-facing list and the reuse fingerprint must not drift:
+        // every knob that forces a rebuild has to be named in the reload log.
+        let base = general_with_fallback_urls();
+        let mut unreported = Vec::new();
+        for (field, mutate) in pool_rebuild_general_knobs() {
+            let mut edited = base.clone();
+            mutate(&mut edited);
+            let reported = crate::config::pool_rebuild_general_fields_changed(&base, &edited);
+            if !reported.contains(&format!("general.{field}").as_str()) {
+                unreported.push(field);
+            }
+        }
+        assert!(
+            unreported.is_empty(),
+            "these knobs rebuild every pool but are not named in the reload log: \
+             {unreported:?}"
+        );
+    }
+
+    #[test]
+    fn general_pool_field_reports_are_empty_without_edits() {
+        let general = general_with_fallback_urls();
+        assert!(
+            crate::config::pool_rebuild_general_fields_changed(&general, &general).is_empty(),
+            "an unchanged general section must not claim a pool rebuild"
+        );
+        assert!(
+            crate::config::restart_only_general_pool_fields_changed(&general, &general).is_empty(),
+            "an unchanged general section must not demand a restart"
         );
     }
 
@@ -2574,13 +2906,25 @@ mod tests {
         let hash_block = &hash_block[..hash_end];
 
         assert!(
-            hash_block.contains("pool_config.hash_value()"),
-            "dedicated auth_query shared pool hash must include the pool config fingerprint"
+            hash_block.contains("static_pool_fingerprint(pool_config, &config.general)"),
+            "dedicated auth_query shared pool must be fingerprinted by the same \
+             function as a static pool, otherwise the two reuse rules fork"
         );
-        assert!(
-            hash_block.contains("general_startup_hash"),
-            "dedicated auth_query shared pool hash must include general.startup_parameters \
-             like static pools do, otherwise migration accepts stale startup baselines"
+
+        // ...and that shared fingerprint has to keep covering the general
+        // startup baseline, otherwise migration accepts stale reset_vals.
+        let pool = ConfigPool::default();
+        let before = General::default();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("search_path".to_string(), "public".to_string());
+        let after = General {
+            startup_parameters: params,
+            ..General::default()
+        };
+        assert_ne!(
+            static_pool_fingerprint(&pool, &before),
+            static_pool_fingerprint(&pool, &after),
+            "the shared fingerprint must include general.startup_parameters"
         );
     }
 

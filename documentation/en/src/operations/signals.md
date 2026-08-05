@@ -25,6 +25,15 @@ Re-reads the config file and applies changes. What reloads:
 - Server-side TLS certificates and CA bundles (lock-free swap; existing TLS connections keep their original context).
 - Talos and JWT public keys.
 - Log level and format.
+- Connection-lifecycle timeouts — `general.idle_timeout`,
+  `general.server_lifetime`, `general.server_idle_check_timeout`,
+  `general.query_wait_timeout`, `general.connect_timeout`. A pool freezes
+  these when it is built, so every pool that inherits an edited value is
+  **recreated**; pools that pin their own pool-level override are left
+  alone. Sessions still holding the previous generation keep it until they
+  disconnect, so it drains in the background rather than being closed under
+  them — PostgreSQL briefly carries backends of both generations. The
+  reload logs the changed field names at `info`.
 
 What does **not** reload:
 
@@ -35,6 +44,17 @@ What does **not** reload:
 - Client-facing TLS certificates — process restart required. Do not rotate
   them during an upgrade where TLS session migration is required.
 - Worker thread count and Tokio runtime parameters.
+- Other `general` values a pool freezes at construction:
+  `max_concurrent_creates`, `server_round_robin`, `scaling_warm_pool_ratio`,
+  `scaling_fast_retries`, `scaling_max_parallel_creates`,
+  `prepared_statements`, `prepared_statements_cache_size`,
+  `server_prepared_statements_cache_size`, `patroni_api_urls`,
+  `fallback_cooldown`, `patroni_api_timeout`, `fallback_connect_timeout`,
+  `fallback_lifetime`. Applying them would mean rebuilding every pool, and a
+  rebuild costs a cold prepared-statement cache plus a burst of re-`Parse`
+  against PostgreSQL — not worth it for cache sizing or failover tuning.
+  Pools keep serving the old values until the process restarts; the reload
+  logs a `warn` naming the changed fields.
 
 After reload, `SHOW CONFIG` reflects the new values. Existing client connections are not re-evaluated against the new `pg_hba.conf` — only new connections. Existing TCP sockets also keep the socket buffer size that was applied when the socket was created.
 
