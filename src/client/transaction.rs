@@ -583,21 +583,29 @@ where
             return false;
         }
 
-        self.stats.transaction();
-        server
-            .stats
-            .transaction(self.server_parameters.get_application_name());
-
-        if !self.transaction_mode {
-            if let Some(start) = self.session_xact_start.take() {
-                server
-                    .stats
-                    .add_xact_time_and_idle(start.elapsed().as_micros() as u64);
-            }
-        }
-
+        // `in_transaction` is only a mirror of the last ReadyForQuery, so it
+        // cannot tell a finished transaction from a batch that is still mid
+        // flight: a Flush ('H') produces no ReadyForQuery at all and an
+        // in-progress COPY has not reached one yet. Both reach this point with
+        // the mirror still false, so the counters must follow
+        // `transaction_complete` - otherwise one extended-protocol statement is
+        // counted once per Flush, while xact_time is recorded once per
+        // checkout, deflating the derived avg_xact_time by the same factor.
         let transaction_complete = !server.in_copy_mode() && (!check_async || !server.is_async());
         if transaction_complete {
+            self.stats.transaction();
+            server
+                .stats
+                .transaction(self.server_parameters.get_application_name());
+
+            if !self.transaction_mode {
+                if let Some(start) = self.session_xact_start.take() {
+                    server
+                        .stats
+                        .add_xact_time_and_idle(start.elapsed().as_micros() as u64);
+                }
+            }
+
             self.prepared.clear_portal_cleanup_commands();
         }
 
@@ -2372,8 +2380,9 @@ where
                     }
                     server.finish_internal_round_trip();
 
-                    // Reset query_start_at for the actual query
-                    query_start_at = now();
+                    // No query_start_at reset here: the transaction loop below
+                    // re-anchors the timer for the actual query on its very
+                    // first iteration, which this path falls straight into.
                 }
 
                 let mut initial_message = Some(message);
@@ -2441,11 +2450,22 @@ where
                     };
                     self.stats.active_idle();
 
-                    // Session mode: reset query timer per message so query_time
-                    // reflects individual queries, not cumulative session duration.
-                    if !self.transaction_mode {
-                        query_start_at = now();
-                    }
+                    // Re-anchor the query timer for every client message, in
+                    // BOTH pooling modes, so query_time measures this message's
+                    // own backend work.
+                    //
+                    // The outer-loop anchor is taken BEFORE the backend
+                    // checkout (it belongs to the serverless
+                    // `try_handle_without_server` fast path, which never checks
+                    // out). Keeping it here would (1) fold the checkout wait
+                    // into the first statement's query_time even though
+                    // checkout_time / total_wait_time already account for it,
+                    // and (2) leave every statement of a BEGIN..COMMIT block
+                    // sharing one anchor - this loop spins once per client
+                    // message of the whole block - so durations accumulate
+                    // quadratically and swallow the client think-time between
+                    // statements.
+                    query_start_at = now();
 
                     // The message will be forwarded to the server intact. We still would like to
                     // parse it below to figure out what to do with it.
@@ -3756,7 +3776,7 @@ mod internal_round_trip_timeout_tests {
             .expect("deferred-BEGIN block not found");
         let block_end = lines[begin_idx..]
             .iter()
-            .position(|l| l.contains("query_start_at = now();"))
+            .position(|l| l.contains("let mut initial_message = Some(message);"))
             .map(|i| begin_idx + i)
             .expect("deferred-BEGIN block end not found");
         let body = lines[begin_idx..=block_end].join("\n");
@@ -5359,7 +5379,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
             .expect("deferred-BEGIN send not found");
         let block_end = lines[send_marker..]
             .iter()
-            .position(|l| l.contains("query_start_at = now();"))
+            .position(|l| l.contains("let mut initial_message = Some(message);"))
             .map(|i| send_marker + i)
             .expect("end of deferred-BEGIN block not found");
         for (i, line) in lines[send_marker..block_end].iter().enumerate() {
@@ -5490,7 +5510,7 @@ mod relay_response_client_write_failure_tests {
     /// `Empty` reader is unsuitable here: its instant EOF makes
     /// `recv_server_response_or_client_disconnect` treat the client as
     /// disconnected before the backend socket readiness is delivered.
-    struct SilentReader;
+    pub(super) struct SilentReader;
 
     impl tokio::io::AsyncRead for SilentReader {
         fn poll_read(
@@ -5504,7 +5524,7 @@ mod relay_response_client_write_failure_tests {
 
     /// Client write half that fails every write with `BrokenPipe`,
     /// modelling a client socket after an RST arrived.
-    struct BrokenPipeWriter;
+    pub(super) struct BrokenPipeWriter;
 
     impl tokio::io::AsyncWrite for BrokenPipeWriter {
         fn poll_write(
@@ -5536,7 +5556,9 @@ mod relay_response_client_write_failure_tests {
         }
     }
 
-    fn test_client_with_broken_pipe_writer() -> Client<SilentReader, BrokenPipeWriter> {
+    /// Shared by `flush_transaction_counter_tests`, which needs a `Client`
+    /// whose in-memory counters can be inspected but performs no client I/O.
+    pub(super) fn test_client_with_broken_pipe_writer() -> Client<SilentReader, BrokenPipeWriter> {
         let addr = "127.0.0.1:6543".parse().unwrap();
         Client {
             read: BufReader::new(SilentReader),
@@ -5633,6 +5655,230 @@ mod relay_response_client_write_failure_tests {
         assert!(
             !server.test_release_cleanup_pending(),
             "the confirmed release round trip must disarm the pending flag"
+        );
+    }
+}
+
+/// `query_time` accuracy lock for the transaction loop.
+///
+/// `query_start_at` is armed once per OUTER loop iteration, i.e. before the
+/// backend checkout, and is only meant to survive un-reset up to the
+/// serverless `try_handle_without_server` fast path (no checkout there, so
+/// the outer anchor is the right one). Every message handled with a
+/// checked-out backend must re-anchor the timer inside the transaction loop,
+/// in BOTH pooling modes:
+///
+///   * without the re-anchor the first statement's `query_time` also carries
+///     the checkout wait, which `checkout_time` / `total_wait_time` already
+///     account for separately (double counting), and
+///   * the transaction loop spins once per client message of the whole
+///     `BEGIN .. COMMIT` block, so a single anchor makes every later
+///     statement inherit its predecessors' duration plus the client
+///     think-time between them.
+///
+/// Structural check: the defect lives in the shape of the loop (an `if`
+/// around the reset), and the loop itself needs a live pool plus a real
+/// backend to drive - same rationale as the other loop-shape locks in this
+/// file.
+#[cfg(test)]
+mod query_timer_anchor_tests {
+    #[test]
+    fn transaction_loop_reanchors_query_timer_for_every_message() {
+        let src = include_str!("transaction.rs");
+        // Production code only: the needles below would otherwise match this
+        // very test module.
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let lines: Vec<&str> = impl_src.lines().collect();
+
+        let checkout_idx = lines
+            .iter()
+            .position(|l| l.contains("let checkout_us = connecting_at.elapsed().as_micros()"))
+            .expect("backend checkout accounting not found");
+        let loop_idx = lines
+            .iter()
+            .position(|l| {
+                l.contains(
+                    "// Transaction loop. Multiple queries can be issued by the client here.",
+                )
+            })
+            .expect("transaction loop not found");
+        let dispatch_idx = loop_idx
+            + lines[loop_idx..]
+                .iter()
+                .position(|l| l.contains("let code = *message.first().unwrap() as char;"))
+                .expect("transaction loop message dispatch not found");
+        let handoff_idx = loop_idx
+            + lines[loop_idx..dispatch_idx]
+                .iter()
+                .position(|l| l.trim() == "self.stats.active_idle();")
+                .expect("transaction loop message hand-off not found");
+        let reset_idx = loop_idx
+            + lines[loop_idx..dispatch_idx]
+                .iter()
+                .position(|l| l.trim() == "query_start_at = now();")
+                .expect(
+                    "the transaction loop must re-anchor query_start_at for every client message",
+                );
+
+        assert!(
+            checkout_idx < loop_idx,
+            "the transaction loop must run after the backend checkout, so re-anchoring \
+             the timer there is what keeps the checkout wait out of query_time"
+        );
+        assert!(
+            handoff_idx < reset_idx && reset_idx < dispatch_idx,
+            "the timer must be re-anchored after the client message has been received \
+             (excluding client think-time) and before the message is dispatched"
+        );
+
+        let gate: Vec<&str> = lines[handoff_idx + 1..reset_idx]
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .collect();
+        assert!(
+            gate.is_empty(),
+            "the per-message query-timer re-anchor must be unconditional - transaction \
+             mode needs it too (double-counted checkout wait + one cumulative anchor for \
+             every statement of a BEGIN..COMMIT block); found gate: {gate:?}"
+        );
+    }
+}
+
+/// Transaction-counter accuracy lock for the extended protocol.
+///
+/// `complete_transaction_if_needed` runs once per Sync AND once per Flush
+/// ('H'). Only the message that actually ends the transaction may bump the
+/// counters: a Flush leaves the backend mid-batch in async mode, produces no
+/// ReadyForQuery, and therefore never flips the mirrored `in_transaction`
+/// back - so the early return above cannot catch it. Counting every Flush
+/// inflates `transaction_count` (SHOW STATS / SHOW CLIENTS / SHOW SERVERS,
+/// `/api/*`) by the number of Flushes in the batch while `xact_time` is
+/// still recorded once per checkout, deflating the derived avg_xact_time by
+/// the same factor.
+#[cfg(test)]
+#[cfg(unix)]
+mod flush_transaction_counter_tests {
+    use super::relay_response_client_write_failure_tests::test_client_with_broken_pipe_writer;
+    use super::*;
+
+    #[tokio::test]
+    async fn flush_in_async_batch_does_not_count_a_transaction() {
+        let mut client = test_client_with_broken_pipe_writer();
+        client.transaction_mode = true;
+        let (mut server, _peer) = Server::test_silent_socket();
+
+        // Mid-batch Flush: handle_sync_flush keeps the backend in async mode
+        // and no ReadyForQuery has arrived, so `in_transaction` is still false.
+        server.set_async_mode(true);
+
+        assert!(
+            !client.complete_transaction_if_needed(&server, true),
+            "a mid-batch Flush must not release the backend"
+        );
+        assert_eq!(
+            client.stats.transaction_count.load(Ordering::Relaxed),
+            0,
+            "a Flush is not a transaction boundary for the client counter"
+        );
+        assert_eq!(
+            server.stats.transaction_count.load(Ordering::Relaxed),
+            0,
+            "a Flush is not a transaction boundary for the server counter"
+        );
+
+        // asyncpg pipelines several Flushes per statement.
+        assert!(!client.complete_transaction_if_needed(&server, true));
+        assert_eq!(
+            client.stats.transaction_count.load(Ordering::Relaxed),
+            0,
+            "one logical statement must not be counted once per Flush"
+        );
+
+        // The Sync that ends the batch leaves async mode: exactly one
+        // transaction, and in transaction mode the backend goes back to the pool.
+        server.set_async_mode(false);
+        assert!(
+            client.complete_transaction_if_needed(&server, true),
+            "the Sync that ends the batch must still release the backend"
+        );
+        assert_eq!(
+            client.stats.transaction_count.load(Ordering::Relaxed),
+            1,
+            "the completed extended-protocol transaction must be counted exactly once"
+        );
+        assert_eq!(
+            server.stats.transaction_count.load(Ordering::Relaxed),
+            1,
+            "the completed extended-protocol transaction must be counted exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_query_still_counts_one_transaction_per_ready_for_query() {
+        let mut client = test_client_with_broken_pipe_writer();
+        client.transaction_mode = true;
+        let (mut server, _peer) = Server::test_silent_socket();
+
+        // ReadyForQuery('T'): the client opened an explicit transaction.
+        server.in_transaction = true;
+        assert!(!client.complete_transaction_if_needed(&server, false));
+        assert_eq!(
+            client.stats.transaction_count.load(Ordering::Relaxed),
+            0,
+            "statements inside an open transaction must not be counted"
+        );
+
+        // ReadyForQuery('I'): COMMIT (or an autocommit statement) finished it.
+        server.in_transaction = false;
+        assert!(
+            client.complete_transaction_if_needed(&server, false),
+            "the simple-query path must still release the backend in transaction mode"
+        );
+        assert_eq!(
+            client.stats.transaction_count.load(Ordering::Relaxed),
+            1,
+            "the simple-query path must still count its transaction"
+        );
+        assert_eq!(
+            server.stats.transaction_count.load(Ordering::Relaxed),
+            1,
+            "the simple-query path must still count its transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_mode_closes_the_xact_timer_on_the_batch_sync() {
+        let mut client = test_client_with_broken_pipe_writer();
+        assert!(
+            !client.transaction_mode,
+            "the shared test client is a session-mode client"
+        );
+        let (mut server, _peer) = Server::test_silent_socket();
+        client.session_xact_start = Some(now());
+
+        // Mid-batch Flush: the transaction is not over, so the session
+        // xact timer must stay armed instead of reporting a partial duration.
+        server.set_async_mode(true);
+        assert!(!client.complete_transaction_if_needed(&server, true));
+        assert!(
+            client.session_xact_start.is_some(),
+            "a mid-batch Flush must not close the session xact timer"
+        );
+        assert_eq!(client.stats.transaction_count.load(Ordering::Relaxed), 0);
+
+        // The batch's Sync ends the transaction: counters bump once and the
+        // xact timer is closed (session mode keeps the backend).
+        server.set_async_mode(false);
+        assert!(
+            !client.complete_transaction_if_needed(&server, true),
+            "session mode never releases the backend at transaction end"
+        );
+        assert_eq!(client.stats.transaction_count.load(Ordering::Relaxed), 1);
+        assert_eq!(server.stats.transaction_count.load(Ordering::Relaxed), 1);
+        assert!(
+            client.session_xact_start.is_none(),
+            "the session xact timer must be closed when the transaction completes"
         );
     }
 }
