@@ -1621,38 +1621,6 @@ fn record_fallback_connection_outcome(pool_name: &str, established: bool) {
     }
 }
 
-struct ServerStatsRegistrationGuard {
-    stats: Arc<ServerStats>,
-    armed: bool,
-}
-
-impl ServerStatsRegistrationGuard {
-    fn register(stats: Arc<ServerStats>) -> Self {
-        stats.register(stats.clone());
-        Self { stats, armed: true }
-    }
-
-    fn disconnect(mut self) {
-        if self.armed {
-            self.stats.disconnect();
-            self.armed = false;
-        }
-    }
-
-    fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ServerStatsRegistrationGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.stats.disconnect();
-            self.armed = false;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2037,42 +2005,6 @@ mod tests {
                 - before,
             1
         );
-    }
-
-    #[test]
-    fn server_stats_registration_guard_disconnects_on_drop_until_disarmed() {
-        let pool = "test_pool_stats_registration_guard";
-        let address = crate::config::Address {
-            pool_name: pool.to_string(),
-            ..crate::config::Address::default()
-        };
-        let stats = Arc::new(ServerStats::new(address, crate::utils::clock::now()));
-
-        {
-            let _guard = ServerStatsRegistrationGuard::register(stats.clone());
-            assert!(
-                crate::stats::get_server_stats()
-                    .values()
-                    .any(|registered| registered.pool_name() == pool),
-                "guard must publish stats while startup is in flight"
-            );
-        }
-        assert!(
-            !crate::stats::get_server_stats()
-                .values()
-                .any(|registered| registered.pool_name() == pool),
-            "dropping an armed guard must remove the in-flight stats"
-        );
-
-        let guard = ServerStatsRegistrationGuard::register(stats.clone());
-        guard.disarm();
-        assert!(
-            crate::stats::get_server_stats()
-                .values()
-                .any(|registered| registered.pool_name() == pool),
-            "disarmed guard hands lifecycle ownership to Server"
-        );
-        stats.disconnect();
     }
 
     #[tokio::test]

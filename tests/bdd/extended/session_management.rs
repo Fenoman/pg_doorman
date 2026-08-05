@@ -725,7 +725,7 @@ pub async fn send_function_call_to_session(
         .filter(|arg| !arg.is_empty())
         .map(|arg| {
             arg.parse::<i32>()
-                .unwrap_or_else(|_| panic!("Invalid FunctionCall int arg '{}'", arg))
+                .unwrap_or_else(|_| panic!("Invalid FunctionCall int arg '{arg}'"))
         })
         .collect::<Vec<_>>();
 
@@ -745,7 +745,7 @@ pub async fn read_postgresql_response_within_timeout(
     let duration = std::time::Duration::from_millis(timeout_ms);
     let messages = tokio::time::timeout(duration, conn.read_all_messages_until_ready())
         .await
-        .unwrap_or_else(|_| panic!("Response not received within {}ms", timeout_ms))
+        .unwrap_or_else(|_| panic!("Response not received within {timeout_ms}ms"))
         .expect("Failed to read messages");
 
     world.session_messages.insert(session_name, messages);
@@ -935,7 +935,7 @@ pub async fn session_should_receive_function_call_response_with_result_size(
     let messages = world
         .session_messages
         .get(&session_name)
-        .unwrap_or_else(|| panic!("No messages stored for session '{}'", session_name));
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
 
     for (msg_type, data) in messages {
         if *msg_type != 'V' {
@@ -953,22 +953,17 @@ pub async fn session_should_receive_function_call_response_with_result_size(
         let result_len = result_len as usize;
         assert_eq!(
             result_len, expected_size,
-            "FunctionCallResponse from session '{}' has {} byte result, expected {}",
-            session_name, result_len, expected_size,
+            "FunctionCallResponse from session '{session_name}' has {result_len} byte result, expected {expected_size}",
         );
         assert_eq!(
             data.len(),
             4 + expected_size,
-            "FunctionCallResponse from session '{}' has unexpected frame body size",
-            session_name,
+            "FunctionCallResponse from session '{session_name}' has unexpected frame body size",
         );
         return;
     }
 
-    panic!(
-        "No FunctionCallResponse received from session '{}'",
-        session_name
-    );
+    panic!("No FunctionCallResponse received from session '{session_name}'");
 }
 
 #[then(regex = r#"^session "([^"]+)" should receive CommandComplete "([^"]+)"$"#)]

@@ -220,17 +220,18 @@ async fn handle_large_function_call_response<C>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
+    let copy_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
     server.buffer.put_u8(code_u8);
     server.buffer.put_i32(message_len);
     let prev_bad = server.bad;
     server.bad = true;
-    write_all_flush(client_stream, &server.buffer).await?;
+    write_all_flush_timeout(client_stream, &server.buffer, copy_timeout).await?;
 
     const HEADER_BYTES: u64 = 1 + mem::size_of::<i32>() as u64;
     let mut payload_copied: usize = 0;
     let res = proxy_copy_data_with_timeout(
-        get_config().general.proxy_copy_data_timeout.as_std(),
-        &mut server.stream,
+        copy_timeout,
+        &mut *server.stream,
         client_stream,
         message_len as usize - mem::size_of::<i32>(),
         &mut payload_copied,
@@ -254,11 +255,12 @@ where
     server
         .stats
         .data_received(server.buffer.len() + message_len as usize);
-    server.last_activity = SystemTime::now();
+    server.touch_activity();
     server.data_available = true;
-    server.buffer.clear();
     server.stats.wait_idle();
-    Ok(server.buffer.clone())
+    // Hand back a fresh empty BytesMut; matches the D/d streaming handlers.
+    server.buffer.clear();
+    Ok(BytesMut::new())
 }
 
 /// Handles large CopyData ('d') messages that exceed max_message_size.
@@ -934,10 +936,10 @@ where
             if !server.buffer.is_empty() {
                 server.pending_large_message = Some((code_u8, message_len));
                 server.data_available = true;
-                let result = server.buffer.clone();
-                server.buffer.clear();
+                // zero-copy split.
+                let result = server.buffer.split();
                 server.stats.data_received(result.len());
-                server.last_activity = SystemTime::now();
+                server.touch_activity();
                 return Ok(result);
             }
             return handle_large_function_call_response(

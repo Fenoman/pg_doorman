@@ -3757,6 +3757,8 @@ pool_size = 10
     assert!(config.general.sync_server_parameters);
     let pool = &config.pools["mydb"];
     assert_eq!(pool.sync_server_parameters, None);
+}
+
 /// Helper for the release_query validation cases below. Builds a
 /// minimal-but-valid pool and lets the caller override `release_query`.
 fn release_query_pool(release_query: Option<String>) -> Pool {

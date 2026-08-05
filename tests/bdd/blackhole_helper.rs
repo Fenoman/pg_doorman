@@ -29,21 +29,16 @@ impl Drop for BlackholeAbortHandles {
 #[given(regex = r"^TCP blackhole listener registered as '(.+)'$")]
 pub async fn start_blackhole_listener(world: &mut DoormanWorld, name: String) {
     let port = portpicker::pick_unused_port().expect("no free ports");
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
         .expect("failed to bind blackhole listener");
 
     let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    tokio::spawn(async move {
-                        let _hold = stream;
-                        futures::future::pending::<()>().await
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _hold = stream;
+                futures::future::pending::<()>().await
+            });
         }
     });
     world.blackhole_aborts.0.push(handle);
@@ -69,7 +64,7 @@ pub async fn attempt_session_expecting_startup_failure(
     database: String,
 ) {
     let doorman_port = world.doorman_port.expect("pg_doorman not started");
-    let doorman_addr = format!("127.0.0.1:{}", doorman_port);
+    let doorman_addr = format!("127.0.0.1:{doorman_port}");
 
     let handle = tokio::spawn(async move {
         let mut conn = PgConnection::connect(&doorman_addr).await.ok()?;

@@ -2527,12 +2527,6 @@ where
                             }
                         }
 
-                        // FunctionCall
-                        'F' => {
-                            self.handle_function_call(&message, server, query_start_at)
-                                .await?
-                        }
-
                         // Terminate
                         'X' => {
                             // ALWAYS release(), even if finalize_checkin
@@ -2657,21 +2651,8 @@ where
                                         .to_string(),
                                 ))
                             } else {
-                                server.set_async_mode(false);
-                                server.set_expected_responses(0);
-                                self.execute_server_roundtrip(Some(&message), server)
-                                    .await?;
-                                self.stats.query();
-                                server.stats.query(
-                                    query_start_at.elapsed().as_micros() as u64,
-                                    self.server_parameters.get_application_name(),
-                                );
-                                if self.complete_transaction_if_needed(server, false) {
-                                    self.stats.idle_read();
-                                    Ok(TransactionAction::Break)
-                                } else {
-                                    Ok(TransactionAction::Continue)
-                                }
+                                self.handle_function_call(&message, server, query_start_at)
+                                    .await
                             }
                         }
 

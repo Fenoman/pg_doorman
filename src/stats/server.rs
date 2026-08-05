@@ -845,7 +845,7 @@ mod tests {
 
         assert!(get_server_stats().contains_key(&server_id));
         assert_eq!(stats.state(), SERVER_STATE_LOGIN);
-        assert_eq!(*stats.application_name.lock(), "Undefined");
+        assert_eq!(stats.application_name(), "Undefined");
 
         drop(registration);
         assert!(!get_server_stats().contains_key(&server_id));

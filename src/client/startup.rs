@@ -10,8 +10,6 @@ use tokio::net::TcpStream;
 use crate::auth::hba::CheckResult;
 use crate::auth::talos::{extract_talos_token, log_talos_routing, resolve_talos_user};
 use crate::auth::{authenticate, OperatorManagedKeys};
-#[cfg(test)]
-use crate::config::check_hba_with_general;
 use crate::config::{check_hba, config_arc, get_config};
 use crate::errors::{ClientIdentifier, Error};
 use crate::messages::constants::*;
@@ -36,36 +34,8 @@ pub(crate) enum ClientConnectionType {
 
 pub(crate) const PRE_AUTH_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-fn talos_hba_allowed(md5: CheckResult, scram: CheckResult) -> bool {
-    matches!(md5, CheckResult::Allow | CheckResult::Trust)
-        || matches!(scram, CheckResult::Allow | CheckResult::Trust)
-}
-
 fn is_admin_database(pool_name: &str) -> bool {
     matches!(pool_name, "pgdoorman" | "pgbouncer")
-}
-
-fn talos_role_hba_checks(
-    transport: &ClientTransport,
-    username: &str,
-    pool_name: &str,
-) -> (CheckResult, CheckResult) {
-    (
-        check_hba(transport, "md5", username, pool_name),
-        check_hba(transport, "scram-sha-256", username, pool_name),
-    )
-}
-
-#[cfg(test)]
-fn talos_role_hba_allowed_with_general(
-    general: &crate::config::General,
-    transport: &ClientTransport,
-    username: &str,
-    pool_name: &str,
-) -> bool {
-    let md5 = check_hba_with_general(general, transport, "md5", username, pool_name);
-    let scram = check_hba_with_general(general, transport, "scram-sha-256", username, pool_name);
-    talos_hba_allowed(md5, scram)
 }
 
 fn merge_safe_client_startup_parameters(
@@ -741,32 +711,12 @@ mod tests {
     use super::is_admin_database;
     use super::merge_safe_client_startup_parameters;
     use super::startup_with_auth_timeout;
-    use super::talos_role_hba_allowed_with_general;
     use super::{Client, ClientServerMap};
-    use crate::auth::hba::PgHba;
-    use crate::config::General;
     use crate::transport::ClientTransport;
     use bytes::{BufMut, BytesMut};
     use dashmap::DashMap;
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
-
-    #[test]
-    fn talos_role_hba_reject_blocks_derived_role() {
-        let general = General {
-            pg_hba: Some(PgHba::from_content(
-                "host all talos 127.0.0.1/32 md5\nhost all owner 127.0.0.1/32 reject",
-            )),
-            ..General::default()
-        };
-        let peer = "127.0.0.1:54321".parse().unwrap();
-        let transport = ClientTransport::Tcp { peer, ssl: false };
-
-        assert!(
-            !talos_role_hba_allowed_with_general(&general, &transport, "owner", "db"),
-            "derived Talos role must be checked against pg_hba"
-        );
-    }
 
     #[test]
     fn admin_database_detection_matches_reserved_names() {

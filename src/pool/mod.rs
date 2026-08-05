@@ -951,7 +951,8 @@ impl ConnectionPool {
                             .server_lifetime
                             .or(pool_config.server_lifetime)
                             .unwrap_or(config.general.server_lifetime.as_millis()),
-                        sync_server_parameters: pool_config.effective_sync_server_parameters(&config.general),
+                        sync_server_parameters: pool_config
+                            .effective_sync_server_parameters(&config.general),
                         intercept_discard_all: pool_config.intercept_discard_all,
                         min_guaranteed_pool_size: pool_config.min_guaranteed_pool_size.unwrap_or(0),
                     },
@@ -1192,7 +1193,8 @@ impl ConnectionPool {
                                 life_time_ms: pool_config
                                     .server_lifetime
                                     .unwrap_or(config.general.server_lifetime.as_millis()),
-                                sync_server_parameters: pool_config.effective_sync_server_parameters(&config.general),
+                                sync_server_parameters: pool_config
+                                    .effective_sync_server_parameters(&config.general),
                                 intercept_discard_all: pool_config.intercept_discard_all,
                                 min_guaranteed_pool_size: pool_config
                                     .min_guaranteed_pool_size
@@ -2014,8 +2016,10 @@ mod tests {
 
     #[test]
     fn effective_sync_server_parameters_falls_back_to_general_when_none() {
-        let mut general = General::default();
-        general.sync_server_parameters = true;
+        let general = General {
+            sync_server_parameters: true,
+            ..General::default()
+        };
         let pool = ConfigPool {
             sync_server_parameters: None,
             ..Default::default()
@@ -2035,8 +2039,10 @@ mod tests {
 
     #[test]
     fn effective_sync_server_parameters_pool_override_wins_over_general() {
-        let mut general = General::default();
-        general.sync_server_parameters = true;
+        let general = General {
+            sync_server_parameters: true,
+            ..General::default()
+        };
         let pool = ConfigPool {
             sync_server_parameters: Some(false),
             ..Default::default()
@@ -2063,10 +2069,14 @@ mod tests {
 
     #[test]
     fn reload_sync_server_parameters_false_to_true_changes_general_startup_hash() {
-        let mut general_before = General::default();
-        general_before.sync_server_parameters = false;
-        let mut general_after = General::default();
-        general_after.sync_server_parameters = true;
+        let general_before = General {
+            sync_server_parameters: false,
+            ..General::default()
+        };
+        let general_after = General {
+            sync_server_parameters: true,
+            ..General::default()
+        };
         assert_ne!(
             compute_general_startup_hash(&general_before),
             compute_general_startup_hash(&general_after),
@@ -2076,10 +2086,14 @@ mod tests {
 
     #[test]
     fn reload_sync_server_parameters_true_to_false_changes_general_startup_hash() {
-        let mut general_before = General::default();
-        general_before.sync_server_parameters = true;
-        let mut general_after = General::default();
-        general_after.sync_server_parameters = false;
+        let general_before = General {
+            sync_server_parameters: true,
+            ..General::default()
+        };
+        let general_after = General {
+            sync_server_parameters: false,
+            ..General::default()
+        };
         assert_ne!(
             compute_general_startup_hash(&general_before),
             compute_general_startup_hash(&general_after),
@@ -2090,10 +2104,14 @@ mod tests {
     #[test]
     fn reload_general_sync_server_parameters_changes_static_pool_fingerprint() {
         let pool = ConfigPool::default();
-        let mut general_before = General::default();
-        general_before.sync_server_parameters = false;
-        let mut general_after = General::default();
-        general_after.sync_server_parameters = true;
+        let general_before = General {
+            sync_server_parameters: false,
+            ..General::default()
+        };
+        let general_after = General {
+            sync_server_parameters: true,
+            ..General::default()
+        };
         assert_ne!(
             compute_pool_fingerprint(&pool, &general_before),
             compute_pool_fingerprint(&pool, &general_after),
@@ -2104,10 +2122,14 @@ mod tests {
     #[test]
     fn reload_general_sync_server_parameters_changes_auth_query_parent_fingerprint() {
         let pool = ConfigPool::default();
-        let mut general_before = General::default();
-        general_before.sync_server_parameters = false;
-        let mut general_after = General::default();
-        general_after.sync_server_parameters = true;
+        let general_before = General {
+            sync_server_parameters: false,
+            ..General::default()
+        };
+        let general_after = General {
+            sync_server_parameters: true,
+            ..General::default()
+        };
         // parent_fingerprint = pool_config.hash_value() ^ general_startup_hash
         let fp_before = pool.hash_value() ^ compute_general_startup_hash(&general_before);
         let fp_after = pool.hash_value() ^ compute_general_startup_hash(&general_after);
@@ -2119,8 +2141,10 @@ mod tests {
 
     #[test]
     fn reload_pool_sync_server_parameters_none_to_true_changes_fingerprint() {
-        let mut general = General::default();
-        general.sync_server_parameters = false;
+        let general = General {
+            sync_server_parameters: false,
+            ..General::default()
+        };
         let pool_before = ConfigPool {
             sync_server_parameters: None,
             ..Default::default()
@@ -2176,16 +2200,20 @@ mod tests {
 
     #[test]
     fn reload_unchanged_sync_server_parameters_preserves_fingerprint() {
-        let mut general = General::default();
-        general.sync_server_parameters = true;
+        let general = General {
+            sync_server_parameters: true,
+            ..General::default()
+        };
         let pool = ConfigPool {
             sync_server_parameters: Some(true),
             ..Default::default()
         };
         // Pool-level override is set; general value is different but
         // pool override wins, so effective value is the same.
-        let mut general2 = General::default();
-        general2.sync_server_parameters = false;
+        let general2 = General {
+            sync_server_parameters: false,
+            ..General::default()
+        };
         let pool2 = ConfigPool {
             sync_server_parameters: Some(true),
             ..Default::default()
