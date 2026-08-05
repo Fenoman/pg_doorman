@@ -26,6 +26,7 @@ Feature: Talos clientId pool routing
       [talos]
       keys = ["${TALOS1_PUBKEY_PATH}"]
       databases = ["example_db"]
+      resource_prefixes = ["postgres.local"]
 
       [pools.example_db]
       server_host = "127.0.0.1"
@@ -59,6 +60,7 @@ Feature: Talos clientId pool routing
       [talos]
       keys = ["${TALOS1_PUBKEY_PATH}"]
       databases = ["example_db"]
+      resource_prefixes = ["postgres.local"]
 
       [pools.example_db]
       server_host = "127.0.0.1"
@@ -92,6 +94,7 @@ Feature: Talos clientId pool routing
       [talos]
       keys = ["${TALOS1_PUBKEY_PATH}"]
       databases = ["example_db"]
+      resource_prefixes = ["postgres.local"]
 
       [pools.example_db]
       server_host = "127.0.0.1"
@@ -120,6 +123,7 @@ Feature: Talos clientId pool routing
       [talos]
       keys = ["${TALOS1_PUBKEY_PATH}"]
       databases = ["example_db"]
+      resource_prefixes = ["postgres.local"]
 
       [pools.example_db]
       server_host = "127.0.0.1"
@@ -147,6 +151,7 @@ Feature: Talos clientId pool routing
       [talos]
       keys = ["${TALOS1_PUBKEY_PATH}"]
       databases = ["example_db"]
+      resource_prefixes = ["postgres.local"]
 
       [pools.example_db]
       server_host = "127.0.0.1"
@@ -177,6 +182,7 @@ Feature: Talos clientId pool routing
       [talos]
       keys = ["${TALOS1_PUBKEY_PATH}"]
       databases = ["example_db"]
+      resource_prefixes = ["postgres.local"]
 
       [pools.example_db]
       server_host = "127.0.0.1"
