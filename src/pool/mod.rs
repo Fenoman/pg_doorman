@@ -1357,6 +1357,19 @@ impl ConnectionPool {
                 .map(|new_pool| Arc::ptr_eq(&pool.init_complete, &new_pool.init_complete))
                 .unwrap_or(false);
             if !same_generation {
+                let replaced = new_pools.contains_key(id);
+                if replaced {
+                    // A REPLACED static generation drains naturally: clients
+                    // that already hold the old pool Arc keep checking out
+                    // from it until they disconnect, while new sessions
+                    // resolve the new generation from POOLS. Closing it here
+                    // failed every in-flight session with 53300 on the next
+                    // checkout after a RELOAD that rebuilt the pool (e.g. a
+                    // sync_server_parameters change).
+                    continue;
+                }
+                // The id is gone from the new config entirely: fail closed so
+                // a retired pool cannot serve fresh checkouts forever.
                 pool.database.close_new_checkouts();
                 removed_static_pools.push(pool.clone());
             }
@@ -2492,11 +2505,18 @@ mod tests {
 
         let removed_static_decl = block
             .find("removed_static_pools")
-            .expect("reload must collect removed/replaced static generations");
-        let close_new_idx = block[removed_static_decl..]
-            .find("close_new_checkouts()")
+            .expect("reload must collect removed static generations");
+        let replaced_gate_idx = block[removed_static_decl..]
+            .find("let replaced = new_pools.contains_key(id);")
             .map(|offset| removed_static_decl + offset)
-            .expect("removed/replaced static generations must close new checkouts");
+            .expect(
+                "reload must distinguish REPLACED static generations (drain naturally, \
+                 in-flight sessions keep their pool Arc) from REMOVED ones",
+            );
+        let close_new_idx = block[replaced_gate_idx..]
+            .find("close_new_checkouts()")
+            .map(|offset| replaced_gate_idx + offset)
+            .expect("removed static generations must close new checkouts");
         let pools_store_idx = block
             .find("POOLS.store")
             .expect("reload must publish POOLS");
@@ -2506,15 +2526,18 @@ mod tests {
         let close_idx = block[drop_guard_idx..]
             .find("removed_static_pools")
             .map(|offset| drop_guard_idx + offset)
-            .expect("reload must drain removed/replaced static generations after unlock");
+            .expect("reload must drain removed static generations after unlock");
 
         assert!(
-            removed_static_decl < close_new_idx && close_new_idx < pools_store_idx,
-            "reload must close new checkouts on removed/replaced static generations before POOLS publish"
+            removed_static_decl < replaced_gate_idx
+                && replaced_gate_idx < close_new_idx
+                && close_new_idx < pools_store_idx,
+            "reload must close new checkouts only on REMOVED (not replaced) static \
+             generations, before POOLS publish"
         );
         assert!(
             pools_store_idx < drop_guard_idx && drop_guard_idx < close_idx,
-            "reload must close removed/replaced static generations after publishing and releasing pool_write_lock"
+            "reload must close removed static generations after publishing and releasing pool_write_lock"
         );
     }
 
