@@ -1218,13 +1218,19 @@ where
     // responses this saves hundreds of MB/s of allocator + memcpy work.
     let bytes = if server.buffer.len() > BUFFER_FLUSH_THRESHOLD {
         // Buffer outgrew the configured per-server cap. Take the whole
-        // payload and let the buffer re-acquire fresh BUFFER_FLUSH_THRESHOLD
-        // capacity on the next push - bounds the long-tail memory of a
-        // chatty backend.
-
+        // payload and hand the connection a fresh one - bounds the long-tail
+        // memory of a chatty backend.
+        //
+        // The replacement gets twice the threshold because the flush check runs
+        // AFTER a message is appended: a bulk response always ends up past the
+        // threshold, so sizing the replacement at exactly the threshold would
+        // guarantee a realloc plus a full memcpy of the accumulated bytes on
+        // the very next cycle. On a 20 MB report that is thousands of avoidable
+        // reallocations; the cost is 8 KiB more steady state on a backend that
+        // has already served an oversized response.
         std::mem::replace(
             &mut server.buffer,
-            BytesMut::with_capacity(BUFFER_FLUSH_THRESHOLD),
+            BytesMut::with_capacity(BUFFER_FLUSH_THRESHOLD * 2),
         )
     } else {
         // Hot path: O(1) split - no allocation, no memcpy.
@@ -2111,6 +2117,55 @@ mod tests {
         assert!(
             !server.is_data_available(),
             "Describe response must not be left unread"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bulk_relay_hands_back_a_buffer_that_survives_the_next_cycle() {
+        // The flush check runs AFTER the message is appended, so a bulk
+        // response always leaves the buffer past BUFFER_FLUSH_THRESHOLD and the
+        // hand-off takes the `mem::replace` arm. If the replacement is sized at
+        // exactly the threshold it is guaranteed to grow again on the very next
+        // cycle, so every flush of a large report pays one realloc plus a full
+        // memcpy of the accumulated bytes.
+        use super::{Server, BUFFER_FLUSH_THRESHOLD};
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.set_async_mode(true);
+        server.set_expected_responses(1);
+
+        // DataRows summing past the threshold, so the relay breaks on the
+        // buffer limit rather than on ReadyForQuery.
+        let peer_task = tokio::spawn(async move {
+            let row_payload = vec![b'x'; 1024];
+            let mut wire = Vec::new();
+            for _ in 0..12 {
+                let len = (row_payload.len() + 4) as i32;
+                wire.push(b'D');
+                wire.extend_from_slice(&len.to_be_bytes());
+                wire.extend_from_slice(&row_payload);
+            }
+            // Writing from a task keeps the socket draining while `recv` reads;
+            // a direct write of this size would block on the socket buffer.
+            let _ = peer.write_all(&wire).await;
+        });
+
+        let relayed = server
+            .recv(tokio::io::sink(), None)
+            .await
+            .expect("bulk DataRows must be relayed");
+        peer_task.abort();
+        assert!(
+            relayed.len() > BUFFER_FLUSH_THRESHOLD,
+            "this test must exercise the oversized hand-off arm"
+        );
+        assert!(
+            server.buffer.capacity() > BUFFER_FLUSH_THRESHOLD,
+            "the replacement buffer must have room past the flush threshold, \
+             otherwise the next cycle reallocates and memcpies again (capacity {})",
+            server.buffer.capacity()
         );
     }
 
