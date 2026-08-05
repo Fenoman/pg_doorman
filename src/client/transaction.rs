@@ -607,6 +607,21 @@ where
             }
 
             self.prepared.clear_portal_cleanup_commands();
+
+            // Release the SQL-level `PREPARE` pin here, on the path both
+            // protocols go through. The pin is armed from `handle_simple_query`
+            // AND from the extended-protocol relay loop, but it used to be
+            // disarmed only in the former - while the backend flag it keys off
+            // is disarmed by the response parser regardless of protocol
+            // (`DEALLOCATE ALL` / `DISCARD ALL`). An extended-only client that
+            // dropped its prepared statements therefore stayed pinned forever
+            // and never gave its backend back.
+            if self.transaction_mode
+                && self.sql_prepare_session_pinned
+                && !server.cleanup_state.needs_cleanup_prepare
+            {
+                self.sql_prepare_session_pinned = false;
+            }
         }
 
         if should_release_transaction_backend(
@@ -5879,6 +5894,84 @@ mod flush_transaction_counter_tests {
         assert!(
             client.session_xact_start.is_none(),
             "the session xact timer must be closed when the transaction completes"
+        );
+    }
+}
+
+/// The SQL-level `PREPARE` pin must be released from BOTH protocols.
+///
+/// A named statement created with SQL `PREPARE` lives in the backend
+/// session, so transaction pooling has to pin that backend to its client
+/// for as long as the statement exists — that part is deliberate. The pin
+/// is armed from the simple-query path AND from the extended-protocol
+/// relay loop, but it used to be disarmed only inside
+/// `handle_simple_query`. The backend-side flag it keys off,
+/// `cleanup_state.needs_cleanup_prepare`, is protocol-agnostic: the
+/// response parser disarms it on `DEALLOCATE ALL` / `DISCARD ALL` no
+/// matter which protocol carried them. So an extended-only client
+/// (asyncpg, npgsql) that ran `PREPARE` and later dropped the statements
+/// kept the pin forever and held its backend until disconnect —
+/// transaction pooling silently degraded into session pooling for that
+/// client and the pool slot was gone for good.
+#[cfg(test)]
+#[cfg(unix)]
+mod sql_prepare_pin_release_tests {
+    use super::relay_response_client_write_failure_tests::test_client_with_broken_pipe_writer;
+    use super::*;
+
+    #[tokio::test]
+    async fn pin_is_released_without_a_simple_query() {
+        let mut client = test_client_with_broken_pipe_writer();
+        client.transaction_mode = true;
+        // An extended-protocol `PREPARE` armed the pin in the relay loop.
+        client.sql_prepare_session_pinned = true;
+        let (mut server, _peer) = Server::test_silent_socket();
+        // A later `DEALLOCATE ALL` — extended protocol as well — disarmed
+        // the backend flag, so there is nothing left to stay pinned for.
+        server.cleanup_state.needs_cleanup_prepare = false;
+
+        assert!(
+            client.complete_transaction_if_needed(&server, false),
+            "with no SQL-level prepared statements left the backend must go back \
+             to the pool, even though this client never sent a simple query"
+        );
+        assert!(
+            !client.sql_prepare_session_pinned,
+            "the pin must be disarmed on the protocol-agnostic completion path, \
+             not only inside handle_simple_query"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_survives_while_prepared_statements_exist() {
+        let mut client = test_client_with_broken_pipe_writer();
+        client.transaction_mode = true;
+        client.sql_prepare_session_pinned = true;
+        let (mut server, _peer) = Server::test_silent_socket();
+        server.cleanup_state.needs_cleanup_prepare = true;
+
+        assert!(
+            !client.complete_transaction_if_needed(&server, false),
+            "a backend still carrying SQL-level prepared statements must stay \
+             pinned to its client"
+        );
+        assert!(
+            client.sql_prepare_session_pinned,
+            "the pin must not be dropped while the statements are still there"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_mode_is_untouched() {
+        let mut client = test_client_with_broken_pipe_writer();
+        client.transaction_mode = false;
+        client.sql_prepare_session_pinned = true;
+        let (mut server, _peer) = Server::test_silent_socket();
+        server.cleanup_state.needs_cleanup_prepare = false;
+
+        assert!(
+            !client.complete_transaction_if_needed(&server, false),
+            "session mode never hands the backend back mid-session"
         );
     }
 }
