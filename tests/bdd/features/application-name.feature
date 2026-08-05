@@ -43,7 +43,7 @@ Feature: Application name tests
     When I run shell command:
       """
       export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&application_name=doorman"
-      cd tests/go && go test -v -run Test_ApplicationName ./application-name
+      cd tests/go && go test -count=1 -v -run Test_ApplicationName ./application-name
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_ApplicationName"

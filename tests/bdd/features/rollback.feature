@@ -47,7 +47,7 @@ Feature: Rollback functionality tests
     When I run shell command:
       """
       export DATABASE_URL_ROLLBACK="postgresql://example_user_rollback:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run Test_Rollback$ ./rollback
+      cd tests/go && go test -count=1 -v -run Test_Rollback$ ./rollback
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_Rollback"
@@ -57,7 +57,7 @@ Feature: Rollback functionality tests
       """
       export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
       export DATABASE_URL_ROLLBACK="postgresql://example_user_rollback:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run Test_RollbackSavePoint ./rollback
+      cd tests/go && go test -count=1 -v -run Test_RollbackSavePoint ./rollback
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_RollbackSavePoint"

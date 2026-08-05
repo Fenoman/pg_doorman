@@ -50,7 +50,7 @@ Feature: Go extended protocol tests
       """
       export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
       export PG_PORT="${PG_PORT}"
-      cd tests/go && go test -v -run Test_ExtendedProtocol$ ./extended
+      cd tests/go && go test -count=1 -v -run Test_ExtendedProtocol$ ./extended
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_ExtendedProtocol"
@@ -59,7 +59,7 @@ Feature: Go extended protocol tests
     When I run shell command:
       """
       export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run Test_SleepBatch ./extended
+      cd tests/go && go test -count=1 -v -run Test_SleepBatch ./extended
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_SleepBatch"
@@ -68,7 +68,7 @@ Feature: Go extended protocol tests
     When I run shell command:
       """
       export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run Test_ErrorBatch ./extended
+      cd tests/go && go test -count=1 -v -run Test_ErrorBatch ./extended
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_ErrorBatch"
@@ -77,7 +77,7 @@ Feature: Go extended protocol tests
     When I run shell command:
       """
       export DATABASE_URL_DISCONNECT="postgresql://example_user_disconnect@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run Test_Disconnect ./extended
+      cd tests/go && go test -count=1 -v -run Test_Disconnect ./extended
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_Disconnect"
@@ -86,7 +86,7 @@ Feature: Go extended protocol tests
     When I run shell command:
       """
       export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run TestCancelTLSQuery ./extended
+      cd tests/go && go test -count=1 -v -run TestCancelTLSQuery ./extended
       """
     Then the command should succeed
     And the command output should contain "PASS: TestCancelTLSQuery"
@@ -96,7 +96,7 @@ Feature: Go extended protocol tests
       """
       export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
       export PG_PORT="${PG_PORT}"
-      cd tests/go && go test -v -run Test_RaceStop ./extended
+      cd tests/go && go test -count=1 -v -run Test_RaceStop ./extended
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_RaceStop"

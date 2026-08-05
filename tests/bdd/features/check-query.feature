@@ -41,6 +41,6 @@ Feature: Check query functionality tests
     When I run shell command:
       """
       export DATABASE_URL="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run "^TestCheckQuery$" ./check-query
+      cd tests/go && go test -count=1 -v -run "^TestCheckQuery$" ./check-query
       """
     Then the command should succeed

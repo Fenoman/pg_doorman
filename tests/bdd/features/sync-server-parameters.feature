@@ -41,7 +41,7 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_SyncServerParametersWithSearchPath"
@@ -71,7 +71,7 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
 
@@ -99,7 +99,7 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_SyncServerParametersWithSearchPath"
@@ -128,7 +128,7 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_SyncServerParametersWithSearchPath"
@@ -178,7 +178,7 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_SyncServerParametersWithSearchPath"
@@ -186,14 +186,14 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/another_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
 
     When I run shell command:
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/other_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
 
@@ -222,7 +222,7 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_BASE="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run Test_ExtendedProtocolPreparedStatementDifferentSchemas ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_ExtendedProtocolPreparedStatementDifferentSchemas ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_ExtendedProtocolPreparedStatementDifferentSchemas"
@@ -273,7 +273,7 @@ Feature: Pool-level sync_server_parameters override
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
       export DOORMAN_PORT="${DOORMAN_PORT}"
-      cd tests/go && go test -v -run Test_PreparedInsertTargetsCorrectSchemaAfterReload ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_PreparedInsertTargetsCorrectSchemaAfterReload ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_PreparedInsertTargetsCorrectSchemaAfterReload"
@@ -324,7 +324,7 @@ Feature: Pool-level sync_server_parameters override
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
       export DOORMAN_PORT="${DOORMAN_PORT}"
-      cd tests/go && go test -v -run Test_PreparedInsertTargetsCorrectSchemaAfterPoolLevelReload ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_PreparedInsertTargetsCorrectSchemaAfterPoolLevelReload ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_PreparedInsertTargetsCorrectSchemaAfterPoolLevelReload"
@@ -354,7 +354,7 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_BASE="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable"
-      cd tests/go && go test -v -run Test_DifferentSearchPathsInSamePool ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_DifferentSearchPathsInSamePool ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_DifferentSearchPathsInSamePool"
@@ -382,7 +382,7 @@ Feature: Pool-level sync_server_parameters override
     When I run shell command:
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
-      cd tests/go && go test -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersWithSearchPath ./sync-parameters
       """
     Then the command should fail
 
@@ -432,7 +432,7 @@ Feature: Pool-level sync_server_parameters override
       """
       export DATABASE_URL_WITH_SEARCH_PATH="postgresql://example_user_1:test@127.0.0.1:${DOORMAN_PORT}/example_db?sslmode=disable&search_path=bucket_0"
       export DOORMAN_PORT="${DOORMAN_PORT}"
-      cd tests/go && go test -v -run Test_SyncServerParametersActivatedAfterReload ./sync-parameters
+      cd tests/go && go test -count=1 -v -run Test_SyncServerParametersActivatedAfterReload ./sync-parameters
       """
     Then the command should succeed
     And the command output should contain "PASS: Test_SyncServerParametersActivatedAfterReload"
