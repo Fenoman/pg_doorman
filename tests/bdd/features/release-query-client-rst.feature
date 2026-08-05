@@ -49,7 +49,9 @@ Feature: Release query after a client RST during response delivery
     And we send Execute "" to session "victim"
     And we send Sync to session "victim"
     # Shrink the client receive buffer, then flood without reading responses.
-    # Each response (one ~7KB DataRow plus ReadyForQuery) stays under 8 KiB, so
+    # Each response (one ~7KB DataRow plus ReadyForQuery) stays under
+    # general.response_flush_threshold (64 KiB by default), so it is terminated by
+    # ReadyForQuery rather than by the flush check:
     # pg_doorman reads it from the backend in one chunk and the backend parks at
     # ReadyForQuery holding the advisory lock. Shrinking only the client receive
     # buffer is not enough on its own: pg_doorman's client-socket send buffer

@@ -249,6 +249,7 @@ fn write_general_fields(out: &mut String, f: &FieldsData) {
         "query_interner_gc_interval_seconds",
         "query_interner_anon_idle_ttl_seconds",
         "message_size_to_be_stream",
+        "response_flush_threshold",
         "scaling_warm_pool_ratio",
         "scaling_fast_retries",
         "scaling_max_parallel_creates",

@@ -105,9 +105,11 @@ use super::parameters::ServerParameters;
 use super::stream::{create_tcp_stream_inner, create_unix_stream_inner, StreamInner};
 use super::{prepared_statements, protocol_io, startup_cancel};
 
-/// Buffer flush threshold in bytes (8 KiB).
-/// When the buffer reaches this size, it will be flushed to avoid excessive memory usage.
-const BUFFER_FLUSH_THRESHOLD: usize = 8192;
+/// Initial capacity of the per-backend relay buffers (8 KiB).
+/// Only a starting size: the buffers grow on demand, and how much of a
+/// response is batched before it is handed to the client is decided by
+/// `general.response_flush_threshold`, not by this constant.
+const INITIAL_BUFFER_CAPACITY: usize = 8192;
 
 /// TCP buffered-stream capacity in
 /// bytes. The default was tokio's 8 KiB. On the bulk-
@@ -123,7 +125,7 @@ const BUFFER_FLUSH_THRESHOLD: usize = 8192;
 /// pair. Memory cost: 64 KiB × (one backend per pool slot + one
 /// client per connection). On a max-1024-client / 256-backend pool
 /// that is ~80 MiB total, acceptable on production hosts that
-/// already size buffer pools with `BUFFER_FLUSH_THRESHOLD = 8 KiB`
+/// already size buffer pools with `INITIAL_BUFFER_CAPACITY = 8 KiB`
 /// times a few-hundred queue slots.
 pub const BUF_STREAM_CAPACITY: usize = 65536;
 
@@ -473,6 +475,14 @@ pub struct Server {
     /// Messages larger than this threshold are streamed directly to avoid excessive memory usage.
     /// A value of 0 disables streaming.
     pub(crate) max_message_size: i32,
+
+    /// Bytes of backend response the relay accumulates before handing the
+    /// batch back to the client (`general.response_flush_threshold`).
+    /// Read by the DataRow / CopyData arms of `protocol_io::recv`, which
+    /// break out of the accumulation loop once the buffer reaches it.
+    /// Configurable so the batch size can be tuned - or rolled back - on a
+    /// running deployment without a rebuild.
+    pub(crate) response_flush_threshold: usize,
 
     /// Large message header saved when recv() needs to return accumulated buffer first.
     /// The large DataRow/CopyData/FunctionCallResponse will be streamed on the next recv() call.
@@ -2573,8 +2583,8 @@ impl Server {
                             BUF_STREAM_CAPACITY,
                             stream,
                         )),
-                        buffer: BytesMut::with_capacity(BUFFER_FLUSH_THRESHOLD),
-                        read_buf: BytesMut::with_capacity(BUFFER_FLUSH_THRESHOLD),
+                        buffer: BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY),
+                        read_buf: BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY),
                         server_parameters,
                         process_id,
                         secret_key,
@@ -2616,6 +2626,8 @@ impl Server {
                         session_mode,
                         max_message_size: config.general.message_size_to_be_stream.as_bytes()
                             as i32,
+                        response_flush_threshold: config.general.response_flush_threshold.as_bytes()
+                            as usize,
                         pending_large_message: None,
                         close_reason: None,
                         override_lifetime_ms: None,
@@ -2936,6 +2948,10 @@ impl Server {
             connected_with_tls: false,
             session_mode: false,
             max_message_size: 0,
+            // Same value a backend built from a default config gets, so
+            // relay tests exercise the production batching granularity.
+            response_flush_threshold: crate::config::General::default_response_flush_threshold()
+                .as_usize(),
             pending_large_message: None,
             close_reason: None,
             override_lifetime_ms: None,

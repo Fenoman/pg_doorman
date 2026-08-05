@@ -62,6 +62,14 @@ pub(crate) const MAX_CONCURRENT_CREATES: usize = 1024;
 pub(crate) const MAX_AUTH_QUERY_WORKERS: u32 = 1024;
 pub(crate) const MAX_POOL_SIZE: u32 = 1_000_000;
 pub(crate) const MAX_PREPARED_STATEMENTS_CACHE_SIZE: usize = 1_000_000;
+/// Lower bound for `general.response_flush_threshold`. Below one page the
+/// relay slices a bulk response so finely that the `write()` count per
+/// response explodes and the batching stops paying for itself.
+pub(crate) const MIN_RESPONSE_FLUSH_THRESHOLD: u64 = 4 * 1024;
+/// Upper bound for `general.response_flush_threshold`. The syscall saving is
+/// already saturated well before this point, while every backend that served
+/// one oversized response keeps twice the threshold resident.
+pub(crate) const MAX_RESPONSE_FLUSH_THRESHOLD: u64 = 1024 * 1024;
 
 /// Configuration file format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +359,10 @@ impl Config {
             self.general.message_size_to_be_stream
         );
         info!(
+            "Response flush threshold: {}",
+            self.general.response_flush_threshold
+        );
+        info!(
             "Max memory usage for processing messages: {}",
             self.general.max_memory_usage
         );
@@ -619,6 +631,16 @@ impl Config {
             return Err(Error::BadConfig(format!(
                 "general.message_size_to_be_stream must be < {} bytes",
                 crate::messages::MAX_MESSAGE_SIZE
+            )));
+        }
+        let response_flush_threshold = self.general.response_flush_threshold.as_bytes();
+        if !(MIN_RESPONSE_FLUSH_THRESHOLD..=MAX_RESPONSE_FLUSH_THRESHOLD)
+            .contains(&response_flush_threshold)
+        {
+            return Err(Error::BadConfig(format!(
+                "general.response_flush_threshold must be between \
+                 {MIN_RESPONSE_FLUSH_THRESHOLD} and {MAX_RESPONSE_FLUSH_THRESHOLD} bytes, \
+                 got {response_flush_threshold}"
             )));
         }
         if self.general.max_concurrent_creates == 0 {

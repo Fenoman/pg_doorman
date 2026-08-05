@@ -91,10 +91,6 @@ const COMMAND_COMPLETE_BY_DEALLOCATE_ALL: &[u8; 15] = b"DEALLOCATE ALL\0";
 /// CLOSE ALL; UNLISTEN *; ...`, so disarms every `needs_cleanup_*` flag.
 const COMMAND_COMPLETE_BY_DISCARD_ALL: &[u8; 12] = b"DISCARD ALL\0";
 
-/// Buffer flush threshold in bytes (8 KiB).
-/// When the buffer reaches this size, it will be flushed to avoid excessive memory usage.
-const BUFFER_FLUSH_THRESHOLD: usize = 8192;
-
 /// Flushes messages within `duration`; timeout marks the server bad.
 pub(crate) async fn send_and_flush_timeout(
     server: &mut Server,
@@ -902,6 +898,12 @@ where
     // once it has returned to the caller).
     server.stats.wait_reading();
     let _wait_guard = WaitIdleOnDrop(std::sync::Arc::clone(&server.stats));
+    // Snapshot of `general.response_flush_threshold` taken when this backend
+    // was created: how many bytes of the response we batch before handing it
+    // to the client. Read once instead of per message - it cannot change
+    // mid-relay - and it keeps the hand-off below borrowing `server.buffer`
+    // mutably while still reading the field.
+    let flush_threshold = server.response_flush_threshold;
     loop {
         // In async mode, check if all expected responses have been received
         if server.is_async() && server.expected_responses() == 0 {
@@ -1075,7 +1077,7 @@ where
                 server.data_available = true;
 
                 // Don't flush yet, the more we buffer, the faster this goes...up to a limit.
-                if server.buffer.len() >= BUFFER_FLUSH_THRESHOLD {
+                if server.buffer.len() >= flush_threshold {
                     break;
                 }
             }
@@ -1117,7 +1119,7 @@ where
             // CopyData
             'd' => {
                 // Don't flush yet, buffer until we reach limit
-                if server.buffer.len() >= BUFFER_FLUSH_THRESHOLD {
+                if server.buffer.len() >= flush_threshold {
                     break;
                 }
             }
@@ -1216,7 +1218,7 @@ where
     // and leaves the capacity behind for the next call - same effect as
     // clone+clear without the alloc+memcpy. At 100k qps with multi-KiB
     // responses this saves hundreds of MB/s of allocator + memcpy work.
-    let bytes = if server.buffer.len() > BUFFER_FLUSH_THRESHOLD {
+    let bytes = if server.buffer.len() > flush_threshold {
         // Buffer outgrew the configured per-server cap. Take the whole
         // payload and hand the connection a fresh one - bounds the long-tail
         // memory of a chatty backend.
@@ -1226,11 +1228,11 @@ where
         // threshold, so sizing the replacement at exactly the threshold would
         // guarantee a realloc plus a full memcpy of the accumulated bytes on
         // the very next cycle. On a 20 MB report that is thousands of avoidable
-        // reallocations; the cost is 8 KiB more steady state on a backend that
-        // has already served an oversized response.
+        // reallocations; the cost is one extra threshold worth of steady state
+        // on a backend that has already served an oversized response.
         std::mem::replace(
             &mut server.buffer,
-            BytesMut::with_capacity(BUFFER_FLUSH_THRESHOLD * 2),
+            BytesMut::with_capacity(flush_threshold * 2),
         )
     } else {
         // Hot path: O(1) split - no allocation, no memcpy.
@@ -2124,24 +2126,30 @@ mod tests {
     #[tokio::test]
     async fn bulk_relay_hands_back_a_buffer_that_survives_the_next_cycle() {
         // The flush check runs AFTER the message is appended, so a bulk
-        // response always leaves the buffer past BUFFER_FLUSH_THRESHOLD and the
-        // hand-off takes the `mem::replace` arm. If the replacement is sized at
-        // exactly the threshold it is guaranteed to grow again on the very next
-        // cycle, so every flush of a large report pays one realloc plus a full
-        // memcpy of the accumulated bytes.
-        use super::{Server, BUFFER_FLUSH_THRESHOLD};
+        // response always leaves the buffer past `response_flush_threshold`
+        // and the hand-off takes the `mem::replace` arm. If the replacement is
+        // sized at exactly the threshold it is guaranteed to grow again on the
+        // very next cycle, so every flush of a large report pays one realloc
+        // plus a full memcpy of the accumulated bytes.
+        use super::Server;
         use tokio::io::AsyncWriteExt;
 
         let (mut server, mut peer) = Server::test_silent_socket();
         server.set_async_mode(true);
         server.set_expected_responses(1);
+        // Lower the configured threshold instead of writing 64 KiB+ of rows:
+        // the invariant under test is relative to the threshold, not to any
+        // particular byte count, and a small value keeps the test cheap.
+        server.response_flush_threshold = 8192;
+        let flush_threshold = server.response_flush_threshold;
 
         // DataRows summing past the threshold, so the relay breaks on the
         // buffer limit rather than on ReadyForQuery.
+        let row_count = flush_threshold.div_ceil(1024) + 4;
         let peer_task = tokio::spawn(async move {
             let row_payload = vec![b'x'; 1024];
             let mut wire = Vec::new();
-            for _ in 0..12 {
+            for _ in 0..row_count {
                 let len = (row_payload.len() + 4) as i32;
                 wire.push(b'D');
                 wire.extend_from_slice(&len.to_be_bytes());
@@ -2158,14 +2166,63 @@ mod tests {
             .expect("bulk DataRows must be relayed");
         peer_task.abort();
         assert!(
-            relayed.len() > BUFFER_FLUSH_THRESHOLD,
+            relayed.len() > flush_threshold,
             "this test must exercise the oversized hand-off arm"
         );
         assert!(
-            server.buffer.capacity() > BUFFER_FLUSH_THRESHOLD,
+            server.buffer.capacity() > flush_threshold,
             "the replacement buffer must have room past the flush threshold, \
              otherwise the next cycle reallocates and memcpies again (capacity {})",
             server.buffer.capacity()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relay_batches_up_to_the_configured_flush_threshold() {
+        // `general.response_flush_threshold` must actually drive the relay:
+        // raising it has to make one recv() carry more of a bulk response,
+        // which is the whole point of making the constant configurable.
+        use super::Server;
+        use tokio::io::AsyncWriteExt;
+
+        async fn relayed_len_for_threshold(threshold: usize) -> usize {
+            let (mut server, mut peer) = Server::test_silent_socket();
+            server.set_async_mode(true);
+            server.set_expected_responses(1);
+            server.response_flush_threshold = threshold;
+
+            // Enough rows to overshoot the largest threshold under test.
+            let peer_task = tokio::spawn(async move {
+                let row_payload = vec![b'x'; 1024];
+                let mut wire = Vec::new();
+                for _ in 0..80 {
+                    let len = (row_payload.len() + 4) as i32;
+                    wire.push(b'D');
+                    wire.extend_from_slice(&len.to_be_bytes());
+                    wire.extend_from_slice(&row_payload);
+                }
+                let _ = peer.write_all(&wire).await;
+            });
+
+            let relayed = server
+                .recv(tokio::io::sink(), None)
+                .await
+                .expect("bulk DataRows must be relayed");
+            peer_task.abort();
+            relayed.len()
+        }
+
+        let small = relayed_len_for_threshold(8 * 1024).await;
+        let large = relayed_len_for_threshold(64 * 1024).await;
+
+        assert!(
+            (8 * 1024..64 * 1024).contains(&small),
+            "an 8 KiB threshold must break the relay right past 8 KiB (got {small})"
+        );
+        assert!(
+            large >= 64 * 1024,
+            "a 64 KiB threshold must batch the response up to 64 KiB (got {large})"
         );
     }
 

@@ -902,6 +902,41 @@ fields:
         The threshold itself defaults to 1 MB.
       default: "1048576 (1 MB)"
 
+    response_flush_threshold:
+      config:
+        en: |
+          How many bytes of a backend response pg_doorman accumulates before writing the batch
+          to the client. Only large responses reach it: OLTP replies are flushed on ReadyForQuery
+          long before the threshold, so raising it changes nothing for short queries.
+          Larger values mean fewer write() syscalls on big result sets, at the cost of memory
+          held by a backend that has served one.
+        ru: |
+          Сколько байт ответа бэкенда pg_doorman накапливает перед записью пачки клиенту.
+          Порога достигают только крупные ответы: OLTP-ответы уходят по ReadyForQuery задолго
+          до него, поэтому на коротких запросах увеличение значения ничего не меняет.
+          Большее значение — меньше write()-syscall'ов на крупных выборках, ценой памяти,
+          которую удерживает обслуживший такой ответ бэкенд.
+      doc: |
+        Batch size of the backend-to-client relay. pg_doorman appends DataRow and CopyData messages
+        to a per-backend buffer and hands the batch to the client once the buffer reaches this
+        threshold, so a large result set is delivered in roughly `response_size / threshold`
+        write cycles. Raising the value from 8 KB to 64 KB cuts the number of `recv`/`write`
+        iterations on a 20 MB report from ~2440 to ~305.
+
+        **This knob does not affect OLTP traffic.** A response smaller than the threshold is
+        flushed when `ReadyForQuery` arrives and never reaches the check, so short queries see the
+        same number of writes regardless of the value. It is worth raising only for workloads that
+        return large result sets (reports, exports, `COPY TO`).
+
+        The cost is memory: a backend whose buffer outgrew the threshold is handed a replacement
+        sized at twice the threshold and keeps it until the connection is closed. With the 64 KB
+        default that is up to 128 KB per backend that has served a large response - budget it
+        against the number of backends, not the number of clients.
+
+        Accepted range: 4096 - 1048576 bytes. Values below 4 KB slice responses so finely that the
+        syscall count outweighs the batching; above 1 MB the saving is already saturated.
+      default: "65536 (64 KB)"
+
     pooler_check_query:
       config:
         en: |

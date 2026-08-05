@@ -660,6 +660,67 @@ async fn test_validate_message_size_to_be_stream_below_protocol_max() {
     );
 }
 
+#[test]
+fn test_response_flush_threshold_defaults_to_64_kib() {
+    // The default is a production-visible tuning decision: 64 KiB batches a
+    // bulk response into ~8x fewer client writes than the historical 8 KiB
+    // hardcoded value. Pin it so a change is deliberate.
+    let general = General::default();
+    assert_eq!(general.response_flush_threshold.as_bytes(), 64 * 1024);
+}
+
+#[tokio::test]
+async fn test_validate_response_flush_threshold_rejects_below_lower_bound() {
+    let mut config = config_with_single_pool_user();
+    config.general.response_flush_threshold =
+        ByteSize::from_bytes(MIN_RESPONSE_FLUSH_THRESHOLD - 1);
+
+    let err = config
+        .validate()
+        .await
+        .expect_err("response_flush_threshold below the lower bound must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("general.response_flush_threshold"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_response_flush_threshold_rejects_above_upper_bound() {
+    let mut config = config_with_single_pool_user();
+    config.general.response_flush_threshold =
+        ByteSize::from_bytes(MAX_RESPONSE_FLUSH_THRESHOLD + 1);
+
+    let err = config
+        .validate()
+        .await
+        .expect_err("response_flush_threshold above the upper bound must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("general.response_flush_threshold"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_response_flush_threshold_accepts_bounds_and_default() {
+    // Both edges are inclusive, and the shipped default must validate.
+    for bytes in [
+        MIN_RESPONSE_FLUSH_THRESHOLD,
+        General::default_response_flush_threshold().as_bytes(),
+        MAX_RESPONSE_FLUSH_THRESHOLD,
+    ] {
+        let mut config = config_with_single_pool_user();
+        config.general.response_flush_threshold = ByteSize::from_bytes(bytes);
+
+        config
+            .validate()
+            .await
+            .unwrap_or_else(|err| panic!("response_flush_threshold {bytes} must validate: {err}"));
+    }
+}
+
 #[tokio::test]
 async fn test_validate_pooler_check_query_rejects_embedded_nul() {
     let mut config = Config::default();

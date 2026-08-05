@@ -312,6 +312,15 @@ general:
   # Default: "1MB" (1048576 bytes)
   message_size_to_be_stream: "1MB"
 
+  # How many bytes of a backend response pg_doorman accumulates before writing the batch
+  # to the client. Only large responses reach it: OLTP replies are flushed on ReadyForQuery
+  # long before the threshold, so raising it changes nothing for short queries.
+  # Larger values mean fewer write() syscalls on big result sets, at the cost of memory
+  # held by a backend that has served one.
+  # Supports human-readable format: "64KB", "64K", or 65536 (bytes)
+  # Default: "64KB" (65536 bytes)
+  response_flush_threshold: "64KB"
+
   # SimpleQuery used by load balancers and monitoring as a liveness probe.
   # The first match per pool is forwarded to PostgreSQL; the response is cached
   # and reused for every subsequent match without touching the backend.

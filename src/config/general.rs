@@ -88,6 +88,21 @@ pub struct General {
     #[serde(default = "General::default_message_size_to_be_stream")] // 1024 * 1024
     pub message_size_to_be_stream: ByteSize,
 
+    /// How many bytes of a backend response the relay accumulates before it
+    /// hands the batch to the client. The check runs after each DataRow /
+    /// CopyData is appended, so the threshold sets the granularity of the
+    /// `recv()` -> `write()` cycle on bulk responses: a 20 MB result is cut
+    /// into `size / threshold` client writes.
+    ///
+    /// OLTP traffic never reaches it — small responses are flushed on
+    /// ReadyForQuery, well below the threshold — so the knob only trades
+    /// syscalls against per-backend memory on large responses. A backend that
+    /// served one oversized response keeps a buffer of twice this size until
+    /// it is closed.
+    /// Default: 65536 (64 KiB). Accepted range: 4 KiB-1 MiB.
+    #[serde(default = "General::default_response_flush_threshold")] // 64 * 1024
+    pub response_flush_threshold: ByteSize,
+
     #[serde(default = "General::default_max_memory_usage")] // 256m
     pub max_memory_usage: ByteSize,
 
@@ -515,6 +530,10 @@ impl General {
         ByteSize::from_mb(1) // 1mb
     }
 
+    pub fn default_response_flush_threshold() -> ByteSize {
+        ByteSize::from_kb(64) // 64kb
+    }
+
     pub fn default_worker_threads() -> usize {
         4
     }
@@ -606,6 +625,7 @@ impl Default for General {
             shutdown_timeout: Self::default_shutdown_timeout(),
             proxy_copy_data_timeout: Self::default_proxy_copy_data_timeout(),
             message_size_to_be_stream: Self::default_message_size_to_be_stream(),
+            response_flush_threshold: Self::default_response_flush_threshold(),
             max_memory_usage: Self::default_max_memory_usage(),
             max_connections: Self::default_max_connections(),
             max_concurrent_creates: Self::default_max_concurrent_creates(),

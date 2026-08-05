@@ -892,6 +892,16 @@ fn write_general_section(w: &mut ConfigWriter, config: &Config) {
         "1048576 bytes",
     );
 
+    write_field_desc(w, fi, "general", "response_flush_threshold");
+    write_byte_size_value(
+        w,
+        fi,
+        "response_flush_threshold",
+        g.response_flush_threshold.as_bytes(),
+        "64KB",
+        "65536 bytes",
+    );
+
     write_field_comment(w, fi, "general", "pooler_check_query");
     w.kv(fi, "pooler_check_query", &w.str_val(&g.pooler_check_query));
     w.blank();
@@ -2174,7 +2184,10 @@ fn write_byte_size_value(
                     indent,
                     &format!(
                         "Supports human-readable format: \"{human_readable}\", \"{}\", or {bytes} (bytes)",
-                        human_readable.replace("MB", "M").replace("GB", "G"),
+                        human_readable
+                            .replace("KB", "K")
+                            .replace("MB", "M")
+                            .replace("GB", "G"),
                     ),
                 );
             }
