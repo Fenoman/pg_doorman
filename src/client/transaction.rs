@@ -249,7 +249,12 @@ const BUFFER_FLUSH_THRESHOLD: usize = 8192;
 /// inside each extended-protocol handler; on overflow the connection
 /// is closed and the backend marked bad (the inner-handler action
 /// match maps the Err to `server.mark_bad` before propagating).
-pub(crate) const EXTENDED_BATCH_BUFFER_CAP: usize = 16 * 1024 * 1024;
+///
+/// Equals `MAX_MESSAGE_SIZE` (256MB), the read-side ceiling for one wire
+/// message: a legitimate single large Bind (a file-upload bytea parameter
+/// arrives as one Bind followed by Sync) always fits, and only pipelining
+/// without Sync/Flush can overflow the cap.
+pub(crate) const EXTENDED_BATCH_BUFFER_CAP: usize = crate::messages::MAX_MESSAGE_SIZE as usize;
 
 /// shared check for every extended-protocol handler before
 /// it appends to `self.buffer`. Returns an Err that propagates through
@@ -274,7 +279,10 @@ pub(crate) fn enforce_extended_batch_buffer_cap(
 /// Cap retained extended-protocol batch metadata that is not necessarily
 /// represented in `self.buffer`. Cached Parse skips append metadata but no
 /// backend-bound bytes, so the wire-buffer cap alone cannot bound memory.
-pub(crate) const EXTENDED_BATCH_METADATA_CAP: usize = EXTENDED_BATCH_BUFFER_CAP;
+/// Deliberately NOT tied to `EXTENDED_BATCH_BUFFER_CAP`: metadata grows only
+/// with the NUMBER of pipelined operations (tens of bytes each), never with
+/// payload size, so a large-payload allowance has no reason to loosen it.
+pub(crate) const EXTENDED_BATCH_METADATA_CAP: usize = 16 * 1024 * 1024;
 
 #[inline]
 fn extended_batch_metadata_bytes(batch_operations: usize, skipped_parses: usize) -> usize {
@@ -3367,9 +3375,30 @@ mod checkout_error_tests {
 #[cfg(test)]
 mod extended_batch_metadata_cap_tests {
     use super::{
-        enforce_extended_batch_metadata_cap, extended_batch_metadata_bytes,
-        EXTENDED_BATCH_METADATA_CAP,
+        enforce_extended_batch_buffer_cap, enforce_extended_batch_metadata_cap,
+        extended_batch_metadata_bytes, EXTENDED_BATCH_BUFFER_CAP, EXTENDED_BATCH_METADATA_CAP,
     };
+
+    #[test]
+    fn buffer_cap_admits_large_single_bind_but_rejects_unbounded_accumulation() {
+        // A file upload arrives as ONE large Bind (npgsql sends the bytea
+        // parameter inline; an attachment over ~10MB produced an 18_632_275-byte
+        // Bind in production) followed immediately by Sync. That legitimate
+        // message must fit under the pending-buffer cap.
+        enforce_extended_batch_buffer_cap(1108, 18_632_275, "Bind")
+            .expect("a single large Bind (file upload) must fit under the cap");
+
+        // A single wire message is itself bounded by MAX_MESSAGE_SIZE (256MB)
+        // at read time, so the cap equals that ceiling: only pipelining
+        // without Sync/Flush can exceed it.
+        assert_eq!(
+            EXTENDED_BATCH_BUFFER_CAP,
+            crate::messages::MAX_MESSAGE_SIZE as usize
+        );
+        let err = enforce_extended_batch_buffer_cap(EXTENDED_BATCH_BUFFER_CAP, 1, "Bind")
+            .expect_err("accumulation past the cap must still be rejected");
+        assert!(err.to_string().contains("pending buffer"));
+    }
 
     #[test]
     fn metadata_cap_rejects_skipped_parse_growth_before_synthetic_response_allocation() {
