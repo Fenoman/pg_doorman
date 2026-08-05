@@ -39,11 +39,20 @@ func Test_Prometheus(t *testing.T) {
 	}
 	assert.NoError(t, session.Close(ctx))
 
-	// Poll metrics endpoint with retries to allow exporter to update
-	body := fetchMetricsWithRetry(t, "http://127.0.0.1:9127/metrics", 60, 250*time.Millisecond)
-
 	// Common labels
 	user := "example_user_prometheus"
+
+	// Poll the metrics endpoint until the exporter has published pool data.
+	// The endpoint answers 200 as soon as the listener is up, but the pool
+	// gauges are refreshed by the stats collector every STAT_PERIOD (15s), so
+	// waiting for HTTP alone returns a body whose pool metrics are still zero.
+	// Budget covers more than two collector periods.
+	body := fetchMetricsWithRetry(t, "http://127.0.0.1:9127/metrics", 160, 250*time.Millisecond,
+		func(b string) bool {
+			v, ok := findMetricValue(b, "pg_doorman_pools_servers",
+				map[string]string{"database": "example_db", "user": user, "status": "idle"})
+			return ok && v > 0
+		})
 
 	// Existing checks
 	v1, ok := findMetricValue(body, "pg_doorman_connection_count", map[string]string{"type": "plain"})
@@ -99,18 +108,26 @@ func Test_Prometheus(t *testing.T) {
 }
 
 // fetchMetricsWithRetry GETs the metrics endpoint with retries and returns the body as string.
-func fetchMetricsWithRetry(t *testing.T, url string, attempts int, pause time.Duration) string {
+// `ready` decides whether the fetched body already carries the metrics the
+// caller needs; the last fetched body is returned when the budget runs out so
+// the caller's own assertions report the actual values.
+func fetchMetricsWithRetry(t *testing.T, url string, attempts int, pause time.Duration, ready func(string) bool) string {
 	client := &http.Client{Timeout: 2 * time.Second}
 	var lastErr error
+	var lastBody string
 	for i := 0; i < attempts; i++ {
 		resp, err := client.Get(url)
 		if err == nil && resp != nil && resp.StatusCode == 200 {
 			b, err := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if err == nil {
-				return string(b)
+				lastBody = string(b)
+				if ready == nil || ready(lastBody) {
+					return lastBody
+				}
+			} else {
+				lastErr = err
 			}
-			lastErr = err
 		} else if err != nil {
 			lastErr = err
 		} else if resp != nil {
@@ -118,6 +135,11 @@ func fetchMetricsWithRetry(t *testing.T, url string, attempts int, pause time.Du
 			_ = resp.Body.Close()
 		}
 		time.Sleep(pause)
+	}
+	if lastBody != "" {
+		// The endpoint responded but never reached the expected state; hand the
+		// body back so the caller's assertions show which metric stayed unset.
+		return lastBody
 	}
 	t.Fatalf("failed to fetch metrics from %s: %v", url, lastErr)
 	return ""
