@@ -85,6 +85,59 @@ pub async fn open_talos_session(
     world.named_sessions.insert(session_name, conn);
 }
 
+/// Opens a `user=talos` session expected to be refused, and asserts the
+/// rejection carries `expected`. Used for pg_hba gating of the user a token
+/// resolves to.
+#[when(
+    regex = r#"^opening a Talos session as client_id '([^']+)' role '([^']+)' database '([^']+)' signed with '([^']+)' is rejected with '([^']+)'$"#
+)]
+pub async fn open_talos_session_rejected(
+    world: &mut DoormanWorld,
+    client_id: String,
+    role: String,
+    database: String,
+    keypair_name: String,
+    expected: String,
+) {
+    let upper = keypair_name.to_uppercase();
+    let priv_path = world
+        .vars
+        .get(&format!("{upper}_PRIVKEY_PATH"))
+        .expect("keypair not generated; missing Given step")
+        .clone();
+    let kid = world
+        .vars
+        .get(&format!("{upper}_KID"))
+        .expect("kid not stored")
+        .clone();
+
+    let token = build_talos_jwt(&client_id, &role, &database, &priv_path, &kid);
+
+    let doorman_port = world.doorman_port.expect("pg_doorman not started");
+    let addr = format!("127.0.0.1:{doorman_port}");
+
+    let mut conn = PgConnection::connect(&addr)
+        .await
+        .expect("failed to connect to pg_doorman");
+    conn.send_startup("talos", &database)
+        .await
+        .expect("failed to send startup");
+
+    match conn.authenticate("talos", &token).await {
+        Ok(()) => panic!(
+            "Talos session for client_id '{client_id}' role '{role}' was admitted, \
+             expected rejection containing '{expected}'"
+        ),
+        Err(err) => {
+            let text = err.to_string();
+            assert!(
+                text.contains(&expected),
+                "unexpected Talos rejection: {text} (expected to contain '{expected}')"
+            );
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct BddTalosRoles<'a> {
     roles: Vec<&'a str>,

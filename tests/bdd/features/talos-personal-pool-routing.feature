@@ -200,3 +200,35 @@ Feature: Talos clientId pool routing
       """
     When we open Talos session 'c1' as client_id 'billing-api' role 'read_only' database 'example_db' signed with 'talos1'
     Then pg_doorman log contains "username=billing-api route=personal_pool"
+
+  @resolved-user-hba
+  Scenario: pg_hba reject on the resolved user blocks the session
+    Given pg_doorman started with config:
+      """
+      [general]
+      host = "127.0.0.1"
+      port = ${DOORMAN_PORT}
+      admin_username = "admin"
+      admin_password = "admin"
+      pg_hba.content = "host all talos 127.0.0.1/32 md5\nhost all billing-api 127.0.0.1/32 reject\nhost all all 127.0.0.1/32 trust"
+
+      [talos]
+      keys = ["${TALOS1_PUBKEY_PATH}"]
+      databases = ["example_db"]
+      resource_prefixes = ["postgres.local"]
+
+      [pools.example_db]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+
+      [[pools.example_db.users]]
+      username = "example_user_1"
+      password = ""
+      pool_size = 5
+
+      [[pools.example_db.users]]
+      username = "billing-api"
+      password = ""
+      pool_size = 5
+      """
+    When opening a Talos session as client_id 'billing-api' role 'owner' database 'example_db' signed with 'talos1' is rejected with '28000'

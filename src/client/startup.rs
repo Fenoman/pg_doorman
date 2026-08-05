@@ -10,6 +10,8 @@ use tokio::net::TcpStream;
 use crate::auth::hba::CheckResult;
 use crate::auth::talos::{extract_talos_token, log_talos_routing, resolve_talos_user};
 use crate::auth::{authenticate, OperatorManagedKeys};
+#[cfg(test)]
+use crate::config::check_hba_with_general;
 use crate::config::{check_hba, config_arc, get_config};
 use crate::errors::{ClientIdentifier, Error};
 use crate::messages::constants::*;
@@ -36,6 +38,38 @@ pub(crate) const PRE_AUTH_CLIENT_TIMEOUT: std::time::Duration = std::time::Durat
 
 fn is_admin_database(pool_name: &str) -> bool {
     matches!(pool_name, "pgdoorman" | "pgbouncer")
+}
+
+fn talos_hba_allowed(md5: CheckResult, scram: CheckResult) -> bool {
+    matches!(md5, CheckResult::Allow | CheckResult::Trust)
+        || matches!(scram, CheckResult::Allow | CheckResult::Trust)
+}
+
+/// Evaluate pg_hba for the user a Talos token resolved to. The token itself
+/// authenticates the literal `talos` user, but the session is then routed to a
+/// derived user (personal pool, service pool, or role); without this check a
+/// `reject` rule written for that user would never apply.
+fn talos_resolved_hba_checks(
+    transport: &ClientTransport,
+    username: &str,
+    pool_name: &str,
+) -> (CheckResult, CheckResult) {
+    (
+        check_hba(transport, "md5", username, pool_name),
+        check_hba(transport, "scram-sha-256", username, pool_name),
+    )
+}
+
+#[cfg(test)]
+fn talos_resolved_hba_allowed_with_general(
+    general: &crate::config::General,
+    transport: &ClientTransport,
+    username: &str,
+    pool_name: &str,
+) -> bool {
+    let md5 = check_hba_with_general(general, transport, "md5", username, pool_name);
+    let scram = check_hba_with_general(general, transport, "scram-sha-256", username, pool_name);
+    talos_hba_allowed(md5, scram)
 }
 
 fn merge_safe_client_startup_parameters(
@@ -483,8 +517,27 @@ where
                     crate::pool::pool_exists,
                 );
                 log_talos_routing(&token.client_id, pool_name.as_str(), token.role, &resolved);
+                // The token authenticated the literal `talos` user; gate the
+                // user it resolved to as well, so a pg_hba rule written for a
+                // personal/service pool or a role still applies.
+                let (resolved_hba_md5, resolved_hba_scram) =
+                    talos_resolved_hba_checks(&transport, &resolved.username, &pool_name);
+                if !talos_hba_allowed(resolved_hba_md5, resolved_hba_scram) {
+                    error_response_terminal(
+                        &mut write,
+                        "Talos user is not allowed by pg_hba rules.",
+                        "28000",
+                    )
+                    .await?;
+                    return Err(Error::AuthError(format!(
+                        "Talos user {} is not allowed by pg_hba for database {pool_name}",
+                        resolved.username
+                    )));
+                }
                 client_identifier.application_name = token.client_id.clone();
                 client_identifier.username = resolved.username;
+                client_identifier.hba_md5 = resolved_hba_md5;
+                client_identifier.hba_scram = resolved_hba_scram;
                 client_identifier.is_talos = true;
             }
         }
@@ -711,12 +764,42 @@ mod tests {
     use super::is_admin_database;
     use super::merge_safe_client_startup_parameters;
     use super::startup_with_auth_timeout;
+    use super::talos_resolved_hba_allowed_with_general;
     use super::{Client, ClientServerMap};
+    use crate::auth::hba::PgHba;
+    use crate::config::General;
     use crate::transport::ClientTransport;
     use bytes::{BufMut, BytesMut};
     use dashmap::DashMap;
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
+
+    // A Talos token authenticates the literal `talos` user, but the pooler then
+    // routes the session to a user derived from the token (personal pool,
+    // service pool, or role). pg_hba must gate that derived user too, otherwise
+    // a `reject` rule for it is silently bypassed.
+    #[test]
+    fn talos_resolved_user_is_checked_against_pg_hba() {
+        let general = General {
+            pg_hba: Some(PgHba::from_content(
+                "host all talos 127.0.0.1/32 md5\n\
+                 host all owner 127.0.0.1/32 reject\n\
+                 host all srv-billing 127.0.0.1/32 md5",
+            )),
+            ..General::default()
+        };
+        let peer = "127.0.0.1:54321".parse().unwrap();
+        let transport = ClientTransport::Tcp { peer, ssl: false };
+
+        assert!(
+            !talos_resolved_hba_allowed_with_general(&general, &transport, "owner", "db"),
+            "a derived Talos user rejected by pg_hba must not be admitted"
+        );
+        assert!(
+            talos_resolved_hba_allowed_with_general(&general, &transport, "srv-billing", "db"),
+            "a derived Talos user allowed by pg_hba must stay admitted"
+        );
+    }
 
     #[test]
     fn admin_database_detection_matches_reserved_names() {

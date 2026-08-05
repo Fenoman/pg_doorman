@@ -314,7 +314,13 @@ impl PgConnection {
                     }
                 }
                 'E' => {
-                    panic!("Error during auth: {:?}", String::from_utf8_lossy(&data));
+                    // Surface the ErrorResponse instead of panicking, so steps
+                    // that assert a refusal can inspect it. Callers that expect
+                    // success keep failing through their own `expect`.
+                    return Err(tokio::io::Error::other(format!(
+                        "Error during auth: {}",
+                        String::from_utf8_lossy(&data)
+                    )));
                 }
                 _ => {
                     println!("Received message during auth: {msg_type} {data:?}");
