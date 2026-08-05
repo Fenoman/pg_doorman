@@ -1632,15 +1632,22 @@ pub fn observe_backend_create_phase(phase: &'static str, seconds: f64) {
 /// that unit; the conversion to seconds happens once here, behind the
 /// inline call, so the hot path stays one division and one
 /// `with_label_values` lookup.
+///
+/// `pool` is the pool name (`Address::pool_name`), NOT
+/// `Address::database`: every call site passes the former. The exported
+/// Prometheus label is still spelled `database` - renaming it would break
+/// existing dashboards and alerts - so the parameter carries the accurate
+/// name while the wire format stays put. The same holds for the two
+/// sibling observers below.
 #[inline]
-pub fn observe_pool_query_microseconds(user: &str, database: &str, microseconds: u64) {
+pub fn observe_pool_query_microseconds(user: &str, pool: &str, microseconds: u64) {
     super::SHOW_POOLS_QUERY_DURATION_SECONDS
-        .with_label_values(&[user, database])
+        .with_label_values(&[user, pool])
         .observe(microseconds as f64 / 1_000_000.0);
     // tracker covers all three pool-latency HistogramVecs (query,
-    // transaction, wait) - they share `(user, db)` label shape so a
+    // transaction, wait) - they share the `(user, pool)` label shape so a
     // single sweep removes the dead series for all three at once.
-    POOL_LATENCY_KEYS.record(user, database);
+    POOL_LATENCY_KEYS.record(user, pool);
 }
 
 /// Phase 0: record a checkout whose parameter diff was empty (no SET round-trip).
@@ -1699,26 +1706,26 @@ pub fn observe_checkin_cleanup(
 /// representing a real transaction, and recording them would pull the
 /// histogram's lowest bucket toward background noise.
 #[inline]
-pub fn observe_pool_transaction_microseconds(user: &str, database: &str, microseconds: u64) {
+pub fn observe_pool_transaction_microseconds(user: &str, pool: &str, microseconds: u64) {
     if microseconds == 0 {
         return;
     }
     super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
-        .with_label_values(&[user, database])
+        .with_label_values(&[user, pool])
         .observe(microseconds as f64 / 1_000_000.0);
     // shared tracker - see `observe_pool_query_microseconds`.
-    POOL_LATENCY_KEYS.record(user, database);
+    POOL_LATENCY_KEYS.record(user, pool);
 }
 
 /// Observes one client checkout wait in the per-pool wait histogram.
 /// Same unit-conversion contract as `observe_pool_query_microseconds`.
 #[inline]
-pub fn observe_pool_wait_microseconds(user: &str, database: &str, microseconds: u64) {
+pub fn observe_pool_wait_microseconds(user: &str, pool: &str, microseconds: u64) {
     super::SHOW_POOLS_WAIT_DURATION_SECONDS
-        .with_label_values(&[user, database])
+        .with_label_values(&[user, pool])
         .observe(microseconds as f64 / 1_000_000.0);
     // shared tracker - see `observe_pool_query_microseconds`.
-    POOL_LATENCY_KEYS.record(user, database);
+    POOL_LATENCY_KEYS.record(user, pool);
 }
 
 /// Refreshes the trio of static info gauges: `build_info` (constant
