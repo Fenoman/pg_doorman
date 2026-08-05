@@ -746,10 +746,13 @@ where
                     return Ok(());
                 }
                 // surface per-pool cancel counter in SHOW POOLS.
-                // Look up the pool by identifier; if the pool was reloaded
-                // away while a cancel was in flight, skip the counter
-                // bump silently - the cancel still goes through.
-                if let Some(pool) = crate::pool::get_pool_by_id(&self.cached_pool_id) {
+                // The pool is resolved from the cancel target, not from this
+                // client: a cancel arrives on its own connection that never
+                // checks out a backend, so its `cached_pool_id` is an empty
+                // placeholder that matches nothing. If the pool was reloaded
+                // away while a cancel was in flight, skip the counter bump
+                // silently - the cancel still goes through.
+                if let Some(pool) = crate::pool::get_pool(&t.pool_name, &t.username) {
                     pool.address.stats.cancel_request();
                 }
                 t.clone()
@@ -5972,6 +5975,55 @@ mod sql_prepare_pin_release_tests {
         assert!(
             !client.complete_transaction_if_needed(&server, false),
             "session mode never hands the backend back mid-session"
+        );
+    }
+}
+
+/// The per-pool cancel counter must be attributable.
+///
+/// A CancelRequest arrives on a brand new connection that never checks out
+/// a backend, so `Client::cached_pool_id` is deliberately left at
+/// `PoolIdentifier::default()` (see the comment where a cancel client is
+/// built in `startup.rs`). Resolving the pool through that placeholder can
+/// never match a real entry, so `pg_doorman_pools_event_counters{kind=
+/// "cancel_requests"}` and the `SHOW POOLS` column behind it stayed at zero
+/// forever. The cancel map entry is the only thing that knows which pool
+/// owns the backend being cancelled, so it has to carry the user as well as
+/// the database.
+#[cfg(test)]
+#[cfg(unix)]
+mod cancel_counter_attribution_tests {
+    #[test]
+    fn cancel_path_does_not_resolve_the_pool_through_cached_pool_id() {
+        let src = include_str!("transaction.rs");
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let start = impl_src
+            .find("async fn handle_cancel_mode")
+            .expect("handle_cancel_mode not found");
+        let end = start
+            + impl_src[start..]
+                .find("\n    async fn try_handle_deferred_extended_begin")
+                .expect("end of handle_cancel_mode not found");
+        // Comments are stripped: the fix documents in prose exactly why
+        // `cached_pool_id` is the wrong handle here, and that prose must not
+        // read as a use of it.
+        let body: String = impl_src[start..end]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !body.contains("cached_pool_id"),
+            "a cancel client never checks out a backend, so its cached_pool_id \
+             is an empty placeholder that matches no pool - the counter bump \
+             must resolve the pool from the cancel target instead"
+        );
+        assert!(
+            body.contains("get_pool("),
+            "the cancel path must look the pool up by (database, user) taken \
+             from the cancel target"
         );
     }
 }

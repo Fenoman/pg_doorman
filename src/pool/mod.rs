@@ -65,6 +65,11 @@ pub struct CancelTarget {
     pub server_tls: Arc<tls::ServerTlsConfig>,
     pub connected_with_tls: bool,
     pub pool_name: String,
+    /// User of the pool that owns this backend. Recorded together with
+    /// `pool_name` because a CancelRequest arrives on its own connection
+    /// that never checks out a backend - this entry is the only thing that
+    /// can attribute the cancel to a pool.
+    pub username: String,
 }
 
 pub type ClientServerMap = Arc<DashMap<(ProcessId, SecretKey), CancelTarget>>;

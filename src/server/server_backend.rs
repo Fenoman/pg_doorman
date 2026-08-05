@@ -1973,6 +1973,7 @@ impl Server {
                 server_tls: self.address.server_tls.clone(),
                 connected_with_tls: self.connected_with_tls,
                 pool_name: self.address.pool_name.clone(),
+                username: self.address.username.clone(),
             },
         );
     }
@@ -4690,5 +4691,41 @@ mod tests {
                 "RESET TimeZone;SET application_name TO $pgdoorman0$svc$pgdoorman0$;"
             );
         }
+    }
+}
+
+/// The cancel map entry must identify the pool that owns the backend.
+///
+/// A CancelRequest arrives on a brand new connection that never checks out
+/// a backend, so the cancel client's `cached_pool_id` is deliberately left
+/// at `PoolIdentifier::default()`. That placeholder matches no pool, so the
+/// per-pool cancel counter behind `SHOW POOLS` and
+/// `pg_doorman_pools_event_counters{kind="cancel_requests"}` could never be
+/// attributed and stayed at zero forever. `claim` is the only production
+/// writer of that map, so the user has to be recorded here alongside the
+/// database.
+#[cfg(test)]
+#[cfg(unix)]
+mod cancel_target_attribution_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn claim_records_the_pool_that_owns_the_backend() {
+        let (mut server, _peer) = Server::test_silent_socket();
+        server.address.username = "app_user".to_string();
+        server.address.pool_name = "app_db".to_string();
+
+        server.claim(42, 4242);
+
+        let entry = server
+            .client_server_map
+            .get(&(42, 4242))
+            .expect("claim must record the cancel target");
+        assert_eq!(
+            crate::pool::PoolIdentifier::new(&entry.pool_name, &entry.username),
+            crate::pool::PoolIdentifier::new("app_db", "app_user"),
+            "the cancel target must identify the pool that owns the backend, \
+             otherwise the per-pool cancel counter cannot be attributed to it"
+        );
     }
 }

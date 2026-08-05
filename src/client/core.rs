@@ -1606,6 +1606,7 @@ mod cache_split_tests {
                 server_tls,
                 connected_with_tls: false,
                 pool_name: client.pool_name.clone(),
+                username: client.username.clone(),
             },
         );
 
@@ -1650,6 +1651,7 @@ mod cache_split_tests {
                 server_tls,
                 connected_with_tls: false,
                 pool_name: client.pool_name.clone(),
+                username: client.username.clone(),
             },
         );
         let key = (client.connection_id as i32, client.secret_key);
