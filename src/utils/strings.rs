@@ -46,12 +46,16 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// explicit `log_enabled!` guards are only useful on hot paths where
 /// avoiding the allocation matters.
 pub fn truncate_query_for_log(query: &str) -> String {
-    let cleaned = query.replace(['\n', '\r'], " ");
-    if cleaned.chars().count() <= LOG_QUERY_MAX_CHARS {
-        return cleaned;
+    // Inspect at most one character beyond the preview. SQL can contain large
+    // literals; neither their allocation nor a full scan belongs in an eviction.
+    let mut chars = query.chars();
+    let mut out = String::with_capacity(query.len().min(LOG_QUERY_MAX_CHARS * 4 + 3));
+    for c in chars.by_ref().take(LOG_QUERY_MAX_CHARS) {
+        out.push(if c == '\n' || c == '\r' { ' ' } else { c });
     }
-    let mut out = truncate_chars(&cleaned, LOG_QUERY_MAX_CHARS);
-    out.push_str("...");
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
     out
 }
 

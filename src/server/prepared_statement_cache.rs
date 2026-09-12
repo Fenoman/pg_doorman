@@ -1,6 +1,8 @@
 use dashmap::mapref::entry::Entry;
 use log::{info, log_enabled, trace, Level};
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -631,10 +633,14 @@ impl CacheEntryKind {
 
 /// Concurrent prepared statement cache using DashMap with approximate LRU eviction.
 ///
-/// This implementation provides lock-free reads and fine-grained locking for writes,
-/// significantly reducing contention compared to a global Mutex<LruCache>.
+/// Hits take only a shard read lock. Inserts serialize the bounded eviction
+/// index; they never force hits to acquire that mutex.
 pub struct PreparedStatementCache {
     cache: FastDashMap<u64, CacheEntry>,
+    /// Every live key appears exactly once. Rotating a small candidate window
+    /// makes eviction visit all entries over time without scanning the map.
+    /// Held before any shard write lock; hit paths never acquire this lock.
+    eviction_keys: Mutex<VecDeque<u64>>,
     /// Maximum number of entries in the cache
     max_size: usize,
     /// Global counter for LRU ordering
@@ -651,9 +657,10 @@ pub struct PreparedStatementCache {
     total_memory_bytes: AtomicU64,
 }
 
-/// Per-entry overhead independent of the Parse content (DashMap key + the
-/// CacheEntry record itself). Variable part is `parse.memory_usage()`.
-const ENTRY_OVERHEAD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<CacheEntry>();
+/// Per-entry overhead: DashMap key, eviction key, and CacheEntry record.
+/// Variable part is `parse.memory_usage()`.
+const ENTRY_OVERHEAD_BYTES: usize =
+    2 * std::mem::size_of::<u64>() + std::mem::size_of::<CacheEntry>();
 
 /// Byte cost of a single cache entry built around `parse`. Same shape as
 /// the original walk in `memory_usage` so the new incremental counter
@@ -694,6 +701,7 @@ impl PreparedStatementCache {
 
         PreparedStatementCache {
             cache: new_fast_dashmap_with_capacity(size, worker_threads),
+            eviction_keys: Mutex::new(VecDeque::with_capacity(size.saturating_add(1))),
             max_size: size,
             counter: AtomicU64::new(0),
             total_memory_bytes: AtomicU64::new(0),
@@ -757,6 +765,10 @@ impl PreparedStatementCache {
             CacheEntryKind::Named
         };
 
+        // Serialize cold mutations so the eviction index has no stale or
+        // duplicate keys. The fast path above remains independent of this lock.
+        let mut eviction_keys = self.eviction_keys.lock();
+
         // Re-check and insert under the shard write lock. Without the
         // `entry()` guard, two cold callers for the same hash could both
         // miss the fast path, overwrite the same DashMap slot, and both
@@ -793,11 +805,29 @@ impl PreparedStatementCache {
                 ));
                 self.total_memory_bytes
                     .fetch_add(inserted_bytes, Ordering::Relaxed);
+                eviction_keys.push_back(hash);
             }
         }
 
-        while self.cache.len() > self.max_size {
-            self.evict_oldest();
+        // With cold mutations serialized, a single insertion needs at most
+        // one eviction. Release the index lock before formatting a log line.
+        let evicted = if eviction_keys.len() > self.max_size {
+            self.evict_oldest(&mut eviction_keys)
+        } else {
+            None
+        };
+        let size = eviction_keys.len();
+        drop(eviction_keys);
+        if let Some((key, entry)) = evicted {
+            info!(
+                "Pool cache eviction: hash={:#x}, kind={}, name={}, query=\"{}\", size={}/{}",
+                key,
+                entry.kind().as_str(),
+                entry.parse.name,
+                truncate_query_for_log(entry.parse.query()),
+                size,
+                self.max_size,
+            );
         }
 
         new_parse
@@ -895,91 +925,39 @@ impl PreparedStatementCache {
         }
     }
 
-    /// Evict the oldest entry from the cache (approximate LRU).
-    ///
-    /// sampled approximate LRU instead of a full O(N)
-    /// scan. Default `max_size = 8192`; under churn workloads
-    /// (heterogeneous SaaS clients, ORMs that auto-prepare unique
-    /// names) every Parse past steady-state used to walk all 8192
-    /// entries to find the lowest `count_used`. At 10k Parse/sec
-    /// this was 80M atomic loads + comparisons per second on the
-    /// cache hot path. Sampling K=8 random entries picks the
-    /// oldest among them with O(K) cost - provably close to true
-    /// LRU for K ≥ ln(max_size) under uniform access. Falls back
-    /// to full scan when the cache is small.
-    fn evict_oldest(&self) {
+    /// Evict the least recently used entry from a rotating window of eight.
+    /// Up to 32 eviction candidates retain exact LRU selection. Each large
+    /// cache eviction does eight point lookups and rotates at most seven keys,
+    /// independent of cache size. Survivors move behind the unsampled entries
+    /// so all keys remain eligible, including entries in later DashMap shards.
+    fn evict_oldest(&self, keys: &mut VecDeque<u64>) -> Option<(u64, CacheEntry)> {
         const SAMPLE_SIZE: usize = 8;
         const FULL_SCAN_THRESHOLD: usize = SAMPLE_SIZE * 4;
-
-        let mut oldest_key: Option<u64> = None;
-        let mut oldest_time = u64::MAX;
-
-        let len = self.cache.len();
-        if len <= FULL_SCAN_THRESHOLD {
-            // Small cache - full scan is cheaper than sampling overhead.
-            for entry in self.cache.iter() {
-                let cu = entry.count_used.load(Ordering::Relaxed);
-                if cu < oldest_time {
-                    oldest_time = cu;
-                    oldest_key = Some(*entry.key());
-                }
-            }
+        let sample_count = if keys.len() <= FULL_SCAN_THRESHOLD {
+            keys.len()
         } else {
-            // Sample SAMPLE_SIZE entries via a single scan that stops
-            // early. DashMap iteration order is shard-then-bucket which
-            // already approximates random against insertion-order
-            // `count_used`. To avoid bias toward the first shard, use
-            // the count_used counter as a poor-man's RNG seed.
-            let seed = self.counter.load(Ordering::Relaxed) as usize;
-            let stride = (len / SAMPLE_SIZE).max(1);
-            let start = seed % stride.max(1);
-            let mut sampled = 0;
-            for (i, entry) in self.cache.iter().enumerate() {
-                if i < start {
-                    continue;
-                }
-                if (i - start) % stride == 0 {
-                    let cu = entry.count_used.load(Ordering::Relaxed);
-                    if cu < oldest_time {
-                        oldest_time = cu;
-                        oldest_key = Some(*entry.key());
-                    }
-                    sampled += 1;
-                    if sampled >= SAMPLE_SIZE {
-                        break;
-                    }
-                }
-            }
-            // Fallback: if sampling somehow saw nothing (e.g.,
-            // concurrent removals), do one full pass to guarantee
-            // forward progress so the size-bounded loop terminates.
-            if oldest_key.is_none() {
-                for entry in self.cache.iter() {
-                    let cu = entry.count_used.load(Ordering::Relaxed);
-                    if cu < oldest_time {
-                        oldest_time = cu;
-                        oldest_key = Some(*entry.key());
-                    }
-                }
-            }
+            SAMPLE_SIZE
+        };
+        let oldest_index = keys
+            .iter()
+            .take(sample_count)
+            .enumerate()
+            .min_by_key(|(_, key)| {
+                self.cache
+                    .get(*key)
+                    .expect("eviction index must contain only live keys")
+                    .count_used
+                    .load(Ordering::Relaxed)
+            })
+            .map(|(index, _)| index)?;
+        let key = keys.remove(oldest_index)?;
+        keys.rotate_left(sample_count - 1);
+        let removed = self.cache.remove(&key);
+        if let Some((_, entry)) = &removed {
+            self.total_memory_bytes
+                .fetch_sub(entry_bytes(&entry.parse), Ordering::Relaxed);
         }
-
-        // Remove the selected entry
-        if let Some(key) = oldest_key {
-            if let Some((_, entry)) = self.cache.remove(&key) {
-                self.total_memory_bytes
-                    .fetch_sub(entry_bytes(&entry.parse), Ordering::Relaxed);
-                info!(
-                    "Pool cache eviction: hash={:#x}, kind={}, name={}, query=\"{}\", size={}/{}",
-                    key,
-                    entry.kind().as_str(),
-                    entry.parse.name,
-                    truncate_query_for_log(entry.parse.query()),
-                    self.cache.len(),
-                    self.max_size,
-                );
-            }
-        }
+        removed
     }
 }
 
@@ -1016,8 +994,7 @@ mod tests {
         h.finish()
     }
 
-    /// Concurrent inserts may temporarily overshoot max_size by the number
-    /// of concurrent inserters, but must not grow without bound.
+    /// Concurrent inserts retain an exact live-key index and byte total.
     #[test]
     fn concurrent_inserts_bounded_overshoot() {
         let max = 50;
@@ -1046,14 +1023,64 @@ mod tests {
             h.join().unwrap();
         }
 
-        let final_size = cache.len();
-        // Overshoot is bounded by the number of concurrent threads.
-        // Without the fix, this was 160 (3.2x max_size).
-        let allowed = max + threads;
-        assert!(
-            final_size <= allowed,
-            "cache size {final_size} exceeded allowed {allowed} (max_size {max} + {threads} threads)",
-        );
+        assert_eq!(cache.len(), max);
+        let keys = cache.eviction_keys.lock();
+        assert_eq!(keys.len(), max);
+        let unique: std::collections::HashSet<_> = keys.iter().copied().collect();
+        assert_eq!(unique.len(), max);
+        assert!(keys.iter().all(|key| cache.cache.contains_key(key)));
+        let walk: usize = cache
+            .cache
+            .iter()
+            .map(|e| entry_bytes(&e.parse) as usize)
+            .sum();
+        assert_eq!(cache.memory_usage(), walk);
+    }
+
+    #[test]
+    fn eviction_revisits_survivors_and_preserves_recent_hits() {
+        let size = 128;
+        let cache = PreparedStatementCache::new(size, 4);
+        let parses: Vec<_> = (0..size * 9)
+            .map(|i| make_parse("stmt", &format!("SELECT {i}")))
+            .collect();
+        for (i, parse) in parses.iter().take(size).enumerate() {
+            cache.get_or_insert(parse, i as u64, Some("stmt"));
+        }
+        for (i, parse) in parses.iter().enumerate().skip(size) {
+            for (hot, parse) in parses.iter().take(4).enumerate() {
+                cache.get_or_insert(parse, hot as u64, Some("stmt"));
+            }
+            cache.get_or_insert(parse, i as u64, Some("stmt"));
+            for hot in 0..4 {
+                assert!(
+                    cache.lookup_by_hash(hot).is_some(),
+                    "hot entry {hot} was evicted"
+                );
+            }
+            assert_eq!(cache.len(), size);
+        }
+        for cold in 4..size {
+            assert!(
+                cache.lookup_by_hash(cold as u64).is_none(),
+                "cold entry {cold} was never reconsidered"
+            );
+        }
+    }
+
+    #[test]
+    fn collision_replacement_does_not_duplicate_eviction_keys() {
+        let cache = PreparedStatementCache::new(2, 1);
+        for i in 0..100 {
+            cache.get_or_insert(&make_parse("stmt", &format!("SELECT {i}")), 1, Some("stmt"));
+        }
+        cache.get_or_insert(&make_parse("stmt", "SELECT 101"), 2, Some("stmt"));
+        cache.get_or_insert(&make_parse("stmt", "SELECT 102"), 3, Some("stmt"));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.eviction_keys.lock().len(), 2);
+        assert!(cache.lookup_by_hash(1).is_none());
+        assert!(cache.lookup_by_hash(2).is_some());
+        assert!(cache.lookup_by_hash(3).is_some());
     }
 
     #[test]

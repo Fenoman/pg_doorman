@@ -93,5 +93,37 @@ fn bench_memory_usage(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_memory_usage);
+/// Exercise steady-state eviction with a bounded query set, so interning does
+/// not grow without limit during Criterion's calibration. The warm-hit control
+/// catches regressions from adding synchronization to cache lookups.
+fn bench_pool_cache(c: &mut Criterion) {
+    use pg_doorman::server::PreparedStatementCache as PoolCache;
+
+    let mut group = c.benchmark_group("pool_prepared_cache");
+    group.throughput(Throughput::Elements(1));
+    for size in [32usize, 1024, 8192] {
+        let parses: Vec<_> = (0..size * 2)
+            .map(|i| Parse::from_parts(&format!("SELECT {i}"), &[]))
+            .collect();
+        let cache = PoolCache::new(size, 2);
+        for (i, parse) in parses.iter().take(size).enumerate() {
+            cache.get_or_insert(parse, i as u64, None);
+        }
+        group.bench_with_input(BenchmarkId::new("warm_hit", size), &size, |b, _| {
+            b.iter(|| std::hint::black_box(cache.get_or_insert(&parses[0], 0, None)))
+        });
+        let mut next = size;
+        group.bench_with_input(BenchmarkId::new("churn", size), &size, |b, _| {
+            b.iter(|| {
+                let i = next % parses.len();
+                next += 1;
+                std::hint::black_box(cache.get_or_insert(&parses[i], i as u64, None))
+            })
+        });
+        assert!(cache.len() <= size);
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_memory_usage, bench_pool_cache);
 criterion_main!(benches);
