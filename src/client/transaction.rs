@@ -46,6 +46,42 @@ fn checkout_resource_exhausted_client_message(_detail: &str) -> &'static str {
     "Connection pooler local resource exhausted. Please try again later."
 }
 
+/// Watch an idle frontend only after checkout actually has to wait. An
+/// immediately available backend keeps the existing single-poll hot path.
+/// Dropping a pending checkout lets its handoff guard return any late delivery
+/// without dispatching the disconnected client's query on a warm backend.
+async fn checkout_or_client_disconnect<R, F>(
+    read: &mut tokio::io::BufReader<R>,
+    checkout: F,
+) -> Result<F::Output, Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: Future,
+{
+    let mut checkout = std::pin::pin!(checkout);
+    if let Poll::Ready(result) = poll_fn(|cx| Poll::Ready(checkout.as_mut().poll(cx))).await {
+        return Ok(result);
+    }
+
+    tokio::select! {
+        biased;
+        client_read = read.fill_buf() => {
+            match client_read {
+                Ok([]) => Err(Error::SocketError(
+                    "client disconnected while waiting for a backend".to_string(),
+                )),
+                // Preserve pipelined bytes. EOF behind accepted frontend
+                // traffic cannot be observed without consuming that traffic.
+                Ok(_) => Ok(checkout.await),
+                Err(err) => Err(Error::SocketError(format!(
+                    "Error reading from client while waiting for a backend: {err:?}"
+                ))),
+            }
+        }
+        result = &mut checkout => Ok(result),
+    }
+}
+
 fn append_pooler_check_query_response(response: &mut BytesMut, bytes: &[u8]) -> Result<(), String> {
     let next_len = response
         .len()
@@ -2113,7 +2149,16 @@ where
                 let connecting_at = now();
                 self.stats.waiting();
                 let mut conn = loop {
-                    match current_pool.database.get().await {
+                    let checkout = match checkout_or_client_disconnect(
+                        &mut self.read,
+                        current_pool.database.get(),
+                    )
+                    .await
+                    {
+                        Ok(checkout) => checkout,
+                        Err(err) => return self.process_error(err).await,
+                    };
+                    match checkout {
                         Ok(mut conn) => {
                             // shard-local atomic consume of the
                             // cancel-quarantine marker; only one client wins
@@ -5174,7 +5219,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
             .find(".try_handle_without_server(&message, current_pool, query_start_at)")
             .expect("no-server fast-path call not found");
         let checkout = handle
-            .find("match current_pool.database.get().await")
+            .find("current_pool.database.get()")
             .expect("backend checkout not found");
         assert!(
             intercept_call < checkout,
@@ -5759,6 +5804,64 @@ mod relay_response_client_write_failure_tests {
         frame.extend_from_slice(&(body.len() as i32 + 4).to_be_bytes());
         frame.extend_from_slice(body);
         frame
+    }
+
+    #[tokio::test]
+    async fn checkout_ready_backend_does_not_read_frontend() {
+        let (socket, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let mut read = BufReader::new(socket);
+        assert_eq!(
+            checkout_or_client_disconnect(&mut read, std::future::ready(42))
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_disconnect_cancels_pending_delivery() {
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let mut read = BufReader::new(socket);
+        let (deliver, receive) = tokio::sync::oneshot::channel::<u32>();
+        let mut checkout = std::pin::pin!(checkout_or_client_disconnect(&mut read, receive));
+        assert!(matches!(futures::poll!(&mut checkout), Poll::Pending));
+        peer.shutdown().await.unwrap();
+        assert!(matches!(checkout.await, Err(Error::SocketError(_))));
+        assert!(
+            deliver.send(42).is_err(),
+            "closed waiter must leave the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_disconnect_wins_over_late_ready_delivery() {
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let mut read = BufReader::new(socket);
+        let (deliver, receive) = tokio::sync::oneshot::channel::<u32>();
+        let mut checkout = std::pin::pin!(checkout_or_client_disconnect(&mut read, receive));
+        assert!(matches!(futures::poll!(&mut checkout), Poll::Pending));
+        deliver.send(42).unwrap();
+        peer.shutdown().await.unwrap();
+        assert!(matches!(checkout.await, Err(Error::SocketError(_))));
+    }
+
+    #[tokio::test]
+    async fn checkout_preserves_pipelined_frontend_bytes() {
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let mut read = BufReader::new(socket);
+        let next_query = backend_frame(b'Q', b"SELECT 84\0");
+        peer.write_all(&next_query).await.unwrap();
+        let (deliver, receive) = tokio::sync::oneshot::channel::<u32>();
+        {
+            let mut checkout = std::pin::pin!(checkout_or_client_disconnect(&mut read, receive));
+            assert!(matches!(futures::poll!(&mut checkout), Poll::Pending));
+            deliver.send(42).unwrap();
+            assert_eq!(checkout.await.unwrap().unwrap(), 42);
+        }
+        let mut preserved = vec![0; next_query.len()];
+        read.read_exact(&mut preserved).await.unwrap();
+        assert_eq!(preserved, next_query);
     }
 
     #[tokio::test]
