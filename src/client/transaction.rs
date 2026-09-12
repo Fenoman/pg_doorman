@@ -1455,6 +1455,14 @@ where
         // Add the sync/flush message to buffer
         self.buffer.put(&message[..]);
 
+        if server.in_copy_mode() {
+            // COPY IN consumes Flush and Sync without replying. Forward any
+            // buffered CopyData with the control frame and keep reading the
+            // client; extended-batch handling would drop rows or wait forever.
+            self.flush_copy_buffer_with_timeout(server).await?;
+            return Ok(TransactionAction::Continue);
+        }
+
         if code == 'H' {
             let was_async = server.is_async();
             // For Flush, enter async mode
@@ -5654,6 +5662,51 @@ mod relay_response_client_write_failure_tests {
             .push(BatchOperation::ParseSkipped {
                 statement_name: Arc::from("cached"),
             });
+    }
+
+    async fn copy_control_preserves_buffered_data(code: u8, extended: bool) {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.in_copy_mode = true;
+        server.set_async_mode(extended);
+        client.prepared.copy_from_extended = extended;
+        let data = BytesMut::from(&b"d\0\0\0\x067\n"[..]);
+        client.handle_copy_data(&data, &mut server).await.unwrap();
+
+        let control = BytesMut::from(&[code, 0, 0, 0, 4][..]);
+        let action = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.handle_sync_flush(&control, &mut server, now(), code as char),
+        )
+        .await
+        .expect("COPY control must not wait for a backend response")
+        .unwrap();
+        assert!(matches!(action, TransactionAction::Continue));
+
+        let mut forwarded_data = [0; 7];
+        tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut forwarded_data))
+            .await
+            .expect("COPY control discarded the buffered row")
+            .unwrap();
+        assert_eq!(forwarded_data, &data[..]);
+        assert!(client.write.bytes.is_empty());
+        assert!(server.in_copy_mode());
+        assert_eq!(server.is_async(), extended);
+        assert_eq!(client.prepared.copy_from_extended, extended);
+    }
+
+    #[tokio::test]
+    async fn copy_flush_preserves_buffered_rows_without_waiting_for_response() {
+        for extended in [false, true] {
+            copy_control_preserves_buffered_data(b'H', extended).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_sync_preserves_buffered_rows_without_waiting_for_response() {
+        for extended in [false, true] {
+            copy_control_preserves_buffered_data(b'S', extended).await;
+        }
     }
 
     #[tokio::test]
