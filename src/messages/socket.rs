@@ -499,6 +499,34 @@ where
     Ok(buf.split())
 }
 
+/// Append an opaque backend frame directly to the accumulated response.
+/// The caller has already checked the upper frame-size bound.
+pub(crate) async fn read_message_body_append<S>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    code: u8,
+    len: i32,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + std::marker::Unpin,
+{
+    if len < 4 {
+        return Err(Error::ProtocolSyncError(format!(
+            "Message length is too small: {len}"
+        )));
+    }
+
+    let previous_len = buf.len();
+    buf.reserve(len as usize + 1);
+    buf.put_u8(code);
+    buf.put_i32(len);
+    if let Err(err) = read_message_body_into_reuse_buf(stream, buf, code, len as usize - 4).await {
+        buf.truncate(previous_len);
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Read message body into a reusable buffer when header is already consumed.
 /// Used by server recv() loop where read_message_header() is called separately.
 /// Same amortized allocation semantics as read_message_reuse, but skips header read.
@@ -1148,6 +1176,29 @@ mod tests {
     // =========================================================================
     // read_message_body_reuse — server-side path
     // =========================================================================
+
+    #[tokio::test]
+    async fn body_append_preserves_prefix_and_stops_at_frame_boundary() {
+        let mut stream = Cursor::new(b"firstsecond".to_vec());
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+        read_message_body_append(&mut stream, &mut buf, b'D', 9)
+            .await
+            .unwrap();
+        read_message_body_append(&mut stream, &mut buf, b'd', 10)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..], b"prefixD\0\0\0\x09firstd\0\0\0\x0asecond");
+        assert_eq!(stream.position(), 11);
+    }
+
+    #[tokio::test]
+    async fn body_append_discards_incomplete_frame_and_keeps_prior_response() {
+        let mut stream = Cursor::new(b"partial".to_vec());
+        let mut buf = BytesMut::from(&b"prior response"[..]);
+        let result = read_message_body_append(&mut stream, &mut buf, b'D', 20).await;
+        assert!(result.is_err());
+        assert_eq!(&buf[..], b"prior response");
+    }
 
     /// Standard CommandComplete read when header is already consumed by recv().
     #[tokio::test]

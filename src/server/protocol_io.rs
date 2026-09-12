@@ -46,6 +46,7 @@ use tokio::time::timeout;
 use crate::config::config_arc;
 use crate::errors::Error;
 use crate::errors::Error::MaxMessageSize;
+use crate::messages::socket::read_message_body_append;
 use crate::messages::PgErrorMsg;
 use crate::messages::MAX_MESSAGE_SIZE;
 use crate::messages::{
@@ -998,6 +999,36 @@ where
             return Err(MaxMessageSize);
         }
 
+        // Row and COPY payloads need no inspection. Read them directly into
+        // the response batch, avoiding a temporary split and a second copy
+        // for every row. The large-frame streaming paths above are unchanged.
+        if matches!(code_u8, b'D' | b'd') {
+            if let Err(err) = read_message_body_append(
+                &mut *server.stream,
+                &mut server.buffer,
+                code_u8,
+                message_len,
+            )
+            .await
+            {
+                error!(
+                    "[{}@{}] server connection terminated pid={}: {err}",
+                    server.address.username,
+                    server.address.pool_name,
+                    server.get_process_id(),
+                );
+                server.mark_bad(format!("Failed to read message data: {err}").as_str());
+                return Err(err);
+            }
+            if code_u8 == b'D' {
+                server.data_available = true;
+            }
+            if server.buffer.len() >= flush_threshold {
+                break;
+            }
+            continue;
+        }
+
         // Read body into per-connection reusable buffer (header already consumed above).
         // per-iter `stats.wait_idle()` dropped - the
         // `WaitIdleOnDrop` guard above restores idle once the recv
@@ -1074,17 +1105,6 @@ where
                 handle_parameter_status(server, &mut message, &mut client_server_parameters)?;
             }
 
-            // DataRow
-            'D' => {
-                // More data is available after this message, this is not the end of the reply.
-                server.data_available = true;
-
-                // Don't flush yet, the more we buffer, the faster this goes...up to a limit.
-                if server.buffer.len() >= flush_threshold {
-                    break;
-                }
-            }
-
             // CopyInResponse: copy is starting from client to server.
             'G' => {
                 server.in_copy_mode = true;
@@ -1120,14 +1140,6 @@ where
                 // next recv() short-circuit on expected_responses == 0 and
                 // left CopyData unread on the backend socket.
                 break;
-            }
-
-            // CopyData
-            'd' => {
-                // Don't flush yet, buffer until we reach limit
-                if server.buffer.len() >= flush_threshold {
-                    break;
-                }
             }
 
             // CopyDone
