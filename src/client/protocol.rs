@@ -106,10 +106,7 @@ fn disabled_parse_name_and_query(message: &BytesMut) -> Option<(String, &[u8], u
     let query_nul = message[query_start..].iter().position(|&byte| byte == 0)? + query_start;
     let params_start = query_nul + 1;
     let num_params_bytes = message.get(params_start..params_start + 2)?;
-    let num_params = i16::from_be_bytes([num_params_bytes[0], num_params_bytes[1]]);
-    if num_params < 0 {
-        return None;
-    }
+    let num_params = u16::from_be_bytes([num_params_bytes[0], num_params_bytes[1]]);
     let params_len = (num_params as usize).checked_mul(4)?;
     if params_start + 2 + params_len != message.len() {
         return None;
@@ -1757,6 +1754,19 @@ mod anonymous_close_tests {
             Some(SetCleanupCommand::SetSessionAuthorization),
             "prepared_statements=false must still attribute unnamed extended SET SESSION AUTHORIZATION"
         );
+    }
+
+    #[test]
+    fn disabled_parse_reader_accepts_unsigned_parameter_counts() {
+        for count in [32_767usize, 32_768, 65_535] {
+            let query = format!("SELECT ${count}::int");
+            let frame = make_parse("bulk", &query, &vec![23; count]);
+            let (name, sql, declared) =
+                disabled_parse_name_and_query(&frame).expect("valid Parse parameter count");
+            assert_eq!(name, "bulk");
+            assert_eq!(sql, query.as_bytes());
+            assert_eq!(declared, count);
+        }
     }
 
     #[tokio::test]

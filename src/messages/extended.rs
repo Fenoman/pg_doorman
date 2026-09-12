@@ -199,7 +199,7 @@ pub struct Parse {
     /// Query text stored as Arc<str> for efficient sharing between clients.
     /// Even when Arc<Parse> is evicted from pool cache, the query text remains shared.
     query: Arc<str>,
-    num_params: i16,
+    num_params: u16,
     param_types: Vec<i32>,
 }
 
@@ -226,16 +226,8 @@ impl TryFrom<&BytesMut> for Parse {
                 "Parse message truncated before num_params".to_string(),
             ));
         }
-        let num_params = cursor.get_i16();
-        // a hostile authenticated client can send `num_params = i16::MIN`.
-        // The cast `num_params as usize` in `TryFrom<Parse> for BytesMut`
-        // would sign-extend to a huge value and overflow length arithmetic.
-        // Reject negative counts at decode time.
-        if num_params < 0 {
-            return Err(Error::ParseBytesError(format!(
-                "Parse declared negative num_params: {num_params}"
-            )));
-        }
+        // PostgreSQL uses the full unsigned 16-bit range for this count.
+        let num_params = cursor.get_u16();
         // Each param_type is 4 bytes; bound-check before the read loop so
         // `Buf::get_i32` cannot panic on EOF.
         let needed = (num_params as usize) * 4;
@@ -292,7 +284,7 @@ impl TryFrom<Parse> for BytesMut {
         bytes.put_i32(checked_msg_len_i32(len)?);
         bytes.put_slice(name);
         bytes.put_slice(query);
-        bytes.put_i16(parse.num_params);
+        bytes.put_u16(parse.num_params);
         for param in parse.param_types {
             bytes.put_i32(param);
         }
@@ -372,7 +364,7 @@ impl Parse {
             let mut hasher = Xxh3::default();
 
             hasher.write(self.query.as_bytes());
-            hasher.write_i16(self.num_params);
+            hasher.write_u16(self.num_params);
             hasher.write(self.param_types.as_slice().as_bytes());
 
             hasher.finish()
@@ -381,7 +373,7 @@ impl Parse {
             let mut hasher = DefaultHasher::new();
 
             hasher.write(self.query.as_bytes());
-            hasher.write_i16(self.num_params);
+            hasher.write_u16(self.num_params);
             hasher.write(self.param_types.as_slice().as_bytes());
 
             hasher.finish()
@@ -401,14 +393,14 @@ impl Parse {
         if self.query.len() >= 64 {
             let mut hasher = Xxh3::default();
             hasher.write(self.query.as_bytes());
-            hasher.write_i16(self.num_params);
+            hasher.write_u16(self.num_params);
             hasher.write(self.param_types.as_slice().as_bytes());
             hasher.write_u64(planner_param_hash);
             hasher.finish()
         } else {
             let mut hasher = DefaultHasher::new();
             hasher.write(self.query.as_bytes());
-            hasher.write_i16(self.num_params);
+            hasher.write_u16(self.num_params);
             hasher.write(self.param_types.as_slice().as_bytes());
             hasher.write_u64(planner_param_hash);
             hasher.finish()
@@ -451,7 +443,7 @@ impl Parse {
     /// client somehow declared parameters on a statement that should have
     /// none (shape mismatch with the substitute query).
     #[inline]
-    pub fn num_params(&self) -> i16 {
+    pub fn num_params(&self) -> u16 {
         self.num_params
     }
 
@@ -463,7 +455,7 @@ impl Parse {
             len: 0, // not used for cache registration
             name: String::new(),
             query: Arc::from(query),
-            num_params: param_types.len() as i16,
+            num_params: param_types.len() as u16,
             param_types: param_types.to_vec(),
         }
     }
@@ -498,7 +490,7 @@ impl Parse {
         bytes.put_i32(checked_msg_len_i32(len)?);
         bytes.put_slice(name_bytes);
         bytes.put_slice(query_bytes);
-        bytes.put_i16(self.num_params);
+        bytes.put_u16(self.num_params);
         for param in &self.param_types {
             bytes.put_i32(*param);
         }
@@ -1576,7 +1568,7 @@ mod tests {
         let body_len = 4 // length field itself
             + name.len() + 1 // name + NUL
             + query.len() + 1 // query + NUL
-            + 2 // num_params (i16)
+            + 2 // num_params (u16)
             + 4 * param_types.len(); // param OIDs (i32 each)
         let mut buf = BytesMut::with_capacity(1 + body_len);
         buf.put_u8(b'P');
@@ -1585,7 +1577,7 @@ mod tests {
         buf.put_u8(0);
         buf.put_slice(query);
         buf.put_u8(0);
-        buf.put_i16(param_types.len() as i16);
+        buf.put_u16(param_types.len() as u16);
         for pt in param_types {
             buf.put_i32(*pt);
         }
@@ -1637,6 +1629,36 @@ mod tests {
         assert_eq!(forwarded.name, "DOORMAN_123");
         assert_eq!(forwarded.query(), query);
         assert_eq!(forwarded.param_types(), param_types);
+    }
+
+    #[test]
+    fn parse_roundtrips_unsigned_parameter_counts() {
+        for count in [32_767usize, 32_768, 65_535] {
+            let query = format!("SELECT ${count}::int");
+            let param_types = vec![23; count];
+            let buf = make_parse("bulk", &query, &param_types);
+            let parse = Parse::try_from(&buf).expect("valid Parse parameter count");
+            assert_eq!(parse.num_params() as usize, count);
+
+            let restored = Parse::from_parts(&query, &param_types);
+            assert_eq!(restored.get_hash(), parse.get_hash());
+            for (name, encoded) in [
+                ("bulk", BytesMut::try_from(parse.clone()).unwrap()),
+                (
+                    "DOORMAN_123",
+                    parse.to_bytes_with_name("DOORMAN_123").unwrap(),
+                ),
+                ("", BytesMut::try_from(restored).unwrap()),
+            ] {
+                let declared = i32::from_be_bytes(encoded[1..5].try_into().unwrap());
+                assert_eq!(declared as usize + 1, encoded.len());
+                let forwarded = Parse::try_from(&encoded).unwrap();
+                assert_eq!(forwarded.name, name);
+                assert_eq!(forwarded.query(), query);
+                assert_eq!(forwarded.num_params() as usize, count);
+                assert_eq!(forwarded.param_types(), param_types);
+            }
+        }
     }
 
     #[test]

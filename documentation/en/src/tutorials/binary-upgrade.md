@@ -469,6 +469,13 @@ If validation fails, the current process keeps serving traffic. If the
 new process already took over, treat the rollback as a normal binary
 upgrade in the opposite direction.
 
+The target binary must also understand the current prepared-statement state.
+Binaries that decode Parse parameter counts as signed 16-bit integers cannot
+import cached statements with 32,768–65,535 explicit parameter types. If such
+statements have been used, rollback to one of those binaries requires allowing
+affected clients to reconnect. Migration from an older binary to one supporting
+the full unsigned count range preserves the existing state format.
+
 Avoid `systemctl restart` or `SIGTERM` for rollback unless reconnects
 are acceptable: both close client sessions instead of migrating them.
 

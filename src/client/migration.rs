@@ -595,9 +595,9 @@ fn serialize_prepared_state(
             )));
         }
         let param_types = cached.parse.param_types();
-        let param_count = i16::try_from(param_types.len()).map_err(|_| {
+        let param_count = u16::try_from(param_types.len()).map_err(|_| {
             Error::ClientError(format!(
-                "migration: param type count {} exceeds i16 frame limit",
+                "migration: param type count {} exceeds u16 frame limit",
                 param_types.len()
             ))
         })?;
@@ -627,7 +627,7 @@ fn serialize_prepared_state(
         buf.put_u64(cached.hash);
         buf.put_u32(query.len() as u32);
         buf.put_slice(query.as_bytes());
-        buf.put_i16(param_count);
+        buf.put_u16(param_count);
         for &pt in param_types {
             buf.put_i32(pt);
         }
@@ -751,13 +751,7 @@ fn deserialize_state(mut buf: BytesMut) -> Result<DeserializedState, Error> {
         let query = String::from_utf8(query_bytes)
             .map_err(|_| Error::ClientError("bad query utf8".into()))?;
         require(&buf, 2)?; // num_params
-        let num_params_raw = buf.get_i16();
-        if num_params_raw < 0 {
-            return Err(Error::ClientError(format!(
-                "migration: negative prepared param count {num_params_raw}"
-            )));
-        }
-        let num_params = num_params_raw as usize;
+        let num_params = buf.get_u16() as usize;
         let param_bytes = num_params.checked_mul(4).ok_or_else(|| {
             Error::ClientError("migration: prepared param byte count overflow".into())
         })?;
@@ -2155,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_rejects_negative_prepared_param_count() {
+    fn deserialize_rejects_truncated_prepared_param_types() {
         let mut buf = BytesMut::new();
         buf.put_u32(MIGRATION_MAGIC);
         buf.put_u16(MIGRATION_VERSION);
@@ -2182,7 +2176,7 @@ mod tests {
         let query = "SELECT 1";
         buf.put_u32(query.len() as u32);
         buf.put_slice(query.as_bytes());
-        buf.put_i16(-1); // invalid negative num_params
+        buf.put_u16(u16::MAX); // count is valid, but all parameter OIDs are missing
 
         assert!(deserialize_state(buf).is_err());
     }
@@ -2822,6 +2816,36 @@ mod tests {
         assert!(serialized.contains("SELECT 42"));
         assert!(!serialized.contains("SELECT 1"));
         assert!(!serialized.contains("discard_all"));
+    }
+
+    #[test]
+    fn prepared_state_roundtrips_unsigned_parameter_counts() {
+        for count in [32_767usize, 32_768, 65_535] {
+            let mut client = migration_test_client(false);
+            let query = format!("SELECT ${count}::int");
+            let param_types = vec![23; count];
+            let parse = Arc::new(Parse::from_parts(&query, &param_types));
+            let hash = parse.get_hash();
+            let _ = client.prepared.cache.put(
+                PreparedStatementKey::Named("bulk".to_string()),
+                CachedStatement::new(parse, hash, None),
+            );
+
+            let serialized = client.serialize_state(false).expect("valid prepared state");
+            let state = deserialize_state(serialized).expect("valid prepared state frame");
+            assert_eq!(state.prepared_entries.len(), 1);
+            let entry = &state.prepared_entries[0];
+            assert_eq!(entry.key, PreparedStatementKey::Named("bulk".to_string()));
+            assert_eq!(entry.hash, hash);
+            assert_eq!(entry.query, query);
+            assert_eq!(entry.param_types, param_types);
+
+            let restored = Parse::from_parts(&entry.query, &entry.param_types);
+            let frame = BytesMut::try_from(restored).expect("restored Parse frame");
+            let forwarded = Parse::try_from(&frame).unwrap();
+            assert_eq!(forwarded.num_params() as usize, count);
+            assert_eq!(forwarded.param_types(), param_types);
+        }
     }
 
     #[test]
