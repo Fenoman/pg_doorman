@@ -102,6 +102,7 @@ pprof = {version = "0.14", features = ["flamegraph", "criterion"]}
 regex = "1"
 serial_test = "3"
 tempfile = "3"
+tokio = { version = "1.48.4", features = ["test-util"] }
 tokio-postgres = "0.7"
 
 [[bin]]

@@ -552,10 +552,6 @@ fn backend_timeout_client_error(err: &Error) -> Option<(&'static str, &'static s
             "pooler is shut down now (flush timeout: server did not accept data within the timeout period)",
             "58006",
         )),
-        Error::SocketError(msg) if msg == "timeout waiting for COPY completion response" => Some((
-            "pooler is shut down now (COPY completion timeout: server did not finish within the timeout period)",
-            "58006",
-        )),
         Error::SocketError(msg)
             if msg == "timeout sending deferred BEGIN"
                 || msg == "timeout waiting for deferred BEGIN response" =>
@@ -1627,27 +1623,15 @@ where
         Ok(())
     }
 
-    async fn recv_copy_completion_with_timeout(
-        &mut self,
-        server: &mut Server,
-    ) -> Result<BytesMut, Error> {
-        let deadline = tokio::time::Instant::now() + HOUSEKEEPING_TIMEOUT;
-        match tokio::time::timeout_at(
-            deadline,
-            server.recv(&mut self.write, Some(&mut self.server_parameters)),
-        )
-        .await
-        {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(err)) => {
+    async fn recv_copy_completion(&mut self, server: &mut Server) -> Result<BytesMut, Error> {
+        // COPY completion can include triggers, commit work, or later SQL in
+        // a Simple Query. Wait like an ordinary user query, while observing
+        // client disconnects; HOUSEKEEPING_TIMEOUT applies only to pooler work.
+        match self.recv_server_response_or_client_disconnect(server).await {
+            Ok(response) => Ok(response),
+            Err(err) => {
                 server.mark_bad(&format!("COPY FROM completion recv failed: {err}"));
                 Err(err)
-            }
-            Err(_) => {
-                server.mark_bad("COPY FROM completion recv timeout");
-                Err(Error::SocketError(
-                    "timeout waiting for COPY completion response".to_string(),
-                ))
             }
         }
     }
@@ -1707,7 +1691,7 @@ where
         server.set_expected_responses(u32::from(extended));
         let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         loop {
-            let response = self.recv_copy_completion_with_timeout(server).await?;
+            let response = self.recv_copy_completion(server).await?;
             if extended && has_error_response(&response) {
                 self.prepared.ignore_until_sync = true;
             }
@@ -3969,10 +3953,10 @@ mod internal_round_trip_timeout_tests {
             ),
             (
                 "async fn flush_copy_buffer_with_timeout(",
-                "\n    async fn recv_copy_completion_with_timeout",
+                "\n    async fn recv_copy_completion",
             ),
             (
-                "async fn recv_copy_completion_with_timeout(",
+                "async fn recv_copy_completion(",
                 "\n    async fn handle_copy_data",
             ),
             (
@@ -4040,31 +4024,6 @@ mod internal_round_trip_timeout_tests {
     }
 
     #[test]
-    fn copy_done_fail_recv_uses_housekeeping_deadline() {
-        let src = include_str!("transaction.rs");
-        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
-        let start = impl_src
-            .find("async fn handle_copy_done_fail(")
-            .expect("COPY completion handler not found");
-        let body = &impl_src[start..];
-        let end = body
-            .find("\n    /// Handle a connected and authenticated client")
-            .expect("client handler should follow COPY completion handler");
-        let body = &body[..end];
-
-        assert!(
-            body.contains("recv_copy_completion_with_timeout(server).await?"),
-            "COPY FROM completion must drain the backend response through a bounded helper"
-        );
-        assert!(
-            !body.contains(
-                ".recv(&mut self.write, Some(&mut self.server_parameters))\n            .await?"
-            ),
-            "COPY FROM completion must not wait on a bare backend recv while holding the checkout"
-        );
-    }
-
-    #[test]
     fn copy_done_fail_client_write_is_deadline_bound() {
         let src = include_str!("transaction.rs");
         let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
@@ -4091,7 +4050,7 @@ mod internal_round_trip_timeout_tests {
         );
 
         let recv_idx = body
-            .find("recv_copy_completion_with_timeout(server).await?")
+            .find("recv_copy_completion(server).await?")
             .expect("COPY completion handler must drain backend response first");
         let write_idx = body
             .find("write_all_flush_timeout(&mut self.write, &response")
@@ -5580,9 +5539,16 @@ mod relay_response_client_write_failure_tests {
     }
 
     fn test_client_with_writer<W>(write: W) -> Client<SilentReader, W> {
+        test_client_with_reader_and_writer(SilentReader, write)
+    }
+
+    fn test_client_with_reader_and_writer<R: tokio::io::AsyncRead, W>(
+        read: R,
+        write: W,
+    ) -> Client<R, W> {
         let addr = "127.0.0.1:6543".parse().unwrap();
         Client {
-            read: BufReader::new(SilentReader),
+            read: BufReader::new(read),
             write,
             buffer: PooledBuffer::new(),
             addr,
@@ -5707,6 +5673,83 @@ mod relay_response_client_write_failure_tests {
         for extended in [false, true] {
             copy_control_preserves_buffered_data(b'S', extended).await;
         }
+    }
+
+    async fn delayed_copy_completion_preserves_response(extended: bool) {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.in_copy_mode = true;
+        client.prepared.copy_from_extended = extended;
+        let done = BytesMut::from(&b"c\0\0\0\x04"[..]);
+        let mut response = b"C\0\0\0\x0bCOPY 1\0".to_vec();
+        if !extended {
+            response.extend_from_slice(b"Z\0\0\0\x05I");
+        }
+
+        let action = {
+            let mut completion = Box::pin(client.handle_copy_done_fail(&done, &mut server));
+            let expected_request = if extended {
+                &b"c\0\0\0\x04H\0\0\0\x04"[..]
+            } else {
+                &done[..]
+            };
+            let mut request = vec![0; expected_request.len()];
+            tokio::select! {
+                biased;
+                _ = &mut completion => panic!("COPY completed before the backend replied"),
+                read = peer.read_exact(&mut request) => read.unwrap(),
+            };
+            assert_eq!(request, expected_request);
+
+            // Start virtual time after the real backend received CopyDone,
+            // so transport readiness cannot race the send timeout.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(31)).await;
+            let still_waiting = matches!(futures::poll!(&mut completion), Poll::Pending);
+            tokio::time::resume();
+            assert!(still_waiting, "COPY applied a housekeeping query deadline");
+
+            peer.write_all(&response).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), completion)
+                .await
+                .expect("COPY did not resume after the backend replied")
+                .unwrap()
+        };
+        assert!(matches!(action, TransactionAction::Continue));
+        assert_eq!(client.write.bytes, response);
+        assert!(!server.in_copy_mode());
+        assert!(!server.is_bad());
+        assert_eq!(server.is_async(), extended);
+    }
+
+    #[tokio::test]
+    async fn simple_copy_completion_outlives_housekeeping_deadline() {
+        delayed_copy_completion_preserves_response(false).await;
+    }
+
+    #[tokio::test]
+    async fn extended_copy_completion_outlives_housekeeping_deadline() {
+        delayed_copy_completion_preserves_response(true).await;
+    }
+
+    #[tokio::test]
+    async fn copy_completion_observes_client_disconnect() {
+        let mut client =
+            test_client_with_reader_and_writer(tokio::io::empty(), RecordingWriter::default());
+        let (mut server, _peer) = Server::test_silent_socket();
+        server.in_copy_mode = true;
+        let done = BytesMut::from(&b"c\0\0\0\x04"[..]);
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.handle_copy_done_fail(&done, &mut server),
+        )
+        .await
+        .expect("COPY kept waiting after the client disconnected")
+        .err()
+        .expect("client disconnect must end the COPY relay");
+        assert!(matches!(err, Error::SocketError(_)));
+        assert!(server.is_bad());
+        assert!(client.write.bytes.is_empty());
     }
 
     #[tokio::test]
