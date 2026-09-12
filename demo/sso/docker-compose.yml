@@ -54,7 +54,9 @@ services:
     volumes:
       - ./pg_doorman.toml:/etc/pg_doorman/pg_doorman.toml:ro
       - ./keys/sso-public.pem:/etc/pg_doorman/sso-public.pem:ro
-    command: ["-c", "/etc/pg_doorman/pg_doorman.toml"]
+    # The config path is a positional argument, not a `-c` flag, and the
+    # image has no ENTRYPOINT — so `command:` has to name the binary too.
+    command: ["pg_doorman", "/etc/pg_doorman/pg_doorman.toml"]
     ports:
       - "127.0.0.1:6432:6432"
       - "127.0.0.1:9127:9127"
