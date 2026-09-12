@@ -127,10 +127,7 @@ impl pool_coordinator::EvictionSource for PoolEvictionSource<'_> {
                     all_other_users.len(),
                     all_other_users
                         .iter()
-                        .map(|(id, _, spare, p95)| format!(
-                            "{}(spare={}, p95_xact={}us)",
-                            id, spare, p95
-                        ))
+                        .map(|(id, _, spare, p95)| format!("{id}(spare={spare}, p95_xact={p95}us)"))
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -144,7 +141,7 @@ impl pool_coordinator::EvictionSource for PoolEvictionSource<'_> {
             candidates.len(),
             candidates
                 .iter()
-                .map(|(id, _, spare, p95)| format!("{}(spare={}, p95_xact={}us)", id, spare, p95))
+                .map(|(id, _, spare, p95)| format!("{id}(spare={spare}, p95_xact={p95}us)"))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
