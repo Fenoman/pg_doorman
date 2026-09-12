@@ -13,7 +13,9 @@ use crate::client::PREPARED_STATEMENT_COUNTER;
 use crate::errors::Error;
 
 pub const MAX_PARSE_NAME_BYTES: usize = 1024;
-pub const MAX_PARSE_QUERY_BYTES: usize = 64 * 1024;
+// SQL text uses the same ceiling as the containing protocol message. Normal
+// bulk statements can exceed 64 KiB; the socket reader bounds the full frame.
+pub const MAX_PARSE_QUERY_BYTES: usize = super::MAX_MESSAGE_SIZE as usize;
 
 /// convert `usize` message length to wire `i32`, returning
 /// `Err` if the value would not fit. Without this, a `len > i32::MAX`
@@ -1613,10 +1615,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_oversized_query_before_cache() {
-        let query = "x".repeat(MAX_PARSE_QUERY_BYTES + 1);
-        let buf = make_parse("stmt", &query, &[]);
-        let err = Parse::try_from(&buf).unwrap_err();
+    fn parse_accepts_bulk_insert_over_64k_and_preserves_parameter_types() {
+        // A normal libpq bulk INSERT crosses 64 KiB at 8,326 parameters.
+        let query = format!(
+            "INSERT INTO review_param_boundary(i) VALUES {}",
+            (1..=8326)
+                .map(|index| format!("(${index})"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(query.len(), 65_544);
+        let param_types = vec![23; 8326];
+        let buf = make_parse("bulk_insert", &query, &param_types);
+
+        let parse = Parse::try_from(&buf).expect("valid bulk INSERT Parse must be accepted");
+        assert_eq!(parse.query(), query);
+        assert_eq!(parse.param_types(), param_types);
+
+        let rewritten = parse.to_bytes_with_name("DOORMAN_123").unwrap();
+        let forwarded = Parse::try_from(&rewritten).unwrap();
+        assert_eq!(forwarded.name, "DOORMAN_123");
+        assert_eq!(forwarded.query(), query);
+        assert_eq!(forwarded.param_types(), param_types);
+    }
+
+    #[test]
+    fn parse_query_reader_rejects_over_limit_before_copy() {
+        // Exercise the bounded reader without allocating a full-size frame.
+        // The socket tests cover rejection at the overall message ceiling.
+        let buf = BytesMut::from(&b"SELECT 123\0"[..]);
+        let mut cursor = std::io::Cursor::new(&buf);
+        let err = read_limited_parse_arc_str(&mut cursor, "Parse query", 9).unwrap_err();
         assert!(err.to_string().contains("query length"));
     }
 
@@ -1633,13 +1662,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_limit_sized_name_and_query() {
+    fn parse_accepts_limit_sized_name_with_large_query() {
         let name = "n".repeat(MAX_PARSE_NAME_BYTES);
-        let query = "x".repeat(MAX_PARSE_QUERY_BYTES);
+        let query = "x".repeat(64 * 1024);
         let buf = make_parse(&name, &query, &[]);
         let parse = Parse::try_from(&buf).unwrap();
         assert_eq!(parse.name.len(), MAX_PARSE_NAME_BYTES);
-        assert_eq!(parse.query().len(), MAX_PARSE_QUERY_BYTES);
+        assert_eq!(parse.query(), query);
     }
 
     #[test]

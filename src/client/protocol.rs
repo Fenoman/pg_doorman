@@ -1814,22 +1814,20 @@ mod anonymous_close_tests {
     }
 
     #[tokio::test]
-    async fn disabled_prepared_oversized_parse_tracks_session_authorization_cleanup() {
+    async fn disabled_prepared_large_parse_tracks_session_authorization_cleanup() {
         let mut client = test_client();
         client.prepared.enabled = false;
         let pool = ConnectionPool::test_for_protocol();
         let (mut server, _peer) = crate::server::Server::test_silent_socket();
-        let oversized_query = format!(
+        let large_query = format!(
             "/*{}*/ SET SESSION AUTHORIZATION app_user",
-            "x".repeat(crate::messages::extended::MAX_PARSE_QUERY_BYTES)
+            "x".repeat(64 * 1024)
         );
 
         client
-            .process_parse_immediate(make_parse("", &oversized_query, &[]), &pool, &mut server)
+            .process_parse_immediate(make_parse("", &large_query, &[]), &pool, &mut server)
             .await
-            .expect(
-                "disabled prepared Parse should be forwarded even when cache Parse would reject it",
-            );
+            .expect("disabled prepared Parse should forward a large SQL statement");
         client
             .process_bind_immediate(make_bind("portal_auth", ""), &pool, &mut server)
             .await
@@ -1839,7 +1837,7 @@ mod anonymous_close_tests {
         assert_eq!(
             server.pop_set_cleanup_command(),
             Some(SetCleanupCommand::SetSessionAuthorization),
-            "disabled prepared mode must attribute oversized SET SESSION AUTHORIZATION Parse frames"
+            "disabled prepared mode must attribute large SET SESSION AUTHORIZATION Parse frames"
         );
     }
 
