@@ -134,6 +134,8 @@ fn main() {
                         }
                     }
                     w.doorman_daemon_pid_file = None;
+                    #[cfg(target_os = "linux")]
+                    doorman_helper::stop_scenario_generations(w);
 
                     if let Some(ref mut child) = w.pgbouncer_process {
                         pgbouncer_helper::stop_pgbouncer(child);

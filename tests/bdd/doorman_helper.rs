@@ -248,6 +248,8 @@ pub async fn start_doorman_with_config(world: &mut DoormanWorld, step: &Step) {
         stop_doorman(child);
     }
     world.doorman_process = None;
+    #[cfg(target_os = "linux")]
+    stop_scenario_generations(world);
 
     let config_content = step
         .docstring
@@ -494,6 +496,58 @@ pub fn stop_doorman(child: &mut Child) {
     }
 }
 
+/// Foreground binary upgrade replaces Child with an untracked process.
+/// Stop every generation using this scenario's exact temporary config.
+#[cfg(target_os = "linux")]
+pub fn stop_scenario_generations(world: &DoormanWorld) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(config) = world.doorman_config_file.as_ref() else {
+        return;
+    };
+    let binary = env!("CARGO_BIN_EXE_pg_doorman").as_bytes();
+    let config = config.path().as_os_str().as_bytes();
+    let uid = unsafe { libc::getuid() };
+    let matches = |pid: u32| {
+        let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
+        if !proc_path.metadata().is_ok_and(|m| m.uid() == uid) {
+            return false;
+        }
+        let Ok(cmdline) = std::fs::read(proc_path.join("cmdline")) else {
+            return false;
+        };
+        let mut args = cmdline.split(|&byte| byte == 0);
+        args.next() == Some(binary) && args.next() == Some(config)
+    };
+    let find_generations = || {
+        std::fs::read_dir("/proc")
+            .expect("read /proc for BDD process cleanup")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| matches(pid))
+            .collect::<Vec<_>>()
+    };
+
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        let pids = find_generations();
+        if pids.is_empty() {
+            return;
+        }
+        for pid in pids {
+            // Recheck exact ownership immediately before each signal.
+            if matches(pid) {
+                unsafe { libc::kill(pid as i32, signal) };
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        find_generations().is_empty(),
+        "foreground BDD generations survived cleanup for {:?}",
+        config
+    );
+}
+
 /// Stop pg_doorman daemon by PID
 pub fn stop_doorman_daemon(pid: u32) {
     unsafe {
@@ -530,6 +584,8 @@ pub async fn start_doorman_daemon_with_config(world: &mut DoormanWorld, step: &S
         }
     }
     world.doorman_daemon_pid_file = None;
+    #[cfg(target_os = "linux")]
+    stop_scenario_generations(world);
 
     let config_content = step
         .docstring
