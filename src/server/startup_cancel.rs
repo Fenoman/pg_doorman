@@ -6,10 +6,11 @@ use log::warn;
 use crate::config::get_config;
 use crate::config::tls::{ServerTlsConfig, ServerTlsMode};
 use crate::errors::Error;
+use crate::messages::config_socket::configure_tcp_socket_for_cancel;
 use crate::messages::constants::CANCEL_REQUEST_CODE;
 use crate::messages::write_all_flush;
 
-use super::stream::{create_tcp_stream_inner, create_unix_stream_inner};
+use super::stream::{create_tcp_stream_inner, create_unix_stream_inner, StreamInner};
 
 /// cap the cancel pipeline (TCP connect + optional
 /// TLS handshake + 16-byte write_all_flush) at `general.connect_timeout`
@@ -62,6 +63,17 @@ pub(crate) async fn cancel(
                 create_tcp_stream_inner(host, port, cancel_tls, pool_name).await?
             };
 
+            // The cancel connection closes immediately after its packet. A
+            // pooled socket's SO_LINGER=0 can reset it before PostgreSQL reads
+            // the request, so use the same orderly close as incoming cancels.
+            match &stream {
+                StreamInner::TCPPlain { stream } => configure_tcp_socket_for_cancel(stream),
+                StreamInner::TCPTls { stream } => {
+                    configure_tcp_socket_for_cancel(stream.get_ref().get_ref().get_ref());
+                }
+                StreamInner::UnixSocket { .. } => {}
+            }
+
             warn!("cancel request forwarded to {host}:{port} pid={process_id}");
 
             let mut bytes = BytesMut::with_capacity(16);
@@ -85,5 +97,45 @@ pub(crate) async fn cancel(
                 "cancel timeout to {host}:{port} pid={process_id}"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn tcp_cancel_delivers_packet_before_orderly_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tls = ServerTlsConfig {
+            mode: ServerTlsMode::Disable,
+            connector: None,
+            cert_hash: None,
+        };
+
+        let (sent, received) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                cancel("127.0.0.1", port, 42, 7, &tls, false, "cancel_test"),
+                async {
+                    let (mut peer, _) = listener.accept().await?;
+                    let mut request = [0; 16];
+                    peer.read_exact(&mut request).await?;
+                    let mut extra = [0; 1];
+                    assert_eq!(peer.read(&mut extra).await?, 0);
+                    Ok::<_, std::io::Error>(request)
+                }
+            )
+        })
+        .await
+        .expect("outgoing CancelRequest did not finish");
+
+        sent.unwrap();
+        assert_eq!(
+            received.expect("CancelRequest must deliver its packet and close without a TCP reset"),
+            [0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 42, 0, 0, 0, 7]
+        );
     }
 }
