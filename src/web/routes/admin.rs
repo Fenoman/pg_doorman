@@ -164,6 +164,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(retired_pools)]
     async fn pause_without_pools_reports_zero_affected() {
         // No pools registered in unit-test global → pause_now returns 0.
         let r = handle_admin_action("/api/admin/pause").await;

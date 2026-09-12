@@ -12,10 +12,14 @@
 //! origin.
 
 use log::info;
+use std::collections::HashSet;
 
 use crate::config::reload_config;
 use crate::errors::Error;
-use crate::pool::{get_all_pools, get_client_server_map, ConnectionPool, PoolIdentifier};
+use crate::pool::{
+    get_all_pools, get_client_server_map, get_retired_pools, pool_write_lock, ConnectionPool,
+    PoolIdentifier,
+};
 
 /// Scope filter for `pause` / `resume` / `reconnect`. The REST surface
 /// accepts both `?db=<name>` (every user@db pool of one database) and
@@ -110,14 +114,23 @@ pub fn resume_now(scope: AdminScope) -> AdminEffect {
 /// Reconnect — bumps the pool epoch and drains idle connections. Active
 /// connections are refused on return.
 pub fn reconnect_now(scope: AdminScope) -> AdminEffect {
-    apply_per_pool(scope, |identifier, pool| {
-        let new_epoch = pool.database.reconnect();
+    let mut drain = Vec::new();
+    let effect = apply_per_pool(scope, |identifier, pool| {
+        // Mark every serving generation under the publication lock, then
+        // close idle sockets after releasing it. Active connections still
+        // fail the epoch check on return, as with Pool::reconnect.
+        let new_epoch = pool.database.server_pool().bump_epoch();
+        drain.push(pool.database.clone());
         crate::admin::events::push_event(
             "RECONNECT",
             format!("pool {identifier} reconnected (epoch={new_epoch})"),
         );
         info!("RECONNECT: reconnected pool {identifier} (new epoch: {new_epoch})");
-    })
+    });
+    for pool in drain {
+        pool.retain(|_, _| false);
+    }
+    effect
 }
 
 /// Iterate the pool table once: skip pools that do not match the scope,
@@ -127,11 +140,34 @@ fn apply_per_pool<F>(scope: AdminScope, mut act: F) -> AdminEffect
 where
     F: FnMut(&PoolIdentifier, &ConnectionPool),
 {
+    // Serialize state changes with replacement publication. The reload
+    // inherits PAUSE and registers retired generations under this same
+    // lock, so each action sees either side of a transition in full.
+    let _guard = pool_write_lock();
     let pools = get_all_pools();
-    if !pools
-        .iter()
-        .any(|(identifier, _)| scope.matches(identifier))
+    let retired = get_retired_pools();
+    let mut affected = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for (identifier, pool) in
+        pools
+            .iter()
+            .map(|(id, pool)| (id.clone(), pool))
+            .chain(retired.iter().map(|pool| {
+                (
+                    PoolIdentifier::new(&pool.address.pool_name, &pool.address.username),
+                    pool.as_ref(),
+                )
+            }))
     {
+        if !scope.matches(&identifier) {
+            continue;
+        }
+        act(&identifier, pool);
+        if seen_ids.insert(identifier.clone()) {
+            affected.push(identifier);
+        }
+    }
+    if affected.is_empty() {
         return match scope {
             AdminScope::AllPools => AdminEffect::Applied {
                 affected: Vec::new(),
@@ -140,20 +176,94 @@ where
             AdminScope::Pool { user, db } => AdminEffect::NoMatchingPool { user, db },
         };
     }
-    let mut affected = Vec::new();
-    for (identifier, pool) in pools.iter() {
-        if !scope.matches(identifier) {
-            continue;
-        }
-        act(identifier, pool);
-        affected.push(identifier.clone());
-    }
     AdminEffect::Applied { affected }
 }
 
 #[cfg(test)]
 mod tests {
     use super::reload_event_message;
+
+    #[tokio::test]
+    #[serial_test::serial(retired_pools)]
+    async fn admin_actions_reach_retired_generations_once_per_logical_pool() {
+        use super::{pause_now, reconnect_now, resume_now, AdminEffect, AdminScope};
+        use crate::pool::{
+            clear_retired_pools_for_test, pool_write_lock, retire_pool_generations, ConnectionPool,
+            PoolIdentifier, POOLS,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let id = PoolIdentifier::new("admin_generation_db", "generation_user");
+        let other_id = PoolIdentifier::new("admin_other_db", "generation_user");
+        let make_pool = |id: &PoolIdentifier| {
+            let mut pool = ConnectionPool::test_for_protocol();
+            pool.address.pool_name = id.db.clone();
+            pool.address.username = id.user.clone();
+            pool
+        };
+        let first = make_pool(&id);
+        let second = make_pool(&id);
+        let live = make_pool(&id);
+        let other = make_pool(&other_id);
+        clear_retired_pools_for_test();
+        retire_pool_generations(vec![first.clone(), second.clone()]);
+        {
+            let _guard = pool_write_lock();
+            let mut pools = (**POOLS.load()).clone();
+            pools.insert(id.clone(), live.clone());
+            pools.insert(other_id.clone(), other.clone());
+            POOLS.store(Arc::new(pools));
+        }
+        scopeguard::defer! {
+            clear_retired_pools_for_test();
+            let _guard = pool_write_lock();
+            let mut pools = (**POOLS.load()).clone();
+            pools.remove(&id);
+            pools.remove(&other_id);
+            POOLS.store(Arc::new(pools));
+        }
+
+        let expected = AdminEffect::Applied {
+            affected: vec![id.clone()],
+        };
+        assert_eq!(pause_now(AdminScope::Database(id.db.clone())), expected);
+        for pool in [&first, &second, &live] {
+            assert!(
+                pool.database.is_paused(),
+                "every serving generation must pause"
+            );
+        }
+        assert!(!other.database.is_paused());
+
+        // A waiter already registered on the oldest generation must wake.
+        let resumed = first.database.server_pool().resume_notified();
+        tokio::pin!(resumed);
+        resumed.as_mut().enable();
+        assert_eq!(
+            resume_now(AdminScope::Pool {
+                user: id.user.clone(),
+                db: id.db.clone(),
+            }),
+            expected
+        );
+        tokio::time::timeout(Duration::from_millis(100), resumed)
+            .await
+            .expect("RESUME must notify a retired generation's existing waiter");
+        for pool in [&first, &second, &live] {
+            assert!(!pool.database.is_paused());
+        }
+
+        assert_eq!(reconnect_now(AdminScope::Database(id.db.clone())), expected);
+        for pool in [&first, &second, &live] {
+            assert_eq!(pool.database.reconnect_epoch(), 1);
+            assert!(
+                !pool.database.is_closed(),
+                "active sessions keep their pool"
+            );
+        }
+        assert_eq!(other.database.reconnect_epoch(), 0);
+    }
 
     #[test]
     fn reload_event_message_distinguishes_changed_and_unchanged() {

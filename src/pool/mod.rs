@@ -488,7 +488,7 @@ pub(crate) fn drop_dynamic_pool_if_init_guard_matches(
 /// PostgreSQL after each reload, invisible in `SHOW POOLS` and in the metrics.
 ///
 /// This registry keeps the replaced generation reachable for housekeeping
-/// only. It is deliberately NOT part of `POOLS`, so it stays out of
+/// and admin controls. It is deliberately NOT part of `POOLS`, so it stays out of
 /// `SHOW POOLS`, `/metrics` and every other consumer of `get_all_pools()` —
 /// a retired generation is not a live pool.
 ///
@@ -510,19 +510,24 @@ static RETIRED_POOLS: Lazy<ArcSwap<Vec<Arc<ConnectionPool>>>> =
 /// many reloads and the backend count on PostgreSQL is inflated accordingly.
 const RETIRED_POOLS_WARN_LEN: usize = 32;
 
-/// Hand replaced pool generations to the retirement registry.
-///
-/// Called by `from_config` AFTER the reload commit guard is dropped: this
-/// takes `pool_write_lock()` itself (`parking_lot::Mutex` is not reentrant).
-/// The gap between the `POOLS` publish and this call is harmless — the
-/// generation is simply not swept for one retain tick; nothing can close it
-/// in the meantime.
+/// Test helper for retiring generations outside a reload commit.
+#[cfg(test)]
 pub(crate) fn retire_pool_generations(generations: Vec<ConnectionPool>) {
+    let guard = pool_write_lock();
+    retire_pool_generations_locked(generations, &guard);
+}
+
+/// Publish retirement while the caller holds the pool write lock. Admin
+/// controls use the same lock, so a replaced generation is never missing
+/// from both their live and retired snapshots during a reload.
+fn retire_pool_generations_locked(
+    generations: Vec<ConnectionPool>,
+    _guard: &parking_lot::MutexGuard<'_, ()>,
+) {
     if generations.is_empty() {
         return;
     }
     let total = {
-        let _guard = pool_write_lock();
         let current = RETIRED_POOLS.load();
         let mut new_registry = Vec::with_capacity(current.len() + generations.len());
         new_registry.extend(current.iter().cloned());
@@ -1543,6 +1548,17 @@ impl ConnectionPool {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Admin PAUSE/RESUME holds the same commit lock. Read the old state
+        // here, after the async build, so an action during that build is
+        // inherited by every replacement before it becomes visible.
+        for (id, pool) in &new_pools {
+            if old_pools
+                .get(id)
+                .is_some_and(|old| old.database.is_paused())
+            {
+                pool.database.pause();
+            }
+        }
         // Publish CONFIG after every fallible pool-build step has
         // succeeded, but before AUTH_QUERY_STATE becomes visible.
         // Otherwise a dynamic auth_query login can observe the new auth
@@ -1565,6 +1581,7 @@ impl ConnectionPool {
         // full reload is published.
         COORDINATORS.store(Arc::new(coordinators));
         AUTH_QUERY_STATE.store(Arc::new(auth_query_states));
+        retire_pool_generations_locked(retired_static_pools, &_commit_guard);
         POOLS.store(Arc::new(new_pools.clone()));
 
         // for removals, publish POOLS first. Hot auth readers do
@@ -1585,11 +1602,6 @@ impl ConnectionPool {
         // sees the old value and re-evaluates the change correctly.
         PREVIOUS_GENERAL_STARTUP_HASH.store(general_startup_hash, Ordering::Relaxed);
         drop(_commit_guard);
-        // Replaced generations stay OPEN (in-flight sessions still use them)
-        // but must remain reachable for housekeeping. Published after the
-        // commit guard is dropped because the registry takes the same
-        // non-reentrant write lock.
-        retire_pool_generations(retired_static_pools);
         for pool in removed_dynamic_pools {
             pool.database.close();
         }
@@ -3462,8 +3474,8 @@ mod tests {
     /// Source contract: the `replaced` branch must hand the old generation
     /// to the retirement registry instead of dropping it on the floor, and
     /// must still NOT fail it closed (`close_new_checkouts`) — that is the
-    /// 53300 regression. The registry publish happens after the commit
-    /// guard is released, like every other post-publish drain step.
+    /// 53300 regression. Retirement and publication share the admin-control
+    /// lock so no PAUSE/RESUME can miss the old generation in between them.
     #[test]
     fn reload_retires_replaced_static_generations() {
         let src = include_str!("mod.rs");
@@ -3495,14 +3507,16 @@ mod tests {
         let drop_guard_idx = block
             .find("drop(_commit_guard)")
             .expect("reload must release pool_write_lock before draining old generations");
-        let publish_idx = block[drop_guard_idx..]
-            .find("retire_pool_generations(retired_static_pools)")
-            .map(|offset| drop_guard_idx + offset)
+        let publish_idx = block
+            .find("retire_pool_generations_locked(retired_static_pools, &_commit_guard)")
             .expect("retired generations must be published to the registry");
+        let pools_idx = block
+            .find("POOLS.store")
+            .expect("live pools must be published");
         assert!(
-            drop_guard_idx < publish_idx,
-            "the registry publish takes pool_write_lock itself, so it must run \
-             after the reload commit guard is dropped"
+            publish_idx < pools_idx && pools_idx < drop_guard_idx,
+            "retirement must share the live-pool publication lock so admin \
+             controls cannot miss a replaced generation"
         );
     }
 
