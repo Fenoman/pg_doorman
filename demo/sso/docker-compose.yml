@@ -32,6 +32,10 @@ services:
       POSTGRES_USER: demo
       POSTGRES_PASSWORD: demo
       POSTGRES_DB: demo
+    volumes:
+      # Runs once, on a fresh volume, right after initdb creates the role.
+      # Pins the SCRAM salt so pg_doorman.toml can carry a matching verifier.
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "demo"]
       interval: 2s

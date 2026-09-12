@@ -44,8 +44,20 @@ sso_admin_groups = ["pg-doorman-admins"]
 server_host = "postgres"
 server_port = 5432
 pool_mode = "transaction"
+# The default release query calls public.pgv_free(), which ships with the
+# pg_variables extension. Stock postgres:16 does not have it, and a failing
+# release query marks the backend bad on every checkin — which shows up as
+# "Unable to retrieve server parameters" on the very first connection.
+# The demo holds no session state worth clearing, so run nothing.
+release_query = ""
 
 [[pools.demo.users]]
 username = "demo"
-password = "demo"
+# The SCRAM verifier for password "demo", pinned by init.sql over a fixed
+# salt. It must stay byte-identical to pg_shadow: pg_doorman proves the
+# client against this copy and replays the resulting ClientKey to
+# PostgreSQL. Plaintext here is not a thing — only MD5, SCRAM, JWT and PAM
+# are accepted, and anything else fails with "Authentication method not
+# supported".
+password = "SCRAM-SHA-256$4096:cGdfZG9vcm1hbl9zc29fZA==$V3O+ABC1CRJ+zGRBm+GqwGjCoHNidy1ekDy2/Nii1gY=:Nhg8yVmo9hnj01h/ps6z5eDKhq3Kqo+BapBrQRbLFYA="
 pool_size = 5

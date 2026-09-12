@@ -13,6 +13,7 @@ the SPA respects the role, and the access log records the user.
 demo/sso/
 ├── docker-compose.yml    # postgres + pg_doorman + mint-jwt helper
 ├── pg_doorman.toml       # SSO config; admin user is admin / admin-demo
+├── init.sql              # pins the demo role's SCRAM salt (see below)
 ├── mint_jwt.py           # PyJWT helper that runs inside `mint-jwt`
 └── keys/
     ├── sso-public.pem    # injected into pg_doorman as sso_public_key_file
@@ -33,6 +34,24 @@ docker compose logs -f pg_doorman   # optional: watch the access log
 
 Each request emits one line on the `pg_doorman::web::access` target.
 Tail the log to confirm the demo is live.
+
+## Prove the pooler path
+
+The demo is mainly about the web/SSO side, but the pooler itself is live
+on 6432 and takes ordinary SQL:
+
+```bash
+PGPASSWORD=demo psql -h 127.0.0.1 -p 6432 -U demo -d demo -c 'SELECT 1'
+```
+
+`pg_doorman.toml` carries the SCRAM verifier for password `demo`, not the
+password itself — plaintext in that field is rejected with
+"Authentication method not supported". The verifier has to match
+`pg_shadow` byte for byte, because pg_doorman proves the client against
+its own copy and replays the resulting ClientKey to PostgreSQL. Since
+`initdb` would salt the password randomly on every fresh volume, `init.sql`
+pins the salt so both sides agree on any clone. Real deployments copy the
+verifier out of `pg_shadow` instead — `pg_doorman generate` does it for you.
 
 ## Prove the SSO path
 

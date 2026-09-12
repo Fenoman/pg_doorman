@@ -1,0 +1,14 @@
+-- Pin the demo role's SCRAM verifier so it is identical on every clone.
+--
+-- POSTGRES_PASSWORD makes initdb hash "demo" with a RANDOM salt, so the
+-- verifier differs on every fresh volume. pg_doorman needs the verifier in
+-- pg_doorman.toml to be byte-identical to the one in pg_shadow: it proves
+-- the client against its own copy, derives the ClientKey from that exchange,
+-- and replays it to PostgreSQL. A verifier built over a different salt
+-- yields a ClientKey the server rejects, so a hardcoded one taken from a
+-- live instance would only ever work on the machine it was copied from.
+--
+-- Pinning the salt here keeps both sides in sync with no generation step.
+-- The password is still "demo"; only the salt is fixed rather than random.
+-- This is a demo convenience — never pin a salt in a real deployment.
+ALTER ROLE demo PASSWORD 'SCRAM-SHA-256$4096:cGdfZG9vcm1hbl9zc29fZA==$V3O+ABC1CRJ+zGRBm+GqwGjCoHNidy1ekDy2/Nii1gY=:Nhg8yVmo9hnj01h/ps6z5eDKhq3Kqo+BapBrQRbLFYA=';
