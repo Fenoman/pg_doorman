@@ -1676,8 +1676,7 @@ pub async fn migration_receiver_task(
                             )
                         else {
                             warn!(
-                                "migrated TLS client fd rejected before reconstruction: too many clients (max={})",
-                                max_connections,
+                                "migrated TLS client fd rejected before reconstruction: too many clients (max={max_connections})",
                             );
                             continue;
                         };
