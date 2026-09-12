@@ -1197,7 +1197,7 @@ impl Pool {
 
         // Slow path: release gate slot so peers can create while we wait.
         drop(gate);
-        let eviction = super::PoolEvictionSource::new(&self.inner.pool_name);
+        let eviction = super::PoolEvictionSource::new(&self.inner.pool_name, self, coordinator);
         let acquire = coordinator.acquire(&self.inner.pool_name, &self.inner.username, &eviction);
         tokio::pin!(acquire);
 
@@ -2378,6 +2378,12 @@ impl Pool {
         self.inner.semaphore.is_closed()
     }
 
+    /// Compare physical pool generations, including when their logical
+    /// database/user identifiers are identical across a reload.
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Stop future checkout attempts without draining idle objects yet.
     pub(crate) fn close_new_checkouts(&self) {
         self.inner.semaphore.close();
@@ -3016,6 +3022,152 @@ mod tests {
             .pool_name("test_db".to_string())
             .username("test_user".to_string())
             .build()
+    }
+
+    #[cfg(unix)]
+    fn donor_test_pool(
+        database: &str,
+        user: &str,
+        coordinator: Arc<pool_coordinator::PoolCoordinator>,
+        minimum: u32,
+    ) -> crate::pool::ConnectionPool {
+        let mut pool = crate::pool::ConnectionPool::test_for_protocol();
+        pool.database = test_pool_with_coordinator(coordinator.clone());
+        pool.database.resize(2);
+        pool.coordinator = Some(coordinator);
+        pool.address.pool_name = database.to_string();
+        pool.address.username = user.to_string();
+        pool.settings.user.min_pool_size = Some(minimum);
+        pool
+    }
+
+    #[cfg(unix)]
+    fn add_idle_donor_backend(pool: &crate::pool::ConnectionPool) -> tokio::net::UnixStream {
+        let (server, peer) = Server::test_silent_socket();
+        let permit = pool.coordinator.as_ref().unwrap().try_acquire().unwrap();
+        let mut inner = pool.database.inner.new_object_inner(server, Some(permit));
+        inner.metrics.recycled = Some(clock::now());
+        let mut slots = pool.database.inner.slots.lock();
+        slots.vec.push_back(inner);
+        slots.size += 1;
+        peer
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(retired_pools)]
+    async fn coordinator_reclaims_same_user_budget_across_pool_generations() {
+        use crate::pool::pool_coordinator::EvictionSource;
+        use crate::pool::{
+            clear_retired_pools_for_test, pool_write_lock, retire_pool_generations,
+            PoolEvictionSource, PoolIdentifier, POOLS,
+        };
+
+        let id = PoolIdentifier::new("donor_generation_db", "donor_user");
+        let coordinator = pool_coordinator::PoolCoordinator::new(
+            id.db.clone(),
+            pool_coordinator::CoordinatorConfig {
+                max_db_connections: 1,
+                min_connection_lifetime_ms: 0,
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 100,
+            },
+        );
+        let old = donor_test_pool(&id.db, &id.user, coordinator.clone(), 0);
+        let live = donor_test_pool(&id.db, &id.user, coordinator.clone(), 1);
+        let _old_peer = add_idle_donor_backend(&old);
+        clear_retired_pools_for_test();
+        retire_pool_generations(vec![old.clone()]);
+        {
+            let _guard = pool_write_lock();
+            let mut pools = (**POOLS.load()).clone();
+            pools.insert(id.clone(), live.clone());
+            POOLS.store(Arc::new(pools));
+        }
+        scopeguard::defer! {
+            clear_retired_pools_for_test();
+            let _guard = pool_write_lock();
+            let mut pools = (**POOLS.load()).clone();
+            pools.remove(&id);
+            POOLS.store(Arc::new(pools));
+        }
+
+        let live_eviction = PoolEvictionSource::new(&id.db, &live.database, &coordinator);
+        assert!(live_eviction.try_evict_one(&id.user));
+        assert_eq!(old.pool_state().size, 0);
+        assert_eq!(coordinator.total_connections(), 0);
+
+        // The reverse direction must work even when the live generation is
+        // at min_pool_size: replacement stays within the same user's budget.
+        let _live_peer = add_idle_donor_backend(&live);
+        let old_eviction = PoolEvictionSource::new(&id.db, &old.database, &coordinator);
+        assert!(old_eviction.try_evict_one(&id.user));
+        assert_eq!(live.pool_state().size, 0);
+        assert_eq!(coordinator.total_connections(), 0);
+
+        let _own_peer = add_idle_donor_backend(&live);
+        assert!(!live_eviction.try_evict_one(&id.user));
+        assert_eq!(live.pool_state().available, 1);
+        assert_eq!(coordinator.total_connections(), 1);
+        assert_eq!(old.database.semaphore().available_permits(), 2);
+        assert_eq!(live.database.semaphore().available_permits(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(retired_pools)]
+    async fn coordinator_donors_preserve_generation_floor_age_and_active_guards() {
+        use crate::pool::pool_coordinator::EvictionSource;
+        use crate::pool::{pool_write_lock, PoolEvictionSource, PoolIdentifier, POOLS};
+
+        for guard in ["coordinator", "minimum", "age", "active"] {
+            let id = PoolIdentifier::new(&format!("donor_guard_{guard}"), "peer_user");
+            let config = pool_coordinator::CoordinatorConfig {
+                max_db_connections: 1,
+                min_connection_lifetime_ms: if guard == "age" { 60_000 } else { 0 },
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 100,
+            };
+            let coordinator = pool_coordinator::PoolCoordinator::new(id.db.clone(), config.clone());
+            let donor_coordinator = if guard == "coordinator" {
+                pool_coordinator::PoolCoordinator::new(id.db.clone(), config)
+            } else {
+                coordinator.clone()
+            };
+            let requester = donor_test_pool(&id.db, "requester", coordinator.clone(), 0);
+            let donor = donor_test_pool(
+                &id.db,
+                &id.user,
+                donor_coordinator.clone(),
+                u32::from(guard == "minimum"),
+            );
+            let _peer = add_idle_donor_backend(&donor);
+            let held = if guard == "active" {
+                Some(donor.database.get().await.unwrap())
+            } else {
+                None
+            };
+            {
+                let _guard = pool_write_lock();
+                let mut pools = (**POOLS.load()).clone();
+                pools.insert(id.clone(), donor.clone());
+                POOLS.store(Arc::new(pools));
+            }
+            scopeguard::defer! {
+                let _guard = pool_write_lock();
+                let mut pools = (**POOLS.load()).clone();
+                pools.remove(&id);
+                POOLS.store(Arc::new(pools));
+            }
+            let eviction = PoolEvictionSource::new(&id.db, &requester.database, &coordinator);
+            assert!(
+                !eviction.try_evict_one("requester"),
+                "must respect {guard} guard"
+            );
+            assert_eq!(donor.pool_state().size, 1, "must preserve {guard} backend");
+            assert_eq!(donor_coordinator.total_connections(), 1);
+            drop(held);
+        }
     }
 
     #[tokio::test]

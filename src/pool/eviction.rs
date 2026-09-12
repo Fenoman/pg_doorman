@@ -4,13 +4,14 @@
 //! scanning idle connections across user pools for the same database.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use log::{debug, info};
 
 use crate::utils::format_duration_ms;
 
 use super::pool_coordinator;
-use super::{get_pool, ConnectionPool, PoolIdentifier, POOLS};
+use super::{get_pool, get_retired_pools, ConnectionPool, Pool, POOLS};
 
 /// Adapter bridging `PoolCoordinator`'s eviction callbacks to real pool state.
 ///
@@ -18,28 +19,62 @@ use super::{get_pool, ConnectionPool, PoolIdentifier, POOLS};
 /// - `try_evict_one`: close one idle connection from another user's pool
 /// - `queued_clients`: how many clients are waiting for this user's pool
 /// - `is_starving`: whether a user is below their guaranteed minimum
-pub struct PoolEvictionSource {
-    database: String,
+pub struct PoolEvictionSource<'a> {
+    database: &'a str,
+    requesting_pool: &'a Pool,
+    coordinator: &'a Arc<pool_coordinator::PoolCoordinator>,
 }
 
-impl PoolEvictionSource {
-    pub fn new(database: &str) -> Self {
+impl<'a> PoolEvictionSource<'a> {
+    pub fn new(
+        database: &'a str,
+        requesting_pool: &'a Pool,
+        coordinator: &'a Arc<pool_coordinator::PoolCoordinator>,
+    ) -> Self {
         Self {
-            database: database.to_string(),
+            database,
+            requesting_pool,
+            coordinator,
+        }
+    }
+
+    fn eligible_capacity(
+        &self,
+        user: &str,
+        pool: &ConnectionPool,
+        requesting_user: &str,
+    ) -> Option<usize> {
+        if pool.database.same_instance(self.requesting_pool)
+            || !pool
+                .coordinator
+                .as_ref()
+                .is_some_and(|coordinator| Arc::ptr_eq(coordinator, self.coordinator))
+        {
+            return None;
+        }
+        if user == requesting_user {
+            // A replacement backend still belongs to the same logical user.
+            // Applying its minimum independently to every generation would
+            // strand the budget in whichever generation obtained it first.
+            Some(pool.pool_state().available)
+        } else {
+            Some(pool.spare_above_min())
         }
     }
 }
 
-impl pool_coordinator::EvictionSource for PoolEvictionSource {
+impl pool_coordinator::EvictionSource for PoolEvictionSource<'_> {
     /// Evict one idle connection from the user with the largest surplus.
     ///
-    /// Scans all pools for the same database, skipping the requesting user.
+    /// Scans live and retired pools sharing this exact coordinator, skipping
+    /// the requesting physical pool. Same-user replacements share one budget.
     /// Snapshots `spare_above_min()` once per candidate to avoid TOCTOU
     /// inconsistency from repeated locking. Evicts only connections older
     /// than `min_connection_lifetime`. The evicted connection's
     /// `CoordinatorPermit` drops synchronously, freeing the slot.
     fn try_evict_one(&self, requesting_user: &str) -> bool {
         let all_pools = POOLS.load();
+        let retired = get_retired_pools();
 
         // Snapshot spare count and p95 xact time once per candidate.
         // Spare avoids TOCTOU from repeated locking. p95 is an atomic
@@ -51,13 +86,21 @@ impl pool_coordinator::EvictionSource for PoolEvictionSource {
         // of the same Vec - one allocation, identical victim ordering
         // (p95 desc, spare desc), and the spare==0 suffix stays available
         // for the diagnostic log below.
-        let mut all_other_users: Vec<(&PoolIdentifier, &ConnectionPool, usize, u64)> = all_pools
+        let mut all_other_users: Vec<(&str, &ConnectionPool, usize, u64)> = all_pools
             .iter()
-            .filter(|(id, _)| id.db == self.database && id.user != requesting_user)
-            .map(|(id, pool)| {
-                let spare = pool.spare_above_min();
+            .map(|(id, pool)| (id.db.as_str(), id.user.as_str(), pool))
+            .chain(retired.iter().map(|pool| {
+                (
+                    pool.address.pool_name.as_str(),
+                    pool.address.username.as_str(),
+                    pool.as_ref(),
+                )
+            }))
+            .filter(|(db, _, _)| *db == self.database)
+            .filter_map(|(_, user, pool)| {
+                let spare = self.eligible_capacity(user, pool, requesting_user)?;
                 let p95 = pool.address.stats.p95_xact_time_us.load(Ordering::Relaxed);
-                (id, pool, spare, p95)
+                Some((user, pool, spare, p95))
             })
             .collect();
 
@@ -73,20 +116,20 @@ impl pool_coordinator::EvictionSource for PoolEvictionSource {
         if candidates.is_empty() {
             if all_other_users.is_empty() {
                 debug!(
-                    "[{requesting_user}@{}] eviction: no other users' pools exist for this database",
+                    "[{requesting_user}@{}] eviction: no peer pool generations share this coordinator",
                     self.database,
                 );
             } else {
                 debug!(
-                    "[{requesting_user}@{}] eviction: {} other user(s) checked, none have spare \
-                     connections above guaranteed minimum (users: {})",
+                    "[{requesting_user}@{}] eviction: {} peer pool generation(s) checked, none have \
+                     eligible connections above guaranteed minimum (users: {})",
                     self.database,
                     all_other_users.len(),
                     all_other_users
                         .iter()
                         .map(|(id, _, spare, p95)| format!(
                             "{}(spare={}, p95_xact={}us)",
-                            id.user, spare, p95
+                            id, spare, p95
                         ))
                         .collect::<Vec<_>>()
                         .join(", "),
@@ -101,29 +144,24 @@ impl pool_coordinator::EvictionSource for PoolEvictionSource {
             candidates.len(),
             candidates
                 .iter()
-                .map(|(id, _, spare, p95)| format!(
-                    "{}(spare={}, p95_xact={}us)",
-                    id.user, spare, p95
-                ))
+                .map(|(id, _, spare, p95)| format!("{}(spare={}, p95_xact={}us)", id, spare, p95))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
 
-        let min_lifetime_ms = candidates
-            .first()
-            .and_then(|(_, pool, _, _)| pool.coordinator.as_ref())
-            .map(|c| c.config().min_connection_lifetime_ms)
-            .unwrap_or(5000);
+        let min_lifetime_ms = self.coordinator.config().min_connection_lifetime_ms;
 
         for (id, pool, spare, _) in candidates {
             // Re-check spare to narrow TOCTOU window: another thread may have
             // acquired a connection since the snapshot, reducing spare to 0.
-            let current_spare = pool.spare_above_min();
+            let current_spare = self
+                .eligible_capacity(id, pool, requesting_user)
+                .unwrap_or(0);
             if current_spare == 0 {
                 debug!(
                     "[{}@{}] eviction: skipped — spare dropped to 0 since snapshot \
                      (was {}, requesting_user='{}')",
-                    id.user, self.database, spare, requesting_user,
+                    id, self.database, spare, requesting_user,
                 );
                 continue;
             }
@@ -131,7 +169,7 @@ impl pool_coordinator::EvictionSource for PoolEvictionSource {
                 info!(
                     "[{}@{}] coordinator evicted idle connection \
                      (spare={}, min_lifetime={}) to free slot for '{}'",
-                    id.user,
+                    id,
                     self.database,
                     spare,
                     format_duration_ms(min_lifetime_ms),
@@ -142,7 +180,7 @@ impl pool_coordinator::EvictionSource for PoolEvictionSource {
             debug!(
                 "[{}@{}] eviction: candidate skipped — \
                  no idle connections older than {} (spare={})",
-                id.user,
+                id,
                 self.database,
                 format_duration_ms(min_lifetime_ms),
                 spare,
@@ -160,13 +198,13 @@ impl pool_coordinator::EvictionSource for PoolEvictionSource {
     }
 
     fn queued_clients(&self, user: &str) -> usize {
-        get_pool(&self.database, user)
+        get_pool(self.database, user)
             .map(|p| p.pool_state().waiting)
             .unwrap_or(0)
     }
 
     fn is_starving(&self, user: &str) -> bool {
-        get_pool(&self.database, user)
+        get_pool(self.database, user)
             .map(|p| {
                 let user_min = p.settings.user.min_pool_size.unwrap_or(0) as usize;
                 let pool_min = p.settings.min_guaranteed_pool_size as usize;
