@@ -211,8 +211,7 @@ Feature: Client migration during binary upgrade
     When we store foreground pg_doorman PID as "old_doorman"
     And we send SIGUSR2 to foreground pg_doorman
     And we wait for foreground binary upgrade to complete
-    # Re-parse same anonymous statement after migration and execute
-    And we send Parse "" with query "SELECT $1::int * 2 AS doubled" to session "anon"
+    # Reuse the migrated anonymous statement without a fresh Parse
     And we send Bind "" to "" with params "50" to session "anon"
     And we send Execute "" to session "anon"
     And we send Sync to session "anon"

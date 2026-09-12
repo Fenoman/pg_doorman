@@ -76,6 +76,82 @@ async fn execute(conn: &mut PgConnection, endpoint: &str, name: &str) -> Protoco
 }
 
 #[then(
+    regex = r#"^a fresh "([^"]+)" Parse observes DDL and rollback while an old Bind keeps its result shape$"#
+)]
+pub async fn fresh_parse_after_ddl(world: &mut DoormanWorld, name: String) {
+    let fresh_name = if name == "anonymous" { "" } else { "fresh" };
+    let query = "SELECT * FROM fresh_parse_rows";
+    for (endpoint, conn) in [
+        ("PostgreSQL", world.pg_conn.as_mut().unwrap()),
+        ("pg_doorman", world.doorman_conn.as_mut().unwrap()),
+    ] {
+        assert_eq!(
+            sqlstate(
+                &simple(
+                    conn,
+                    endpoint,
+                    "BEGIN; CREATE TEMP TABLE fresh_parse_rows AS SELECT 7 AS value",
+                )
+                .await
+            ),
+            None,
+            "{endpoint}"
+        );
+        let pid = values(&simple(conn, endpoint, "SELECT pg_backend_pid()").await);
+        parse(conn, endpoint, "old", query).await;
+        assert_eq!(values(&execute(conn, endpoint, "old").await), ["7"]);
+        simple(conn, endpoint, "SAVEPOINT before_ddl").await;
+        assert_eq!(
+            sqlstate(
+                &simple(
+                    conn,
+                    endpoint,
+                    "ALTER TABLE fresh_parse_rows ADD COLUMN note text DEFAULT 'new'",
+                )
+                .await
+            ),
+            None,
+            "{endpoint}"
+        );
+        simple(conn, endpoint, "SAVEPOINT after_ddl").await;
+        assert_eq!(
+            sqlstate(&execute(conn, endpoint, "old").await),
+            Some("0A000".to_string()),
+            "{endpoint}: old Bind must retain its original result descriptor"
+        );
+        simple(conn, endpoint, "ROLLBACK TO after_ddl").await;
+        parse(conn, endpoint, fresh_name, query).await;
+        let response = execute(conn, endpoint, fresh_name).await;
+        assert_eq!(
+            sqlstate(&response),
+            None,
+            "{endpoint}: fresh Parse reused an old plan"
+        );
+        let rows: Vec<_> = response.iter().filter(|(kind, _)| *kind == 'D').collect();
+        assert_eq!(rows.len(), 1, "{endpoint}");
+        // Two text fields: integer 7 and the newly added column's default.
+        assert_eq!(rows[0].1, b"\0\x02\0\0\0\x017\0\0\0\x03new", "{endpoint}");
+        assert_eq!(
+            sqlstate(&execute(conn, endpoint, "old").await),
+            Some("0A000".to_string()),
+            "{endpoint}: fresh Parse must not overwrite the old logical statement"
+        );
+        simple(conn, endpoint, "ROLLBACK TO before_ddl").await;
+        parse(conn, endpoint, "after_rollback", query).await;
+        assert_eq!(
+            values(&execute(conn, endpoint, "after_rollback").await),
+            ["7"]
+        );
+        assert_eq!(values(&execute(conn, endpoint, "old").await), ["7"]);
+        assert_eq!(
+            values(&simple(conn, endpoint, "SELECT pg_backend_pid()").await),
+            pid
+        );
+        simple(conn, endpoint, "ROLLBACK").await;
+    }
+}
+
+#[then(
     regex = r#"^a cold "([^"]+)" after "([^"]+)" preserves the open protocol cycle using "([^"]+)"$"#
 )]
 pub async fn cold_after_flush(
@@ -325,7 +401,7 @@ pub async fn cold_reprepare_streaming(world: &mut DoormanWorld, case: String) {
                 .map(|(kind, _)| *kind)
                 .collect::<String>(),
             "21D",
-            "{endpoint}: synthetic ParseComplete was out of order"
+            "{endpoint}: frontend ParseComplete was out of order"
         );
         assert!(sqlstate(&response).is_none(), "{endpoint}");
         if case == "large row" {

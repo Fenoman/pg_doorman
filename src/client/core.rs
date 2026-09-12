@@ -88,8 +88,7 @@ pub struct PreparedStatementCache {
     ///
     /// Tracks the same fixed-overhead components the old walk attributed
     /// to the client side: the key enum, its Named string length, the
-    /// CachedStatement struct, and the `async_name` String capacity for
-    /// async clients. The old walk additionally added
+    /// CachedStatement struct, and the unique backend name bytes. The old walk additionally added
     /// `parse.memory_usage()` when `Arc::strong_count(parse) == 1`; that
     /// term is deliberately dropped here because (a) the Arc is the
     /// canonical property of the pool-side `PreparedStatementCache`
@@ -131,12 +130,12 @@ fn named_entry_fixed_bytes(name_len: usize, value: &CachedStatement) -> u64 {
 }
 
 /// Value-side fixed cost (CachedStatement struct + shared backend name bytes).
-/// Async entries share that allocation with async_name; count it only once.
+/// Both name handles share that allocation; count it only once.
 /// The key cost cancels on
 /// Replaced branches where the previous entry and the new entry share
 /// the same key allocation (Named) or the same fixed Anonymous overhead.
 ///
-/// the implementation note: switching `async_name` from `String` to `Arc<str>`
+/// the implementation note: switching `unique_name` from `String` to `Arc<str>`
 /// changes the "owned bytes per entry" accounting from `String::capacity`
 /// (which includes spare allocator slack) to `Arc<str>::len` (exact
 /// payload + no slack). The walk-vs-approx invariant test
@@ -698,8 +697,18 @@ pub(crate) struct PreparedNamespaceChange {
     pub is_parse: bool,
 }
 
-/// Cached prepared statement entry.
-/// For async clients, stores an optional unique name to avoid "prepared statement already exists" errors.
+/// A fresh frontend Parse has its own result descriptor, even when another
+/// logical statement shares the SQL text. Use the same naming rule after
+/// migration so restored statements keep separate backend identities too.
+pub(crate) fn fresh_server_statement_name() -> Arc<str> {
+    Arc::from(format!(
+        "DOORMAN_{}",
+        super::PREPARED_STATEMENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Cached prepared statement entry with shared Parse metadata and a separate
+/// physical backend name for each frontend Parse.
 #[derive(Clone)]
 pub struct CachedStatement {
     /// Shared backend alias allocated once per cached statement.
@@ -718,23 +727,23 @@ pub struct CachedStatement {
     pub(crate) set_cleanup_command: Option<SetCleanupCommand>,
     /// Cleanup attribution for successful extended-protocol RESET executions.
     pub(crate) reset_cleanup_command: Option<ResetCleanupCommand>,
-    /// Unique statement name for async clients (e.g., "DOORMAN_async_12345").
-    /// None for non-async clients (they use `parse.name` directly).
+    /// Unique name for this logical statement (e.g., "DOORMAN_12345").
+    /// An absent override uses the metadata name in `parse.name`.
     ///
     /// stored as `Arc<str>` because every Bind/Describe/
     /// Close on the extended-protocol hot path used to clone the name as
     /// `String`. The refcount-bump path lets the per-batch
     /// `BatchOperation` entries share the same allocation
     /// the cache itself already owns.
-    pub async_name: Option<Arc<str>>,
+    pub unique_name: Option<Arc<str>>,
 }
 
 impl CachedStatement {
     /// Build a plain cached statement entry with no cleanup attribution.
     #[must_use]
-    pub fn new(parse: Arc<Parse>, hash: u64, async_name: Option<Arc<str>>) -> Self {
+    pub fn new(parse: Arc<Parse>, hash: u64, unique_name: Option<Arc<str>>) -> Self {
         Self {
-            shared_server_name: async_name
+            shared_server_name: unique_name
                 .clone()
                 .unwrap_or_else(|| Arc::from(parse.name.as_str())),
             parse,
@@ -742,15 +751,15 @@ impl CachedStatement {
             intercepted_discard_all: false,
             set_cleanup_command: None,
             reset_cleanup_command: None,
-            async_name,
+            unique_name,
         }
     }
 
     /// Returns the statement name to use when communicating with the server.
-    /// For async clients, returns the unique async_name; otherwise returns parse.name.
+    /// Uses the per-Parse override when present, otherwise the metadata's name.
     #[inline(always)]
     pub fn server_name(&self) -> &str {
-        self.async_name
+        self.unique_name
             .as_ref()
             .map(|s| s.as_ref())
             .unwrap_or(&self.parse.name)
@@ -1544,7 +1553,7 @@ mod cache_split_tests {
             intercepted_discard_all: false,
             set_cleanup_command: None,
             reset_cleanup_command: None,
-            async_name: None,
+            unique_name: None,
         }
     }
 

@@ -11,9 +11,7 @@ use std::ffi::c_void;
 
 use crate::client::buffer_pool::PooledBuffer;
 use crate::client::core::{CachedStatement, Client, PreparedStatementKey, PreparedStatementKeyRef};
-use crate::client::util::{
-    extract_reset_cleanup_commands, extract_set_cleanup_commands, PREPARED_STATEMENT_COUNTER,
-};
+use crate::client::util::{extract_reset_cleanup_commands, extract_set_cleanup_commands};
 use crate::config::{get_config, BackendAuthMethod};
 use crate::errors::Error;
 use crate::messages::config_socket::configure_tcp_socket;
@@ -1191,20 +1189,8 @@ fn reconstruct_prepared_state(
         else {
             continue;
         };
-        // `Arc<str>` instead of `String` to match the migrated
-        // `CachedStatement.async_name` type.
-        let async_name: Option<std::sync::Arc<str>> = if async_client {
-            Some(std::sync::Arc::<str>::from(
-                format!(
-                    "DOORMAN_async_{}",
-                    PREPARED_STATEMENT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                )
-                .as_str(),
-            ))
-        } else {
-            None
-        };
-        let mut cached = CachedStatement::new(shared_parse, hash, async_name);
+        let unique_name = Some(super::core::fresh_server_statement_name());
+        let mut cached = CachedStatement::new(shared_parse, hash, unique_name);
         cached.set_cleanup_command = extract_set_cleanup_commands(cached.parse.query().as_bytes())
             .first()
             .copied();

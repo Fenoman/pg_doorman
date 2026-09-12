@@ -60,7 +60,9 @@ func TestPgxV4Prepared(t *testing.T) {
 					&preparedCount, &backendPid); err != nil {
 					assert.NoError(t, err)
 				}
-				assert.True(t, preparedCount < 10)
+				// Per-client aliases can exceed the SQL working-set size.
+				// This fixture sets server_prepared_statements_cache_size = 64.
+				assert.LessOrEqual(t, preparedCount, 64)
 				if err := tx.QueryRow(ctx, "select sum(used_bytes) from pg_backend_memory_contexts").Scan(&memory); err != nil {
 					assert.NoError(t, err)
 				}

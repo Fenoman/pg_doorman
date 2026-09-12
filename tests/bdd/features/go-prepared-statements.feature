@@ -25,6 +25,7 @@ Feature: Go prepared statements tests
       pg_hba = {path = "${DOORMAN_HBA_FILE}"}
       prepared_statements = true
       prepared_statements_cache_size = 10000
+      server_prepared_statements_cache_size = 64
       tls_private_key = "${DOORMAN_SSL_KEY}"
       tls_certificate = "${DOORMAN_SSL_CERT}"
 
