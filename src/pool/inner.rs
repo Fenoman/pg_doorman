@@ -860,7 +860,7 @@ enum CheckoutPreparation<'a> {
 
 /// RAII guard that owns the semaphore-permits-forgotten-for-eviction
 /// accounting in `Pool::evict_dead_backends`. The happy-path commit
-/// pushes survivors back, deducts `evicted` from `slots.size`, and
+/// publishes survivors, deducts `evicted` from `slots.size`, and
 /// restores all `checked` permits via a single `add_permits` (disarming
 /// the guard). If the scan task is dropped at any await point inside
 /// the off-lock check loop - cancellation, panic during `check_alive`,
@@ -949,7 +949,7 @@ impl<'p> EvictGuard<'p> {
         }
     }
 
-    /// Happy-path finalisation. Re-insert survivors via `push_idle`,
+    /// Happy-path finalisation. Hand survivors to waiters or return them idle,
     /// deduct `evicted` from `slots.size`, then restore all permits.
     /// Marks the guard committed only at the END so a panic anywhere
     /// inside this function (debug_assert, `push_idle` OOM,
@@ -966,7 +966,12 @@ impl<'p> EvictGuard<'p> {
         if !survivors.is_empty() || evicted > 0 {
             let mut guard = self.pool.slots.lock();
             for obj in survivors {
-                push_idle(queue_mode, &mut guard.vec, obj);
+                // A survivor still owns its database permit. A coordinator
+                // waiter already holds a checkout permit, so restoring the
+                // scan's permit below cannot wake it without this handoff.
+                if let Some(obj) = send_handoff(&mut guard, obj) {
+                    push_idle(queue_mode, &mut guard.vec, obj);
+                }
             }
             if evicted > 0 {
                 guard.size = guard.size.saturating_sub(evicted);
@@ -2135,7 +2140,7 @@ impl Pool {
                 .store(evicted > 0, Ordering::Relaxed);
         }
 
-        // 3. Happy-path commit: push survivors back, deduct evicted from
+        // 3. Happy-path commit: publish survivors, deduct evicted from
         // `slots.size`, then restore all permits. EvictGuard.commit handles
         // the strict ordering (size -= ... -> unlock -> add_permits) inside a
         // single helper so the contract cannot drift in a future refactor.
@@ -3307,6 +3312,108 @@ mod tests {
     #[tokio::test]
     async fn replenish_cancelled_delivery_reaches_next_waiter() {
         check_replenish_handoff(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn check_dead_scan_handoff(cancel_first: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let coord = pool_coordinator::PoolCoordinator::new(
+            "test_db".to_string(),
+            pool_coordinator::CoordinatorConfig {
+                max_db_connections: 1,
+                min_connection_lifetime_ms: 0,
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 2000,
+            },
+        );
+        let pool = test_pool_with_coordinator(coord.clone());
+        pool.resize(3);
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.last_activity = std::time::SystemTime::now() - Duration::from_secs(60);
+        let mut inner = pool.inner.new_object_inner(server, coord.try_acquire());
+        inner.metrics.recycled = Some(clock::now());
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = 1;
+            slots.vec.push_back(inner);
+        }
+
+        let scan_pool = pool.clone();
+        let scan = tokio::spawn(async move {
+            scan_pool
+                .evict_dead_backends(Duration::from_secs(2), 8, Duration::from_secs(30))
+                .await
+        });
+        let mut query = [0; 7];
+        tokio::time::timeout(Duration::from_millis(500), peer.read_exact(&mut query))
+            .await
+            .expect("the real scan must send its health-check query")
+            .unwrap();
+        assert_eq!(query, [b'Q', 0, 0, 0, 6, b';', 0]);
+        assert_eq!(pool.status().available, 0);
+
+        let timeouts = Timeouts {
+            wait: Some(Duration::from_millis(500)),
+            ..Timeouts::default()
+        };
+        let mut first = Box::pin(pool.timeout_get(&timeouts));
+        let mut second = Box::pin(pool.timeout_get(&timeouts));
+        for (index, waiter) in [&mut first, &mut second].into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    assert!(futures::poll!(&mut *waiter).is_pending());
+                    if pool.inner.slots.lock().waiters.len() == index + 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("checkout must register its coordinator handoff");
+        }
+        assert_eq!(pool.scaling_stats().creates_started, 2);
+        assert_eq!(pool.scaling_stats().inflight_creates, 0);
+        assert_eq!(pool.semaphore().available_permits(), 0);
+
+        // Complete the real probe while both checkouts wait for its backend.
+        // Neither receiver is polled until the scan has published its survivor.
+        peer.write_all(&[b'Z', 0, 0, 0, 5, b'I']).await.unwrap();
+        assert_eq!(scan.await.unwrap(), (1, 0));
+        assert_eq!(pool.status().size, 1);
+        assert_eq!(pool.semaphore().available_permits(), 1);
+        if cancel_first {
+            drop(first);
+        } else {
+            let object = first
+                .await
+                .expect("a healthy scan survivor must reach the oldest coordinator waiter");
+            assert!(futures::poll!(&mut second).is_pending());
+            drop(object);
+        }
+        let object = second.await.expect(
+            "the scan survivor must also reach the next waiter after return or cancellation",
+        );
+        assert_eq!(coord.total_connections(), 1);
+        drop(object);
+        assert_eq!(pool.status().size, 1);
+        assert_eq!(pool.status().available, 1);
+        assert_eq!(pool.semaphore().available_permits(), 3);
+        assert!(pool.inner.slots.lock().waiters.is_empty());
+        pool.close();
+        assert_eq!(coord.total_connections(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evict_dead_backends_wakes_coordinator_waiters_in_order() {
+        check_dead_scan_handoff(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evict_dead_backends_cancelled_delivery_reaches_next_waiter() {
+        check_dead_scan_handoff(true).await;
     }
 
     #[tokio::test]
