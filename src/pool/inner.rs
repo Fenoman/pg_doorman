@@ -380,6 +380,17 @@ fn push_handoff_waiter(slots: &mut Slots, sender: oneshot::Sender<ObjectInner>) 
     slots.waiters.push_back(sender);
 }
 
+/// Deliver to the oldest live waiter without changing semaphore accounting.
+fn send_handoff(slots: &mut Slots, mut inner: ObjectInner) -> Option<ObjectInner> {
+    while let Some(sender) = slots.waiters.pop_front() {
+        match sender.send(inner) {
+            Ok(()) => return None,
+            Err(returned_inner) => inner = returned_inner,
+        }
+    }
+    Some(inner)
+}
+
 #[inline(always)]
 fn close_and_drain_handoff_receiver<T>(
     rx: &mut oneshot::Receiver<T>,
@@ -415,12 +426,7 @@ impl Drop for HandoffReceiverGuard<'_> {
         };
 
         match close_and_drain_handoff_receiver(&mut rx) {
-            Ok(inner) => {
-                let mut slots = self.pool.slots.lock();
-                push_idle(self.pool.config.queue_mode, &mut slots.vec, inner);
-                drop(slots);
-                self.pool.notify_return_observers();
-            }
+            Ok(inner) => self.pool.requeue_handoff(inner),
             Err(_) => {
                 drop(rx);
                 let mut slots = self.pool.slots.lock();
@@ -740,25 +746,15 @@ impl PoolInner {
 
         // Direct handoff: send to the oldest registered waiter.
         // Waiters whose receiver was dropped (timeout) are skipped.
-        while let Some(sender) = slots.waiters.pop_front() {
-            match sender.send(inner) {
-                Ok(()) => {
-                    drop(slots);
-                    // Restore the returning client's semaphore permit.
-                    // The waiter holds its OWN permit (from acquire_semaphore),
-                    // so this is not double-counting — it compensates for the
-                    // permit.forget() when this connection was last wrapped.
-                    // Without this, each handoff permanently drains one permit
-                    // because the returning client re-enters timeout_get and
-                    // acquires a NEW permit, but the old one was never restored.
-                    self.semaphore.add_permits(1);
-                    return;
-                }
-                Err(returned_inner) => {
-                    // Receiver dropped (timeout) — try the next waiter.
-                    inner = returned_inner;
-                }
+        match send_handoff(&mut slots, inner) {
+            None => {
+                drop(slots);
+                // The returning checkout restores its permit; the receiving
+                // waiter holds a separate permit from acquire_semaphore.
+                self.semaphore.add_permits(1);
+                return;
             }
+            Some(returned_inner) => inner = returned_inner,
         }
 
         // No waiters — normal path.
@@ -768,12 +764,25 @@ impl PoolInner {
         self.notify_return_observers();
     }
 
+    /// A cancelled receiver's delivery has already restored the returning
+    /// checkout's permit. Pass it to the next waiter, or back to idle, without
+    /// restoring that permit again. Coordinator waiters need this handoff:
+    /// an idle backend still holds its database permit and cannot wake them.
+    fn requeue_handoff(&self, inner: ObjectInner) {
+        let mut slots = self.slots.lock();
+        if let Some(inner) = send_handoff(&mut slots, inner) {
+            push_idle(self.config.queue_mode, &mut slots.vec, inner);
+            drop(slots);
+            self.notify_return_observers();
+        }
+    }
+
     /// Wake peer-pool coordinator waiter after a connection lands in
     /// `slots.vec` (the no-waiter path of `return_object`). The coordinator
     /// the wait queue waiter scans this pool's idle vec via `evict_one_idle` and
     /// drops the returned connection to free a coordinator slot.
     ///
-    /// Same-pool waiters (Phase B anticipation, burst gate) now receive
+    /// Same-pool waiters (anticipation, burst gate, coordinator) receive
     /// connections via the direct-handoff oneshot channel inside
     /// `return_object` and never park on a Notify.
     #[inline(always)]
@@ -833,6 +842,20 @@ enum CoordinatorJitResult<'a> {
     },
     /// A recycled connection was found during the slow-path wait.
     Recycled(Box<ObjectInner>),
+}
+
+/// Result of the bounded wait phases. Backend creation starts after this
+/// boundary and retains its independent create/connect timeout.
+// The recycled value is immediately returned to the caller as an Object.
+// Boxing it here would add an allocation to every successful warm checkout.
+#[allow(clippy::large_enum_variant)]
+enum CheckoutPreparation<'a> {
+    Recycled(Object),
+    Create {
+        permit: SemaphorePermit<'a>,
+        coordinator_permit: Option<pool_coordinator::CoordinatorPermit>,
+        gate: BurstGateGuard<'a>,
+    },
 }
 
 /// RAII guard that owns the semaphore-permits-forgotten-for-eviction
@@ -1120,17 +1143,12 @@ impl Pool {
             }
 
             // A connection could arrive between the poll of rx and the
-            // drop of the select future. Push it to idle directly —
+            // drop of the select future. Pass it to the next waiter or idle —
             // the original return_object that sent it here already
             // called add_permits(1), so calling return_object again
             // would double-count the permit.
             match handoff_rx.close_and_drain() {
-                Ok(inner) => {
-                    let mut slots = self.inner.slots.lock();
-                    push_idle(self.inner.config.queue_mode, &mut slots.vec, inner);
-                    drop(slots);
-                    self.inner.notify_return_observers();
-                }
+                Ok(inner) => self.inner.requeue_handoff(inner),
                 Err(_) => {
                     let mut slots = self.inner.slots.lock();
                     prune_closed_handoff_waiters(&mut slots);
@@ -1175,10 +1193,54 @@ impl Pool {
         // Slow path: release gate slot so peers can create while we wait.
         drop(gate);
         let eviction = super::PoolEvictionSource::new(&self.inner.pool_name);
-        let p = match coordinator
-            .acquire(&self.inner.pool_name, &self.inner.username, &eviction)
-            .await
-        {
+        let acquire = coordinator.acquire(&self.inner.pool_name, &self.inner.username, &eviction);
+        tokio::pin!(acquire);
+
+        // A database permit belongs to the physical backend, so same-pool
+        // checkin does not release it. Wait for that backend as well as for a
+        // permit to create another one, keeping this coordinator request alive
+        // across failed handoffs so its timeout and reserve priority persist.
+        let acquired = loop {
+            if self.is_closed() {
+                return Err(PoolError::Closed);
+            }
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut slots = self.inner.slots.lock();
+                push_handoff_waiter(&mut slots, tx);
+            }
+            let mut handoff_rx = HandoffReceiverGuard::new(&self.inner, rx);
+
+            // Register before checking idle to close the checkin/park race.
+            if let RecycleOutcome::Reused(inner) = self.inner.try_recycle_one(timeouts).await {
+                return Ok(CoordinatorJitResult::Recycled(inner));
+            }
+
+            tokio::select! {
+                biased;
+                result = handoff_rx.rx_mut() => {
+                    if let Ok(inner) = result {
+                        if let Ok(inner) = self.recycle_handoff(inner, timeouts).await {
+                            return Ok(CoordinatorJitResult::Recycled(Box::new(inner)));
+                        }
+                    }
+                }
+                result = &mut acquire => {
+                    // Check once more before committing to a permit or an error:
+                    // checkin can race the first receiver poll above. Closing
+                    // the receiver makes any later checkin use the idle queue.
+                    if let Ok(inner) = handoff_rx.close_and_drain() {
+                        if let Ok(inner) = self.recycle_handoff(inner, timeouts).await {
+                            return Ok(CoordinatorJitResult::Recycled(Box::new(inner)));
+                        }
+                    }
+                    prune_closed_handoff_waiters(&mut self.inner.slots.lock());
+                    break result;
+                }
+            }
+        };
+
+        let p = match acquired {
             Ok(p) => p,
             Err(pool_coordinator::AcquireError::NoConnection(info)) => {
                 let slots = self.inner.slots.lock();
@@ -1490,7 +1552,49 @@ impl Pool {
         }
 
         let start = tokio::time::Instant::now();
+        let preparation = self.prepare_checkout(timeouts, start);
+        let prepared = match timeouts.wait.filter(|wait| !wait.is_zero()) {
+            Some(wait) => tokio::time::timeout_at(start + wait, preparation)
+                .await
+                .map_err(|_| PoolError::Timeout(TimeoutType::Wait))?,
+            // Zero retains the existing non-blocking per-pool behavior and
+            // coordinator timeout; None does not impose a checkout deadline.
+            None => preparation.await,
+        }?;
 
+        let (permit, coordinator_permit, _gate) = match prepared {
+            CheckoutPreparation::Recycled(object) => return Ok(object),
+            CheckoutPreparation::Create {
+                permit,
+                coordinator_permit,
+                gate,
+            } => (permit, coordinator_permit, gate),
+        };
+
+        let obj_inner = self
+            .inner
+            .create_connection(timeouts, coordinator_permit)
+            .await
+            .map_err(|e| {
+                let slots = self.inner.slots.lock();
+                warn!(
+                    "[{}@{}] checkout failed at phase=create elapsed={}ms size={} err={}",
+                    self.inner.pool_name,
+                    self.inner.username,
+                    start.elapsed().as_millis(),
+                    slots.size,
+                    e,
+                );
+                e
+            })?;
+        Ok(self.wrap_checkout(obj_inner, permit))
+    }
+
+    async fn prepare_checkout(
+        &self,
+        timeouts: &Timeouts,
+        start: tokio::time::Instant,
+    ) -> Result<CheckoutPreparation<'_>, PoolError> {
         self.wait_if_paused(timeouts).await?;
         let permit = self.acquire_semaphore(timeouts).await.inspect_err(|_e| {
             let slots = self.inner.slots.lock();
@@ -1509,17 +1613,21 @@ impl Pool {
             // `return_object`, preserving slot-size invariants.
             let obj = self.wrap_checkout(*inner, permit);
             self.maybe_trigger_pre_replacement(&obj.inner.as_ref().unwrap().metrics);
-            return Ok(obj);
+            return Ok(CheckoutPreparation::Recycled(obj));
         }
 
         if let Some(inner) = self.try_anticipate(timeouts, start).await {
-            return Ok(self.wrap_checkout(inner, permit));
+            return Ok(CheckoutPreparation::Recycled(
+                self.wrap_checkout(inner, permit),
+            ));
         }
 
         loop {
             match self.inner.try_recycle_one(timeouts).await {
                 RecycleOutcome::Reused(inner) => {
-                    return Ok(self.wrap_checkout(*inner, permit));
+                    return Ok(CheckoutPreparation::Recycled(
+                        self.wrap_checkout(*inner, permit),
+                    ));
                 }
                 RecycleOutcome::Failed => continue,
                 RecycleOutcome::Empty => break,
@@ -1530,7 +1638,9 @@ impl Pool {
         let _create_gate = match self.acquire_burst_gate(timeouts, non_blocking).await {
             BurstGateOutcome::Acquired(guard) => guard,
             BurstGateOutcome::Recycled(inner) => {
-                return Ok(self.wrap_checkout(*inner, permit));
+                return Ok(CheckoutPreparation::Recycled(
+                    self.wrap_checkout(*inner, permit),
+                ));
             }
             BurstGateOutcome::Timeout => {
                 let slots = self.inner.slots.lock();
@@ -1552,27 +1662,17 @@ impl Pool {
                     gate: g,
                 } => (cp, g),
                 CoordinatorJitResult::Recycled(inner) => {
-                    return Ok(self.wrap_checkout(*inner, permit));
+                    return Ok(CheckoutPreparation::Recycled(
+                        self.wrap_checkout(*inner, permit),
+                    ));
                 }
             };
 
-        let obj_inner = self
-            .inner
-            .create_connection(timeouts, coordinator_permit)
-            .await
-            .map_err(|e| {
-                let slots = self.inner.slots.lock();
-                warn!(
-                    "[{}@{}] checkout failed at phase=create elapsed={}ms size={} err={}",
-                    self.inner.pool_name,
-                    self.inner.username,
-                    start.elapsed().as_millis(),
-                    slots.size,
-                    e,
-                );
-                e
-            })?;
-        Ok(self.wrap_checkout(obj_inner, permit))
+        Ok(CheckoutPreparation::Create {
+            permit,
+            coordinator_permit,
+            gate: _gate,
+        })
     }
 
     /// Resizes the pool.
@@ -2904,6 +3004,208 @@ mod tests {
             .pool_name("test_db".to_string())
             .username("test_user".to_string())
             .build()
+    }
+
+    #[tokio::test]
+    async fn checkout_wait_deadline_bounds_coordinator_wait() {
+        let coord = pool_coordinator::PoolCoordinator::new(
+            "test_db".to_string(),
+            pool_coordinator::CoordinatorConfig {
+                max_db_connections: 1,
+                min_connection_lifetime_ms: 0,
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 2000,
+            },
+        );
+        let _held = coord.try_acquire().unwrap();
+        let pool = test_pool_with_coordinator(coord.clone());
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            pool.timeout_get(&Timeouts {
+                wait: Some(Duration::from_millis(50)),
+                ..Timeouts::default()
+            }),
+        )
+        .await
+        .expect("query wait deadline must bound the longer coordinator wait");
+        assert!(matches!(result, Err(PoolError::Timeout(TimeoutType::Wait))));
+        assert_eq!(coord.total_connections(), 1);
+        assert_eq!(pool.inner.inflight_creates.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.semaphore().available_permits(), pool.status().max_size);
+    }
+
+    #[tokio::test]
+    async fn checkout_wait_deadline_bounds_burst_gate_wait() {
+        let pool = empty_test_pool();
+        let mut held = Vec::new();
+        while let Some(gate) = pool.inner.try_acquire_burst_gate() {
+            held.push(gate);
+        }
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            pool.timeout_get(&Timeouts {
+                wait: Some(Duration::from_millis(50)),
+                ..Timeouts::default()
+            }),
+        )
+        .await
+        .expect("query wait deadline must bound a saturated burst gate");
+        assert!(matches!(result, Err(PoolError::Timeout(TimeoutType::Wait))));
+        assert_eq!(pool.semaphore().available_permits(), pool.status().max_size);
+        assert!(pool.inner.slots.lock().waiters.is_empty());
+        drop(held);
+        assert_eq!(pool.inner.inflight_creates.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn checkout_wait_deadline_is_shared_by_pause_and_semaphore() {
+        let pool = empty_test_pool_with_max_size(1);
+        let _held = pool.semaphore().acquire().await.unwrap();
+        pool.pause();
+        let resume_pool = pool.clone();
+        let resume = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            resume_pool.resume();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_millis(350),
+            pool.timeout_get(&Timeouts {
+                wait: Some(Duration::from_millis(250)),
+                ..Timeouts::default()
+            }),
+        )
+        .await
+        .expect("resume must not start a second query wait budget");
+        assert!(matches!(result, Err(PoolError::Timeout(TimeoutType::Wait))));
+        resume.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkout_wait_reuses_same_pool_return_at_database_limit() {
+        let coord = pool_coordinator::PoolCoordinator::new(
+            "test_db".to_string(),
+            pool_coordinator::CoordinatorConfig {
+                max_db_connections: 1,
+                min_connection_lifetime_ms: 0,
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 2000,
+            },
+        );
+        let pool = test_pool_with_coordinator(coord.clone());
+        pool.resize(2);
+        let (server, _peer) = Server::test_silent_socket();
+        let mut inner = pool.inner.new_object_inner(server, coord.try_acquire());
+        inner.metrics.recycled = Some(clock::now());
+        pool.inner.slots.lock().size = 1;
+        let held = pool.wrap_checkout(inner, pool.semaphore().acquire().await.unwrap());
+
+        let waiter_pool = pool.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_pool
+                .timeout_get(&Timeouts {
+                    wait: Some(Duration::from_millis(250)),
+                    ..Timeouts::default()
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(pool.scaling_stats().creates_started > 0);
+        assert_eq!(pool.inner.inflight_creates.load(Ordering::Relaxed), 0);
+        drop(held);
+
+        let object = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("same-pool checkin must wake the coordinator waiter")
+            .unwrap()
+            .expect("a returned backend needs no new database permit");
+        assert_eq!(coord.total_connections(), 1);
+        assert_eq!(pool.status().size, 1);
+        drop(object);
+        assert_eq!(pool.semaphore().available_permits(), 2);
+        assert_eq!(pool.status().available, 1);
+        assert!(pool.inner.slots.lock().waiters.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkout_wait_cancelled_delivery_reaches_next_coordinator_waiter() {
+        let coord = pool_coordinator::PoolCoordinator::new(
+            "test_db".to_string(),
+            pool_coordinator::CoordinatorConfig {
+                max_db_connections: 1,
+                min_connection_lifetime_ms: 0,
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 2000,
+            },
+        );
+        let pool = test_pool_with_coordinator(coord.clone());
+        pool.resize(3);
+        let (server, _peer) = Server::test_silent_socket();
+        let mut inner = pool.inner.new_object_inner(server, coord.try_acquire());
+        inner.metrics.recycled = Some(clock::now());
+        pool.inner.slots.lock().size = 1;
+        let held = pool.wrap_checkout(inner, pool.semaphore().acquire().await.unwrap());
+
+        let mut waiters = Vec::new();
+        for count in 1..=2 {
+            let waiter_pool = pool.clone();
+            waiters.push(tokio::spawn(async move {
+                waiter_pool
+                    .timeout_get(&Timeouts {
+                        wait: Some(Duration::from_millis(400)),
+                        ..Timeouts::default()
+                    })
+                    .await
+            }));
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while pool.inner.slots.lock().waiters.len() != count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("checkout must register its handoff before the next waiter");
+        }
+
+        // Deliver synchronously, then cancel the recipient before it can poll.
+        drop(held);
+        let first = waiters.remove(0);
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let object = tokio::time::timeout(Duration::from_millis(150), waiters.remove(0))
+            .await
+            .expect("cancelled delivery must reach the next waiter without a new permit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(coord.total_connections(), 1);
+        assert_eq!(pool.status().size, 1);
+        drop(object);
+        assert_eq!(pool.semaphore().available_permits(), 3);
+        assert_eq!(pool.status().available, 1);
+        assert!(pool.inner.slots.lock().waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkout_wait_zero_preserves_coordinator_timeout() {
+        let coord = pool_coordinator::PoolCoordinator::new(
+            "test_db".to_string(),
+            pool_coordinator::CoordinatorConfig {
+                max_db_connections: 1,
+                min_connection_lifetime_ms: 0,
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 50,
+            },
+        );
+        let _held = coord.try_acquire().unwrap();
+        let pool = test_pool_with_coordinator(coord);
+        let result = pool
+            .timeout_get(&Timeouts {
+                wait: Some(Duration::ZERO),
+                ..Timeouts::default()
+            })
+            .await;
+        assert!(matches!(result, Err(PoolError::DbLimitExhausted(_))));
     }
 
     /// `notify_return_observers` wakes the peer-pool coordinator the wait queue

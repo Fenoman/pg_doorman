@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use log::{debug, info, warn};
@@ -188,7 +188,7 @@ impl PartialEq for ReserveRequest {
 impl Eq for ReserveRequest {}
 
 impl PoolCoordinator {
-    /// Create a new coordinator. Spawns the reserve arbiter task.
+    /// Create a new coordinator. Spawns an arbiter only when reserve is enabled.
     pub fn new(database: String, config: CoordinatorConfig) -> Arc<Self> {
         let (reserve_tx, reserve_rx) = mpsc::channel(256);
         let coordinator = Arc::new(Self {
@@ -205,10 +205,12 @@ impl PoolCoordinator {
             config,
         });
 
-        let coordinator_clone = coordinator.clone();
-        tokio::spawn(async move {
-            reserve_arbiter(reserve_rx, coordinator_clone).await;
-        });
+        if coordinator.config.reserve_pool_size > 0 {
+            let weak = Arc::downgrade(&coordinator);
+            tokio::spawn(async move {
+                reserve_arbiter(reserve_rx, weak).await;
+            });
+        }
 
         coordinator
     }
@@ -722,15 +724,15 @@ impl std::error::Error for AcquireError {}
 
 const ARBITER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-async fn reserve_arbiter(
-    mut rx: mpsc::Receiver<ReserveRequest>,
-    coordinator: Arc<PoolCoordinator>,
-) {
+async fn reserve_arbiter(mut rx: mpsc::Receiver<ReserveRequest>, weak: Weak<PoolCoordinator>) {
     use std::collections::BinaryHeap;
 
     let mut pending: BinaryHeap<ReserveRequest> = BinaryHeap::new();
 
     loop {
+        let Some(coordinator) = weak.upgrade() else {
+            return;
+        };
         // Collect new requests (non-blocking)
         while let Ok(req) = rx.try_recv() {
             debug!(
@@ -808,21 +810,21 @@ async fn reserve_arbiter(
             }
         }
 
-        tokio::select! {
-            req = rx.recv() => {
-                match req {
-                    Some(req) => {
-                        debug!(
-                            "[pool: {}] arbiter: received reserve request from '{}' \
-                             (score=starving:{}, queued:{})",
-                            coordinator.database, req.user, req.score.0, req.score.1,
-                        );
-                        pending.push(req);
-                    }
-                    None => return, // channel closed, coordinator dropped
-                }
+        // Never keep an owner across an await: the coordinator owns reserve_tx,
+        // so retaining it here would prevent rx from closing on retirement.
+        drop(coordinator);
+        let request = if pending.is_empty() {
+            // Idle coordinators need no periodic wakeups.
+            rx.recv().await
+        } else {
+            tokio::select! {
+                request = rx.recv() => request,
+                _ = tokio::time::sleep(ARBITER_POLL_INTERVAL) => continue,
             }
-            _ = tokio::time::sleep(ARBITER_POLL_INTERVAL) => {}
+        };
+        match request {
+            Some(request) => pending.push(request),
+            None => return, // also drops the pending requests' response senders
         }
     }
 }
@@ -883,6 +885,48 @@ mod tests {
             reserve_pool_size: reserve,
             reserve_pool_timeout_ms: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn retired_coordinator_is_released_without_runtime_shutdown() {
+        for reserve in [0, 2] {
+            let coord = PoolCoordinator::new("retired".to_string(), test_config(2, reserve));
+            let weak = Arc::downgrade(&coord);
+            // Let the background task enter its idle wait before retiring it.
+            tokio::task::yield_now().await;
+            drop(coord);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                weak.upgrade().is_none(),
+                "arbiter retained coordinator with reserve={reserve}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_coordinator_closes_pending_reserve_requests() {
+        let coord = PoolCoordinator::new("retired".to_string(), test_config(1, 1));
+        let weak = Arc::downgrade(&coord);
+        // Exhaust reserve while leaving no external RAII owner. The pending
+        // request itself must not keep a retired coordinator alive.
+        coord.reserve_semaphore.try_acquire().unwrap().forget();
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        coord
+            .reserve_tx
+            .send(ReserveRequest {
+                user: "pending".to_string(),
+                score: (0, 1),
+                response,
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        drop(coord);
+        let result = tokio::time::timeout(Duration::from_millis(250), receiver)
+            .await
+            .expect("retirement must close pending reserve requests");
+        assert!(result.is_err());
+        assert!(weak.upgrade().is_none());
     }
 
     #[tokio::test]

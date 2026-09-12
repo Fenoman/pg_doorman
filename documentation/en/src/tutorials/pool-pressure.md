@@ -172,10 +172,12 @@ where `adaptive_cap` is derived from real transaction latency:
 | Steady state | xact_p99 × 2 ± 20% jitter | p99=0.7ms → 5ms (min); p99=50ms → 100ms |
 | High latency | Capped at 500ms | p99=300ms → 500ms |
 
-The budget is measured against a timestamp captured at the top of
-`timeout_get`. Phase 1/2 semaphore wait consumes from the same budget,
-so the cumulative wait across phases cannot exceed the caller's
-`query_wait_timeout`.
+For a positive `query_wait_timeout`, one deadline starts at entry to
+`timeout_get` and covers PAUSE, semaphore, anticipation, burst-gate,
+recycle and coordinator waits, including reserve grants. Moving between
+phases does not restart that budget. Once creation can start, the new
+backend gets its separate `connect_timeout`; this connection attempt can
+finish after the query wait deadline.
 
 The ±20% jitter prevents a **timeout cliff**: without it, N clients that
 entered Phase 4 at the same instant all exit simultaneously and
@@ -288,11 +290,10 @@ connection or returns a wait timeout error.
 **Limitation when the coordinator is enabled.** Non-blocking only skips
 the anticipation and burst-gate waits inside the per-pool path. If
 `max_db_connections` is configured and the coordinator's wait phases
-(B–D) take time, a non-blocking caller still blocks inside
-`coordinator.acquire()` for up to `reserve_pool_timeout` (default 3000
-ms) before returning. For a strict zero-wait deadline on
-coordinator-managed databases, set `reserve_pool_timeout` low enough to
-fit your tolerance.
+(B–D) take time, the caller still waits using `reserve_pool_timeout`
+(default 3000 ms) and the reserve grant timeout. Zero does not install
+a global checkout deadline. Use a positive `query_wait_timeout` to
+bound waiting across all phases on coordinator-managed databases.
 
 ### Background replenish
 
@@ -317,20 +318,24 @@ When a connection is returned, `return_object` first checks the
 direct-handoff `waiters` queue inside `Slots`. If at least one waiter
 is registered, the connection is sent through the oldest oneshot
 channel, bypassing the idle `VecDeque` and the semaphore entirely.
-The waiter already holds a semaphore permit, so no `add_permits` call
-is needed. Waiters whose receiver has been dropped (the caller timed
+The returning checkout restores its semaphore permit; the waiter already
+holds a separate permit. Waiters whose receiver has been dropped (the caller timed
 out) are skipped: `send` returns `Err` with the connection, and
 `return_object` tries the next waiter in the queue.
+
+If a receiver is cancelled after delivery, the backend goes to the next
+registered waiter or back to idle. This redistribution does not restore
+another semaphore permit.
 
 If no waiters are registered (the common case at high throughput where
 every checkout hits the hot path), the connection is pushed into the
 idle `VecDeque` and `semaphore.add_permits(1)` wakes a Phase 1/2
 waiter as before.
 
-In both cases, the coordinator (if configured) is notified via
-`notify_return_observers` so peer-pool Phase C waiters can scan for
-eviction candidates. Same-pool waiters never park on a `Notify` — they
-receive connections directly through the oneshot channel.
+When a backend enters the idle queue, the coordinator (if configured)
+is notified via `notify_return_observers` so peer-pool Phase C waiters
+can scan for eviction candidates. Same-pool waiters receive connections
+directly through the oneshot channel.
 
 ### FIFO fairness and latency distribution
 
@@ -643,6 +648,13 @@ acquire into a fast and a slow path. The fast path is a non-blocking
 `try_acquire()` inside the gate slot — no time is wasted. If it fails,
 the caller **releases the gate slot**, waits on the coordinator (may
 evict / wait for a peer return), and then re-acquires a gate slot.
+
+While waiting, the caller also joins its own pool's direct-handoff
+queue. A returned backend keeps its existing database permit and can
+serve the waiting query immediately, even when the database cap is full.
+The coordinator request is cancelled when this handoff succeeds. The
+positive query wait deadline covers both alternatives and any subsequent
+wait to re-acquire the burst gate.
 
 ```
         Coordinator + plain mode acquisition flow (JIT)

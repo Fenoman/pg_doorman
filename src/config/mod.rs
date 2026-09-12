@@ -996,7 +996,7 @@ impl Config {
                 continue;
             }
             let rpt = pool_config.reserve_pool_timeout.unwrap_or(3000);
-            if rpt > qwt {
+            if qwt > 0 && rpt > qwt {
                 log::warn!(
                     "[pool: {pool_name}] reserve_pool_timeout ({rpt}ms) > query_wait_timeout ({qwt}ms); \
                      the outer timeout will fire first, producing a generic Timeout error \
