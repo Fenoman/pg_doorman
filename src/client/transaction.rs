@@ -26,7 +26,7 @@ use crate::errors::Error;
 use crate::messages::{
     ends_with_idle_ready_for_query, error_response_timeout, has_error_response,
     insert_close_complete_after_last_close_complete, read_message_reuse,
-    read_message_reuse_cancel_safe, simple_query, write_all_flush_timeout, Parse,
+    read_message_reuse_cancel_safe, simple_query, write_all_flush_timeout, Parse, PgErrorMsg,
 };
 use crate::pool::{canceled_pids_consume, CancelMarker};
 use crate::server::{
@@ -397,7 +397,37 @@ impl Drop for TransactionGuard {
 /// Result of waiting for the next client message while monitoring server liveness.
 enum NextClientMessage {
     Message(BytesMut),
+    ServerMessage {
+        response: BytesMut,
+        copy_error: bool,
+    },
     ServerDead,
+}
+
+/// A fully buffered frame cannot suspend after consuming its header, so the
+/// ordinary reader remains cancellation-safe here. Fragmented frames retain
+/// their progress in read_buf when backend activity interrupts the wait.
+async fn read_transaction_message<S>(
+    read: &mut tokio::io::BufReader<S>,
+    read_buf: &mut BytesMut,
+    max_memory_usage: u64,
+) -> Result<BytesMut, Error>
+where
+    S: tokio::io::AsyncRead + std::marker::Unpin,
+{
+    if read_buf.is_empty() {
+        let available = read
+            .fill_buf()
+            .await
+            .map_err(|err| Error::SocketError(format!("Error reading client message: {err}")))?;
+        if available.len() >= 5 {
+            let len = u32::from_be_bytes(available[1..5].try_into().unwrap()) as usize;
+            if len < available.len() {
+                return read_message_reuse(read, read_buf, max_memory_usage).await;
+            }
+        }
+    }
+    read_message_reuse_cancel_safe(read, read_buf, max_memory_usage).await
 }
 
 /// Action to take after processing a message in the transaction loop
@@ -666,11 +696,17 @@ where
     ///
     /// 3. **Full monitor** (`select!`): client is truly idle (> 100 ms) — now
     ///    worth paying for the second epoll interest to race client read
-    ///    against `server_readable()`.  Detects dead servers (e.g.
+    ///    against `wait_server_data()`. Detects dead servers (e.g.
     ///    `pg_terminate_backend`, `idle_in_transaction_session_timeout`) and
     ///    releases the pool slot early instead of holding it indefinitely.
-    async fn wait_for_next_message(&mut self, server: &Server) -> Result<NextClientMessage, Error> {
-        let mut read_fut = std::pin::pin!(read_message_reuse(
+    async fn wait_for_next_message(
+        &mut self,
+        server: &mut Server,
+        monitor_backend: bool,
+    ) -> Result<NextClientMessage, Error> {
+        // A backend notification can interrupt a partially received frontend
+        // frame. Keep its prefix in read_buf when returning that notification.
+        let mut read_fut = std::pin::pin!(read_transaction_message(
             &mut self.read,
             &mut self.read_buf,
             self.max_memory_usage
@@ -686,24 +722,53 @@ where
             return result.map(NextClientMessage::Message);
         }
 
-        if let Ok(result) = tokio::time::timeout(Duration::from_millis(100), &mut read_fut).await {
-            return result.map(NextClientMessage::Message);
+        if !monitor_backend {
+            if let Ok(result) =
+                tokio::time::timeout(Duration::from_millis(100), &mut read_fut).await
+            {
+                return result.map(NextClientMessage::Message);
+            }
         }
 
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut read_fut => {
-                    return result.map(NextClientMessage::Message);
-                }
-                _ = server.server_readable() => {
-                    if server.check_server_alive() {
-                        continue;
-                    }
+        tokio::select! {
+            biased;
+            result = &mut read_fut => {
+                return result.map(NextClientMessage::Message);
+            }
+            _ = server.wait_server_data() => {}
+        }
+
+        // Readiness also means ordinary protocol data: LISTEN notifications,
+        // notices, parameter changes, or a recoverable COPY cancellation. Read
+        // one complete frame outside select so a frontend arrival cannot tear
+        // the backend read. A truncated backend frame remains timeout-bounded.
+        let timeout = config_arc().general.proxy_copy_data_timeout.as_std();
+        let was_copy = server.in_copy_mode();
+        let response = match tokio::time::timeout(
+            timeout,
+            server.recv_one(&mut self.write, Some(&mut self.server_parameters)),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            _ => return Ok(NextClientMessage::ServerDead),
+        };
+        if response.first() == Some(&b'E') {
+            if let Ok(error) = PgErrorMsg::parse(&response[5..]) {
+                let severity = if error.severity.is_empty() {
+                    &error.severity_localized
+                } else {
+                    &error.severity
+                };
+                if matches!(severity.as_str(), "FATAL" | "PANIC") {
                     return Ok(NextClientMessage::ServerDead);
                 }
             }
         }
+        Ok(NextClientMessage::ServerMessage {
+            copy_error: was_copy && response.first() == Some(&b'E'),
+            response,
+        })
     }
 
     /// Handle cancel mode - when client wants to cancel a earlier issued query.
@@ -1934,18 +1999,21 @@ where
                     }
                 };
             #[cfg(not(unix))]
-            let (message, replayed_pre_server_message) = if let Some(message) =
-                pre_server_replay.pop_front()
-            {
-                (message, true)
-            } else {
-                match read_message_reuse(&mut self.read, &mut self.read_buf, self.max_memory_usage)
+            let (message, replayed_pre_server_message) =
+                if let Some(message) = pre_server_replay.pop_front() {
+                    (message, true)
+                } else {
+                    match read_message_reuse_cancel_safe(
+                        &mut self.read,
+                        &mut self.read_buf,
+                        self.max_memory_usage,
+                    )
                     .await
-                {
-                    Ok(message) => (message, false),
-                    Err(err) => return self.process_error(err).await,
-                }
-            };
+                    {
+                        Ok(message) => (message, false),
+                        Err(err) => return self.process_error(err).await,
+                    }
+                };
             if message[0] as char == 'X' {
                 debug!(
                     "[{}@{} #c{}] client {} sent Terminate",
@@ -1971,6 +2039,12 @@ where
                 handle_admin(&mut self.write, message, self.client_server_map.clone())
                     .await
                     .inspect_err(|_| self.stats.disconnect())?;
+                continue;
+            }
+
+            // COPY input already in flight when PostgreSQL ends COPY is ignored
+            // in command mode, including after its backend has been released.
+            if matches!(message[0], b'd' | b'c' | b'f') {
                 continue;
             }
 
@@ -2419,6 +2493,7 @@ where
                 }
 
                 let mut initial_message = Some(message);
+                let mut monitor_backend = false;
 
                 // Transaction loop. Multiple queries can be issued by the client here.
                 // The connection belongs to the client until the transaction is over,
@@ -2433,8 +2508,56 @@ where
                     ) {
                         None => {
                             self.stats.active_read();
-                            match self.wait_for_next_message(server).await {
-                                Ok(NextClientMessage::Message(msg)) => msg,
+                            match self.wait_for_next_message(server, monitor_backend).await {
+                                Ok(NextClientMessage::Message(msg)) => {
+                                    monitor_backend = false;
+                                    msg
+                                }
+                                Ok(NextClientMessage::ServerMessage {
+                                    response,
+                                    copy_error,
+                                }) => {
+                                    // Keep draining an idle notification burst or the RFQ
+                                    // after a simple COPY error without 100 ms per frame.
+                                    monitor_backend = true;
+                                    if copy_error {
+                                        self.buffer.clear();
+                                        if std::mem::take(&mut self.prepared.copy_from_extended) {
+                                            self.prepared.ignore_until_sync = true;
+                                        }
+                                    }
+                                    drop(server.take_rejected_prepared_statement_names());
+                                    self.reconcile_prepared_namespace(&response, server);
+                                    log_server_to_client(
+                                        &self.addr_str,
+                                        server.get_process_id(),
+                                        &response,
+                                    );
+                                    self.stats.active_write();
+                                    let write_timeout =
+                                        config_arc().general.proxy_copy_data_timeout.as_std();
+                                    if let Err(err) = write_all_flush_timeout(
+                                        &mut self.write,
+                                        &response,
+                                        write_timeout,
+                                    )
+                                    .await
+                                    {
+                                        server.mark_bad(
+                                            "client disconnected during idle backend response",
+                                        );
+                                        self.release_after_inner_handler_error();
+                                        return Err(err);
+                                    }
+                                    self.stats.active_idle();
+                                    if response.first() == Some(&b'Z')
+                                        && self.complete_transaction_if_needed(server, true)
+                                    {
+                                        self.stats.idle_read();
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 Ok(NextClientMessage::ServerDead) => {
                                     warn!(
                                         "[{}@{} #c{}] server died while idle in transaction pid={}",
@@ -2552,6 +2675,9 @@ where
                     // whose release_query semantics still apply.
                     let action_result: Result<TransactionAction, Error> = match code {
                         _ if self.prepared.ignore_until_sync && code != 'S' && code != 'X' => {
+                            Ok(TransactionAction::Continue)
+                        }
+                        _ if matches!(code, 'd' | 'c' | 'f') && !server.in_copy_mode() => {
                             Ok(TransactionAction::Continue)
                         }
                         // Query
@@ -5630,6 +5756,130 @@ mod relay_response_client_write_failure_tests {
             });
     }
 
+    fn backend_frame(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![kind];
+        frame.extend_from_slice(&(body.len() as i32 + 4).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    #[tokio::test]
+    async fn fully_buffered_frontend_frames_complete_without_suspension() {
+        let frames = [
+            backend_frame(b'Q', b"SELECT 42\0"),
+            backend_frame(b'Q', b"SELECT 84\0"),
+        ];
+        let (socket, mut frontend) = tokio::io::duplex(256);
+        let mut read = BufReader::new(socket);
+        let mut read_buf = BytesMut::new();
+        frontend.write_all(&frames.concat()).await.unwrap();
+        read.fill_buf().await.unwrap();
+        for expected in frames {
+            let mut message =
+                std::pin::pin!(read_transaction_message(&mut read, &mut read_buf, u64::MAX));
+            match poll_fn(|cx| Poll::Ready(message.as_mut().poll(cx))).await {
+                Poll::Ready(Ok(bytes)) => assert_eq!(&bytes[..], &expected),
+                _ => panic!("fully buffered reader must finish in one poll"),
+            }
+        }
+        assert!(read.buffer().is_empty());
+        assert!(read_buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_backend_notification_preserves_partial_frontend_frame() {
+        let query = backend_frame(b'Q', b"SELECT 42\0");
+        let notification = backend_frame(b'A', b"\0\0\0\x2achannel\0payload\0");
+        for prefix_len in [1, 3, 8] {
+            let (read, mut frontend) = tokio::io::duplex(256);
+            let mut client = test_client_with_reader_and_writer(read, tokio::io::sink());
+            let (mut server, mut backend) = Server::test_silent_socket();
+            frontend.write_all(&query[..prefix_len]).await.unwrap();
+            backend.write_all(&notification).await.unwrap();
+
+            let message = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.wait_for_next_message(&mut server, false),
+            )
+            .await
+            .expect("notification must not wait for ReadyForQuery")
+            .unwrap();
+            assert!(
+                matches!(message, NextClientMessage::ServerMessage { ref response, copy_error: false } if response.as_ref() == notification.as_slice())
+            );
+            assert_eq!(&client.read_buf[..], &query[..prefix_len]);
+            assert!(!server.is_bad());
+
+            frontend.write_all(&query[prefix_len..]).await.unwrap();
+            let message = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.wait_for_next_message(&mut server, false),
+            )
+            .await
+            .expect("partial frontend frame must resume")
+            .unwrap();
+            assert!(
+                matches!(message, NextClientMessage::Message(ref bytes) if bytes.as_ref() == query.as_slice())
+            );
+            assert!(client.read_buf.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_backend_copy_error_updates_state_without_expected_responses() {
+        for extended in [false, true] {
+            let mut client = test_client_with_writer(tokio::io::sink());
+            let (mut server, mut backend) = Server::test_silent_socket();
+            server.in_copy_mode = true;
+            server.in_transaction = true;
+            server.set_async_mode(extended);
+            server.set_expected_responses(0);
+            let error = backend_frame(b'E', b"SERROR\0VERROR\0C57014\0Mcancelled\0\0");
+            backend.write_all(&error).await.unwrap();
+            let message = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.wait_for_next_message(&mut server, false),
+            )
+            .await
+            .expect("COPY error must arrive without Sync or CopyDone")
+            .unwrap();
+            assert!(
+                matches!(message, NextClientMessage::ServerMessage { ref response, copy_error: true } if response.as_ref() == error.as_slice())
+            );
+            assert!(!server.in_copy_mode());
+            assert!(server.in_transaction());
+            assert!(!server.is_bad());
+            assert_eq!(server.expected_responses(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_backend_fatal_and_eof_still_release_connection() {
+        for fatal in [false, true] {
+            let mut client = test_client_with_writer(tokio::io::sink());
+            let (mut server, mut backend) = Server::test_silent_socket();
+            if fatal {
+                backend
+                    .write_all(&backend_frame(
+                        b'E',
+                        b"SFATAL\0VFATAL\0C57P01\0Mterminated\0\0",
+                    ))
+                    .await
+                    .unwrap();
+            } else {
+                backend.shutdown().await.unwrap();
+            }
+            let message = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.wait_for_next_message(&mut server, false),
+            )
+            .await
+            .expect("closed backend must be detected")
+            .unwrap();
+            assert!(matches!(message, NextClientMessage::ServerDead));
+        }
+    }
+
     async fn copy_control_preserves_buffered_data(code: u8, extended: bool) {
         let mut client = test_client_with_writer(RecordingWriter::default());
         let (mut server, mut peer) = Server::test_silent_socket();
@@ -5940,7 +6190,9 @@ mod query_timer_anchor_tests {
         let handoff_idx = loop_idx
             + lines[loop_idx..dispatch_idx]
                 .iter()
-                .position(|l| l.trim() == "self.stats.active_idle();")
+                // Backend notifications also restore active_idle inside the
+                // receive match. The final occurrence hands off a client frame.
+                .rposition(|l| l.trim() == "self.stats.active_idle();")
                 .expect("transaction loop message hand-off not found");
         let reset_idx = loop_idx
             + lines[loop_idx..dispatch_idx]

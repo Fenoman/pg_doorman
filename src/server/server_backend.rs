@@ -883,7 +883,21 @@ impl Server {
     where
         C: tokio::io::AsyncWrite + std::marker::Unpin,
     {
-        protocol_io::recv(self, client_stream, client_server_parameters, false).await
+        protocol_io::recv::<_, false>(self, client_stream, client_server_parameters, false).await
+    }
+
+    /// Read one unsolicited backend frame using the normal protocol state
+    /// handlers. A notification has no ReadyForQuery; an extended COPY error
+    /// may arrive after Flush has consumed all expected responses.
+    pub(crate) async fn recv_one<C>(
+        &mut self,
+        client_stream: C,
+        client_server_parameters: Option<&mut ServerParameters>,
+    ) -> Result<BytesMut, Error>
+    where
+        C: tokio::io::AsyncWrite + std::marker::Unpin,
+    {
+        protocol_io::recv::<_, true>(self, client_stream, client_server_parameters, false).await
     }
 
     /// Allow the client relay to insert pending protocol acknowledgements
@@ -897,7 +911,7 @@ impl Server {
     where
         C: tokio::io::AsyncWrite + std::marker::Unpin,
     {
-        protocol_io::recv(
+        protocol_io::recv::<_, false>(
             self,
             client_stream,
             client_server_parameters,
@@ -987,28 +1001,6 @@ impl Server {
     pub async fn wait_server_data(&mut self) {
         use tokio::io::AsyncBufReadExt;
         let _ = self.stream.fill_buf().await;
-    }
-
-    /// Verify that server_readable() readiness is genuine, not spurious.
-    /// Returns true if the connection is alive (WouldBlock = no real data).
-    /// Returns false if the server sent data or closed the connection (dead).
-    pub fn check_server_alive(&self) -> bool {
-        if self.stream.get_ref().is_tls() {
-            // For TLS connections, readable() fires on raw TCP socket readiness.
-            // Calling try_read() on the raw socket would consume bytes that the
-            // TLS layer hasn't processed, corrupting the session.
-            //
-            // On an idle PostgreSQL connection, the raw socket should never become
-            // readable (PostgreSQL does not send unsolicited data, and TLS
-            // renegotiation is disabled since PG14). If readable() fired, the
-            // server disconnected or sent an error — treat as dead.
-            return false;
-        }
-        let mut buf = [0u8; 1];
-        matches!(
-            self.stream.get_ref().try_read(&mut buf),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-        )
     }
 
     /// Server & client are out of sync, we must discard this connection.

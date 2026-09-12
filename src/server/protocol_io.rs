@@ -852,7 +852,7 @@ fn handle_parameter_status(
 
 /// Receive data from the server in response to a client request.
 /// Must be called multiple times while `server.is_data_available()` is true.
-pub(crate) async fn recv<C>(
+pub(crate) async fn recv<C, const ONE_MESSAGE: bool>(
     server: &mut Server,
     mut client_stream: C,
     mut client_server_parameters: Option<&mut ServerParameters>,
@@ -910,7 +910,7 @@ where
     let flush_threshold = server.response_flush_threshold;
     loop {
         // In async mode, check if all expected responses have been received
-        if server.is_async() && server.expected_responses() == 0 {
+        if !ONE_MESSAGE && server.is_async() && server.expected_responses() == 0 {
             server.data_available = false;
             break;
         }
@@ -1023,7 +1023,7 @@ where
             if code_u8 == b'D' {
                 server.data_available = true;
             }
-            if server.buffer.len() >= flush_threshold {
+            if ONE_MESSAGE || server.buffer.len() >= flush_threshold {
                 break;
             }
             continue;
@@ -1238,6 +1238,12 @@ where
             // Keep buffering until ReadyForQuery shows up.
             _ => (),
         };
+
+        // Idle notifications and COPY errors need no subsequent client request
+        // or ReadyForQuery. Return the complete frame without waiting for one.
+        if ONE_MESSAGE {
+            break;
+        }
     }
 
     // zero-copy hand-off. `BytesMut::clone()` would deep-copy every

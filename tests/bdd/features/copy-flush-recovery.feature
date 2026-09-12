@@ -36,3 +36,12 @@ Feature: COPY input preserves data across Flush and Sync
       | simple   | Sync    |
       | extended | Flush   |
       | extended | Sync    |
+
+  @idle-backend-response
+  Scenario Outline: Cancellation during idle COPY preserves the client and transaction
+    Then cancellation during idle COPY via "<protocol>" preserves the client session
+    Examples:
+      | protocol       |
+      | simple         |
+      | extended_sync  |
+      | extended_flush |
