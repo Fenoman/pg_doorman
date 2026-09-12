@@ -2347,7 +2347,14 @@ impl Pool {
                 }
                 let inner = self.inner.new_object_inner(obj, coordinator_permit);
                 slots.size += 1;
-                push_idle(self.inner.config.queue_mode, &mut slots.vec, inner);
+                // A ready refill still holds its database permit, so waiting
+                // checkouts need a handoff. They already own their checkout
+                // permits; replenishing must not add semaphore permits here.
+                if let Some(inner) = send_handoff(&mut slots, inner) {
+                    push_idle(self.inner.config.queue_mode, &mut slots.vec, inner);
+                    drop(slots);
+                    self.inner.notify_return_observers();
+                }
             }
 
             created += 1;
@@ -3184,6 +3191,122 @@ mod tests {
         assert_eq!(pool.semaphore().available_permits(), 3);
         assert_eq!(pool.status().available, 1);
         assert!(pool.inner.slots.lock().waiters.is_empty());
+    }
+
+    async fn check_replenish_handoff(cancel_first: bool) {
+        use crate::config::{Address, User};
+        use dashmap::DashMap;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coord = pool_coordinator::PoolCoordinator::new(
+            "test_db".to_string(),
+            pool_coordinator::CoordinatorConfig {
+                max_db_connections: 1,
+                min_connection_lifetime_ms: 0,
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 2000,
+            },
+        );
+        let server_pool = ServerPool::new(
+            Address {
+                port: listener.local_addr().unwrap().port(),
+                ..Address::default()
+            },
+            User::default(),
+            "test_db",
+            Arc::new(DashMap::new()),
+            false,
+            false,
+            0,
+            "test_app".to_string(),
+            1,
+            60_000,
+            60_000,
+            60_000,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            false,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        )
+        .with_release_query(Some(String::new()));
+        let pool = Pool::builder(server_pool)
+            .config(PoolConfig::new(3))
+            .coordinator(Some(coord.clone()))
+            .pool_name("test_db".to_string())
+            .username("test_user".to_string())
+            .build();
+        let refill_pool = pool.clone();
+        let refill = tokio::spawn(async move { refill_pool.replenish(1).await });
+        let (mut backend, _) = listener.accept().await.unwrap();
+        let startup_len = backend.read_u32().await.unwrap() as usize;
+        let mut startup = vec![0; startup_len - 4];
+        backend.read_exact(&mut startup).await.unwrap();
+
+        // Refill owns the last database permit but has not published a backend.
+        // Poll checkouts ourselves so cancellation can occur after delivery,
+        // before the receiving future gets another poll.
+        assert_eq!(coord.total_connections(), 1);
+        assert_eq!(pool.status().size, 0);
+        let timeouts = Timeouts {
+            wait: Some(Duration::from_millis(500)),
+            ..Timeouts::default()
+        };
+        let mut first = Box::pin(pool.timeout_get(&timeouts));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert_eq!(pool.inner.slots.lock().waiters.len(), 1);
+        let mut second = Box::pin(pool.timeout_get(&timeouts));
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(pool.inner.slots.lock().waiters.len(), 2);
+
+        // AuthenticationOk, BackendKeyData(pid=1234), ReadyForQuery(idle).
+        backend
+            .write_all(&[
+                b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'K', 0, 0, 0, 12, 0, 0, 4, 210, 0, 0, 0, 1, b'Z', 0,
+                0, 0, 5, b'I',
+            ])
+            .await
+            .unwrap();
+        assert_eq!(refill.await.unwrap(), 1);
+        assert_eq!(pool.inner.inflight_creates.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.status().size, 1);
+        assert_eq!(pool.semaphore().available_permits(), 1);
+
+        if cancel_first {
+            drop(first);
+        } else {
+            let object = first
+                .await
+                .expect("ready refill must reach the oldest coordinator waiter");
+            assert_eq!(object.get_process_id(), 1234);
+            assert!(futures::poll!(&mut second).is_pending());
+            drop(object);
+        }
+        let object = second
+            .await
+            .expect("the same backend must reach the next coordinator waiter");
+        assert_eq!(object.get_process_id(), 1234);
+        assert_eq!(coord.total_connections(), 1);
+        drop(object);
+        assert_eq!(pool.status().size, 1);
+        assert_eq!(pool.status().available, 1);
+        assert_eq!(pool.semaphore().available_permits(), 3);
+        assert!(pool.inner.slots.lock().waiters.is_empty());
+        pool.close();
+        assert_eq!(coord.total_connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn replenish_wakes_coordinator_waiters_in_order() {
+        check_replenish_handoff(false).await;
+    }
+
+    #[tokio::test]
+    async fn replenish_cancelled_delivery_reaches_next_waiter() {
+        check_replenish_handoff(true).await;
     }
 
     #[tokio::test]
