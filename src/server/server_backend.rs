@@ -875,7 +875,27 @@ impl Server {
     where
         C: tokio::io::AsyncWrite + std::marker::Unpin,
     {
-        protocol_io::recv(self, client_stream, client_server_parameters).await
+        protocol_io::recv(self, client_stream, client_server_parameters, false).await
+    }
+
+    /// Allow the client relay to insert pending protocol acknowledgements
+    /// before a large frame is streamed directly to the client.
+    pub(crate) async fn recv_with_deferred_large_messages<C>(
+        &mut self,
+        client_stream: C,
+        client_server_parameters: Option<&mut ServerParameters>,
+        defer_large_messages: bool,
+    ) -> Result<BytesMut, Error>
+    where
+        C: tokio::io::AsyncWrite + std::marker::Unpin,
+    {
+        protocol_io::recv(
+            self,
+            client_stream,
+            client_server_parameters,
+            defer_large_messages,
+        )
+        .await
     }
 
     /// Indicate that this server connection cannot be re-used and must be discarded.
@@ -1841,7 +1861,10 @@ impl Server {
         should_send_parse_to_server: bool,
         housekeeping_timeout: Duration,
     ) -> Result<(), Error> {
-        if !self.has_prepared_statement(server_name) {
+        if self.has_prepared_statement(server_name) {
+            return Ok(());
+        }
+        {
             if should_send_parse_to_server && self.is_async() {
                 let reason = format!(
                     "cannot register prepared statement `{server_name}` with backend-only Sync \
@@ -1851,8 +1874,16 @@ impl Server {
                 return Err(Error::ProtocolSyncError(reason));
             }
 
-            self.registering_prepared_statement
-                .push_back(server_name.to_string());
+            if should_send_parse_to_server {
+                // This internal round trip reaches PostgreSQL before Parse
+                // messages still buffered by the client. Its ParseComplete
+                // must acknowledge this entry, not a deferred frontend Parse.
+                self.registering_prepared_statement
+                    .push_front(server_name.to_string());
+            } else {
+                self.registering_prepared_statement
+                    .push_back(server_name.to_string());
+            }
 
             // take the already-serialized Parse buffer as the
             // owned wire buffer directly instead of allocating a fresh
@@ -4231,6 +4262,43 @@ mod tests {
                 .is_err(),
             "peer must not receive backend-only Close+Sync while client Sync is still pending"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn register_cached_statement_records_one_hit_without_io() {
+        use super::Server;
+        use crate::messages::Parse;
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        for deferred in [false, true] {
+            let (mut server, mut peer) = Server::test_silent_socket();
+            server.prepared_statement_cache = Some(LruCache::with_hasher(
+                NonZeroUsize::new(4).unwrap(),
+                ahash::RandomState::new(),
+            ));
+            server.add_prepared_statement_to_cache("DOORMAN_1");
+            if deferred {
+                server.queue_deferred_eviction_close("DOORMAN_1".to_string());
+            }
+            let hits = server.stats.prepared_hit_count.load(Ordering::Relaxed);
+            server
+                .register_prepared_statement(&Parse::from_parts("SELECT 1", &[]), "DOORMAN_1", true)
+                .await
+                .unwrap();
+            assert_eq!(
+                server.stats.prepared_hit_count.load(Ordering::Relaxed) - hits,
+                1,
+                "one cached registration must record one hit, deferred={deferred}"
+            );
+            let mut byte = [0];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), peer.read(&mut byte))
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[cfg(unix)]

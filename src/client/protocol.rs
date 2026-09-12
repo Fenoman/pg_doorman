@@ -55,8 +55,8 @@ fn synthetic_miss_should_warn() -> bool {
 }
 
 use super::core::{
-    BatchOperation, CachedStatement, Client, ParseCompleteTarget, PreparedStatementKey, PutOutcome,
-    SkippedParse,
+    BatchOperation, CachedStatement, Client, PreparedNamespaceChange, PreparedStatementKey,
+    PutOutcome, SkippedParse,
 };
 use super::PREPARED_STATEMENT_COUNTER;
 
@@ -289,6 +289,9 @@ where
         pool: &ConnectionPool,
         server: &mut Server,
     ) -> Result<(), Error> {
+        if self.prepared.ignore_until_sync {
+            return Ok(());
+        }
         // cap pending pipelined extended-protocol buffer.
         crate::client::transaction::enforce_extended_batch_buffer_cap(
             self.buffer.len(),
@@ -461,8 +464,8 @@ where
         // For async clients, generate a unique name to avoid "prepared statement already exists" errors
         // The query text is still shared via Arc<Parse> from pool cache.
         // build the name as `Arc<str>` directly so every downstream
-        // clone (CachedStatement.async_name, BatchOperation::*,
-        // SkippedParse.statement_name) is a refcount bump instead of a
+        // clone (CachedStatement.async_name, BatchOperation::*) is a
+        // refcount bump instead of a
         // fresh String allocation per Bind/Describe/Close roundtrip.
         let async_name: Option<Arc<str>> = if self.prepared.async_client {
             Some(Arc::<str>::from(
@@ -500,6 +503,7 @@ where
 
         // For anonymous prepared statements, use hash as key to avoid collisions
         // Save hash for anonymous prepared statement lookup
+        let previous_anonymous_hash = self.prepared.last_anonymous_hash;
         if client_given_name.is_empty() {
             self.prepared.last_anonymous_hash = Some(hash);
         }
@@ -518,6 +522,7 @@ where
         };
 
         let cached = CachedStatement {
+            shared_server_name: Arc::clone(&server_stmt_name),
             parse: shared_parse.clone(),
             hash,
             intercepted_discard_all,
@@ -533,6 +538,15 @@ where
         //     schedule a backend `Close S <server_name>` so the PG-side
         //     prepared cache doesn't accumulate orphans.
         //   * Replaced / Inserted: no eviction, no counter bump.
+        let mut change = PreparedNamespaceChange {
+            operation_index: self.prepared.batch_operations.len(),
+            key: cache_key.clone(),
+            previous: None,
+            previous_anonymous_hash,
+            evicted: None,
+            close_on_success: None,
+            is_parse: true,
+        };
         match self.prepared.cache.put(cache_key, cached) {
             PutOutcome::Evicted(evicted) => {
                 self.prepared.anonymous_evictions += 1;
@@ -549,6 +563,7 @@ where
                         truncate_query_for_log(evicted.parse.query()),
                     );
                 }
+                change.evicted = Some((PreparedStatementKey::Anonymous(evicted.hash), evicted));
             }
             PutOutcome::NamedEvicted {
                 client_name: evicted_client_name,
@@ -573,7 +588,8 @@ where
                 // server doesn't have it (e.g., transaction-pool fan-out
                 // means a different backend was used), the deferred close
                 // is a no-op on that backend's cache state.
-                server.queue_deferred_eviction_close(evicted_server_name);
+                change.close_on_success = Some(evicted_server_name);
+                change.evicted = Some((PreparedStatementKey::Named(evicted_client_name), evicted));
             }
             // re-Parse with same client name but
             // different query body returns Replaced(prev). The
@@ -595,7 +611,7 @@ where
                          name, different body): evicting server-side {:?}",
                         self.username, self.pool_name, self.connection_id, evicted_server_name,
                     );
-                    server.queue_deferred_eviction_close(evicted_server_name);
+                    change.close_on_success = Some(evicted_server_name);
                 } else {
                     trace!(
                         "[{}@{} #c{}] prepared replacement reused backend name {:?}; \
@@ -606,9 +622,11 @@ where
                         server_stmt_name,
                     );
                 }
+                change.previous = Some(prev);
             }
             _ => {}
         }
+        self.prepared.namespace_changes.push_back(change);
 
         // Update prepared cache stats after modification
         self.update_prepared_cache_stats();
@@ -647,11 +665,6 @@ where
                     self.username, self.pool_name, self.connection_id,
                     server_stmt_name, server.get_process_id()
                 );
-                // insert_at_beginning starts as false. It will be set to true later
-                // if a new Parse is sent to server AFTER this skipped Parse.
-                // This ensures correct ordering: ParseComplete for skipped Parse that comes
-                // BEFORE new Parse should be at the beginning of the response.
-                // has_bind starts as false - will be set to true when Bind is processed.
                 crate::client::transaction::enforce_extended_batch_metadata_cap(
                     self.prepared.batch_operations.len(),
                     self.prepared.skipped_parses.len(),
@@ -659,12 +672,7 @@ where
                     1,
                     "cached Parse",
                 )?;
-                self.prepared.skipped_parses.push(SkippedParse {
-                    statement_name: server_stmt_name.clone(),
-                    target: ParseCompleteTarget::BindComplete,
-                    insert_at_beginning: false,
-                    has_bind: false,
-                });
+                self.prepared.skipped_parses.push(SkippedParse);
                 // Track operation order for correct ParseComplete insertion
                 self.prepared
                     .batch_operations
@@ -687,16 +695,6 @@ where
                 server,
             )
             .await?;
-
-            // Before sending new Parse, mark pending skipped_parses as insert_at_beginning=true
-            // because their ParseComplete should come before the ParseComplete from server.
-            // BUT only if they don't have a corresponding Bind yet - if they have Bind,
-            // their ParseComplete should be inserted before BindComplete, not at beginning.
-            for skipped in &mut self.prepared.skipped_parses {
-                if !skipped.insert_at_beginning && !skipped.has_bind {
-                    skipped.insert_at_beginning = true;
-                }
-            }
 
             // Add parse message to buffer with the server statement name
             let parse_bytes = shared_parse
@@ -727,46 +725,42 @@ where
         error_response_timeout(&mut self.write, message, code, write_timeout).await
     }
 
-    /// Get lookup key for prepared statement (handles anonymous statements)
-    async fn get_prepared_statement_lookup_key(
-        &mut self,
+    /// Look up the logical namespace without emitting an out-of-order error.
+    fn get_prepared_statement_lookup_key(
+        &self,
         client_given_name: &str,
-    ) -> Result<PreparedStatementKey, Error> {
+    ) -> Option<PreparedStatementKey> {
         if client_given_name.is_empty() {
-            match self.prepared.last_anonymous_hash {
-                Some(hash) => Ok(PreparedStatementKey::Anonymous(hash)),
-                None => {
-                    if synthetic_miss_should_warn() {
-                        warn!(
-                            "[{}@{} #c{}] anonymous prepared statement referenced but none registered (suppressing further WARNs for {}s)",
-                            self.username,
-                            self.pool_name,
-                            self.connection_id,
-                            SYNTHETIC_MISS_WARN_INTERVAL_MS / 1000,
-                        );
-                    } else {
-                        debug!(
-                            "[{}@{} #c{}] anonymous prepared statement referenced but none registered",
-                            self.username, self.pool_name, self.connection_id,
-                        );
-                    }
-                    crate::web::metrics::record_synthetic_miss();
-                    // SQLSTATE 26000 (invalid_sql_statement_name) matches the
-                    // error native PostgreSQL raises for the same condition;
-                    // see src/backend/tcop/postgres.c exec_bind_message.
-                    self.write_prepared_error_response(
-                        "unnamed prepared statement does not exist",
-                        "26000",
-                    )
-                    .await?;
-                    Err(Error::ClientError(
-                        "Anonymous prepared statement doesn't exist".to_string(),
-                    ))
-                }
-            }
+            self.prepared
+                .last_anonymous_hash
+                .map(PreparedStatementKey::Anonymous)
         } else {
-            Ok(PreparedStatementKey::Named(client_given_name.to_string()))
+            Some(PreparedStatementKey::Named(client_given_name.to_string()))
         }
+    }
+
+    fn missing_prepared_statement_name(&self, client_name: &str) -> Arc<str> {
+        if client_name.is_empty() {
+            crate::web::metrics::record_synthetic_miss();
+            if synthetic_miss_should_warn() {
+                warn!(
+                    "[{}@{} #c{}] unnamed prepared statement is absent; backend will report 26000",
+                    self.username, self.pool_name, self.connection_id,
+                );
+            }
+        }
+        Self::unregistered_prepared_statement_name()
+    }
+
+    fn unregistered_prepared_statement_name() -> Arc<str> {
+        // Never forward a cache-miss client name verbatim: it could coincide
+        // with another logical statement's cached DOORMAN_* backend alias.
+        // A fresh unregistered name makes PostgreSQL produce the error in
+        // batch order and enter its normal skip-until-Sync state.
+        Arc::from(format!(
+            "DOORMAN_missing_{}",
+            PREPARED_STATEMENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// Process Bind message immediately without buffering.
@@ -777,6 +771,9 @@ where
         pool: &ConnectionPool,
         server: &mut Server,
     ) -> Result<(), Error> {
+        if self.prepared.ignore_until_sync {
+            return Ok(());
+        }
         // cap pending pipelined extended-protocol buffer.
         crate::client::transaction::enforce_extended_batch_buffer_cap(
             self.buffer.len(),
@@ -790,12 +787,12 @@ where
                 self.username, self.pool_name, self.connection_id,
             );
             if let (Ok(client_given_name), Ok(client_portal_name)) =
-                (Bind::get_name(&message), Bind::get_portal_str(&message))
+                (Bind::get_name_str(&message), Bind::get_portal_str(&message))
             {
                 if let Some(command) = self
                     .prepared
                     .disabled_statement_set_cleanup_commands
-                    .get(client_given_name.as_str())
+                    .get(client_given_name)
                     .copied()
                 {
                     self.prepared
@@ -803,7 +800,7 @@ where
                 } else if let Some(command) = self
                     .prepared
                     .disabled_statement_reset_cleanup_commands
-                    .get(client_given_name.as_str())
+                    .get(client_given_name)
                     .copied()
                 {
                     self.prepared
@@ -821,13 +818,13 @@ where
             return Ok(());
         }
 
-        let client_given_name = Bind::get_name(&message)?;
+        let client_given_name = Bind::get_name_str(&message)?;
         let client_portal_name = Bind::get_portal_str(&message)?;
-        let lookup_key = self
-            .get_prepared_statement_lookup_key(&client_given_name)
-            .await?;
-
-        let cached = self.prepared.cache.get(&lookup_key).cloned();
+        let lookup_key = self.get_prepared_statement_lookup_key(client_given_name);
+        let cached = lookup_key
+            .as_ref()
+            .and_then(|key| self.prepared.cache.get(key))
+            .cloned();
         match cached {
             Some(cached) => {
                 if cached.intercepted_discard_all && server.in_transaction() {
@@ -869,22 +866,12 @@ where
                 // callee skips a second cache lookup + clone. `lookup_key`
                 // is still needed for the pop-on-reject eviction path.
                 self.ensure_prepared_statement_is_on_server_cached(
-                    &cached, lookup_key, pool, server,
+                    &cached,
+                    lookup_key.unwrap(),
+                    pool,
+                    server,
                 )
                 .await?;
-
-                // Mark the corresponding skipped_parse as having a Bind.
-                // This prevents it from being marked as insert_at_beginning when a new Parse arrives,
-                // because its ParseComplete should be inserted before BindComplete, not at beginning.
-                if let Some(skipped) = self.prepared.skipped_parses.iter_mut().find(|s| {
-                    // Arc<str> <-> Arc<str> comparison goes through
-                    // str equality on the underlying bytes.
-                    s.statement_name.as_ref() == server_name.as_ref()
-                        && s.target == ParseCompleteTarget::BindComplete
-                        && !s.has_bind
-                }) {
-                    skipped.has_bind = true;
-                }
 
                 if let Some(command) = cached.set_cleanup_command {
                     self.prepared
@@ -897,10 +884,8 @@ where
                         .remove_portal_cleanup_command(client_portal_name);
                 }
 
-                let message = Bind::rename(message, &server_name)?;
-
-                // Add directly to buffer after portal-attribution cap checks.
-                self.buffer.put(&message[..]);
+                // Append directly after portal-attribution cap checks.
+                Bind::append_renamed(&message, &server_name, &mut self.buffer)?;
 
                 // Track operation order for correct ParseComplete insertion
                 self.prepared.batch_operations.push(BatchOperation::Bind {
@@ -918,47 +903,12 @@ where
                 Ok(())
             }
             None => {
-                if client_given_name.is_empty() {
-                    // Bind "" landed after the anonymous entry was evicted from
-                    // the per-client LRU or expired from the interner. Mirror
-                    // native PostgreSQL: SQLSTATE 26000 with the canonical
-                    // "unnamed prepared statement does not exist" message so
-                    // drivers can re-Parse transparently.
-                    if synthetic_miss_should_warn() {
-                        warn!(
-                            "[{}@{} #c{}] Bind \"\" but anonymous prepared no longer cached (suppressing further WARNs for {}s)",
-                            self.username,
-                            self.pool_name,
-                            self.connection_id,
-                            SYNTHETIC_MISS_WARN_INTERVAL_MS / 1000,
-                        );
-                    } else {
-                        debug!(
-                            "[{}@{} #c{}] Bind \"\" but anonymous prepared no longer cached",
-                            self.username, self.pool_name, self.connection_id,
-                        );
-                    }
-                    crate::web::metrics::record_synthetic_miss();
-                    self.write_prepared_error_response(
-                        "unnamed prepared statement does not exist",
-                        "26000",
-                    )
-                    .await?;
-                } else {
-                    warn!(
-                        "[{}@{} #c{}] Bind references unknown prepared statement {client_given_name:?}",
-                        self.username, self.pool_name, self.connection_id,
-                    );
-                    self.write_prepared_error_response(
-                        &format!("prepared statement \"{client_given_name}\" does not exist"),
-                        "26000",
-                    )
-                    .await?;
-                }
-
-                Err(Error::ClientError(format!(
-                    "Prepared statement `{client_given_name}` doesn't exist"
-                )))
+                let server_name = self.missing_prepared_statement_name(client_given_name);
+                Bind::append_renamed(&message, &server_name, &mut self.buffer)?;
+                self.prepared.batch_operations.push(BatchOperation::Bind {
+                    statement_name: server_name,
+                });
+                Ok(())
             }
         }
     }
@@ -999,6 +949,9 @@ where
         pool: &ConnectionPool,
         server: &mut Server,
     ) -> Result<(), Error> {
+        if self.prepared.ignore_until_sync {
+            return Ok(());
+        }
         // cap pending pipelined extended-protocol buffer.
         crate::client::transaction::enforce_extended_batch_buffer_cap(
             self.buffer.len(),
@@ -1055,11 +1008,11 @@ where
         }
 
         let client_given_name = describe.statement_name.clone();
-        let lookup_key = self
-            .get_prepared_statement_lookup_key(&client_given_name)
-            .await?;
-
-        let cached = self.prepared.cache.get(&lookup_key).cloned();
+        let lookup_key = self.get_prepared_statement_lookup_key(&client_given_name);
+        let cached = lookup_key
+            .as_ref()
+            .and_then(|key| self.prepared.cache.get(key))
+            .cloned();
         match cached {
             Some(cached) => {
                 // refcount-bumped Arc<str>; downstream clones (skip
@@ -1083,33 +1036,12 @@ where
                 // skip a second cache lookup + clone. `lookup_key` is still
                 // needed for the pop-on-reject eviction path.
                 self.ensure_prepared_statement_is_on_server_cached(
-                    &cached, lookup_key, pool, server,
+                    &cached,
+                    lookup_key.unwrap(),
+                    pool,
+                    server,
                 )
                 .await?;
-
-                // If Parse was skipped for this statement, we need to insert ParseComplete
-                // before ParameterDescription in the response (not before BindComplete).
-                // Find and remove the skipped parse entry, then add a new one with ParameterDescription target.
-                // Using position() + remove() + push() instead of iter_mut().find() to avoid issues
-                // when multiple Parse operations for the same statement are skipped in a batch.
-                if let Some(idx) = self.prepared.skipped_parses.iter().position(|s| {
-                    s.statement_name.as_ref() == server_name.as_ref()
-                        && s.target == ParseCompleteTarget::BindComplete
-                }) {
-                    debug!(
-                        "[{}@{} #c{}] Describe follows skipped Parse for `{}`, adjusting synthetic ParseComplete position",
-                        self.username, self.pool_name, self.connection_id, server_name
-                    );
-                    let insert_at_beginning = self.prepared.skipped_parses[idx].insert_at_beginning;
-                    let has_bind = self.prepared.skipped_parses[idx].has_bind;
-                    self.prepared.skipped_parses.remove(idx);
-                    self.prepared.skipped_parses.push(SkippedParse {
-                        statement_name: server_name.clone(),
-                        target: ParseCompleteTarget::ParameterDescription,
-                        insert_at_beginning,
-                        has_bind,
-                    });
-                }
 
                 // Add directly to buffer
                 let describe_bytes: BytesMut = describe.try_into()?;
@@ -1126,76 +1058,29 @@ where
             }
 
             None => {
-                if client_given_name.is_empty() {
-                    if synthetic_miss_should_warn() {
-                        warn!(
-                            "[{}@{} #c{}] Describe \"\" but anonymous prepared no longer cached (suppressing further WARNs for {}s)",
-                            self.username,
-                            self.pool_name,
-                            self.connection_id,
-                            SYNTHETIC_MISS_WARN_INTERVAL_MS / 1000,
-                        );
-                    } else {
-                        debug!(
-                            "[{}@{} #c{}] Describe \"\" but anonymous prepared no longer cached",
-                            self.username, self.pool_name, self.connection_id,
-                        );
-                    }
-                    crate::web::metrics::record_synthetic_miss();
-                    self.write_prepared_error_response(
-                        "unnamed prepared statement does not exist",
-                        "26000",
-                    )
-                    .await?;
-                } else {
-                    warn!(
-                        "[{}@{} #c{}] Describe references unknown prepared statement `{}`",
-                        self.username, self.pool_name, self.connection_id, client_given_name
-                    );
-                    self.write_prepared_error_response(
-                        &format!("prepared statement \"{client_given_name}\" does not exist"),
-                        "26000",
-                    )
-                    .await?;
-                }
-
-                Err(Error::ClientError(format!(
-                    "Prepared statement `{client_given_name}` doesn't exist"
-                )))
+                let server_name = self.missing_prepared_statement_name(&client_given_name);
+                let message: BytesMut = describe.rename(&server_name).try_into()?;
+                self.buffer.put(&message[..]);
+                self.prepared
+                    .batch_operations
+                    .push(BatchOperation::Describe {
+                        statement_name: server_name,
+                    });
+                Ok(())
             }
         }
     }
 
-    /// Process Close message immediately without buffering.
-    /// For prepared statements: removes from the per-client cache.
-    /// For others (portal `P` close): adds data directly to self.buffer.
-    ///
-    /// This function does not increment `pending_close_complete`. The
-    /// counter is now always
-    /// 0 in this code path, so the related branches in
-    /// `execute_server_roundtrip` are inert. The field + reset are
-    /// retained as defence-in-depth for a future re-introduction of
-    /// the rewrite path.
-    ///
-    /// Previously rewrote Close to use the cached
-    /// backend `DOORMAN_N` server-name. That created a cross-cache
-    /// desync - backend dropped DOORMAN_N, but the POOL'S prepared
-    /// statement cache (`pool.prepared_statement_cache`) still held
-    /// the DOORMAN_N -> Arc<Parse> mapping. The next Parse for the same
-    /// query text hit the pool cache and reused DOORMAN_N as the
-    /// server-name, while pg_doorman's `ensure_prepared_statement_is_on_server`
-    /// check still believed the backend had it (it just dropped it!),
-    /// causing the immediate next Bind/Describe to fail with SQLSTATE
-    /// 26000 `prepared statement "DOORMAN_N" does not exist`.
-    /// (Verified by `batch-parse-describe-bug.feature:138` BDD scenario.)
-    ///
-    /// The "verbatim Close" behaviour is the acceptable trade-off: the
-    /// backend's DOORMAN_N remains cached until the per-server LRU
-    /// evicts it. The leak is bounded by `server_prepared_statements_cache_size`.
-    /// A future fix should ALSO evict from the pool cache when client
-    /// Close happens, then re-enable the rewrite.
+    /// Close the logical statement while retaining its cached backend plan.
+    /// PostgreSQL acknowledges a Close for an absent name, so a fresh unused
+    /// alias preserves response order without touching any physical statement.
+    /// Client names can coincide with another statement's DOORMAN_* alias.
+    /// Portal Close and uncached statement Close retain their original names.
     #[inline]
     pub(crate) fn process_close_immediate(&mut self, message: BytesMut) -> Result<(), Error> {
+        if self.prepared.ignore_until_sync {
+            return Ok(());
+        }
         // cap pending pipelined extended-protocol buffer.
         crate::client::transaction::enforce_extended_batch_buffer_cap(
             self.buffer.len(),
@@ -1203,9 +1088,19 @@ where
             "Close",
         )?;
         let close: Close = (&message).try_into()?;
+        let message = if self.prepared.enabled && close.is_prepared_statement() {
+            let rewritten = Close::rename(message, &Self::unregistered_prepared_statement_name())?;
+            crate::client::transaction::enforce_extended_batch_buffer_cap(
+                self.buffer.len(),
+                rewritten.len(),
+                "Close",
+            )?;
+            rewritten
+        } else {
+            message
+        };
 
-        // Always add Close to buffer in extended query protocol
-        // This ensures Close is sent to server when followed by Flush
+        // Let PostgreSQL produce CloseComplete in the actual batch order.
         self.buffer.put(&message[..]);
 
         // Track Close operation for correct ParseComplete insertion order
@@ -1220,11 +1115,10 @@ where
                 .remove_disabled_statement_cleanup_command(close.name.as_str());
         }
 
-        // Drop the client-side cache entry immediately. The Close is still
-        // forwarded verbatim, matching the bounded server-side tradeoff above,
-        // but pg_doorman must not let a later Bind/Describe reuse a statement
-        // the client explicitly closed.
+        // Apply the logical Close for later messages in this batch. Keep its
+        // previous value until CloseComplete confirms the backend reached it.
         if self.prepared.enabled && close.is_prepared_statement() {
+            let previous_anonymous_hash = self.prepared.last_anonymous_hash;
             let key = if close.anonymous() {
                 match self.prepared.last_anonymous_hash.take() {
                     Some(hash) => PreparedStatementKey::Anonymous(hash),
@@ -1233,7 +1127,8 @@ where
             } else {
                 PreparedStatementKey::Named(close.name.clone())
             };
-            if self.prepared.cache.pop(&key).is_some() {
+            let previous = self.prepared.cache.pop(&key);
+            if previous.is_some() {
                 // Cache shrunk; refresh client stats so memory/count
                 // counters drop accordingly. Without this, SHOW POOLS /
                 // Prometheus keep the pre-Close count until the next
@@ -1241,6 +1136,17 @@ where
                 // stats for the full LRU lifetime).
                 self.update_prepared_cache_stats();
             }
+            self.prepared
+                .namespace_changes
+                .push_back(PreparedNamespaceChange {
+                    operation_index: self.prepared.batch_operations.len() - 1,
+                    key,
+                    previous,
+                    previous_anonymous_hash,
+                    evicted: None,
+                    close_on_success: None,
+                    is_parse: false,
+                });
         }
 
         Ok(())
@@ -1255,27 +1161,99 @@ where
         self.prepared.clear_disabled_statement_cleanup_commands();
     }
 
-    pub(crate) fn drop_rejected_prepared_cache_entries(
-        &mut self,
-        rejected_server_names: &[String],
-    ) -> usize {
-        let mut removed = 0usize;
-        for server_name in rejected_server_names {
-            while let Some((key, _)) = self.prepared.cache.pop_by_server_name(server_name) {
-                if let PreparedStatementKey::Anonymous(hash) = key {
-                    if self.prepared.last_anonymous_hash == Some(hash) {
-                        self.prepared.last_anonymous_hash = None;
+    /// Commit Parse/Close effects only as their replies become visible to the
+    /// client. The response already includes synthesized ParseComplete frames.
+    pub(crate) fn reconcile_prepared_namespace(&mut self, response: &[u8], server: &mut Server) {
+        if self.prepared.batch_operations.is_empty() && !self.prepared.ignore_until_sync {
+            return;
+        }
+        if self.prepared.namespace_changes.is_empty() {
+            // recv already tracks ErrorResponse through the next RFQ. A warm
+            // Bind/Execute batch needs no second pass over its DataRows.
+            self.prepared.ignore_until_sync = server.response_cycle_had_error;
+            return;
+        }
+        let mut pos = 0;
+        while pos + 5 <= response.len() {
+            let kind = response[pos];
+            let len = u32::from_be_bytes(response[pos + 1..pos + 5].try_into().unwrap()) as usize;
+            if len < 4 || pos + 1 + len > response.len() {
+                break;
+            }
+            pos += 1 + len;
+            if kind == b'Z' {
+                self.prepared.ignore_until_sync = false;
+                continue;
+            }
+            if self.prepared.ignore_until_sync {
+                continue;
+            }
+            if kind == b'E' {
+                // A failed unnamed Parse destroys the old unnamed statement;
+                // unnamed operations in the skipped suffix have no effect.
+                let failed_unnamed_parse =
+                    self.prepared
+                        .namespace_changes
+                        .front()
+                        .is_some_and(|change| {
+                            change.operation_index == self.prepared.namespace_response_index
+                                && change.is_parse
+                                && matches!(change.key, PreparedStatementKey::Anonymous(_))
+                        });
+                while let Some(change) = self.prepared.namespace_changes.pop_back() {
+                    self.prepared.cache.pop(&change.key);
+                    if let Some(previous) = change.previous {
+                        let _ = self.prepared.cache.put(change.key, previous);
+                    }
+                    if let Some((key, evicted)) = change.evicted {
+                        let _ = self.prepared.cache.put(key, evicted);
+                    }
+                    self.prepared.last_anonymous_hash = change.previous_anonymous_hash;
+                }
+                if failed_unnamed_parse {
+                    self.prepared.last_anonymous_hash = None;
+                }
+                self.update_prepared_cache_stats();
+                self.prepared.ignore_until_sync = true;
+                continue;
+            }
+            let acknowledged = match self
+                .prepared
+                .batch_operations
+                .get(self.prepared.namespace_response_index)
+            {
+                Some(BatchOperation::ParseSent { .. } | BatchOperation::ParseSkipped { .. }) => {
+                    kind == b'1'
+                }
+                Some(BatchOperation::Bind { .. }) => kind == b'2',
+                Some(BatchOperation::Describe { .. } | BatchOperation::DescribePortal) => {
+                    matches!(kind, b'T' | b'n')
+                }
+                Some(BatchOperation::Execute) => matches!(kind, b'C' | b'I' | b's' | b'G'),
+                Some(BatchOperation::Close) => kind == b'3',
+                None => false,
+            };
+            if acknowledged {
+                self.prepared.namespace_response_index += 1;
+                while self
+                    .prepared
+                    .namespace_changes
+                    .front()
+                    .is_some_and(|change| {
+                        change.operation_index < self.prepared.namespace_response_index
+                    })
+                {
+                    let change = self.prepared.namespace_changes.pop_front().unwrap();
+                    if let Some(name) = change.close_on_success {
+                        server.queue_deferred_eviction_close(name);
                     }
                 }
-                removed += 1;
+                if self.prepared.namespace_changes.is_empty() {
+                    self.prepared.ignore_until_sync = server.response_cycle_had_error;
+                    break;
+                }
             }
         }
-
-        if removed > 0 {
-            self.update_prepared_cache_stats();
-        }
-
-        removed
     }
 }
 
@@ -1449,7 +1427,7 @@ mod discard_all_transaction_guard_tests {
             .find("ensure_prepared_statement_is_on_server_cached")
             .expect("backend prepare/send path not found");
         let buffer = body
-            .find("self.buffer.put(&message[..])")
+            .find("Bind::append_renamed(&message, &server_name, &mut self.buffer)")
             .expect("Bind buffer append not found");
 
         assert!(
@@ -1473,7 +1451,7 @@ mod discard_all_transaction_guard_tests {
             .expect("prepared error response helper not found");
         let helper_body = &impl_src[helper_start..];
         let helper_end = helper_body
-            .find("\n    async fn get_prepared_statement_lookup_key")
+            .find("\n    fn get_prepared_statement_lookup_key")
             .expect("prepared lookup should follow error helper");
         let helper_body = &helper_body[..helper_end];
         assert!(
@@ -1485,11 +1463,10 @@ mod discard_all_transaction_guard_tests {
             "prepared synthetic errors must use the deadline-bound protocol helper"
         );
 
-        for function_name in [
-            "async fn get_prepared_statement_lookup_key",
-            "pub(crate) async fn process_bind_immediate",
-            "pub(crate) async fn process_describe_immediate",
-        ] {
+        // Cache misses now receive backend-generated errors. The intercepted
+        // DISCARD Bind guard is the remaining local prepared error response.
+        {
+            let function_name = "pub(crate) async fn process_bind_immediate";
             let start = impl_src
                 .find(function_name)
                 .unwrap_or_else(|| panic!("{function_name} not found"));
@@ -1553,6 +1530,7 @@ mod replacement_close_tests {
         let mut parse = Parse::from_parts("SELECT 1", &[]);
         parse.name = name.to_string();
         CachedStatement {
+            shared_server_name: Arc::from(parse.name.as_str()),
             parse: Arc::new(parse),
             hash: 0xCAFE,
             intercepted_discard_all: false,
@@ -1646,6 +1624,7 @@ mod anonymous_close_tests {
         let mut parse = Parse::from_parts("SELECT 1", &[]);
         parse.name = name.to_string();
         CachedStatement {
+            shared_server_name: Arc::from(parse.name.as_str()),
             parse: Arc::new(parse),
             hash: 0xCAFE,
             intercepted_discard_all: false,
@@ -1715,6 +1694,7 @@ mod anonymous_close_tests {
         let mut parse = Parse::from_parts("SET SESSION AUTHORIZATION app_user", &[]);
         parse.name = "DOORMAN_1".to_string();
         let cached = CachedStatement {
+            shared_server_name: Arc::from(parse.name.as_str()),
             parse: Arc::new(parse),
             hash: 0x5150,
             intercepted_discard_all: false,
@@ -1758,6 +1738,7 @@ mod anonymous_close_tests {
         let mut parse = Parse::from_parts("SET client.app_user = 'tenant'", &[]);
         parse.name = "DOORMAN_1".to_string();
         let cached = CachedStatement {
+            shared_server_name: Arc::from(parse.name.as_str()),
             parse: Arc::new(parse),
             hash: 0x5151,
             intercepted_discard_all: false,
@@ -1932,6 +1913,47 @@ mod anonymous_close_tests {
     }
 
     #[test]
+    fn statement_close_does_not_address_another_logical_statements_backend_alias() {
+        for known_name in [false, true] {
+            let mut client = test_client();
+            let keep = PreparedStatementKey::Named("keep".to_string());
+            let physical_alias = "DOORMAN_1";
+            let _ = client
+                .prepared
+                .cache
+                .put(keep.clone(), cached_with_server_name(physical_alias));
+            if known_name {
+                let _ = client.prepared.cache.put(
+                    PreparedStatementKey::Named(physical_alias.to_string()),
+                    cached_with_server_name("DOORMAN_2"),
+                );
+            }
+            let close: BytesMut = Close::new(physical_alias).try_into().unwrap();
+            client.process_close_immediate(close).unwrap();
+            let forwarded = Close::try_from(&BytesMut::from(&client.buffer[..])).unwrap();
+            assert_ne!(
+                forwarded.name, physical_alias,
+                "a logical Close must not deallocate another statement's physical alias"
+            );
+            assert!(client.prepared.cache.get(&keep).is_some());
+        }
+    }
+
+    #[test]
+    fn portal_and_uncached_statement_closes_preserve_the_wire_name() {
+        for (enabled, portal) in [(false, false), (false, true), (true, true)] {
+            let mut client = test_client();
+            client.prepared.enabled = enabled;
+            let mut close: BytesMut = Close::new("DOORMAN_1").try_into().unwrap();
+            if portal {
+                close[5] = b'P';
+            }
+            client.process_close_immediate(close.clone()).unwrap();
+            assert_eq!(&client.buffer[..], &close[..]);
+        }
+    }
+
+    #[test]
     fn close_anonymous_clears_last_anonymous_hash_and_cache_entry() {
         let mut client = test_client();
         let hash = 0xBADC0FFE;
@@ -1960,33 +1982,40 @@ mod anonymous_close_tests {
         );
     }
 
-    #[test]
-    fn rejected_parse_rollback_drops_client_cache_entry_and_stats() {
+    #[tokio::test]
+    async fn skipped_close_restores_cache_entries_and_stats_without_removing_other_aliases() {
         let mut client = test_client();
-        let key_a = PreparedStatementKey::Named("bad_stmt_a".to_string());
-        let key_b = PreparedStatementKey::Named("bad_stmt_b".to_string());
+        let (mut server, _peer) = Server::test_silent_socket();
+        let key_a = PreparedStatementKey::Named("keep_a".to_string());
+        let key_b = PreparedStatementKey::Named("keep_b".to_string());
         let _ = client
             .prepared
             .cache
-            .put(key_a.clone(), cached_with_server_name("DOORMAN_bad"));
+            .put(key_a.clone(), cached_with_server_name("DOORMAN_shared"));
         let _ = client
             .prepared
             .cache
-            .put(key_b.clone(), cached_with_server_name("DOORMAN_bad"));
+            .put(key_b.clone(), cached_with_server_name("DOORMAN_shared"));
         client.update_prepared_cache_stats();
-
-        assert_eq!(client.stats.prepared_named_count(), 2);
-
-        let rejected = vec!["DOORMAN_bad".to_string()];
-        let removed = client.drop_rejected_prepared_cache_entries(&rejected);
-
-        assert_eq!(removed, 2);
-        assert!(client.prepared.cache.get(&key_a).is_none());
-        assert!(client.prepared.cache.get(&key_b).is_none());
+        client
+            .prepared
+            .batch_operations
+            .push(BatchOperation::ParseSent {
+                statement_name: Arc::from("DOORMAN_bad"),
+            });
+        let close: BytesMut = Close::new("keep_a").try_into().unwrap();
+        client.process_close_immediate(close).unwrap();
+        assert_eq!(client.stats.prepared_named_count(), 1);
+        client.reconcile_prepared_namespace(
+            &[b'E', 0, 0, 0, 5, 0, b'Z', 0, 0, 0, 5, b'I'],
+            &mut server,
+        );
+        assert!(client.prepared.cache.get(&key_a).is_some());
+        assert!(client.prepared.cache.get(&key_b).is_some());
         assert_eq!(
             client.stats.prepared_named_count(),
-            0,
-            "rollback must refresh prepared-cache stats after removing the optimistic Parse"
+            2,
+            "rollback must restore counts while retaining the confirmed alias"
         );
     }
 }

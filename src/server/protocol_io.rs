@@ -463,7 +463,10 @@ fn track_command_complete_transaction_state(server: &mut Server, message: &[u8])
 /// Logs the error and updates server state accordingly.
 fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
     server.response_cycle_had_error = true;
+    let mut recoverable = false;
     if let Ok(msg) = PgErrorMsg::parse(message) {
+        recoverable = msg.severity == "ERROR"
+            || (msg.severity.is_empty() && msg.severity_localized == "ERROR");
         let mut details = format!(
             "[{}@{}] server error pid={}: severity={}, code={}, message=\"{}\", in_transaction={}, in_copy={}",
             server.address.username, server.address.pool_name, server.get_process_id(),
@@ -537,16 +540,11 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
     // Handle async mode errors
     if server.is_async() {
         server.data_available = false;
-        // was `needs_cleanup()` - a getter whose bool
-        // result was silently dropped. In session-mode (where
-        // mark_bad is NOT called below), the backend used to return
-        // to the SAME client with cleanup_state untouched, so any
-        // SET that the failed batch performed before the error
-        // leaked across the next checkout. set_true() marks all
-        // three cleanup buckets (SET / PREPARE / DECLARE), forcing
-        // RESET ALL + DEALLOCATE ALL on the next checkin.
+        // Keep cleanup attribution armed while the same client owns the
+        // backend until Sync. An ordinary SQL error is recoverable and must
+        // not discard the session's warm temp state at that later checkin.
         server.cleanup_state.set_true();
-        if !server.session_mode {
+        if !recoverable && !server.session_mode {
             server.mark_bad("PostgreSQL error in asynchronous operation mode");
         }
     }
@@ -853,6 +851,7 @@ pub(crate) async fn recv<C>(
     server: &mut Server,
     mut client_stream: C,
     mut client_server_parameters: Option<&mut ServerParameters>,
+    defer_large_messages: bool,
 ) -> Result<BytesMut, Error>
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
@@ -917,10 +916,10 @@ where
             && message_len > server.max_message_size
             && code_u8 as char == 'D'
         {
-            // If buffer has accumulated messages (e.g. BindComplete, RowDescription),
-            // return them first so execute_server_roundtrip can run
-            // reorder_parse_complete_responses before we stream to client.
-            if !server.buffer.is_empty() {
+            // Return buffered responses before direct streaming. A client
+            // with pending synthetic acknowledgements also needs this handoff
+            // when the large frame is the first backend response.
+            if !server.buffer.is_empty() || defer_large_messages {
                 server.pending_large_message = Some((code_u8, message_len));
                 server.data_available = true;
                 // zero-copy split - hands ownership of the filled
@@ -939,7 +938,7 @@ where
             && message_len > server.max_message_size
             && code_u8 as char == 'd'
         {
-            if !server.buffer.is_empty() {
+            if !server.buffer.is_empty() || defer_large_messages {
                 server.pending_large_message = Some((code_u8, message_len));
                 server.data_available = true;
                 // zero-copy split.
@@ -956,7 +955,7 @@ where
             && message_len > server.max_message_size
             && code_u8 as char == 'V'
         {
-            if !server.buffer.is_empty() {
+            if !server.buffer.is_empty() || defer_large_messages {
                 server.pending_large_message = Some((code_u8, message_len));
                 server.data_available = true;
                 // zero-copy split.
@@ -1085,6 +1084,9 @@ where
             // CopyInResponse: copy is starting from client to server.
             'G' => {
                 server.in_copy_mode = true;
+                // The next bytes belong to the client even if a preceding
+                // statement in this Simple Query produced DataRows.
+                server.data_available = false;
                 // CopyXResponse is the terminal
                 // response to an Execute. In async (Flush-only)
                 // mode `expected_responses` must be decremented
@@ -1302,6 +1304,25 @@ mod tests {
             !server.has_prepared_statement("DOORMAN_bad"),
             "server-side optimistic prepared cache entry must be rolled back too"
         );
+    }
+
+    #[tokio::test]
+    async fn async_sql_error_keeps_backend_owned_until_sync_but_fatal_error_evicts() {
+        for (severity, bad) in [("ERROR", false), ("FATAL", true)] {
+            let (mut server, _peer) = crate::server::Server::test_silent_socket();
+            server.session_mode = false;
+            server.set_async_mode(true);
+            let body = format!("S{severity}\0V{severity}\0C57014\0MCOPY canceled\0\0");
+            handle_error_response(&mut server, &mut BytesMut::from(body.as_bytes()));
+            assert_eq!(
+                server.is_bad(),
+                bad,
+                "unexpected disposition for {severity}"
+            );
+            assert!(server.is_async(), "an error is not a Sync acknowledgement");
+            assert!(server.response_cycle_had_error);
+            assert!(!server.is_data_available());
+        }
     }
 
     #[tokio::test]

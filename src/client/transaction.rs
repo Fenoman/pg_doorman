@@ -860,6 +860,7 @@ where
         if message[0] != b'Q' {
             return Ok(false);
         }
+        self.prepared.last_anonymous_hash = None;
 
         // Pooler health-check query — byte-for-byte match against the
         // pre-encoded `general.pooler_check_query`. The same snapshot is
@@ -1191,6 +1192,7 @@ where
         server: &mut Server,
         query_start_at: quanta::Instant,
     ) -> Result<TransactionAction, Error> {
+        self.prepared.last_anonymous_hash = None;
         // Simple query always ends with ReadyForQuery, so disable async mode
         // to wait for 'Z' instead of using expected_responses counter
         server.set_async_mode(false);
@@ -1447,6 +1449,9 @@ where
         query_start_at: quanta::Instant,
         code: char,
     ) -> Result<TransactionAction, Error> {
+        if code == 'H' && self.prepared.ignore_until_sync {
+            return Ok(TransactionAction::Continue);
+        }
         // Add the sync/flush message to buffer
         self.buffer.put(&message[..]);
 
@@ -1510,7 +1515,7 @@ where
             // unsynced batch, keep the existing hold until Sync reconciles the
             // backend protocol state.
             if expected == 0 && !was_async {
-                self.write_synthetic_parse_completes().await?;
+                self.write_synthetic_parse_completes(server).await?;
                 server.set_async_mode(false);
                 server.set_expected_responses(0);
                 self.buffer.clear();
@@ -1530,7 +1535,7 @@ where
             // synthetic ParseComplete stays at its original batch position
             // relative to backend responses from earlier/later operations.
             if expected == 0 && !self.prepared.skipped_parses.is_empty() {
-                self.write_synthetic_parse_completes().await?;
+                self.write_synthetic_parse_completes(server).await?;
             }
         } else {
             // For Sync, exit async mode
@@ -1539,6 +1544,10 @@ where
         }
 
         self.execute_server_roundtrip(None, server).await?;
+
+        if server.in_copy_mode() && !server.is_data_available() {
+            self.prepared.copy_from_extended = true;
+        }
 
         // Batch is complete — send deferred eviction Close messages.
         // These statements were evicted from the LRU during this batch but
@@ -1576,7 +1585,7 @@ where
         Ok(TransactionAction::Continue)
     }
 
-    async fn write_synthetic_parse_completes(&mut self) -> Result<(), Error> {
+    async fn write_synthetic_parse_completes(&mut self, server: &mut Server) -> Result<(), Error> {
         let count = self.prepared.skipped_parses.len();
         if count == 0 {
             return Ok(());
@@ -1589,6 +1598,7 @@ where
         for _ in 0..count {
             synthetic_response.extend_from_slice(&PARSE_COMPLETE_MSG);
         }
+        self.reconcile_prepared_namespace(&synthetic_response, server);
         let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
         write_all_flush_timeout(&mut self.write, &synthetic_response, write_timeout).await?;
         self.prepared.skipped_parses.clear();
@@ -1677,39 +1687,48 @@ where
         self.ensure_copy_mode(server)?;
         // We may already have some copy data in the buffer, add this message to buffer
         self.buffer.put(&message[..]);
-
+        let extended = std::mem::take(&mut self.prepared.copy_from_extended);
+        if extended {
+            // Flush the terminal Execute response without waiting for Sync.
+            // The client may wait for CommandComplete before sending Sync.
+            self.buffer.put(&b"H\0\0\0\x04"[..]);
+        }
         self.flush_copy_buffer_with_timeout(server).await?;
 
-        // COPY FROM STDIN completion is a synchronous backend response
-        // sequence (CommandComplete/ErrorResponse through ReadyForQuery).
-        // If the COPY was entered via extended Flush, async mode may have
-        // expected_responses == 0 after CopyInResponse; leaving it armed would
-        // make Server::recv return before reading the completion frames.
-        server.set_async_mode(false);
-        server.set_expected_responses(0);
-
-        let response = self.recv_copy_completion_with_timeout(server).await?;
-
-        self.stats.active_write();
+        server.set_async_mode(extended);
+        server.set_expected_responses(u32::from(extended));
         let write_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
-        match write_all_flush_timeout(&mut self.write, &response, write_timeout).await {
-            Ok(_) => self.stats.active_idle(),
-            Err(err) => {
-                server.wait_available().await;
-                server.mark_bad(
-                    format!(
-                        "failed to flush CopyDone response to client {}: {:?}",
-                        self.addr, err
-                    )
-                    .as_str(),
-                );
-                return Err(err);
+        loop {
+            let response = self.recv_copy_completion_with_timeout(server).await?;
+            if extended && has_error_response(&response) {
+                self.prepared.ignore_until_sync = true;
             }
-        };
+            self.stats.active_write();
+            match write_all_flush_timeout(&mut self.write, &response, write_timeout).await {
+                Ok(_) => self.stats.active_idle(),
+                Err(err) => {
+                    server.wait_available().await;
+                    server.mark_bad(
+                        format!(
+                            "failed to flush CopyDone response to client {}: {:?}",
+                            self.addr, err
+                        )
+                        .as_str(),
+                    );
+                    return Err(err);
+                }
+            }
+            // A Simple Query may continue with streamed results, COPY OUT,
+            // or another COPY FROM. Only RFQ or the next CopyInResponse
+            // hands control back; a flush-sized chunk is not completion.
+            if !server.is_data_available() {
+                break;
+            }
+        }
 
         server.send_deferred_eviction_closes().await?;
 
-        if self.complete_transaction_if_needed(server, false) {
+        if self.complete_transaction_if_needed(server, true) {
             return Ok(TransactionAction::Break);
         }
 
@@ -1961,6 +1980,10 @@ where
                     .await
                     .inspect_err(|_| self.stats.disconnect())?;
                 continue;
+            }
+
+            if message[0] == b'Q' {
+                self.prepared.last_anonymous_hash = None;
             }
 
             let message = if replayed_pre_server_message {
@@ -2536,6 +2559,9 @@ where
                     // backend and the next checkout gets a fresh one
                     // whose release_query semantics still apply.
                     let action_result: Result<TransactionAction, Error> = match code {
+                        _ if self.prepared.ignore_until_sync && code != 'S' && code != 'X' => {
+                            Ok(TransactionAction::Continue)
+                        }
                         // Query
                         'Q' => {
                             if !non_extended_protocol_can_forward(
@@ -2927,11 +2953,20 @@ where
         &mut self,
         server: &mut Server,
     ) -> Result<BytesMut, Error> {
+        let defer_large_messages = self.prepared.skipped_parses.len()
+            > self
+                .prepared
+                .processed_response_counts
+                .synthetic_parse_complete;
         let mut watch_client = self.read.buffer().is_empty();
         loop {
             if !watch_client || server.is_data_available() {
                 return server
-                    .recv(&mut self.write, Some(&mut self.server_parameters))
+                    .recv_with_deferred_large_messages(
+                        &mut self.write,
+                        Some(&mut self.server_parameters),
+                        defer_large_messages,
+                    )
                     .await;
             }
 
@@ -2946,7 +2981,11 @@ where
                 // never becomes readable again.
                 _ = server.wait_server_data() => {
                     return server
-                        .recv(&mut self.write, Some(&mut self.server_parameters))
+                        .recv_with_deferred_large_messages(
+                            &mut self.write,
+                            Some(&mut self.server_parameters),
+                            defer_large_messages,
+                        )
                         .await;
                 }
                 client_read = self.read.fill_buf() => {
@@ -3011,10 +3050,10 @@ where
                     return Err(err);
                 }
             };
-            let rejected_prepared_statement_names = server.take_rejected_prepared_statement_names();
-            if !rejected_prepared_statement_names.is_empty() {
-                self.drop_rejected_prepared_cache_entries(&rejected_prepared_statement_names);
-            }
+            // Server already evicted rejected physical registrations. Their
+            // aliases may also belong to confirmed logical statements; only
+            // the operation journal may roll back the client's namespace.
+            drop(server.take_rejected_prepared_statement_names());
 
             // Insert pending ParseComplete messages based on batch_operations order
             // This ensures ParseComplete messages are inserted in the correct position
@@ -3026,6 +3065,16 @@ where
                 response = self.reorder_parse_complete_responses(response, append_trailing_pending);
             }
 
+            if server.pending_large_message.is_some() {
+                // The next recv streams the deferred frame directly. Append
+                // only its ready Parse prefix now, using the same client write
+                // as the buffered response. Ordinary PBE needs no early flush.
+                response.extend_from_slice(&self.take_ready_parse_complete_responses());
+                if response.is_empty() {
+                    continue;
+                }
+            }
+
             // Insert pending CloseComplete messages after last CloseComplete from server
             if self.prepared.pending_close_complete > 0 {
                 let (new_response, inserted) = insert_close_complete_after_last_close_complete(
@@ -3035,6 +3084,8 @@ where
                 response = new_response;
                 self.prepared.pending_close_complete -= inserted;
             }
+
+            self.reconcile_prepared_namespace(&response, server);
 
             // Debug log: server -> client (after all modifications to show what client actually receives)
             log_server_to_client(&self.addr_str, server.get_process_id(), &response);
@@ -3981,33 +4032,6 @@ mod internal_round_trip_timeout_tests {
     }
 
     #[test]
-    fn copy_done_fail_recv_disables_async_short_circuit() {
-        let src = include_str!("transaction.rs");
-        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
-        let start = impl_src
-            .find("async fn handle_copy_done_fail(")
-            .expect("COPY completion handler not found");
-        let body = &impl_src[start..];
-        let end = body
-            .find("\n    /// Handle a connected and authenticated client")
-            .expect("client handler should follow COPY completion handler");
-        let body = &body[..end];
-        let recv_idx = body
-            .find("recv_copy_completion_with_timeout(server).await?")
-            .expect("COPY completion handler must drain backend response");
-        let before_recv = &body[..recv_idx];
-
-        assert!(
-            before_recv.contains("server.set_async_mode(false);"),
-            "CopyDone/CopyFail completion must disable async recv short-circuit before draining"
-        );
-        assert!(
-            before_recv.contains("server.set_expected_responses(0);"),
-            "CopyDone/CopyFail completion must reset expected responses before draining"
-        );
-    }
-
-    #[test]
     fn copy_done_fail_recv_uses_housekeeping_deadline() {
         let src = include_str!("transaction.rs");
         let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
@@ -4129,7 +4153,7 @@ mod internal_round_trip_timeout_tests {
         let zero_branch = &body[branch_start..branch_end];
 
         assert!(
-            zero_branch.contains("self.write_synthetic_parse_completes().await?;"),
+            zero_branch.contains("self.write_synthetic_parse_completes(server).await?;"),
             "fresh zero-response Flush must still emit queued synthetic ParseComplete replies"
         );
         assert!(
@@ -4280,39 +4304,6 @@ mod pre_server_replay_tests {
             BytesMut::from(&b"D"[..])
         );
         assert!(take_queued_pre_server_message(&mut initial, &mut replay).is_none());
-    }
-}
-
-#[cfg(test)]
-mod rejected_parse_rollback_tests {
-    #[test]
-    fn relay_response_rolls_back_rejected_parse_cache_before_reordering() {
-        let src = include_str!("transaction.rs");
-        let impl_src = {
-            let tests_start = src
-                .find("\n#[cfg(test)]")
-                .expect("at least one test module should follow the impl");
-            &src[..tests_start]
-        };
-        let relay_start = impl_src
-            .find("pub(crate) async fn relay_response(")
-            .expect("relay_response should exist");
-        let relay_body = &impl_src[relay_start..];
-
-        let take_idx = relay_body
-            .find("server.take_rejected_prepared_statement_names()")
-            .expect("relay_response must take rejected Parse names from Server");
-        let drop_idx = relay_body
-            .find("self.drop_rejected_prepared_cache_entries(&rejected_prepared_statement_names)")
-            .expect("relay_response must roll back rejected Parse names from client cache");
-        let reorder_idx = relay_body
-            .find("self.reorder_parse_complete_responses")
-            .expect("relay_response should still perform ParseComplete reordering");
-
-        assert!(
-            take_idx < drop_idx && drop_idx < reorder_idx,
-            "rejected Parse cache rollback must run before synthetic ParseComplete reordering"
-        );
     }
 }
 
@@ -5513,7 +5504,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
 mod relay_response_client_write_failure_tests {
     use super::*;
     use crate::client::buffer_pool::PooledBuffer;
-    use crate::client::core::PreparedStatementState;
+    use crate::client::core::{PreparedStatementState, SkippedParse};
     use crate::pool::PoolIdentifier;
     use crate::server::ServerParameters;
     use crate::stats::ClientStats;
@@ -5577,10 +5568,14 @@ mod relay_response_client_write_failure_tests {
     /// Shared by `flush_transaction_counter_tests`, which needs a `Client`
     /// whose in-memory counters can be inspected but performs no client I/O.
     pub(super) fn test_client_with_broken_pipe_writer() -> Client<SilentReader, BrokenPipeWriter> {
+        test_client_with_writer(BrokenPipeWriter)
+    }
+
+    fn test_client_with_writer<W>(write: W) -> Client<SilentReader, W> {
         let addr = "127.0.0.1:6543".parse().unwrap();
         Client {
             read: BufReader::new(SilentReader),
-            write: BrokenPipeWriter,
+            write,
             buffer: PooledBuffer::new(),
             addr,
             addr_str: addr.to_string(),
@@ -5618,6 +5613,127 @@ mod relay_response_client_write_failure_tests {
         b'C', 0, 0, 0, 13, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0, b'Z', 0, 0, 0, 5,
         b'I',
     ];
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            self.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn queue_cached_parse(client: &mut Client<SilentReader, RecordingWriter>) {
+        client.prepared.skipped_parses.push(SkippedParse);
+        client
+            .prepared
+            .batch_operations
+            .push(BatchOperation::ParseSkipped {
+                statement_name: Arc::from("cached"),
+            });
+    }
+
+    #[tokio::test]
+    async fn cached_parse_bind_execute_flushes_one_combined_response() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        queue_cached_parse(&mut client);
+        client.prepared.batch_operations.push(BatchOperation::Bind {
+            statement_name: Arc::from("cached"),
+        });
+        client
+            .prepared
+            .batch_operations
+            .push(BatchOperation::Execute);
+        let (mut server, mut peer) = Server::test_silent_socket();
+        let response = [
+            &[b'2', 0, 0, 0, 4][..],
+            &[b'D', 0, 0, 0, 12, 0, 1, 0, 0, 0, 2, b'4', b'2'][..],
+            COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE,
+        ]
+        .concat();
+        peer.write_all(&response).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.relay_response(&mut server))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            client.write.bytes,
+            [&PARSE_COMPLETE_MSG[..], &response].concat()
+        );
+        assert_eq!(
+            client.write.flushes, 1,
+            "ordinary cached PBE must combine ParseComplete with the backend response"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_parse_precedes_direct_large_row_with_or_without_buffered_prefix() {
+        for buffered_prefix in [false, true] {
+            let mut client = test_client_with_writer(RecordingWriter::default());
+            let (mut server, mut peer) = Server::test_silent_socket();
+            server.max_message_size = 16;
+            let mut response = Vec::new();
+            let mut expected = Vec::new();
+            if buffered_prefix {
+                client.prepared.batch_operations.push(BatchOperation::Bind {
+                    statement_name: Arc::from("existing"),
+                });
+                response.extend_from_slice(&[b'2', 0, 0, 0, 4]);
+                expected.extend_from_slice(&response);
+            }
+            queue_cached_parse(&mut client);
+            client
+                .prepared
+                .batch_operations
+                .push(BatchOperation::Execute);
+            let payload = [b'x'; 64];
+            let mut row = vec![b'D'];
+            row.extend_from_slice(&(4_i32 + 2 + 4 + payload.len() as i32).to_be_bytes());
+            row.extend_from_slice(&1_i16.to_be_bytes());
+            row.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+            row.extend_from_slice(&payload);
+            response.extend_from_slice(&row);
+            response.extend_from_slice(COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE);
+            expected.extend_from_slice(&PARSE_COMPLETE_MSG);
+            expected.extend_from_slice(&row);
+            expected.extend_from_slice(COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE);
+            peer.write_all(&response).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), client.relay_response(&mut server))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                client.write.bytes, expected,
+                "buffered prefix: {buffered_prefix}"
+            );
+            assert!(server.pending_large_message.is_none());
+            assert!(!server.is_data_available());
+            assert!(!server.is_bad());
+        }
+    }
 
     #[tokio::test]
     async fn client_write_failure_after_ready_for_query_runs_release_cleanup() {

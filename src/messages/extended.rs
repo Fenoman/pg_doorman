@@ -751,6 +751,11 @@ impl Bind {
 
     /// Gets the name of the prepared statement from the buffer.
     pub fn get_name(buf: &BytesMut) -> Result<String, Error> {
+        Self::get_name_str(buf).map(str::to_owned)
+    }
+
+    /// Borrow the prepared statement name without allocating on each Bind.
+    pub fn get_name_str(buf: &BytesMut) -> Result<&str, Error> {
         let data = &buf[..];
         if data.len() < 5 {
             return Err(Error::ParseBytesError("Bind message too short".to_string()));
@@ -762,8 +767,31 @@ impl Bind {
         let stmt_end =
             find_capped_name_nul(data, stmt_start, "statement name", MAX_PARSE_NAME_BYTES)?;
         std::str::from_utf8(&data[stmt_start..stmt_end])
-            .map(|name| name.to_string())
             .map_err(|err| Error::ParseBytesError(format!("Bind statement invalid utf8: {err}")))
+    }
+
+    /// Append a rewritten Bind directly to the destination batch. Its portal,
+    /// parameter values and format codes are copied only once; there is no
+    /// intermediate allocation proportional to the parameter payload.
+    pub fn append_renamed(buf: &BytesMut, new_name: &str, out: &mut BytesMut) -> Result<(), Error> {
+        if buf.len() < 5 {
+            return Err(Error::ParseBytesError("Bind message too short".to_string()));
+        }
+        let portal_end = find_capped_name_nul(buf, 5, "portal name", MAX_PARSE_NAME_BYTES)?;
+        let stmt_start = portal_end + 1;
+        let stmt_end =
+            find_capped_name_nul(buf, stmt_start, "statement name", MAX_PARSE_NAME_BYTES)?;
+        let old_name_len = stmt_end - stmt_start;
+        let new_len = buf.len() - old_name_len + new_name.len();
+        let wire_len = i32::try_from(new_len - 1)
+            .map_err(|_| Error::ParseBytesError("rewritten Bind is too large".to_string()))?;
+        out.reserve(new_len);
+        out.put_u8(buf[0]);
+        out.put_i32(wire_len);
+        out.put_slice(&buf[5..stmt_start]);
+        out.put_slice(new_name.as_bytes());
+        out.put_slice(&buf[stmt_end..]);
+        Ok(())
     }
 
     /// Renames the prepared statement to a new name.
@@ -1348,6 +1376,39 @@ mod tests {
             err.to_string().contains("Bind trailing bytes"),
             "unexpected error for malformed Bind with trailing bytes: {err}"
         );
+    }
+
+    #[test]
+    fn bind_append_renamed_preserves_complete_wire_frames() {
+        for portal in ["", "portal"] {
+            for old_name in ["", "s", "DOORMAN_123", "long_client_statement_name"] {
+                for new_name in ["x", "DOORMAN_456", "DOORMAN_async_789"] {
+                    let payload = vec![0x42; 65536];
+                    let frame = make_bind_with_params(portal, old_name, &[b"hello", &payload]);
+                    let expected = Bind::rename(frame.clone(), new_name).unwrap();
+                    let mut batch = BytesMut::from(&b"existing batch"[..]);
+                    let prefix_len = batch.len();
+                    Bind::append_renamed(&frame, new_name, &mut batch).unwrap();
+                    assert_eq!(&batch[..prefix_len], b"existing batch");
+                    assert_eq!(&batch[prefix_len..], &expected[..]);
+                    let rewritten = batch.split_off(prefix_len);
+                    let parsed = Bind::try_from(&rewritten).unwrap();
+                    assert_eq!(parsed.portal, portal);
+                    assert_eq!(parsed.prepared_statement, new_name);
+                    assert_eq!(parsed.param_values[1].1.as_ref(), payload.as_slice());
+                    assert_eq!(Bind::get_name_str(&frame).unwrap(), old_name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bind_append_renamed_keeps_batch_intact_on_invalid_frame() {
+        for frame in [BytesMut::new(), BytesMut::from(&b"B\0\0\0\x04portal"[..])] {
+            let mut batch = BytesMut::from(&b"existing batch"[..]);
+            assert!(Bind::append_renamed(&frame, "DOORMAN_1", &mut batch).is_err());
+            assert_eq!(&batch[..], b"existing batch");
+        }
     }
 
     #[test]

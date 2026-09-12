@@ -1210,18 +1210,14 @@ fn reconstruct_prepared_state(
         } else {
             None
         };
-        let cached = CachedStatement {
-            set_cleanup_command: extract_set_cleanup_commands(shared_parse.query().as_bytes())
+        let mut cached = CachedStatement::new(shared_parse, hash, async_name);
+        cached.set_cleanup_command = extract_set_cleanup_commands(cached.parse.query().as_bytes())
+            .first()
+            .copied();
+        cached.reset_cleanup_command =
+            extract_reset_cleanup_commands(cached.parse.query().as_bytes())
                 .first()
-                .copied(),
-            reset_cleanup_command: extract_reset_cleanup_commands(shared_parse.query().as_bytes())
-                .first()
-                .copied(),
-            parse: shared_parse,
-            hash,
-            intercepted_discard_all: false,
-            async_name,
-        };
+                .copied();
         // Replay-evictions during reconstruction are an artefact of the new
         // LRU cap vs the size of the migration blob, not real workload
         // pressure on the running pooler. Drop the outcome instead of
@@ -2802,22 +2798,11 @@ mod tests {
     #[test]
     fn serialize_prepared_state_drops_intercepted_discard_all_rewrites() {
         let mut prepared = PreparedStatementState::new(true, 0);
-        let intercepted = CachedStatement {
-            parse: Arc::new(Parse::from_parts("SELECT 1", &[])),
-            hash: 0x11,
-            intercepted_discard_all: true,
-            set_cleanup_command: None,
-            reset_cleanup_command: None,
-            async_name: None,
-        };
-        let normal = CachedStatement {
-            parse: Arc::new(Parse::from_parts("SELECT 42", &[])),
-            hash: 0x22,
-            intercepted_discard_all: false,
-            set_cleanup_command: None,
-            reset_cleanup_command: None,
-            async_name: None,
-        };
+        let mut intercepted =
+            CachedStatement::new(Arc::new(Parse::from_parts("SELECT 1", &[])), 0x11, None);
+        intercepted.intercepted_discard_all = true;
+        let normal =
+            CachedStatement::new(Arc::new(Parse::from_parts("SELECT 42", &[])), 0x22, None);
 
         let _ = prepared.cache.put(
             PreparedStatementKey::Named("discard_all".to_string()),
@@ -2844,14 +2829,7 @@ mod tests {
     fn serialize_prepared_state_rejects_growth_past_state_cap_before_writing() {
         let mut prepared = PreparedStatementState::new(true, 0);
         let parse = Arc::new(Parse::from_parts("SELECT 1", &[]));
-        let cached = CachedStatement {
-            parse,
-            hash: 1,
-            intercepted_discard_all: false,
-            set_cleanup_command: None,
-            reset_cleanup_command: None,
-            async_name: None,
-        };
+        let cached = CachedStatement::new(parse, 1, None);
         let _ = prepared
             .cache
             .put(PreparedStatementKey::Anonymous(1), cached);

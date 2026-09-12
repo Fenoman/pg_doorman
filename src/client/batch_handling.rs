@@ -97,19 +97,28 @@ fn next_response_anchor(
 /// Helper to add or increment count for an index in InsertionMap
 #[inline]
 fn insertion_map_add(map: &mut InsertionMap, index: usize, count: usize) {
-    if let Some(entry) = map.iter_mut().find(|(idx, _)| *idx == index) {
-        entry.1 += count;
-    } else {
-        map.push((index, count));
+    if let Some((last_index, last_count)) = map.last_mut() {
+        debug_assert!(*last_index <= index, "response anchors must be ordered");
+        if *last_index == index {
+            *last_count += count;
+            return;
+        }
     }
+    map.push((index, count));
 }
 
 /// Helper to get count for an index from InsertionMap
 #[inline]
 fn insertion_map_get(map: &InsertionMap, index: usize) -> Option<usize> {
-    map.iter()
-        .find(|(idx, _)| *idx == index)
-        .map(|(_, count)| *count)
+    if map.len() <= 8 {
+        map.iter()
+            .find(|(idx, _)| *idx == index)
+            .map(|(_, count)| *count)
+    } else {
+        map.binary_search_by_key(&index, |(idx, _)| *idx)
+            .ok()
+            .map(|position| map[position].1)
+    }
 }
 
 /// Helper to sum all counts in InsertionMap
@@ -126,6 +135,51 @@ where
     S: tokio::io::AsyncRead + std::marker::Unpin,
     T: tokio::io::AsyncWrite + std::marker::Unpin,
 {
+    /// Emit cached Parses whose preceding operations have all completed.
+    /// A following large DataRow may bypass response buffering entirely, so
+    /// these acknowledgements must be written before the next backend recv.
+    pub(crate) fn take_ready_parse_complete_responses(&mut self) -> BytesMut {
+        let mut remaining = self.prepared.processed_response_counts.clone();
+        if self.prepared.ignore_until_sync
+            || remaining.synthetic_parse_complete == self.prepared.skipped_parses.len()
+        {
+            return BytesMut::new();
+        }
+        // ParameterDescription alone does not complete a statement Describe.
+        remaining.param_desc -= remaining.statement_desc_pending;
+        let mut ready = 0;
+        for operation in &self.prepared.batch_operations {
+            let acknowledged = match operation {
+                BatchOperation::ParseSkipped { .. } => {
+                    if remaining.synthetic_parse_complete > 0 {
+                        remaining.synthetic_parse_complete -= 1;
+                    } else {
+                        ready += 1;
+                    }
+                    continue;
+                }
+                BatchOperation::ParseSent { .. } => &mut remaining.parse_complete,
+                BatchOperation::Bind { .. } => &mut remaining.bind_complete,
+                BatchOperation::Describe { .. } => &mut remaining.param_desc,
+                BatchOperation::DescribePortal => &mut remaining.portal_desc,
+                BatchOperation::Execute => &mut remaining.execute,
+                BatchOperation::Close => &mut remaining.close_complete,
+            };
+            if *acknowledged == 0 {
+                break;
+            }
+            *acknowledged -= 1;
+        }
+        let mut response = BytesMut::with_capacity(ready * PARSE_COMPLETE_MSG.len());
+        for _ in 0..ready {
+            response.extend_from_slice(&PARSE_COMPLETE_MSG);
+        }
+        self.prepared
+            .processed_response_counts
+            .synthetic_parse_complete += ready;
+        response
+    }
+
     /// Insert ParseComplete messages into response based on batch_operations order.
     /// This ensures that ParseComplete for skipped Parse operations appears in the
     /// correct position relative to other responses.
@@ -146,7 +200,13 @@ where
         response: BytesMut,
         append_trailing_pending: bool,
     ) -> BytesMut {
-        if self.prepared.batch_operations.is_empty() || self.prepared.skipped_parses.is_empty() {
+        if self.prepared.batch_operations.is_empty()
+            || self
+                .prepared
+                .processed_response_counts
+                .synthetic_parse_complete
+                == self.prepared.skipped_parses.len()
+        {
             return response;
         }
 
@@ -195,11 +255,20 @@ where
         let mut insert_before_close: InsertionMap = SmallVec::new();
         let mut close_index: usize = 0;
 
+        let mut skipped_index = 0;
+        let emitted = self
+            .prepared
+            .processed_response_counts
+            .synthetic_parse_complete;
         for op in &self.prepared.batch_operations {
             match op {
                 BatchOperation::ParseSkipped { .. } => {
-                    // Mark that we need to insert ParseComplete
-                    pending_insertions += 1;
+                    // An Execute may span many recv chunks. Once sent, its
+                    // preceding ParseComplete must not be inserted again.
+                    if skipped_index >= emitted {
+                        pending_insertions += 1;
+                    }
+                    skipped_index += 1;
                 }
                 BatchOperation::ParseSent { .. } => {
                     // Server sends ParseComplete. If skipped Parse operations
@@ -365,10 +434,8 @@ where
                                 execute_offset + execute_count,
                                 close_offset + close_complete_count,
                             );
-                            match anchor {
-                                Some(ResponseAnchor::PortalDesc) => portal_desc_count += 1,
-                                Some(ResponseAnchor::Execute) => execute_count += 1,
-                                _ => {}
+                            if anchor == Some(ResponseAnchor::PortalDesc) {
+                                portal_desc_count += 1;
                             }
                         }
                     }
@@ -586,9 +653,10 @@ where
                         Some(ResponseAnchor::PortalDesc) => {
                             insertion_map_get(&relevant_portal_desc, portal_desc_count).unwrap_or(0)
                         }
-                        Some(ResponseAnchor::Execute) => {
+                        Some(ResponseAnchor::Execute) if !in_execute => {
                             insertion_map_get(&relevant_execute, execute_count).unwrap_or(0)
                         }
+                        Some(ResponseAnchor::Execute) => 0,
                         Some(ResponseAnchor::Close) => {
                             insertion_map_get(&relevant_close, close_count).unwrap_or(0)
                         }
@@ -639,9 +707,13 @@ where
             if remaining > 0 {
                 for _ in 0..remaining {
                     new_response.extend_from_slice(&PARSE_COMPLETE_MSG);
+                    inserted_count += 1;
                 }
             }
         }
+        self.prepared
+            .processed_response_counts
+            .synthetic_parse_complete += inserted_count;
 
         new_response
     }
@@ -651,7 +723,7 @@ where
 mod tests {
     use super::*;
     use crate::client::buffer_pool::PooledBuffer;
-    use crate::client::core::{ParseCompleteTarget, PreparedStatementState, SkippedParse};
+    use crate::client::core::{PreparedStatementState, SkippedParse};
     use crate::pool::PoolIdentifier;
     use crate::server::ServerParameters;
     use crate::stats::ClientStats;
@@ -742,12 +814,7 @@ mod tests {
     }
 
     fn queue_skipped_parse(client: &mut Client<Empty, Sink>, name: &str) {
-        client.prepared.skipped_parses.push(SkippedParse {
-            statement_name: name.into(),
-            target: ParseCompleteTarget::BindComplete,
-            insert_at_beginning: false,
-            has_bind: false,
-        });
+        client.prepared.skipped_parses.push(SkippedParse);
         client
             .prepared
             .batch_operations
@@ -934,5 +1001,104 @@ mod tests {
     #[test]
     fn skipped_parse_before_describe_portal_no_data_is_emitted_before_no_data() {
         assert_skipped_parse_before_describe_portal_response_is_emitted_before(no_data(), "NoData");
+    }
+
+    #[test]
+    fn many_sparse_parse_insertions_keep_order_across_response_chunks() {
+        let mut client = test_client();
+        for _ in 0..32 {
+            client.prepared.batch_operations.push(BatchOperation::Bind {
+                statement_name: Arc::from("existing"),
+            });
+            queue_skipped_parse(&mut client, "cached");
+            client.prepared.batch_operations.push(BatchOperation::Bind {
+                statement_name: Arc::from("cached"),
+            });
+        }
+        let mut response = [b'2', 0, 0, 0, 4].repeat(64);
+        response.extend_from_slice(&ready_for_query());
+        // Split after an odd BindComplete: the next chunk starts with an
+        // insertion whose absolute anchor must be adjusted by the offset.
+        let first = client.reorder_parse_complete_responses(BytesMut::from(&response[..85]), false);
+        let second =
+            client.reorder_parse_complete_responses(BytesMut::from(&response[85..]), false);
+        let mut expected = [b'2', 0, 0, 0, 4, b'1', 0, 0, 0, 4, b'2', 0, 0, 0, 4].repeat(32);
+        expected.extend_from_slice(&ready_for_query());
+        assert_eq!([first.as_ref(), second.as_ref()].concat(), expected);
+    }
+
+    #[test]
+    fn cached_parse_before_streaming_execute_is_acknowledged_only_once() {
+        for terminal in [command_complete(b"SELECT 2"), error_response()] {
+            for split in [false, true] {
+                let mut client = test_client();
+                queue_skipped_parse(&mut client, "cached");
+                client
+                    .prepared
+                    .batch_operations
+                    .push(BatchOperation::Execute);
+                let row = message(b'D', &[0, 0]);
+                let first = if split {
+                    client.reorder_parse_complete_responses(BytesMut::from(&row[..]), false)
+                } else {
+                    BytesMut::new()
+                };
+                let mut rest = if split { Vec::new() } else { row.clone() };
+                rest.extend_from_slice(
+                    &[row.clone(), terminal.clone(), ready_for_query()].concat(),
+                );
+                let second =
+                    client.reorder_parse_complete_responses(BytesMut::from(&rest[..]), false);
+                let expected = [
+                    parse_complete(),
+                    row.clone(),
+                    row,
+                    terminal.clone(),
+                    ready_for_query(),
+                ]
+                .concat();
+                assert_eq!(
+                    [first.as_ref(), second.as_ref()].concat(),
+                    expected,
+                    "an Execute spanning recv chunks must not repeat ParseComplete"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ready_parse_completes_wait_for_complete_describe_and_execute() {
+        let mut client = test_client();
+        client
+            .prepared
+            .batch_operations
+            .push(BatchOperation::Describe {
+                statement_name: "described".into(),
+            });
+        queue_skipped_parse(&mut client, "before_execute");
+        client
+            .prepared
+            .batch_operations
+            .push(BatchOperation::Execute);
+        queue_skipped_parse(&mut client, "after_execute");
+        assert!(client.take_ready_parse_complete_responses().is_empty());
+        let parameters = message(b't', &[0, 0]);
+        client.reorder_parse_complete_responses(BytesMut::from(&parameters[..]), false);
+        assert!(client.take_ready_parse_complete_responses().is_empty());
+        client.reorder_parse_complete_responses(BytesMut::from(&row_description()[..]), false);
+        assert_eq!(
+            client.take_ready_parse_complete_responses().as_ref(),
+            parse_complete()
+        );
+        assert!(client.take_ready_parse_complete_responses().is_empty());
+        client.reorder_parse_complete_responses(
+            BytesMut::from(&command_complete(b"SELECT 1")[..]),
+            false,
+        );
+        assert_eq!(
+            client.take_ready_parse_complete_responses().as_ref(),
+            parse_complete()
+        );
+        assert!(client.take_ready_parse_complete_responses().is_empty());
     }
 }

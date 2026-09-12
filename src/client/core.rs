@@ -117,8 +117,7 @@ fn entry_fixed_bytes(key: &PreparedStatementKey, value: &CachedStatement) -> u64
         PreparedStatementKey::Named(s) => std::mem::size_of::<PreparedStatementKey>() + s.len(),
         PreparedStatementKey::Anonymous(_) => std::mem::size_of::<PreparedStatementKey>(),
     };
-    let stmt_bytes =
-        std::mem::size_of::<CachedStatement>() + value.async_name.as_ref().map_or(0, |n| n.len());
+    let stmt_bytes = value_only_bytes(value) as usize;
     (key_bytes + stmt_bytes) as u64
 }
 
@@ -131,8 +130,9 @@ fn named_entry_fixed_bytes(name_len: usize, value: &CachedStatement) -> u64 {
     std::mem::size_of::<PreparedStatementKey>() as u64 + name_len as u64 + value_only_bytes(value)
 }
 
-/// Value-side fixed cost (CachedStatement struct + async_name heap
-/// bytes - `Arc<str>` length ). The key cost cancels on
+/// Value-side fixed cost (CachedStatement struct + shared backend name bytes).
+/// Async entries share that allocation with async_name; count it only once.
+/// The key cost cancels on
 /// Replaced branches where the previous entry and the new entry share
 /// the same key allocation (Named) or the same fixed Anonymous overhead.
 ///
@@ -144,8 +144,7 @@ fn named_entry_fixed_bytes(name_len: usize, value: &CachedStatement) -> u64 {
 /// using the same helper, so the convergence guarantee is preserved.
 #[inline]
 fn value_only_bytes(value: &CachedStatement) -> u64 {
-    std::mem::size_of::<CachedStatement>() as u64
-        + value.async_name.as_ref().map_or(0, |n| n.len()) as u64
+    std::mem::size_of::<CachedStatement>() as u64 + value.shared_server_name.len() as u64
 }
 
 /// Outcome of `PreparedStatementCache::put`.
@@ -563,13 +562,7 @@ impl PreparedStatementCache {
                     std::mem::size_of::<PreparedStatementKey>() as u64
                 }
             };
-            total += std::mem::size_of::<CachedStatement>() as u64;
-            if let Some(ref name) = cached.async_name {
-                // `Arc<str>::len()` replaces `String::capacity()` -
-                // see `value_only_bytes` doc for why this still keeps
-                // walk and approx in lock-step.
-                total += name.len() as u64;
-            }
+            total += value_only_bytes(cached);
         }
         total
     }
@@ -626,35 +619,9 @@ impl<'a> Iterator for AnonIter<'a> {
     }
 }
 
-/// What response message we're waiting for to insert ParseComplete
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParseCompleteTarget {
-    /// Waiting for BindComplete - insert ParseComplete before it
-    BindComplete,
-    /// Waiting for ParameterDescription - insert ParseComplete before it (Describe flow)
-    ParameterDescription,
-}
-
-/// Tracks a skipped Parse message that needs a synthetic ParseComplete response
-#[derive(Debug, Clone)]
-pub struct SkippedParse {
-    /// The rewritten statement name (e.g., DOORMAN_5).
-    /// `Arc<str>` because every Bind/Describe/Close that
-    /// references this skipped Parse used to clone the name as `String`;
-    /// the refcount bump is ~12× cheaper than a per-message allocation
-    /// on the extended-protocol hot path.
-    pub statement_name: Arc<str>,
-    /// What response we're waiting for to insert ParseComplete
-    pub target: ParseCompleteTarget,
-    /// If true, ParseComplete should be inserted at the beginning of the response.
-    /// This is set when a skipped Parse comes before a new Parse in the same batch,
-    /// AND there is no corresponding Bind for this skipped Parse yet.
-    pub insert_at_beginning: bool,
-    /// If true, a Bind message for this statement has been processed.
-    /// This prevents marking insert_at_beginning=true when a new Parse arrives,
-    /// because the ParseComplete should be inserted before BindComplete, not at beginning.
-    pub has_bind: bool,
-}
+/// One pending synthetic ParseComplete. BatchOperation stores its position.
+#[derive(Debug, Clone, Copy)]
+pub struct SkippedParse;
 
 /// Tracks response message counts across multiple chunks.
 /// Replaces HashMap<char, usize> with fixed fields for better performance.
@@ -662,6 +629,8 @@ pub struct SkippedParse {
 pub struct ResponseCounts {
     /// Count of ParseComplete ('1') messages
     pub parse_complete: usize,
+    /// Count of synthetic ParseComplete messages already sent for this batch.
+    pub synthetic_parse_complete: usize,
     /// Count of BindComplete ('2') messages
     pub bind_complete: usize,
     /// Count of ParameterDescription ('t') messages
@@ -681,6 +650,7 @@ impl ResponseCounts {
     #[inline(always)]
     pub fn clear(&mut self) {
         self.parse_complete = 0;
+        self.synthetic_parse_complete = 0;
         self.bind_complete = 0;
         self.param_desc = 0;
         self.portal_desc = 0;
@@ -715,10 +685,25 @@ pub enum BatchOperation {
     Close,
 }
 
+/// One optimistic Parse/Close change awaiting its protocol acknowledgement.
+/// Keeping only changed entries lets error recovery preserve the acknowledged
+/// prefix without copying the client cache for ordinary Bind/Execute batches.
+pub(crate) struct PreparedNamespaceChange {
+    pub operation_index: usize,
+    pub key: PreparedStatementKey,
+    pub previous: Option<CachedStatement>,
+    pub previous_anonymous_hash: Option<u64>,
+    pub evicted: Option<(PreparedStatementKey, CachedStatement)>,
+    pub close_on_success: Option<String>,
+    pub is_parse: bool,
+}
+
 /// Cached prepared statement entry.
 /// For async clients, stores an optional unique name to avoid "prepared statement already exists" errors.
 #[derive(Clone)]
 pub struct CachedStatement {
+    /// Shared backend alias allocated once per cached statement.
+    pub shared_server_name: Arc<str>,
     /// Shared Parse from pool cache (contains query text)
     pub parse: Arc<Parse>,
     /// Hash of the statement
@@ -739,7 +724,7 @@ pub struct CachedStatement {
     /// stored as `Arc<str>` because every Bind/Describe/
     /// Close on the extended-protocol hot path used to clone the name as
     /// `String`. The refcount-bump path lets the per-batch
-    /// `BatchOperation`/`SkippedParse` entries share the same allocation
+    /// `BatchOperation` entries share the same allocation
     /// the cache itself already owns.
     pub async_name: Option<Arc<str>>,
 }
@@ -749,6 +734,9 @@ impl CachedStatement {
     #[must_use]
     pub fn new(parse: Arc<Parse>, hash: u64, async_name: Option<Arc<str>>) -> Self {
         Self {
+            shared_server_name: async_name
+                .clone()
+                .unwrap_or_else(|| Arc::from(parse.name.as_str())),
             parse,
             hash,
             intercepted_discard_all: false,
@@ -768,18 +756,10 @@ impl CachedStatement {
             .unwrap_or(&self.parse.name)
     }
 
-    /// owned `Arc<str>` view over the server-side
-    /// statement name. For async clients this is a cheap refcount bump
-    /// on the already-`Arc<str>` async name. For non-async clients
-    /// `parse.name` is still a `String`, so this path allocates once
-    /// per call - removing it needs the deferred `Parse.name
-    /// -> Arc<str>` migration, a separate change.
+    /// Share the backend alias without allocating on each Bind or Describe.
     #[inline]
     pub fn server_name_arc(&self) -> Arc<str> {
-        match &self.async_name {
-            Some(a) => Arc::clone(a),
-            None => Arc::<str>::from(self.parse.name.as_str()),
-        }
+        Arc::clone(&self.shared_server_name)
     }
 }
 
@@ -792,6 +772,10 @@ pub struct PreparedStatementState {
     /// Whether this client has ever used async protocol (Flush command)
     /// Once set to true, prepared statements caching is disabled for this client
     pub async_client: bool,
+
+    /// COPY FROM entered through extended protocol completes an Execute;
+    /// ReadyForQuery still requires a subsequent client Sync.
+    pub copy_from_extended: bool,
 
     /// Mapping of client named prepared statement to cached statement info
     pub cache: PreparedStatementCache,
@@ -806,12 +790,16 @@ pub struct PreparedStatementState {
     pub last_bound_for_top: Option<(u64, bool)>,
 
     /// Tracks skipped Parse messages that need synthetic ParseComplete responses.
-    /// Each entry contains the statement name and what response we're waiting for.
     pub skipped_parses: Vec<SkippedParse>,
 
     /// Tracks all operations in current batch to determine correct ParseComplete insertion order.
     /// Cleared after Sync.
     pub batch_operations: Vec<BatchOperation>,
+
+    pub(crate) namespace_changes: std::collections::VecDeque<PreparedNamespaceChange>,
+    pub(crate) namespace_response_index: usize,
+    /// ErrorResponse from Flush keeps this set until the actual Sync reply.
+    pub(crate) ignore_until_sync: bool,
 
     /// Cleanup attribution copied from prepared statement to bound portal.
     /// Extended Parse does not execute SQL; Bind creates the portal and Execute
@@ -857,11 +845,15 @@ impl PreparedStatementState {
         Self {
             enabled,
             async_client: false,
+            copy_from_extended: false,
             cache: PreparedStatementCache::new(anon_cache_size),
             last_anonymous_hash: None,
             last_bound_for_top: None,
             skipped_parses: Vec::new(),
             batch_operations: Vec::new(),
+            namespace_changes: std::collections::VecDeque::new(),
+            namespace_response_index: 0,
+            ignore_until_sync: false,
             portal_set_cleanup_commands: AHashMap::new(),
             portal_reset_cleanup_commands: AHashMap::new(),
             portal_cleanup_attribution_bytes: 0,
@@ -882,6 +874,8 @@ impl PreparedStatementState {
         self.parses_sent_in_batch = 0;
         self.skipped_parses.clear();
         self.batch_operations.clear();
+        self.namespace_changes.clear();
+        self.namespace_response_index = 0;
         self.processed_response_counts.clear();
     }
 
@@ -1113,6 +1107,10 @@ impl PreparedStatementState {
     pub fn discard_clear(&mut self) -> usize {
         let cleared = self.cache.len();
         self.cache.clear();
+        self.namespace_changes.clear();
+        self.namespace_response_index = 0;
+        self.ignore_until_sync = false;
+        self.copy_from_extended = false;
         // Extended-protocol scratch that was attributed to statements we
         // just forgot about. Leaving these populated would let stale Parse
         // hashes leak into the next Sync attribution and confuse the
@@ -1540,6 +1538,7 @@ mod cache_split_tests {
         buf.put_i16(0);
         let parse: crate::messages::Parse = (&buf).try_into().unwrap();
         CachedStatement {
+            shared_server_name: Arc::from(parse.name.as_str()),
             parse: Arc::new(parse),
             hash: 0xdead_beef,
             intercepted_discard_all: false,
@@ -2064,12 +2063,7 @@ mod cache_split_tests {
         );
         state.last_anonymous_hash = Some(0xdead_beef);
         state.last_bound_for_top = Some((0x0000_face, true));
-        state.skipped_parses.push(SkippedParse {
-            statement_name: "DOORMAN_1".into(),
-            target: ParseCompleteTarget::BindComplete,
-            insert_at_beginning: false,
-            has_bind: false,
-        });
+        state.skipped_parses.push(SkippedParse);
         state.batch_operations.push(BatchOperation::Execute);
         state
             .portal_set_cleanup_commands
@@ -2093,6 +2087,7 @@ mod cache_split_tests {
         state.processed_response_counts.execute = 7;
         state.processed_response_counts.close_complete = 2;
         state.processed_response_counts.parse_complete = 11;
+        state.processed_response_counts.synthetic_parse_complete = 4;
         // Regression seed: pending_close_complete used to escape
         // discard_clear because the simple-query DISCARD ALL path doesn't
         // normally interact with extended-protocol Close. Seed a non-zero
@@ -2146,6 +2141,7 @@ mod cache_split_tests {
         );
         assert_eq!(state.parses_sent_in_batch, 0);
         assert_eq!(state.processed_response_counts.parse_complete, 0);
+        assert_eq!(state.processed_response_counts.synthetic_parse_complete, 0);
         assert_eq!(
             state.processed_response_counts.bind_complete, 0,
             "bind_complete counter must reset for symmetry with reset_batch"

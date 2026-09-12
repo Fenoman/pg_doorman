@@ -4,5 +4,6 @@ mod backend_pid;
 mod cancel_protocol;
 mod dual_connection;
 pub mod helpers;
+mod protocol_recovery;
 mod release_cleanup;
 mod session_management;
