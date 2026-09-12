@@ -526,7 +526,11 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
     // statement names. Drop the optimistic LRU entries so the next Bind
     // re-Parses instead of hitting a stale DOORMAN_N.
     if !server.registering_prepared_statement.is_empty() {
-        let pending: Vec<String> = server.registering_prepared_statement.drain(..).collect();
+        let pending: Vec<String> = server
+            .registering_prepared_statement
+            .drain(..)
+            .map(|pending| pending.name)
+            .collect();
         server
             .rejected_prepared_statement_names
             .extend(pending.iter().cloned());
@@ -1140,8 +1144,17 @@ where
             // ParseComplete'd — which Java pgjdbc surfaced as
             // "Connection reset by peer" on its eighth pipelined batch.
             '1' => {
-                let _ = server.registering_prepared_statement.pop_front();
-                if server.is_async() {
+                let suppress_complete = server
+                    .registering_prepared_statement
+                    .pop_front()
+                    .is_some_and(|pending| pending.suppress_complete);
+                if suppress_complete {
+                    // This Parse was inserted before a cold Bind/Describe.
+                    // It is not a frontend operation and must neither leak a
+                    // ParseComplete nor consume that operation's Flush reply.
+                    server.buffer.truncate(server.buffer.len() - 5);
+                    server.stats.data_received(5);
+                } else if server.is_async() {
                     server.decrement_expected();
                 }
             }
@@ -1288,9 +1301,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .put("DOORMAN_bad".to_string(), ());
-        server
-            .registering_prepared_statement
-            .push_back("DOORMAN_bad".to_string());
+        server.registering_prepared_statement.push_back(
+            super::super::server_backend::PendingPreparedStatement {
+                name: "DOORMAN_bad".to_string(),
+                suppress_complete: false,
+            },
+        );
 
         let mut body = BytesMut::from(&b"SERROR\0C42601\0Mbad parse\0\0"[..]);
         handle_error_response(&mut server, &mut body);

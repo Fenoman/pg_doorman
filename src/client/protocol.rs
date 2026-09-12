@@ -145,7 +145,8 @@ where
     /// [`Self::ensure_prepared_statement_is_on_server_cached`]. Hot-path
     /// callers (`process_bind_immediate` / `process_describe_immediate`)
     /// that have already cloned the [`CachedStatement`] call the `_cached`
-    /// variant directly to avoid this second lookup + clone.
+    /// variant directly to avoid this second lookup + clone. A missing backend
+    /// statement is queued before the frontend operation that references it.
     /// Retained as the lookup-and-delegate entry point / test seam.
     #[allow(dead_code)]
     pub(crate) async fn ensure_prepared_statement_is_on_server(
@@ -167,10 +168,7 @@ where
 
     /// Same as [`Self::ensure_prepared_statement_is_on_server`] but the
     /// caller supplies the already-looked-up [`CachedStatement`], skipping
-    /// the second ahash lookup + clone on the Bind/Describe hot path
-    ///. `key` is still required: on `PreparedStatementError`
-    /// the rejected entry must be popped from the client cache (and the
-    /// stats refreshed) to prevent a later SQLSTATE 26000 desync.
+    /// the second ahash lookup + clone on the Bind/Describe hot path.
     pub(crate) async fn ensure_prepared_statement_is_on_server_cached(
         &mut self,
         cached: &CachedStatement,
@@ -191,56 +189,19 @@ where
                 truncate_query_for_log(cached.parse.query()),
             );
         }
-        // Get the server-side name (may be async_name for async clients).
-        // Borrow it as &str -- register_parse_to_server_cache takes
-        // &str, so the per-Bind/Describe String allocation is unnecessary.
-        // server_name borrows `cached` (a separate borrow from the
-        // `server: &mut Server` argument), so there is no borrow conflict.
-        let server_name = cached.server_name();
-        // In this case we want to send the parse message to the server
-        // since pgcat is initiating the prepared statement on this specific server
-        match self
-            .register_parse_to_server_cache(
-                true,
-                &cached.hash,
-                &cached.parse,
-                server_name,
-                pool,
-                server,
-            )
-            .await
+        pool.promote_prepared_statement_hash(&cached.hash);
+        if let Some(parse) =
+            server.prepare_statement_for_frontend(&cached.parse, cached.server_name())?
         {
-            Ok(_) => (),
-            Err(err) => match err {
-                Error::PreparedStatementError => {
-                    warn!("[{}@{} #c{}] server rejected prepared statement {:?}, evicting from client cache", self.username, self.pool_name, self.connection_id, key);
-                    self.prepared.cache.pop(&key);
-                    // Cache shrank - refresh ClientStats snapshot so
-                    // SHOW POOLS / Prometheus don't keep showing the
-                    // pre-eviction count until the next Parse.
-                    self.update_prepared_cache_stats();
-                    // earlier this branch fell
-                    // through with `Ok(())`. Callers
-                    // (process_bind_immediate /
-                    // process_describe_immediate) then
-                    // enqueued the Bind/Describe into
-                    // `self.buffer` against the
-                    // server-side name the backend just
-                    // rejected - the next Sync produced
-                    // SQLSTATE 26000 AFTER earlier
-                    // ParseComplete responses had been
-                    // forwarded, desyncing the driver.
-                    // Propagate so the outer match
-                    // mark_bad's the server and the client
-                    // gets a clean error instead of stream
-                    // corruption.
-                    return Err(Error::PreparedStatementError);
-                }
-
-                _ => {
-                    return Err(err);
-                }
-            },
+            crate::client::transaction::enforce_extended_batch_buffer_cap(
+                self.buffer.len(),
+                parse.len(),
+                "backend reprepare",
+            )?;
+            // Keep the reprepare after all preceding frontend operations,
+            // including a buffered ROLLBACK TO SAVEPOINT. An internal Sync
+            // here would split their transaction and invalidate live portals.
+            self.buffer.put(&parse[..]);
         }
 
         Ok(())
@@ -863,8 +824,7 @@ where
                 // For async clients, Parse may NOT be in buffer if client reuses cached prepared statement
                 // (e.g., asyncpg sends only Bind without Parse for cached statements)
                 // Pass the CachedStatement already cloned above so the
-                // callee skips a second cache lookup + clone. `lookup_key`
-                // is still needed for the pop-on-reject eviction path.
+                // callee skips a second cache lookup + clone.
                 self.ensure_prepared_statement_is_on_server_cached(
                     &cached,
                     lookup_key.unwrap(),
@@ -1033,8 +993,7 @@ where
                 // For async clients, Parse may NOT be in buffer if client reuses cached prepared statement
                 // (e.g., asyncpg sends only Describe without Parse for cached statements)
                 // Reuse the CachedStatement already cloned above to
-                // skip a second cache lookup + clone. `lookup_key` is still
-                // needed for the pop-on-reject eviction path.
+                // skip a second cache lookup + clone.
                 self.ensure_prepared_statement_is_on_server_cached(
                     &cached,
                     lookup_key.unwrap(),

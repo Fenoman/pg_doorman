@@ -290,6 +290,14 @@ pub(crate) fn sql_string_literal(value: &str) -> Result<String, Error> {
     )))
 }
 
+/// A backend Parse awaiting confirmation in the actual send order.
+#[derive(Debug)]
+pub(crate) struct PendingPreparedStatement {
+    pub name: String,
+    /// A cold Bind/Describe needs a backend Parse but owns no frontend ParseComplete.
+    pub suppress_complete: bool,
+}
+
 /// Represents a connection to a PostgreSQL server (backend).
 ///
 /// This structure maintains the state of a single connection to a PostgreSQL database server,
@@ -436,7 +444,7 @@ pub struct Server {
 
     /// Queue of prepared statement names currently being registered on the server.
     /// Used to track Parse messages that haven't been confirmed yet.
-    pub(crate) registering_prepared_statement: VecDeque<String>,
+    pub(crate) registering_prepared_statement: VecDeque<PendingPreparedStatement>,
 
     /// Prepared statement names whose optimistic server/client cache entries
     /// must be rolled back because PostgreSQL returned ErrorResponse before
@@ -1833,6 +1841,30 @@ impl Server {
         std::mem::take(&mut self.rejected_prepared_statement_names)
     }
 
+    /// Reprepare a cold logical statement in the frontend's actual wire order.
+    /// The caller appends the returned Parse immediately before its Bind/Describe.
+    /// Its ParseComplete is hidden; an error is relayed at that operation's position.
+    pub(crate) fn prepare_statement_for_frontend(
+        &mut self,
+        parse: &Parse,
+        server_name: &str,
+    ) -> Result<Option<BytesMut>, Error> {
+        if self.has_prepared_statement(server_name) {
+            return Ok(None);
+        }
+        let bytes = parse.to_bytes_with_name(server_name)?;
+        self.registering_prepared_statement
+            .push_back(PendingPreparedStatement {
+                name: server_name.to_string(),
+                suppress_complete: true,
+            });
+        self.has_pending_cache_entries = true;
+        if let Some(evicted_name) = self.add_prepared_statement_to_cache(server_name) {
+            self.queue_deferred_eviction_close(evicted_name);
+        }
+        Ok(Some(bytes))
+    }
+
     /// Register a prepared statement on the server.
     ///
     /// # Arguments
@@ -1874,15 +1906,17 @@ impl Server {
                 return Err(Error::ProtocolSyncError(reason));
             }
 
+            let pending = PendingPreparedStatement {
+                name: server_name.to_string(),
+                suppress_complete: false,
+            };
             if should_send_parse_to_server {
                 // This internal round trip reaches PostgreSQL before Parse
                 // messages still buffered by the client. Its ParseComplete
                 // must acknowledge this entry, not a deferred frontend Parse.
-                self.registering_prepared_statement
-                    .push_front(server_name.to_string());
+                self.registering_prepared_statement.push_front(pending);
             } else {
-                self.registering_prepared_statement
-                    .push_back(server_name.to_string());
+                self.registering_prepared_statement.push_back(pending);
             }
 
             // take the already-serialized Parse buffer as the

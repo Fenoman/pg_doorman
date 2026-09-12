@@ -2,6 +2,7 @@ mod admin_session;
 mod advanced_testing;
 mod backend_pid;
 mod cancel_protocol;
+mod cold_bind_recovery;
 mod copy_flush_recovery;
 mod dual_connection;
 pub mod helpers;
