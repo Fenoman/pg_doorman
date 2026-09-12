@@ -100,7 +100,7 @@ dead_backend_check_max_per_cycle = 8
 # Default: 10000 (10000 ms)
 shutdown_timeout = 10000
 
-# Timeout for COPY data operations.
+# Maximum pause without read/write progress while proxying data.
 # Default: 15000 (15000 ms)
 proxy_copy_data_timeout = 15000
 

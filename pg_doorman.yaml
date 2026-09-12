@@ -136,7 +136,7 @@ general:
   # Default: "10s" (10000 ms)
   shutdown_timeout: "10s"
 
-  # Timeout for COPY data operations.
+  # Maximum pause without read/write progress while proxying data.
   # Supports human-readable format: "15s", "15000ms", or 15000 (milliseconds)
   # Default: "15s" (15000 ms)
   proxy_copy_data_timeout: "15s"

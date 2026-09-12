@@ -9,6 +9,56 @@ use crate::errors::Error;
 use crate::errors::Error::ProxyTimeout;
 use crate::messages::{CURRENT_MEMORY, MAX_MESSAGE_SIZE};
 
+/// Bound a framed read by lack of byte progress, including partial headers.
+/// Used only while receiving unsolicited backend frames; ordinary query reads
+/// retain their existing execution-time policy.
+pub(crate) struct ReadIdleTimeout<'a, R> {
+    read: &'a mut R,
+    duration: Duration,
+    timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<'a, R> ReadIdleTimeout<'a, R> {
+    pub(crate) fn new(read: &'a mut R, duration: Duration) -> Self {
+        Self {
+            read,
+            duration,
+            timer: Box::pin(tokio::time::sleep(duration)),
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ReadIdleTimeout<'_, R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut *this.read).poll_read(cx, buf) {
+            Poll::Ready(result) => {
+                if result.is_ok() && buf.filled().len() > before {
+                    this.timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.duration);
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => match this.timer.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "backend read made no progress before the idle timeout",
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
 /// Default capacity for a freshly allocated reusable read buffer.
 const REUSE_BUF_DEFAULT_CAPACITY: usize = 16 * 1024;
 
@@ -141,8 +191,8 @@ where
     }
 }
 
-/// Write all data and flush the stream under a single caller-provided deadline
-/// for each operation.
+/// Write all data, allowing at most `duration` without a successful write.
+/// Flush has its own bound because AsyncWrite exposes no partial flush progress.
 pub async fn write_all_flush_timeout<S>(
     stream: &mut S,
     buf: &[u8],
@@ -151,14 +201,22 @@ pub async fn write_all_flush_timeout<S>(
 where
     S: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    match timeout(duration, stream.write_all(buf)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => {
-            return Err(Error::SocketError(format!(
-                "Error writing to socket: {err:?}"
-            )))
+    let mut remaining = buf;
+    while !remaining.is_empty() {
+        match timeout(duration, stream.write(remaining)).await {
+            Ok(Ok(0)) => {
+                return Err(Error::SocketError(
+                    "Error writing to socket: writer accepted no bytes".to_string(),
+                ))
+            }
+            Ok(Ok(written)) => remaining = &remaining[written..],
+            Ok(Err(err)) => {
+                return Err(Error::SocketError(format!(
+                    "Error writing to socket: {err:?}"
+                )))
+            }
+            Err(_) => return Err(ProxyTimeout),
         }
-        Err(_) => return Err(ProxyTimeout),
     }
 
     match timeout(duration, stream.flush()).await {
@@ -562,13 +620,12 @@ where
     }
 }
 
-/// Copy data from one stream to another with a timeout.
+/// Copy data, allowing at most `duration` without a successful read or write.
 ///
 /// `copied` is updated as bytes flow so the caller can record the
 /// actual amount forwarded even when the underlying copy fails or
 /// times out partway through. On a clean copy `copied == len` on
-/// return; on a timeout-driven cancellation the future is dropped and
-/// `copied` reflects how far the copy got before tokio aborted it.
+/// return; on failure it retains the prefix already accepted by the writer.
 pub async fn proxy_copy_data_with_timeout<R, W>(
     duration: tokio::time::Duration,
     read: &mut R,
@@ -580,11 +637,7 @@ where
     R: tokio::io::AsyncRead + std::marker::Unpin,
     W: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    match timeout(duration, proxy_copy_data(read, write, len, copied)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(ProxyTimeout),
-    }
+    proxy_copy_data_inner::<_, _, true>(read, write, len, copied, duration).await
 }
 
 /// Copy data from one stream to another.
@@ -599,6 +652,20 @@ pub async fn proxy_copy_data<R, W>(
     write: &mut W,
     len: usize,
     copied: &mut usize,
+) -> Result<(), Error>
+where
+    R: tokio::io::AsyncRead + std::marker::Unpin,
+    W: tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    proxy_copy_data_inner::<_, _, false>(read, write, len, copied, Duration::ZERO).await
+}
+
+async fn proxy_copy_data_inner<R, W, const IDLE_TIMEOUT: bool>(
+    read: &mut R,
+    write: &mut W,
+    len: usize,
+    copied: &mut usize,
+    duration: Duration,
 ) -> Result<(), Error>
 where
     R: tokio::io::AsyncRead + std::marker::Unpin,
@@ -619,7 +686,14 @@ where
     let mut buffer = vec![0u8; buffer_size];
     loop {
         // read.
-        match read.read(&mut buffer[..buffer_size]).await {
+        let result = if IDLE_TIMEOUT {
+            timeout(duration, read.read(&mut buffer[..buffer_size]))
+                .await
+                .map_err(|_| ProxyTimeout)?
+        } else {
+            read.read(&mut buffer[..buffer_size]).await
+        };
+        match result {
             Ok(n) => bytes_readed = n,
             Err(err) => {
                 return Err(Error::SocketError(format!(
@@ -640,7 +714,14 @@ where
         // of the buffer it managed to push first.
         let mut written = 0usize;
         while written < bytes_readed {
-            match write.write(&buffer[written..bytes_readed]).await {
+            let result = if IDLE_TIMEOUT {
+                timeout(duration, write.write(&buffer[written..bytes_readed]))
+                    .await
+                    .map_err(|_| ProxyTimeout)?
+            } else {
+                write.write(&buffer[written..bytes_readed]).await
+            };
+            match result {
                 Ok(0) => {
                     return Err(Error::SocketError(
                         "Error writing to socket: writer accepted no bytes".to_string(),
@@ -751,6 +832,161 @@ mod tests {
             .expect_err("stalled writer must time out");
 
         assert!(matches!(err, Error::ProxyTimeout));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_idle_timeout_allows_continuous_read_progress() {
+        let (mut source, mut reader) = tokio::io::duplex(1);
+        let feeder = tokio::spawn(async move {
+            for byte in b"abcdef" {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                if source.write_all(&[*byte]).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut output = Vec::new();
+        let mut copied = 0;
+        let result = proxy_copy_data_with_timeout(
+            Duration::from_millis(100),
+            &mut reader,
+            &mut output,
+            6,
+            &mut copied,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "continuous read progress timed out: {result:?}"
+        );
+        assert_eq!(output, b"abcdef");
+        assert_eq!(copied, 6);
+        feeder.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_idle_timeout_allows_partial_write_progress() {
+        let mut reader = Cursor::new(b"abcdef");
+        let (mut writer, mut sink) = tokio::io::duplex(1);
+        let consumer = tokio::spawn(async move {
+            let mut output = Vec::new();
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                output.push(sink.read_u8().await.unwrap());
+            }
+            output
+        });
+        let mut copied = 0;
+        let result = proxy_copy_data_with_timeout(
+            Duration::from_millis(100),
+            &mut reader,
+            &mut writer,
+            6,
+            &mut copied,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "continuous write progress timed out: {result:?}"
+        );
+        assert_eq!(copied, 6);
+        assert_eq!(consumer.await.unwrap(), b"abcdef");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_idle_timeout_bounds_read_stall_after_progress() {
+        let (mut source, mut reader) = tokio::io::duplex(8);
+        source.write_all(b"ab").await.unwrap();
+        let mut output = Vec::new();
+        let mut copied = 0;
+        let result = proxy_copy_data_with_timeout(
+            Duration::from_millis(100),
+            &mut reader,
+            &mut output,
+            6,
+            &mut copied,
+        )
+        .await;
+        assert!(matches!(result, Err(Error::ProxyTimeout)));
+        assert_eq!(output, b"ab");
+        assert_eq!(copied, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_idle_timeout_bounds_write_stall_and_records_prefix() {
+        let mut reader = Cursor::new(b"abcdef");
+        let (mut writer, mut sink) = tokio::io::duplex(2);
+        let mut copied = 0;
+        let result = proxy_copy_data_with_timeout(
+            Duration::from_millis(100),
+            &mut reader,
+            &mut writer,
+            6,
+            &mut copied,
+        )
+        .await;
+        assert!(matches!(result, Err(Error::ProxyTimeout)));
+        assert_eq!(copied, 2);
+        let mut output = [0; 2];
+        sink.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"ab");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_idle_timeout_allows_partial_write_progress() {
+        let (mut writer, mut sink) = tokio::io::duplex(1);
+        let consumer = tokio::spawn(async move {
+            let mut output = Vec::new();
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                output.push(sink.read_u8().await.unwrap());
+            }
+            output
+        });
+        let result =
+            write_all_flush_timeout(&mut writer, b"abcdef", Duration::from_millis(100)).await;
+        assert!(
+            result.is_ok(),
+            "continuous response write timed out: {result:?}"
+        );
+        assert_eq!(consumer.await.unwrap(), b"abcdef");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_idle_timeout_allows_progress_within_one_body() {
+        let (mut source, mut reader) = tokio::io::duplex(1);
+        let feeder = tokio::spawn(async move {
+            for byte in b"abcdef" {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                source.write_all(&[*byte]).await.unwrap();
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let mut timed = ReadIdleTimeout::new(&mut reader, Duration::from_millis(100));
+        let frame = read_message_body_reuse(&mut timed, &mut BytesMut::new(), b'A', 10)
+            .await
+            .expect("progress within one body must extend its idle deadline");
+        assert_eq!(&frame[..], &wire_msg(b'A', b"abcdef"));
+        assert!(started.elapsed() > Duration::from_millis(100));
+        feeder.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_idle_timeout_bounds_incomplete_header_and_body() {
+        for header in [true, false] {
+            let (mut source, mut reader) = tokio::io::duplex(16);
+            source.write_all(b"D\0\0").await.unwrap();
+            let mut timed = ReadIdleTimeout::new(&mut reader, Duration::from_millis(100));
+            let error = if header {
+                read_message_header(&mut timed).await.unwrap_err()
+            } else {
+                read_message_body_reuse(&mut timed, &mut BytesMut::new(), b'A', 20)
+                    .await
+                    .unwrap_err()
+            };
+            assert!(matches!(error, Error::SocketError(_)));
+            assert!(error.to_string().contains("idle timeout"));
+        }
     }
 
     // =========================================================================

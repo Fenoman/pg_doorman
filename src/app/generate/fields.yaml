@@ -480,9 +480,9 @@ fields:
 
     proxy_copy_data_timeout:
       config:
-        en: "Timeout for COPY data operations."
-        ru: "Таймаут операций COPY."
-      doc: "Maximum time to wait for data copy operations during proxying, in milliseconds."
+        en: "Maximum pause without read/write progress while proxying data."
+        ru: "Максимальная пауза без прогресса чтения/записи при передаче данных."
+      doc: "Maximum interval without a successful byte read or write while proxying data, in milliseconds. Applies to streamed DataRow, CopyData and FunctionCallResponse bodies, response writes, and partial unsolicited backend frames. Each successful read or write restarts the interval, so a continuously progressing transfer may take longer than this value. A separate flush operation has the same time limit because the stream interface exposes no partial flush progress."
       default: "15000 (15 sec)"
 
     tcp_keepalives_idle:

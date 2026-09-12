@@ -741,17 +741,15 @@ where
         // Readiness also means ordinary protocol data: LISTEN notifications,
         // notices, parameter changes, or a recoverable COPY cancellation. Read
         // one complete frame outside select so a frontend arrival cannot tear
-        // the backend read. A truncated backend frame remains timeout-bounded.
-        let timeout = config_arc().general.proxy_copy_data_timeout.as_std();
+        // the backend read. recv_one bounds partial reads by lack of progress,
+        // so a slow but continuing frame has no enclosing total deadline.
         let was_copy = server.in_copy_mode();
-        let response = match tokio::time::timeout(
-            timeout,
-            server.recv_one(&mut self.write, Some(&mut self.server_parameters)),
-        )
-        .await
+        let response = match server
+            .recv_one(&mut self.write, Some(&mut self.server_parameters))
+            .await
         {
-            Ok(Ok(response)) => response,
-            _ => return Ok(NextClientMessage::ServerDead),
+            Ok(response) => response,
+            Err(_) => return Ok(NextClientMessage::ServerDead),
         };
         if response.first() == Some(&b'E') {
             if let Ok(error) = PgErrorMsg::parse(&response[5..]) {
@@ -5784,6 +5782,50 @@ mod relay_response_client_write_failure_tests {
         }
         assert!(read.buffer().is_empty());
         assert!(read_buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_backend_frame_allows_slow_progress_and_keeps_frontend_prefix() {
+        let query = backend_frame(b'Q', b"SELECT 42\0");
+        let notification = backend_frame(b'A', b"\0\0\0\x2achannel\0payload\0");
+        let (read, mut frontend) = tokio::io::duplex(256);
+        let mut client = test_client_with_reader_and_writer(read, tokio::io::sink());
+        let (mut server, mut backend) = Server::test_silent_socket();
+        frontend.write_all(&query[..3]).await.unwrap();
+        backend.write_all(&notification[..3]).await.unwrap();
+        let trailing = notification[3..].to_vec();
+        // Real socket readiness is used here. Two individually short pauses
+        // exceed the configured total deadline and must still preserve framing.
+        let idle_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
+        let pause = idle_timeout.mul_f64(0.55);
+        let feeder = tokio::spawn(async move {
+            tokio::time::sleep(pause).await;
+            backend.write_all(&trailing[..7]).await.unwrap();
+            tokio::time::sleep(pause).await;
+            backend.write_all(&trailing[7..]).await.unwrap();
+        });
+        let message = tokio::time::timeout(
+            idle_timeout * 3,
+            client.wait_for_next_message(&mut server, false),
+        )
+        .await
+        .expect("progressing backend frame did not complete")
+        .unwrap();
+        assert!(
+            matches!(message, NextClientMessage::ServerMessage { ref response, copy_error: false } if response.as_ref() == notification.as_slice()),
+            "progressing backend frame must not be classified as backend death"
+        );
+        assert_eq!(&client.read_buf[..], &query[..3]);
+        assert!(!server.is_bad());
+        frontend.write_all(&query[3..]).await.unwrap();
+        let message = client
+            .wait_for_next_message(&mut server, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(message, NextClientMessage::Message(ref bytes) if bytes.as_ref() == query.as_slice())
+        );
+        feeder.await.unwrap();
     }
 
     #[tokio::test]

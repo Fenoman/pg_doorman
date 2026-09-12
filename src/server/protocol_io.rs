@@ -861,6 +861,11 @@ pub(crate) async fn recv<C, const ONE_MESSAGE: bool>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
+    let idle_timeout = if ONE_MESSAGE {
+        config_arc().general.proxy_copy_data_timeout.as_std()
+    } else {
+        Duration::ZERO
+    };
     // Handle deferred large message from previous recv() call.
     // When recv() encounters a large backend message but the buffer already has
     // accumulated messages, it returns the buffer first (for response ordering)
@@ -915,7 +920,15 @@ where
             break;
         }
 
-        let (code_u8, message_len) = read_message_header(&mut *server.stream).await?;
+        let (code_u8, message_len) = if ONE_MESSAGE {
+            read_message_header(&mut crate::messages::socket::ReadIdleTimeout::new(
+                &mut *server.stream,
+                idle_timeout,
+            ))
+            .await?
+        } else {
+            read_message_header(&mut *server.stream).await?
+        };
         // Handle large DataRow messages that exceed max_message_size
         if server.max_message_size > 0
             && message_len > server.max_message_size
@@ -1003,14 +1016,27 @@ where
         // the response batch, avoiding a temporary split and a second copy
         // for every row. The large-frame streaming paths above are unchanged.
         if matches!(code_u8, b'D' | b'd') {
-            if let Err(err) = read_message_body_append(
-                &mut *server.stream,
-                &mut server.buffer,
-                code_u8,
-                message_len,
-            )
-            .await
-            {
+            let result = if ONE_MESSAGE {
+                read_message_body_append(
+                    &mut crate::messages::socket::ReadIdleTimeout::new(
+                        &mut *server.stream,
+                        idle_timeout,
+                    ),
+                    &mut server.buffer,
+                    code_u8,
+                    message_len,
+                )
+                .await
+            } else {
+                read_message_body_append(
+                    &mut *server.stream,
+                    &mut server.buffer,
+                    code_u8,
+                    message_len,
+                )
+                .await
+            };
+            if let Err(err) = result {
                 error!(
                     "[{}@{}] server connection terminated pid={}: {err}",
                     server.address.username,
@@ -1035,14 +1061,27 @@ where
         // loop returns to the caller. Observers only ever sampled
         // the nibble at admin-poll cadence; the transient
         // "idle-between-reads" flicker was pure observability noise.
-        let mut message = match read_message_body_reuse(
-            &mut *server.stream,
-            &mut server.read_buf,
-            code_u8,
-            message_len,
-        )
-        .await
-        {
+        let result = if ONE_MESSAGE {
+            read_message_body_reuse(
+                &mut crate::messages::socket::ReadIdleTimeout::new(
+                    &mut *server.stream,
+                    idle_timeout,
+                ),
+                &mut server.read_buf,
+                code_u8,
+                message_len,
+            )
+            .await
+        } else {
+            read_message_body_reuse(
+                &mut *server.stream,
+                &mut server.read_buf,
+                code_u8,
+                message_len,
+            )
+            .await
+        };
+        let mut message = match result {
             Ok(message) => message,
             Err(err) => {
                 error!(
