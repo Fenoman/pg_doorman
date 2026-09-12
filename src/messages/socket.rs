@@ -904,6 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(current_memory)]
     async fn read_message_data_with_memory_limit_rejects_large_body_before_read() {
         let mut stream = Cursor::new(Vec::<u8>::new());
         let before = CURRENT_MEMORY.load(Ordering::SeqCst);
@@ -947,6 +948,7 @@ mod tests {
     /// guard against COPY chunks / outsized DataRow that actually
     /// move RSS, which this test still exercises with a large body.
     #[tokio::test]
+    #[serial_test::serial(current_memory)]
     async fn reuse_memory_limit_large_rejected() {
         // Body 8 KiB - above the skip threshold so the budget kicks
         // in. With `max_memory_usage = 1` the reservation must fail.
@@ -978,8 +980,9 @@ mod tests {
     }
 
     /// Memory counter delta must be 0 after successful read.
-    /// Uses delta instead of absolute value to avoid races with parallel tests.
+    /// Serialized with memory-reserving tests so the snapshot is stable.
     #[tokio::test]
+    #[serial_test::serial(current_memory)]
     async fn reuse_memory_counter_balanced_on_success() {
         let data = wire_msg(b'Z', b"I");
         let mut stream = Cursor::new(data);
@@ -1000,8 +1003,9 @@ mod tests {
     }
 
     /// Memory counter delta must be 0 even on read failure (EOF mid-body).
-    /// Uses delta instead of absolute value to avoid races with parallel tests.
+    /// Serialized with memory-reserving tests so the snapshot is stable.
     #[tokio::test]
+    #[serial_test::serial(current_memory)]
     async fn reuse_memory_counter_balanced_on_read_error() {
         let mut data = vec![b'D'];
         data.extend_from_slice(&100_i32.to_be_bytes());
@@ -1071,6 +1075,7 @@ mod tests {
     /// The reusable buf gets near-zero remaining capacity, so the next reserve()
     /// allocates a fresh small buffer. No permanent bloat from a single large message.
     #[tokio::test]
+    #[serial_test::serial(current_memory)]
     async fn reuse_large_then_small_no_bloat() {
         let large_body = vec![0u8; 100_000];
         let small_body = vec![0u8; 10];
@@ -1110,6 +1115,7 @@ mod tests {
     /// clients that each ran one large INSERT once, this compounds to multi-GiB
     /// pooler RSS. The test fails when the leak is present.
     #[tokio::test]
+    #[serial_test::serial(current_memory)]
     async fn reuse_large_dropped_then_small_no_bloat() {
         let large_body = vec![0u8; 5 * 1024 * 1024]; // 5 MiB — matches mcp-ss-bitmaps payloads
         let small_body = vec![0u8; 16];
