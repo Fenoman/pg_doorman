@@ -1,8 +1,8 @@
 @dotnet @pipeline-write-error-default
-Feature: Pipeline disconnect with default message_size_to_be_stream
-  Same test as pipeline-cancel-disconnect-bug but with default message_size_to_be_stream (1MB).
-  4MB DataRow still goes through handle_large_data_row (> 1MB threshold).
-  If the bug reproduces here too, the issue is not specific to low thresholds.
+Feature: Pool recovery after a 4 MiB response at the default streaming threshold
+  Client A verifies a 4 MiB response through the default 1 MiB streaming threshold,
+  then closes its transport with TCP RST. Client B must receive a complete response.
+  The close happens after the first complete row, not in the middle of a frame.
 
   Background:
     Given PostgreSQL started with pg_hba.conf:
@@ -46,7 +46,6 @@ Feature: Pipeline disconnect with default message_size_to_be_stream
       tests/dotnet/run_test.sh pipeline_cancel_disconnect pipeline_cancel_disconnect.cs
       """
     Then the command should succeed
-    And the command output should contain "Client A: Exception caught"
+    And the command output should contain "Client A: Transport closed after verified 4 MiB response"
     And the command output should contain "Client B: Query completed successfully"
-    And the command output should not contain "Bug detected"
     And the command output should contain "pipeline_cancel_disconnect complete"

@@ -336,7 +336,7 @@ Feature: Session mode does not destroy connections on SQL errors
     Then session "s2" should receive DataRow with "0"
 
   @session-error-txmode-control
-  Scenario: Transaction mode — Parse error via Flush destroys connection (control test)
+  Scenario: Transaction mode — recoverable Parse error preserves the backend and temp state
     Given pg_doorman started with config:
       """
       [general]
@@ -360,10 +360,14 @@ Feature: Session mode does not destroy connections on SQL errors
       """
     When we create session "s1" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT pg_backend_pid()" to session "s1" and store backend_pid as "before_error"
-    # Trigger error in async mode — mark_bad is called in transaction mode
+    And we send SimpleQuery "CREATE TEMP TABLE tx_error_warm(value integer); INSERT INTO tx_error_warm VALUES (41)" to session "s1"
+    # A recoverable async SQL error keeps the backend until Sync.
     And we send Parse "" with query "bad sql syntax" to session "s1"
     And we send Flush to session "s1"
     And we send Sync to session "s1"
-    # Next query gets a new connection (old one was destroyed)
+    Then session "s1" should receive error containing "syntax" with code "42601"
+    # Sync restores command mode without discarding the warm backend.
     When we send SimpleQuery "SELECT pg_backend_pid()" to session "s1" and store backend_pid as "after_error"
-    Then named backend_pid "after_error" from session "s1" is different from "before_error"
+    Then named backend_pid "after_error" from session "s1" is same as "before_error"
+    When we send SimpleQuery "SELECT value FROM tx_error_warm" to session "s1" and store response
+    Then session "s1" should receive DataRow with "41"

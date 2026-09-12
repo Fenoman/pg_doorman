@@ -3,45 +3,35 @@ using System.Net.Sockets;
 using System.Reflection;
 using Npgsql;
 
-// Exact reproduction of the reported bug
+// Verify pool recovery after a complete streamed response and a frontend RST.
 // Use DATABASE_URL environment variable if set, otherwise use default
 string baseConnectionString = Environment.GetEnvironmentVariable("DATABASE_URL")
     ?? "Host=127.0.0.1;Port=6433;Database=example_db;Username=example_user_1;Password=test;";
 
-// Npgsql pool with Maximum Pool Size=1 — forces connection reuse on Npgsql side
+// Keep one Npgsql pool slot; ClearPool discards the physically closed frontend.
 // Timeout=0 — no connection timeout
 string connectionString = baseConnectionString + "Timeout=0;Maximum Pool Size=1;";
 
-Console.WriteLine("Test: Pipeline cancel disconnect - kill socket during 4MB transfer");
+string payload = new('0', 4 * 1024 * 1024);
+bool transportClosedAfterVerifiedRow = false;
 
-// Client A: send query with ~4MB parameter, read result, kill socket mid-transfer
+Console.WriteLine("Test: Complete 4 MiB response, then TCP RST and pool recovery");
+
 try
 {
     await RunWithPhysicalBreakConnection(connectionString);
 }
-catch
+catch (Exception) when (transportClosedAfterVerifiedRow)
 {
-    // ignore
+    // Disposing the reader/connection after the deliberate RST may fail.
 }
-Console.WriteLine("Client A: Exception caught");
+if (!transportClosedAfterVerifiedRow)
+    throw new Exception("Client A did not verify a row and close its transport");
+Console.WriteLine("Client A: Transport closed after verified 4 MiB response");
 
-// Client B: reuse the same connection — must work cleanly
-try
-{
-    await Run(connectionString);
-    Console.WriteLine("Client B: Query completed successfully");
-}
-catch (Exception e)
-{
-    if (e.ToString().Contains("Please file a bug"))
-    {
-        Console.WriteLine("Bug detected: " + e.Message);
-    }
-    else
-    {
-        Console.WriteLine("Client B: Error - " + e.Message);
-    }
-}
+// A new frontend must receive a complete response from the same pool.
+await Run(connectionString);
+Console.WriteLine("Client B: Query completed successfully");
 
 Console.WriteLine("pipeline_cancel_disconnect complete");
 
@@ -50,15 +40,13 @@ async Task RunWithPhysicalBreakConnection(string connStr)
     await using var connection = new NpgsqlConnection(connStr);
     await using var cmd = connection.CreateCommand();
     cmd.CommandText = "SELECT @payload";
-    // ~4MB text parameter
-    cmd.Parameters.Add(new NpgsqlParameter("payload", string.Join("", Enumerable.Repeat("0", 1_000_000))));
+    cmd.Parameters.Add(new NpgsqlParameter("payload", payload));
     await connection.OpenAsync();
     await using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess);
-    while (await reader.ReadAsync())
-    {
-        _ = reader.GetString(0);
-        KillTransport(connection);
-    }
+    if (!await reader.ReadAsync() || reader.GetString(0) != payload)
+        throw new Exception("Client A did not receive the complete 4 MiB payload");
+    KillTransport(connection);
+    transportClosedAfterVerifiedRow = true;
     await connection.CloseAsync();
 }
 
@@ -67,17 +55,17 @@ async Task Run(string connStr)
     await using var connection = new NpgsqlConnection(connStr);
     await using var cmd = connection.CreateCommand();
     cmd.CommandText = "SELECT @payload";
-    cmd.Parameters.Add(new NpgsqlParameter("payload", string.Join("", Enumerable.Repeat("0", 1_000_000))));
+    cmd.Parameters.Add(new NpgsqlParameter("payload", payload));
     await connection.OpenAsync();
     await using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess);
-    while (await reader.ReadAsync())
-    {
-        _ = reader.GetString(0);
-    }
+    if (!await reader.ReadAsync() || reader.GetString(0) != payload)
+        throw new Exception("Client B did not receive the complete 4 MiB payload");
+    if (await reader.ReadAsync())
+        throw new Exception("Client B received an unexpected extra row");
     await connection.CloseAsync();
 }
 
-void KillTransport(NpgsqlConnection connection, bool abortive = true)
+void KillTransport(NpgsqlConnection connection)
 {
     var connectorProp = typeof(NpgsqlConnection).GetProperty(
                             "Connector",
@@ -93,12 +81,13 @@ void KillTransport(NpgsqlConnection connection, bool abortive = true)
     var streamField = t.GetField("_stream", BindingFlags.Instance | BindingFlags.NonPublic);
     var baseStreamField = t.GetField("_baseStream", BindingFlags.Instance | BindingFlags.NonPublic);
 
-    if (socketField?.GetValue(connector) is Socket socket && abortive)
-        socket.LingerState = new LingerOption(enable: true, seconds: 0);
+    if (socketField?.GetValue(connector) is not Socket socket)
+        throw new MissingMemberException("Npgsql connector socket not found");
+    socket.LingerState = new LingerOption(enable: true, seconds: 0);
+    socket.Dispose();
 
     try { (streamField?.GetValue(connector) as IDisposable)?.Dispose(); } catch { }
     try { (baseStreamField?.GetValue(connector) as IDisposable)?.Dispose(); } catch { }
-    try { (socketField?.GetValue(connector) as IDisposable)?.Dispose(); } catch { }
 
     NpgsqlConnection.ClearPool(connection);
 }

@@ -45,3 +45,7 @@ Feature: COPY input preserves data across Flush and Sync
       | simple         |
       | extended_sync  |
       | extended_flush |
+
+  @streamed-copy-cancel
+  Scenario: Cancelling COPY output after one complete large frame preserves the client
+    Then cancellation after a complete large COPY frame preserves the client session

@@ -1,11 +1,8 @@
 @dotnet @pipeline-cancel-disconnect-bug
-Feature: Pipeline cancel disconnect bug (.NET Npgsql reproduction)
-  Exact reproduction of the bug: Client A sends a parameterized query with ~4MB text
-  via Npgsql extended protocol, reads the result, then kills the TCP socket with RST.
-  Client B reuses the same server connection (pool_size=1) and gets protocol violation.
-
-  Key config: message_size_to_be_stream = 2048 (2KB) — forces DataRow streaming through
-  handle_large_data_row path where error handling differs from normal buffered path.
+Feature: Pool recovery after a complete streamed Npgsql response and TCP RST
+  Client A verifies a 4 MiB response through the 2 KiB streaming threshold,
+  then closes its transport with TCP RST. Client B opens a new frontend and
+  must receive another complete response from the same one-slot backend pool.
 
   Background:
     Given PostgreSQL started with pg_hba.conf:
@@ -43,14 +40,13 @@ Feature: Pipeline cancel disconnect bug (.NET Npgsql reproduction)
       """
 
   @pipeline-cancel-disconnect-bug
-  Scenario: Npgsql client kills socket during 4MB streaming transfer - next client must work
+  Scenario: Npgsql closes its socket after a verified 4 MiB response - next client must work
     When I run shell command:
       """
       export DATABASE_URL="Host=127.0.0.1;Port=${DOORMAN_PORT};Database=example_db;Username=example_user_1;Password="
       tests/dotnet/run_test.sh pipeline_cancel_disconnect pipeline_cancel_disconnect.cs
       """
     Then the command should succeed
-    And the command output should contain "Client A: Exception caught"
+    And the command output should contain "Client A: Transport closed after verified 4 MiB response"
     And the command output should contain "Client B: Query completed successfully"
-    And the command output should not contain "Bug detected"
     And the command output should contain "pipeline_cancel_disconnect complete"

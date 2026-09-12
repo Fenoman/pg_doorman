@@ -34,6 +34,27 @@ fn first_value(messages: &ProtocolMessages) -> String {
     String::from_utf8(body[6..6 + len].to_vec()).unwrap()
 }
 
+async fn completed_cancel_request(conn: &PgConnection, addr: &str) {
+    let mut cancel = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut request = Vec::with_capacity(16);
+    for value in [
+        16i32,
+        80877102,
+        conn.get_process_id().unwrap(),
+        conn.get_secret_key().unwrap(),
+    ] {
+        request.extend_from_slice(&value.to_be_bytes());
+    }
+    cancel.write_all(&request).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), cancel.read(&mut [0]))
+            .await
+            .expect("CancelRequest connection did not close")
+            .unwrap(),
+        0
+    );
+}
+
 #[then(regex = r#"^COPY FROM via "(simple|extended)" preserves rows across "(Flush|Sync)"$"#)]
 pub async fn copy_control_preserves_rows(
     world: &mut DoormanWorld,
@@ -145,24 +166,7 @@ pub async fn idle_copy_cancel_preserves_session(world: &mut DoormanWorld, protoc
         read_until(conn, endpoint, 'G').await;
         // Enter the idle backend monitor before the cancellation arrives.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let mut cancel = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut request = Vec::with_capacity(16);
-        for value in [
-            16i32,
-            80877102,
-            conn.get_process_id().unwrap(),
-            conn.get_secret_key().unwrap(),
-        ] {
-            request.extend_from_slice(&value.to_be_bytes());
-        }
-        cancel.write_all(&request).await.unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), cancel.read(&mut [0]))
-                .await
-                .expect("CancelRequest connection did not close")
-                .unwrap(),
-            0
-        );
+        completed_cancel_request(conn, &addr).await;
         // Advance COPY's input so PostgreSQL can process the pending cancel.
         // The application then waits for the error without sending CopyDone.
         conn.send_copy_data(&b"7\n".repeat(5000)).await.unwrap();
@@ -236,5 +240,74 @@ pub async fn idle_copy_cancel_preserves_session(world: &mut DoormanWorld, protoc
             "42",
             "{endpoint}: client could not start its next transaction"
         );
+    }
+}
+
+#[then("cancellation after a complete large COPY frame preserves the client session")]
+pub async fn large_copy_cancel_preserves_session(world: &mut DoormanWorld) {
+    let pg_addr = format!("127.0.0.1:{}", world.pg_port.unwrap());
+    let doorman_addr = format!("127.0.0.1:{}", world.doorman_port.unwrap());
+    for (endpoint, addr, conn) in [
+        ("PostgreSQL", pg_addr, world.pg_conn.as_mut().unwrap()),
+        (
+            "pg_doorman",
+            doorman_addr,
+            world.doorman_conn.as_mut().unwrap(),
+        ),
+    ] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            conn.shrink_recv_buffer(65_536).unwrap();
+            // At most 16 MiB of payload; the fourth row cannot finish before
+            // cancellation within this test's deadline.
+            conn.send_simple_query(
+                "COPY (SELECT i, repeat('X', 4194304), \
+                 pg_sleep(CASE WHEN i = 4 THEN 30 ELSE 0 END) \
+                 FROM generate_series(1, 4) AS g(i)) TO STDOUT",
+            )
+            .await
+            .unwrap();
+            read_until(conn, endpoint, 'H').await;
+            let mut rows = 0;
+            let mut cancelled = false;
+            loop {
+                let (kind, body) = conn.read_message().await.unwrap();
+                match kind {
+                    'd' => {
+                        assert!(!cancelled, "{endpoint}: COPY row arrived after ERROR");
+                        rows += 1;
+                        assert!(rows <= 3, "{endpoint}: COPY finished before cancellation");
+                        let prefix = format!("{rows}\t");
+                        assert_eq!(body.len(), prefix.len() + 4 * 1024 * 1024 + 2);
+                        assert!(body.starts_with(prefix.as_bytes()));
+                        assert!(body.ends_with(b"\t\n"));
+                        assert!(body[prefix.len()..body.len() - 2]
+                            .iter()
+                            .all(|&b| b == b'X'));
+                        if rows == 1 {
+                            completed_cancel_request(conn, &addr).await;
+                        }
+                    }
+                    'E' => {
+                        assert!(!cancelled, "{endpoint}: duplicate COPY error");
+                        assert!(rows > 0, "{endpoint}: no complete streamed row");
+                        assert!(body.split(|&b| b == 0).any(|field| field == b"C57014"));
+                        cancelled = true;
+                    }
+                    'Z' => {
+                        assert!(cancelled, "{endpoint}: COPY was not cancelled");
+                        assert_eq!(body, b"I");
+                        break;
+                    }
+                    _ => panic!("{endpoint}: unexpected COPY message {kind}"),
+                }
+            }
+            assert_eq!(
+                first_value(&simple(conn, endpoint, "SELECT 424242").await),
+                "424242",
+                "{endpoint}: original frontend did not recover"
+            );
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{endpoint}: streamed COPY cancel timed out"));
     }
 }
