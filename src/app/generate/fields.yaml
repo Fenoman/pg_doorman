@@ -1725,6 +1725,15 @@ fields:
         for a connection to be returned, and finally falls back to the reserve pool. Set to `0`
         (or omit) to disable coordination — each user pool works independently, capped only by its
         own `pool_size`. Similar to PgBouncer's `max_db_connections`.
+
+        `RELOAD` changes the shared budget for all existing and replacement user pools,
+        including when enabling or disabling the limit with `0`. Existing leases finish
+        normally. When the new `max_db_connections + reserve_pool_size` is lower than usage,
+        excess idle connections are closed and active connections retire as their leases
+        return. This administrative reduction takes precedence over idle age and user
+        minimums. No new connection is admitted until the shared budget has room.
+        Connections already being closed can briefly remain visible in PostgreSQL while
+        their asynchronous shutdown finishes; they cannot be reused by clients.
       default: "0 (disabled)"
 
     min_connection_lifetime:

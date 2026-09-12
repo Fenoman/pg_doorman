@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use log::{debug, info, warn};
+use log::{info, warn};
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -210,11 +210,8 @@ fn canceled_pids_consume_with_ttl(pid: ProcessId, ttl: Duration) -> CancelMarker
 }
 
 /// Per-database pool coordinators, keyed by pool name.
-/// Created in `from_config()` for pools with `max_db_connections > 0`.
-/// Replaced atomically on RELOAD. When a coordinator is replaced, old connections
-/// that hold permits from the previous coordinator continue working until they
-/// are naturally closed — the old `Arc<PoolCoordinator>` lives as long as its
-/// permits do.
+/// Created even when admission is disabled, so a later RELOAD can account for
+/// every existing physical backend. Reload preserves each database budget Arc.
 pub static COORDINATORS: Lazy<ArcSwap<HashMap<String, Arc<pool_coordinator::PoolCoordinator>>>> =
     Lazy::new(|| ArcSwap::from_pointee(HashMap::new()));
 
@@ -733,9 +730,8 @@ pub struct ConnectionPool {
     /// self-invalidates when `general.pooler_check_query` changes via RELOAD.
     pub check_query_cache: Arc<CheckQueryCache>,
 
-    /// Database-level connection coordinator. `Some` when `max_db_connections > 0`
-    /// in the pool config, `None` otherwise (disabled, zero overhead).
-    /// Shared across all user pools for the same database.
+    /// Database budget shared across all user pools and generations, including
+    /// when admission is disabled. Isolated tests may omit it.
     pub(crate) coordinator: Option<Arc<pool_coordinator::PoolCoordinator>>,
 
     /// Consecutive replenish failure counter for log noise suppression.
@@ -827,40 +823,29 @@ impl ConnectionPool {
         set_client_server_map(client_server_map.clone());
         let mut new_pools = HashMap::new();
 
-        // Build per-database coordinators for pools with max_db_connections > 0.
-        // Reuse existing coordinators when config hasn't changed (avoids resetting
-        // semaphore state and losing in-flight permits on benign RELOAD).
+        // Keep one budget Arc across all generations, including disabled admission.
+        // Stage updates now; a failed build must not change the live budget.
         let mut coordinators: HashMap<String, Arc<pool_coordinator::PoolCoordinator>> =
             HashMap::new();
+        let mut coordinator_updates = Vec::new();
         let old_coordinators = COORDINATORS.load();
         for (pool_name, pool_config) in &config.pools {
-            let max = pool_config.max_db_connections.unwrap_or(0) as usize;
-            if max == 0 {
-                continue;
-            }
             let new_cfg = pool_coordinator::CoordinatorConfig {
-                max_db_connections: max,
+                max_db_connections: pool_config.max_db_connections.unwrap_or(0) as usize,
                 min_connection_lifetime_ms: pool_config.min_connection_lifetime.unwrap_or(30_000),
                 reserve_pool_size: pool_config.reserve_pool_size.unwrap_or(0) as usize,
                 reserve_pool_timeout_ms: pool_config.reserve_pool_timeout.unwrap_or(3000),
             };
-            // Reuse if config unchanged — keeps semaphores, arbiter, and in-flight permits alive.
-            if let Some(existing) = old_coordinators.get(pool_name.as_str()) {
-                if *existing.config() == new_cfg {
-                    debug!("[pool: {pool_name}] coordinator config unchanged, reusing");
-                    coordinators.insert(pool_name.clone(), existing.clone());
-                    continue;
+            let coordinator = match old_coordinators.get(pool_name.as_str()) {
+                Some(existing) => {
+                    if existing.config() != new_cfg {
+                        coordinator_updates.push((existing.clone(), new_cfg));
+                    }
+                    existing.clone()
                 }
-                info!(
-                    "[pool: {pool_name}] coordinator config changed, creating new (old connections drain naturally)"
-                );
-            } else {
-                info!("[pool: {pool_name}] creating coordinator (max_db_connections={max})");
-            }
-            coordinators.insert(
-                pool_name.clone(),
-                pool_coordinator::PoolCoordinator::new(pool_name.clone(), new_cfg),
-            );
+                None => pool_coordinator::PoolCoordinator::new(pool_name.clone(), new_cfg),
+            };
+            coordinators.insert(pool_name.clone(), coordinator);
         }
 
         // Hashing each pool's effective config against (Pool, general
@@ -1559,6 +1544,11 @@ impl ConnectionPool {
                 pool.database.pause();
             }
         }
+        // Every fallible step has succeeded. Reconfigure the shared budgets
+        // before publishing replacement generations; old leases keep their permits.
+        for (coordinator, config) in coordinator_updates {
+            coordinator.reconfigure(config);
+        }
         // Publish CONFIG after every fallible pool-build step has
         // succeeded, but before AUTH_QUERY_STATE becomes visible.
         // Otherwise a dynamic auth_query login can observe the new auth
@@ -1601,7 +1591,16 @@ impl ConnectionPool {
         // PREVIOUS_GENERAL_STARTUP_HASH alone so the next reload still
         // sees the old value and re-evaluates the change correctly.
         PREVIOUS_GENERAL_STARTUP_HASH.store(general_startup_hash, Ordering::Relaxed);
+        let retired_for_capacity = RETIRED_POOLS.load_full();
         drop(_commit_guard);
+        // Administrative cap reductions override idle age and generation floors.
+        // Each permit claims at most one retirement, shared across all generations.
+        for pool in new_pools.values() {
+            pool.database.retire_over_limit_idle();
+        }
+        for pool in retired_for_capacity.iter() {
+            pool.database.retire_over_limit_idle();
+        }
         for pool in removed_dynamic_pools {
             pool.database.close();
         }
@@ -2073,8 +2072,7 @@ pub fn get_all_pools() -> Arc<PoolMap> {
     POOLS.load_full()
 }
 
-/// Get pool coordinator for a database pool (if `max_db_connections > 0`).
-/// Returns `None` when coordination is disabled for this pool.
+/// Get the shared physical-backend budget, including when admission is disabled.
 pub fn get_coordinator(db: &str) -> Option<Arc<pool_coordinator::PoolCoordinator>> {
     COORDINATORS.load().get(db).cloned()
 }

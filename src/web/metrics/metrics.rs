@@ -1275,6 +1275,7 @@ fn update_coordinator_metrics() {
 
     let current: std::collections::HashMap<String, usize> = coordinators
         .iter()
+        .filter(|(_, coordinator)| coordinator.is_enabled())
         .map(|(db, arc)| (db.clone(), Arc::as_ptr(arc) as usize))
         .collect();
 
@@ -1297,6 +1298,9 @@ fn update_coordinator_metrics() {
     }
 
     for (db, coordinator) in coordinators.iter() {
+        if !coordinator.is_enabled() {
+            continue;
+        }
         let stats = coordinator.stats();
         let config = coordinator.config();
 

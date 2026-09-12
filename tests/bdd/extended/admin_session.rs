@@ -401,6 +401,39 @@ pub async fn verify_admin_column_in_range(
     );
 }
 
+/// ReadyForQuery delivery can precede backend check-in. Wait for the shared
+/// coordinator count instead of racing that asynchronous cleanup after COMMIT.
+#[then(regex = r#"^admin session "([^"]+)" eventually shows coordinator current (\d+)$"#)]
+pub async fn verify_admin_eventually_shows_coordinator_current(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected: u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        execute_admin_query_and_store_response(
+            world,
+            "SHOW POOL_COORDINATOR".to_string(),
+            session_name.clone(),
+        )
+        .await;
+        let response = super::helpers::get_admin_response(&world.session_messages, &session_name);
+        let lines: Vec<_> = response.lines().collect();
+        assert!(lines.len() >= 2, "Missing coordinator row: {response}");
+        let (column, use_pipe) = super::helpers::find_column_index(lines[0], "current");
+        let values = super::helpers::split_row(lines[1], use_pipe);
+        let actual: u64 = values[column].parse().expect("Invalid coordinator count");
+        if actual == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Coordinator current did not reach {expected} within 5s: {response}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[then(regex = r#"^admin session "([^"]+)" column "([^"]+)" should be at least (\d+)$"#)]
 pub async fn verify_admin_column_at_least(
     world: &mut DoormanWorld,

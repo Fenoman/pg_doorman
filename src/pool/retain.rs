@@ -215,6 +215,9 @@ pub async fn retain_connections() {
                 continue;
             }
             if let Some(ref coordinator) = pool.coordinator {
+                if !coordinator.is_enabled() {
+                    continue;
+                }
                 let upgraded = pool.database.upgrade_reserve_to_main();
                 if upgraded > 0 {
                     info!(

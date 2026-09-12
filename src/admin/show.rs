@@ -987,6 +987,9 @@ where
 
     for db in db_names {
         if let Some(coordinator) = coordinators.get(db) {
+            if !coordinator.is_enabled() {
+                continue;
+            }
             let stats = coordinator.stats();
             let config = coordinator.config();
             res.put(data_row(&[

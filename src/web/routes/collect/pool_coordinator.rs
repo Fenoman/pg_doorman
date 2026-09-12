@@ -7,6 +7,7 @@ pub(crate) fn collect_pool_coordinator() -> PoolCoordinatorDto {
     let coordinators = COORDINATORS.load();
     let mut databases: Vec<PoolCoordinatorRowDto> = coordinators
         .iter()
+        .filter(|(_, coordinator)| coordinator.is_enabled())
         .map(|(db, coordinator)| {
             let stats = coordinator.stats();
             let config = coordinator.config();

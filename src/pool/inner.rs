@@ -37,7 +37,8 @@ const BURST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
 /// - Acquired when a NEW connection is created (timeout_get / replenish)
 /// - Stays with the ObjectInner when returned to the idle pool (VecDeque)
 /// - Dropped when the connection is destroyed → frees coordinator semaphore slot
-/// - `None` when coordination is disabled (max_db_connections = 0)
+/// - Tracked even with max_db_connections = 0 so RELOAD can enable the limit
+///   without forgetting existing backends; `None` is used by isolated tests
 #[derive(Debug)]
 struct ObjectInner {
     obj: Server,
@@ -45,6 +46,14 @@ struct ObjectInner {
     /// Held for RAII — dropped when connection is destroyed, freeing coordinator slot.
     #[allow(dead_code)]
     coordinator_permit: Option<pool_coordinator::CoordinatorPermit>,
+}
+
+impl ObjectInner {
+    fn claim_capacity_retirement(&mut self) -> bool {
+        self.coordinator_permit
+            .as_mut()
+            .is_some_and(|permit| permit.claim_retirement())
+    }
 }
 
 /// Wrapper around the actual pooled object which implements Deref and DerefMut.
@@ -68,7 +77,7 @@ impl Drop for Object {
                         inner.obj.mark_bad(reason);
                     }
                 }
-                let must_evict = inner.obj.is_bad();
+                let must_evict = inner.obj.is_bad() || inner.claim_capacity_retirement();
                 if must_evict {
                     // A backend already bad before the recycle-safety check died
                     // on a real transport/query error (e.g. PostgreSQL restart),
@@ -254,7 +263,8 @@ struct PoolInner {
     users: AtomicUsize,
     semaphore: Semaphore,
     config: PoolConfig,
-    /// Database-level coordinator (None when max_db_connections = 0).
+    /// Shared database budget, including when admission is disabled.
+    /// Isolated tests may omit it.
     coordinator: Option<Arc<pool_coordinator::PoolCoordinator>>,
     /// Pool name (database name in config), used in coordinator error messages.
     pool_name: String,
@@ -561,9 +571,11 @@ impl PoolInner {
         // connection just landed. Mirrors the waiter-drain in
         // `return_object`.
         let mut handoff_done = false;
+        let mut inner = self.new_object_inner(obj, coordinator_permit);
         {
             let mut slots = self.slots.lock();
-            if !self.accepts_fresh_backend_after_create(&slots) {
+            if !self.accepts_fresh_backend_after_create(&slots) || inner.claim_capacity_retirement()
+            {
                 drop(slots);
                 log::debug!(
                     "[{}@{}] pre-replace: dropped fresh backend because pool generation closed",
@@ -576,7 +588,6 @@ impl PoolInner {
                 return;
             }
             slots.size += 1;
-            let inner = self.new_object_inner(obj, coordinator_permit);
             let mut carry: Option<ObjectInner> = Some(inner);
             while let Some(sender) = slots.waiters.pop_front() {
                 let take = carry.take().expect("carry held one inner per iteration");
@@ -639,17 +650,37 @@ impl PoolInner {
                 .map_err(PoolError::Backend)?,
         };
 
+        let mut inner = self.new_object_inner(obj, coordinator_permit);
         {
             let mut slots = self.slots.lock();
             if !self.accepts_fresh_backend_after_create(&slots) {
                 drop(slots);
-                drop(obj);
+                drop(inner);
                 return Err(PoolError::Closed);
+            }
+            if inner.claim_capacity_retirement() {
+                drop(slots);
+                let coordinator = self
+                    .coordinator
+                    .as_ref()
+                    .expect("retirement has a coordinator");
+                let config = coordinator.config();
+                let info = pool_coordinator::NoConnectionInfo {
+                    database: self.pool_name.clone(),
+                    user: self.username.clone(),
+                    max_db_connections: config.max_db_connections,
+                    active_connections: coordinator.total_connections(),
+                    reserve_size: config.reserve_pool_size,
+                    reserve_in_use: coordinator.reserve_in_use(),
+                    phase: pool_coordinator::AcquirePhase::NoReserve,
+                };
+                drop(inner);
+                return Err(PoolError::DbLimitExhausted(info));
             }
             slots.size += 1;
         }
 
-        Ok(self.new_object_inner(obj, coordinator_permit))
+        Ok(inner)
     }
 
     /// Returns true when every permit is in use — clients are either holding
@@ -709,8 +740,10 @@ impl PoolInner {
         };
 
         match recycle_result {
-            Ok(()) => RecycleOutcome::Reused(Box::new(guard.disarm())),
-            Err(_) => {
+            Ok(()) if !guard.as_mut().claim_capacity_retirement() => {
+                RecycleOutcome::Reused(Box::new(guard.disarm()))
+            }
+            _ => {
                 // Guard's Drop decrements `slots.size` and closes the
                 // backend's TCP fd via `Server::drop`.
                 drop(guard);
@@ -723,13 +756,14 @@ impl PoolInner {
     fn return_object(&self, mut inner: ObjectInner) {
         let mut slots = self.slots.lock();
 
-        if slots.size > slots.max_size {
+        let retire_pool_slot = slots.size > slots.max_size;
+        if retire_pool_slot || inner.claim_capacity_retirement() {
             slots.size = slots.size.saturating_sub(1);
             // retire the returning permit
             // only when resize() pre-marked one. A pre_replace_one overshoot
             // leaves permits_to_retire == 0, so the permit is restored below
             // instead of leaked.
-            let retire_permit = slots.permits_to_retire > 0;
+            let retire_permit = retire_pool_slot && slots.permits_to_retire > 0;
             if retire_permit {
                 slots.permits_to_retire -= 1;
             }
@@ -768,8 +802,15 @@ impl PoolInner {
     /// checkout's permit. Pass it to the next waiter, or back to idle, without
     /// restoring that permit again. Coordinator waiters need this handoff:
     /// an idle backend still holds its database permit and cannot wake them.
-    fn requeue_handoff(&self, inner: ObjectInner) {
+    fn requeue_handoff(&self, mut inner: ObjectInner) {
         let mut slots = self.slots.lock();
+        if inner.claim_capacity_retirement() {
+            slots.size = slots.size.saturating_sub(1);
+            drop(slots);
+            drop(inner);
+            self.notify_return_observers();
+            return;
+        }
         if let Some(inner) = send_handoff(&mut slots, inner) {
             push_idle(self.config.queue_mode, &mut slots.vec, inner);
             drop(slots);
@@ -949,8 +990,8 @@ impl<'p> EvictGuard<'p> {
         }
     }
 
-    /// Happy-path finalisation. Hand survivors to waiters or return them idle,
-    /// deduct `evicted` from `slots.size`, then restore all permits.
+    /// Happy-path finalisation. Retire excess survivors after a capacity shrink,
+    /// hand the rest to waiters or return them idle, then restore all permits.
     /// Marks the guard committed only at the END so a panic anywhere
     /// inside this function (debug_assert, `push_idle` OOM,
     /// `add_permits` overflow) still triggers `Drop`'s worst-case
@@ -963,9 +1004,16 @@ impl<'p> EvictGuard<'p> {
             self.popped_count,
             "EvictGuard.commit: survivors + evicted must equal popped",
         );
+        let mut retired = Vec::new();
         if !survivors.is_empty() || evicted > 0 {
             let mut guard = self.pool.slots.lock();
-            for obj in survivors {
+            for mut obj in survivors {
+                // RELOAD cannot see backends temporarily owned by this scan.
+                // Check the shared shrink budget before making them reusable.
+                if obj.claim_capacity_retirement() {
+                    retired.push(obj);
+                    continue;
+                }
                 // A survivor still owns its database permit. A coordinator
                 // waiter already holds a checkout permit, so restoring the
                 // scan's permit below cannot wake it without this handoff.
@@ -973,10 +1021,11 @@ impl<'p> EvictGuard<'p> {
                     push_idle(queue_mode, &mut guard.vec, obj);
                 }
             }
-            if evicted > 0 {
-                guard.size = guard.size.saturating_sub(evicted);
+            if evicted > 0 || !retired.is_empty() {
+                guard.size = guard.size.saturating_sub(evicted + retired.len());
             }
         }
+        drop(retired); // Close outside slots; budget stays held until ObjectInner drops.
         self.pool.semaphore.add_permits(self.popped_count);
         // Disarm AFTER all bookkeeping. Any panic before this point
         // falls through to `Drop::drop` which conservatively treats
@@ -1411,10 +1460,15 @@ impl Pool {
         // Skip anticipation — creating a new connection is cheaper.
         // Disabled when a coordinator is configured: anticipation acts as
         // a natural throttle preventing one pool from grabbing all permits.
-        let capacity_deficit = self.inner.coordinator.is_none() && {
-            let slots = self.inner.slots.lock();
-            slots.vec.is_empty() && slots.size < slots.max_size
-        };
+        let capacity_deficit = self
+            .inner
+            .coordinator
+            .as_ref()
+            .is_none_or(|c| !c.is_enabled())
+            && {
+                let slots = self.inner.slots.lock();
+                slots.vec.is_empty() && slots.size < slots.max_size
+            };
 
         // Direct handoff via oneshot channel.
         if !capacity_deficit && !non_blocking {
@@ -2180,10 +2234,9 @@ impl Pool {
     ///
     /// Returns the number of permits upgraded.
     pub fn upgrade_reserve_to_main(&self) -> usize {
-        let coordinator = match self.inner.coordinator.as_ref() {
-            Some(c) => c,
-            None => return 0,
-        };
+        if self.inner.coordinator.is_none() {
+            return 0;
+        }
         let mut upgraded = 0;
         let mut guard = self.inner.slots.lock();
         for obj in guard.vec.iter_mut() {
@@ -2193,8 +2246,7 @@ impl Pool {
             if !permit.is_reserve {
                 continue;
             }
-            if coordinator.try_upgrade_reserve_to_main() {
-                permit.is_reserve = false;
+            if permit.try_upgrade_to_main() {
                 upgraded += 1;
             } else {
                 // Main is saturated too; no point walking the rest of the
@@ -2336,21 +2388,21 @@ impl Pool {
                 }
             };
 
+            let mut inner = self.inner.new_object_inner(obj, coordinator_permit);
             {
                 let mut slots = self.inner.slots.lock();
-                if !self.inner.accepts_fresh_backend_after_create(&slots) {
+                if !self.inner.accepts_fresh_backend_after_create(&slots)
+                    || inner.claim_capacity_retirement()
+                {
                     drop(slots);
-                    drop(obj);
-                    drop(coordinator_permit);
+                    drop(inner);
                     break;
                 }
                 if slots.size >= slots.max_size {
                     drop(slots);
-                    drop(obj);
-                    drop(coordinator_permit);
+                    drop(inner);
                     break;
                 }
-                let inner = self.inner.new_object_inner(obj, coordinator_permit);
                 slots.size += 1;
                 // A ready refill still holds its database permit, so waiting
                 // checkouts need a handoff. They already own their checkout
@@ -2365,6 +2417,39 @@ impl Pool {
             created += 1;
         }
         created
+    }
+
+    /// Close only the idle backends claimed by a shared administrative shrink.
+    /// Active leases return through Object::drop and claim retirement there.
+    pub(crate) fn retire_over_limit_idle(&self) -> usize {
+        if self
+            .inner
+            .coordinator
+            .as_ref()
+            .is_none_or(|coordinator| !coordinator.needs_retirement())
+        {
+            return 0;
+        }
+        let mut retired = Vec::new();
+        {
+            let mut slots = self.inner.slots.lock();
+            let mut keep = VecDeque::with_capacity(slots.vec.len());
+            for mut inner in slots.vec.drain(..) {
+                if inner.claim_capacity_retirement() {
+                    retired.push(inner);
+                } else {
+                    keep.push_back(inner);
+                }
+            }
+            slots.vec = keep;
+            slots.size = slots.size.saturating_sub(retired.len());
+        }
+        let count = retired.len();
+        drop(retired);
+        if count > 0 {
+            self.inner.notify_return_observers();
+        }
+        count
     }
 
     /// Closes this Pool.
@@ -2534,12 +2619,12 @@ impl Pool {
             }
         };
         match recycle_result {
-            Ok(()) => {
+            Ok(()) if !guard.as_mut().claim_capacity_retirement() => {
                 let inner = guard.disarm();
                 self.maybe_trigger_pre_replacement(&inner.metrics);
                 Ok(inner)
             }
-            Err(_) => {
+            _ => {
                 drop(guard);
                 Err(())
             }
@@ -3055,6 +3140,100 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn administrative_shrink_drains_idle_despite_old_minimum_and_age() {
+        let config = pool_coordinator::CoordinatorConfig {
+            max_db_connections: 2,
+            reserve_pool_size: 0,
+            min_connection_lifetime_ms: 60_000,
+            reserve_pool_timeout_ms: 100,
+        };
+        let coordinator = pool_coordinator::PoolCoordinator::new("shrink".into(), config);
+        let pool = donor_test_pool("shrink", "user", coordinator.clone(), 2);
+        let _peers = [add_idle_donor_backend(&pool), add_idle_donor_backend(&pool)];
+        assert!(!pool.database.evict_one_idle(60_000));
+        coordinator.reconfigure(pool_coordinator::CoordinatorConfig {
+            max_db_connections: 1,
+            ..config
+        });
+        assert_eq!(pool.database.retire_over_limit_idle(), 1);
+        assert_eq!(pool.database.retire_over_limit_idle(), 0);
+        assert_eq!(pool.pool_state().size, 1);
+        assert_eq!(coordinator.total_connections(), 1);
+        assert_eq!(pool.database.semaphore().available_permits(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn administrative_shrink_rejects_inflight_handoff() {
+        let config = pool_coordinator::CoordinatorConfig {
+            max_db_connections: 2,
+            reserve_pool_size: 0,
+            min_connection_lifetime_ms: 0,
+            reserve_pool_timeout_ms: 100,
+        };
+        let coordinator = pool_coordinator::PoolCoordinator::new("shrink".into(), config);
+        let pool = donor_test_pool("shrink", "user", coordinator.clone(), 0);
+        let _peers = [add_idle_donor_backend(&pool), add_idle_donor_backend(&pool)];
+        let (first, second) = {
+            let mut slots = pool.database.inner.slots.lock();
+            (
+                slots.vec.pop_front().unwrap(),
+                slots.vec.pop_front().unwrap(),
+            )
+        };
+        coordinator.reconfigure(pool_coordinator::CoordinatorConfig {
+            max_db_connections: 1,
+            ..config
+        });
+        assert!(pool
+            .database
+            .recycle_handoff(first, &pool.database.timeouts())
+            .await
+            .is_err());
+        pool.database.inner.requeue_handoff(second);
+        assert_eq!(pool.pool_state().size, 1);
+        assert_eq!(pool.pool_state().available, 1);
+        assert_eq!(coordinator.total_connections(), 1);
+        assert_eq!(pool.database.semaphore().available_permits(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn administrative_shrink_retires_health_scan_survivors() {
+        let config = pool_coordinator::CoordinatorConfig {
+            max_db_connections: 2,
+            reserve_pool_size: 0,
+            min_connection_lifetime_ms: 0,
+            reserve_pool_timeout_ms: 100,
+        };
+        let coordinator = pool_coordinator::PoolCoordinator::new("shrink".into(), config);
+        let pool = donor_test_pool("shrink", "user", coordinator.clone(), 0);
+        let _peers = [add_idle_donor_backend(&pool), add_idle_donor_backend(&pool)];
+        let survivors = pool.database.inner.slots.lock().vec.drain(..).collect();
+        pool.database
+            .semaphore()
+            .try_acquire_many(2)
+            .unwrap()
+            .forget();
+        let scan = EvictGuard::new(&pool.database.inner, 2);
+        coordinator.reconfigure(pool_coordinator::CoordinatorConfig {
+            max_db_connections: 1,
+            ..config
+        });
+        assert_eq!(
+            pool.database.retire_over_limit_idle(),
+            0,
+            "scan owns the idle backends"
+        );
+        scan.commit(QueueMode::Fifo, survivors, 0);
+        assert_eq!(pool.pool_state().size, 1);
+        assert_eq!(pool.pool_state().available, 1);
+        assert_eq!(coordinator.total_connections(), 1);
+        assert_eq!(pool.database.semaphore().available_permits(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     #[serial_test::serial(retired_pools)]
     async fn coordinator_reclaims_same_user_budget_across_pool_generations() {
         use crate::pool::pool_coordinator::EvictionSource;
@@ -3128,7 +3307,7 @@ mod tests {
                 reserve_pool_size: 0,
                 reserve_pool_timeout_ms: 100,
             };
-            let coordinator = pool_coordinator::PoolCoordinator::new(id.db.clone(), config.clone());
+            let coordinator = pool_coordinator::PoolCoordinator::new(id.db.clone(), config);
             let donor_coordinator = if guard == "coordinator" {
                 pool_coordinator::PoolCoordinator::new(id.db.clone(), config)
             } else {
@@ -3706,8 +3885,8 @@ mod tests {
         assert_eq!(coord.total_connections(), 0);
     }
 
-    /// A pool without a coordinator (max_db_connections = 0) has no
-    /// reserve concept at all — the helper must short-circuit and
+    /// A test pool without a coordinator has no reserve concept at all;
+    /// the helper must short-circuit and
     /// return 0 without locking `slots`.
     #[tokio::test]
     async fn upgrade_reserve_to_main_returns_zero_without_coordinator() {

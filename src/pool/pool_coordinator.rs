@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ pub trait EvictionSource: Send + Sync {
     fn is_starving(&self, user: &str) -> bool;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoordinatorConfig {
     pub max_db_connections: usize,
     pub min_connection_lifetime_ms: u64,
@@ -42,6 +42,49 @@ pub struct CoordinatorStats {
 pub struct CoordinatorPermit {
     coordinator: Arc<PoolCoordinator>,
     pub is_reserve: bool,
+    retiring: bool,
+}
+
+impl CoordinatorPermit {
+    /// Claim one excess physical backend for retirement, without releasing its
+    /// budget until Drop. Call only when the backend has no active lease.
+    pub(crate) fn claim_retirement(&mut self) -> bool {
+        if self.retiring {
+            return true;
+        }
+        if !self.coordinator.needs_retirement() {
+            return false;
+        }
+        let mut state = self.coordinator.state.lock();
+        let issued = self.coordinator.issued_locked(&state);
+        let (main, reserve) = state.capacities();
+        if issued.saturating_sub(state.pending_retirements) <= main + reserve {
+            return false;
+        }
+        state.pending_retirements += 1;
+        self.retiring = true;
+        self.coordinator.refresh_retirement_hint(&state);
+        true
+    }
+
+    pub(crate) fn try_upgrade_to_main(&mut self) -> bool {
+        if !self.is_reserve || self.retiring {
+            return false;
+        }
+        let mut state = self.coordinator.state.lock();
+        let Ok(permit) = self.coordinator.db_semaphore.try_acquire() else {
+            return false;
+        };
+        permit.forget();
+        self.coordinator.release_reserve_locked(&mut state);
+        self.coordinator
+            .reserve_in_use
+            .fetch_sub(1, Ordering::Relaxed);
+        self.is_reserve = false;
+        drop(state);
+        self.coordinator.connection_returned.notify_one();
+        true
+    }
 }
 
 impl std::fmt::Debug for CoordinatorPermit {
@@ -55,18 +98,24 @@ impl std::fmt::Debug for CoordinatorPermit {
 impl Drop for CoordinatorPermit {
     fn drop(&mut self) {
         let permit_type = if self.is_reserve { "reserve" } else { "main" };
+        let mut state = self.coordinator.state.lock();
         if self.is_reserve {
-            self.coordinator.reserve_semaphore.add_permits(1);
+            self.coordinator.release_reserve_locked(&mut state);
             self.coordinator
                 .reserve_in_use
                 .fetch_sub(1, Ordering::Relaxed);
         } else {
-            self.coordinator.db_semaphore.add_permits(1);
+            PoolCoordinator::release_locked(&self.coordinator.db_semaphore, &mut state.main_debt);
+        }
+        if self.retiring {
+            state.pending_retirements -= 1;
         }
         let prev = self
             .coordinator
             .total_connections
             .fetch_sub(1, Ordering::Relaxed);
+        self.coordinator.refresh_retirement_hint(&state);
+        drop(state);
         self.coordinator.connection_returned.notify_one();
         debug!(
             "[pool: {}] coordinator: {} permit released (active: {} -> {})",
@@ -96,9 +145,14 @@ impl ReserveGrant {
     /// The reserve semaphore permit is now owned by the CoordinatorPermit's Drop.
     fn into_permit(mut self) -> CoordinatorPermit {
         let coordinator = self.coordinator.take().expect("grant already consumed");
+        coordinator
+            .total_connections
+            .fetch_add(1, Ordering::Relaxed);
+        coordinator.reserve_in_use.fetch_add(1, Ordering::Relaxed);
         CoordinatorPermit {
             coordinator,
             is_reserve: true,
+            retiring: false,
         }
     }
 }
@@ -110,7 +164,11 @@ impl Drop for ReserveGrant {
                 "[pool: {}] coordinator: unused reserve grant returned to semaphore",
                 coordinator.database,
             );
-            coordinator.reserve_semaphore.add_permits(1);
+            let mut state = coordinator.state.lock();
+            coordinator.release_reserve_locked(&mut state);
+            coordinator.refresh_retirement_hint(&state);
+            drop(state);
+            coordinator.connection_returned.notify_one();
         }
     }
 }
@@ -133,18 +191,44 @@ pub struct PoolCoordinator {
     /// the wait queue handles both cases uniformly: on every wake it retries
     /// `eviction_source.try_evict_one(user)` before `try_acquire()`.
     connection_returned: Notify,
-    config: CoordinatorConfig,
+    state: parking_lot::Mutex<CoordinatorState>,
+    enabled: AtomicBool,
+    needs_retirement: AtomicBool,
     evictions_total: AtomicU64,
     reserve_acquisitions_total: AtomicU64,
     exhaustions_total: AtomicU64,
     reserve_tx: mpsc::Sender<ReserveRequest>,
 }
 
+#[derive(Debug)]
+struct CoordinatorState {
+    config: CoordinatorConfig,
+    main_debt: usize,
+    reserve_debt: usize,
+    pending_retirements: usize,
+}
+
+impl CoordinatorState {
+    fn capacities(&self) -> (usize, usize) {
+        if self.config.max_db_connections == 0 {
+            // Semaphore capacity is a counter, not an allocation. Even when
+            // admission is disabled, every physical create must remain counted
+            // so a later RELOAD can enable a cap without missing old backends.
+            (Semaphore::MAX_PERMITS, 0)
+        } else {
+            (
+                self.config.max_db_connections,
+                self.config.reserve_pool_size,
+            )
+        }
+    }
+}
+
 impl std::fmt::Debug for PoolCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PoolCoordinator")
             .field("database", &self.database)
-            .field("config", &self.config)
+            .field("config", &self.config())
             .field(
                 "total_connections",
                 &self.total_connections.load(Ordering::Relaxed),
@@ -188,13 +272,20 @@ impl PartialEq for ReserveRequest {
 impl Eq for ReserveRequest {}
 
 impl PoolCoordinator {
-    /// Create a new coordinator. Spawns an arbiter only when reserve is enabled.
+    /// Create a shared budget, including when admission is initially disabled.
     pub fn new(database: String, config: CoordinatorConfig) -> Arc<Self> {
         let (reserve_tx, reserve_rx) = mpsc::channel(256);
+        let state = CoordinatorState {
+            config,
+            main_debt: 0,
+            reserve_debt: 0,
+            pending_retirements: 0,
+        };
+        let (main, reserve) = state.capacities();
         let coordinator = Arc::new(Self {
             database,
-            db_semaphore: Semaphore::new(config.max_db_connections),
-            reserve_semaphore: Semaphore::new(config.reserve_pool_size),
+            db_semaphore: Semaphore::new(main),
+            reserve_semaphore: Semaphore::new(reserve),
             total_connections: AtomicUsize::new(0),
             reserve_in_use: AtomicUsize::new(0),
             connection_returned: Notify::new(),
@@ -202,15 +293,17 @@ impl PoolCoordinator {
             reserve_acquisitions_total: AtomicU64::new(0),
             exhaustions_total: AtomicU64::new(0),
             reserve_tx,
-            config,
+            state: parking_lot::Mutex::new(state),
+            enabled: AtomicBool::new(config.max_db_connections > 0),
+            needs_retirement: AtomicBool::new(false),
         });
 
-        if coordinator.config.reserve_pool_size > 0 {
-            let weak = Arc::downgrade(&coordinator);
-            tokio::spawn(async move {
-                reserve_arbiter(reserve_rx, weak).await;
-            });
-        }
+        // Keep the weak arbiter available for a future reserve=0 -> N reload.
+        // Without requests it sleeps on rx.recv and holds no coordinator Arc.
+        let weak = Arc::downgrade(&coordinator);
+        tokio::spawn(async move {
+            reserve_arbiter(reserve_rx, weak).await;
+        });
 
         coordinator
     }
@@ -218,6 +311,10 @@ impl PoolCoordinator {
     /// Fast path: try to acquire a permit without blocking.
     /// Returns None if the database limit is reached.
     pub fn try_acquire(self: &Arc<Self>) -> Option<CoordinatorPermit> {
+        let state = self.state.lock();
+        if self.headroom_locked(&state) == 0 {
+            return None;
+        }
         match self.db_semaphore.try_acquire() {
             Ok(permit) => {
                 permit.forget();
@@ -225,10 +322,104 @@ impl PoolCoordinator {
                 Some(CoordinatorPermit {
                     coordinator: Arc::clone(self),
                     is_reserve: false,
+                    retiring: false,
                 })
             }
             Err(_) => None,
         }
+    }
+
+    fn issued_locked(&self, state: &CoordinatorState) -> usize {
+        let (main, reserve) = state.capacities();
+        main + state.main_debt - self.db_semaphore.available_permits()
+            + reserve
+            + state.reserve_debt
+            - self.reserve_semaphore.available_permits()
+    }
+
+    fn headroom_locked(&self, state: &CoordinatorState) -> usize {
+        let (main, reserve) = state.capacities();
+        (main + reserve).saturating_sub(self.issued_locked(state))
+    }
+
+    fn refresh_retirement_hint(&self, state: &CoordinatorState) {
+        let (main, reserve) = state.capacities();
+        self.needs_retirement.store(
+            self.issued_locked(state)
+                .saturating_sub(state.pending_retirements)
+                > main + reserve,
+            Ordering::Release,
+        );
+    }
+
+    fn release_locked(semaphore: &Semaphore, debt: &mut usize) {
+        if *debt > 0 {
+            *debt -= 1;
+        } else {
+            semaphore.add_permits(1);
+        }
+    }
+
+    fn release_reserve_locked(&self, state: &mut CoordinatorState) {
+        Self::release_locked(&self.reserve_semaphore, &mut state.reserve_debt);
+    }
+
+    fn resize_locked(semaphore: &Semaphore, debt: &mut usize, old: usize, new: usize) {
+        if new < old {
+            let removed = semaphore.forget_permits(old - new);
+            *debt += old - new - removed;
+        } else {
+            let growth = new - old;
+            let cancelled = growth.min(*debt);
+            *debt -= cancelled;
+            semaphore.add_permits(growth - cancelled);
+        }
+    }
+
+    /// Apply only in the infallible reload commit, after staging succeeds.
+    /// No active lease is interrupted; its permit remains accounted until Drop.
+    pub(crate) fn reconfigure(&self, config: CoordinatorConfig) {
+        let mut state = self.state.lock();
+        let (old_main, old_reserve) = state.capacities();
+        state.config = config;
+        let (new_main, new_reserve) = state.capacities();
+        Self::resize_locked(&self.db_semaphore, &mut state.main_debt, old_main, new_main);
+        Self::resize_locked(
+            &self.reserve_semaphore,
+            &mut state.reserve_debt,
+            old_reserve,
+            new_reserve,
+        );
+        self.enabled
+            .store(config.max_db_connections > 0, Ordering::Release);
+        self.refresh_retirement_hint(&state);
+        drop(state);
+        self.connection_returned.notify_waiters();
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn needs_retirement(&self) -> bool {
+        self.needs_retirement.load(Ordering::Acquire)
+    }
+
+    fn available_reserve_permits(&self) -> usize {
+        let state = self.state.lock();
+        self.reserve_semaphore
+            .available_permits()
+            .min(self.headroom_locked(&state))
+    }
+
+    fn try_reserve_grant(self: &Arc<Self>) -> Option<ReserveGrant> {
+        let state = self.state.lock();
+        if self.headroom_locked(&state) == 0 {
+            return None;
+        }
+        let permit = self.reserve_semaphore.try_acquire().ok()?;
+        permit.forget();
+        Some(ReserveGrant::new(self.clone()))
     }
 
     /// Full acquisition path: try → reserve-first → evict → wait → reserve → error.
@@ -255,7 +446,7 @@ impl PoolCoordinator {
         user: &str,
         eviction_source: &dyn EvictionSource,
     ) -> Result<CoordinatorPermit, AcquireError> {
-        let max = self.config.max_db_connections;
+        let max = self.config().max_db_connections;
 
         // Phase A: fast path — non-blocking semaphore acquire
         if let Some(permit) = self.try_acquire() {
@@ -280,9 +471,8 @@ impl PoolCoordinator {
         // `try_acquire` and now (any concurrent `CoordinatorPermit::drop`
         // bumps `db_semaphore` without going through this path). Re-check
         // the cheap fast path before incurring reserve or eviction work:
-        // closing a peer backend that didn't need to be closed is
-        // unrecoverable damage, and a single extra atomic CAS is essentially
-        // free compared to the alternative.
+        // the short budget lock can avoid closing a peer backend when a
+        // permit has already become available.
         if let Some(permit) = self.try_acquire() {
             debug!(
                 "[{}@{}] coordinator: permit became free between fast-path \
@@ -298,11 +488,10 @@ impl PoolCoordinator {
         // Reserve-first: if the reserve pool has headroom, grant a reserve
         // permit directly. Skips Phase B (closing a peer backend) and
         // the wait queue (parking for up to `reserve_pool_timeout_ms`), which is
-        // where the p99 tail used to come from. The `available_permits()`
-        // check matches what the arbiter will itself try — a lock-free
-        // peek on the semaphore, no extra atomics compared to the Phase D
-        // path below.
-        if self.config.reserve_pool_size > 0 && self.reserve_semaphore.available_permits() > 0 {
+        // where the p99 tail used to come from. The headroom check takes the
+        // budget lock; the arbiter rechecks it under the same lock before
+        // granting, including reservations that are still being delivered.
+        if self.available_reserve_permits() > 0 {
             if let Some(permit) = self
                 .try_grant_reserve(database, user, eviction_source)
                 .await
@@ -353,7 +542,7 @@ impl PoolCoordinator {
         //
         // Register `notified()` BEFORE `try_acquire()` so that the
         // `notify_one` from CoordinatorPermit::drop is not lost.
-        let timeout_ms = self.config.reserve_pool_timeout_ms;
+        let timeout_ms = self.config().reserve_pool_timeout_ms;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         let mut wait_wakeups = 0u32;
 
@@ -391,8 +580,7 @@ impl PoolCoordinator {
             // `CoordinatorPermit::drop`) may have already left a free permit
             // in the semaphore. `try_evict_one` would close a peer connection
             // for nothing in that case — the slot is already there for the
-            // taking. The atomic CAS is roughly five nanoseconds; an avoided
-            // eviction saves a peer backend.
+            // taking. The short budget lock avoids an unnecessary eviction.
             if let Some(permit) = self.try_acquire() {
                 debug!(
                     "[{}@{}] coordinator: wait phase acquired free permit \
@@ -404,6 +592,15 @@ impl PoolCoordinator {
                     max,
                 );
                 return Ok(permit);
+            }
+
+            if self.available_reserve_permits() > 0 {
+                if let Some(permit) = self
+                    .try_grant_reserve(database, user, eviction_source)
+                    .await
+                {
+                    return Ok(permit);
+                }
             }
 
             // Opportunistic eviction retry. The wake-up may have come from
@@ -466,7 +663,7 @@ impl PoolCoordinator {
         // holder dropped its permit), at the cost of a single arbiter
         // round-trip. The cost is negligible compared to the wait-queue wait
         // we just spent.
-        let phase = if self.config.reserve_pool_size > 0 {
+        let phase = if self.config().reserve_pool_size > 0 {
             if let Some(permit) = self
                 .try_grant_reserve(database, user, eviction_source)
                 .await
@@ -496,7 +693,7 @@ impl PoolCoordinator {
             active,
             max,
             reserve_in_use,
-            self.config.reserve_pool_size,
+            self.config().reserve_pool_size,
             phase,
             self.exhaustions_total.load(Ordering::Relaxed),
         );
@@ -504,9 +701,9 @@ impl PoolCoordinator {
         Err(AcquireError::NoConnection(NoConnectionInfo {
             database: database.to_string(),
             user: user.to_string(),
-            max_db_connections: self.config.max_db_connections,
+            max_db_connections: self.config().max_db_connections,
             active_connections: active,
-            reserve_size: self.config.reserve_pool_size,
+            reserve_size: self.config().reserve_pool_size,
             reserve_in_use,
             phase,
         }))
@@ -525,7 +722,9 @@ impl PoolCoordinator {
     /// timeout into Phase D even though the cross-pool system had headroom
     /// every few milliseconds.
     pub(crate) fn notify_idle_returned(&self) {
-        self.connection_returned.notify_one();
+        if self.is_enabled() {
+            self.connection_returned.notify_one();
+        }
     }
 
     /// Send a reserve request to the arbiter and wait for the grant.
@@ -539,7 +738,7 @@ impl PoolCoordinator {
         user: &str,
         eviction_source: &dyn EvictionSource,
     ) -> Option<CoordinatorPermit> {
-        let max = self.config.max_db_connections;
+        let max = self.config().max_db_connections;
         let starving = u8::from(eviction_source.is_starving(user));
         let queued = eviction_source.queued_clients(user);
         let reserve_in_use = self.reserve_in_use.load(Ordering::Relaxed);
@@ -552,7 +751,7 @@ impl PoolCoordinator {
             starving == 1,
             queued,
             reserve_in_use,
-            self.config.reserve_pool_size,
+            self.config().reserve_pool_size,
         );
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -568,8 +767,7 @@ impl PoolCoordinator {
             .is_ok()
         {
             if let Ok(Ok(grant)) = tokio::time::timeout(ARBITER_RESPONSE_TIMEOUT, rx).await {
-                self.total_connections.fetch_add(1, Ordering::Relaxed);
-                self.reserve_in_use.fetch_add(1, Ordering::Relaxed);
+                let permit = grant.into_permit();
                 self.reserve_acquisitions_total
                     .fetch_add(1, Ordering::Relaxed);
                 info!(
@@ -580,9 +778,9 @@ impl PoolCoordinator {
                     self.total_connections.load(Ordering::Relaxed),
                     max,
                     self.reserve_in_use.load(Ordering::Relaxed),
-                    self.config.reserve_pool_size,
+                    self.config().reserve_pool_size,
                 );
-                return Some(grant.into_permit());
+                return Some(permit);
             }
         }
 
@@ -593,44 +791,9 @@ impl PoolCoordinator {
             user,
             database,
             self.reserve_in_use.load(Ordering::Relaxed),
-            self.config.reserve_pool_size,
+            self.config().reserve_pool_size,
         );
         None
-    }
-
-    /// Try to convert a reserve permit into a main permit in-place. Called
-    /// by the retain task when it finds an idle reserve backend in one of
-    /// the user pools sharing this coordinator while `db_semaphore` still
-    /// has headroom.
-    ///
-    /// On success, the caller is responsible for flipping `permit.is_reserve`
-    /// to `false` on the matching `CoordinatorPermit` so that `Drop` releases
-    /// the slot into the main semaphore, not the reserve one. The upgrade
-    /// keeps the backend alive — no reconnect, no peer churn — and the
-    /// reserve pool regains a slot for actual burst traffic instead of
-    /// holding a permit hostage to a warm idle connection.
-    ///
-    /// `total_connections` stays unchanged: it is the same backend, just
-    /// accounted against a different semaphore.
-    pub fn try_upgrade_reserve_to_main(&self) -> bool {
-        match self.db_semaphore.try_acquire() {
-            Ok(sem) => {
-                sem.forget();
-                self.reserve_semaphore.add_permits(1);
-                self.reserve_in_use.fetch_sub(1, Ordering::Relaxed);
-                debug!(
-                    "[pool: {}] coordinator: reserve→main upgrade \
-                     (reserve_in_use={}/{}, main_active={}/{})",
-                    self.database,
-                    self.reserve_in_use.load(Ordering::Relaxed),
-                    self.config.reserve_pool_size,
-                    self.total_connections.load(Ordering::Relaxed),
-                    self.config.max_db_connections,
-                );
-                true
-            }
-            Err(_) => false,
-        }
     }
 
     pub fn total_connections(&self) -> usize {
@@ -651,14 +814,17 @@ impl PoolCoordinator {
         }
     }
 
-    pub fn config(&self) -> &CoordinatorConfig {
-        &self.config
+    pub fn config(&self) -> CoordinatorConfig {
+        self.state.lock().config
     }
 
     /// Number of free main (non-reserve) permits. Used by pre-replacement
     /// to check headroom before speculatively creating a connection.
     pub fn available_main_permits(&self) -> usize {
-        self.db_semaphore.available_permits()
+        let state = self.state.lock();
+        self.db_semaphore
+            .available_permits()
+            .min(self.headroom_locked(&state))
     }
 }
 
@@ -745,10 +911,8 @@ async fn reserve_arbiter(mut rx: mpsc::Receiver<ReserveRequest>, weak: Weak<Pool
 
         // Grant to highest-scoring request if reserve available
         while pending.peek().is_some() {
-            if let Ok(sem_permit) = coordinator.reserve_semaphore.try_acquire() {
-                sem_permit.forget();
+            if let Some(grant) = coordinator.try_reserve_grant() {
                 let req = pending.pop().unwrap();
-                let grant = ReserveGrant::new(coordinator.clone());
                 let sent = req.response.send(grant);
                 if sent.is_ok() {
                     debug!(
@@ -791,7 +955,7 @@ async fn reserve_arbiter(mut rx: mpsc::Receiver<ReserveRequest>, weak: Weak<Pool
             }
 
             const HEAP_CAP_MULTIPLIER: usize = 4;
-            let cap = coordinator.config.reserve_pool_size.max(1) * HEAP_CAP_MULTIPLIER;
+            let cap = coordinator.config().reserve_pool_size.max(1) * HEAP_CAP_MULTIPLIER;
             if pending.len() > cap {
                 let dropped = pending.len() - cap;
                 let mut kept = BinaryHeap::with_capacity(cap);
@@ -885,6 +1049,183 @@ mod tests {
             reserve_pool_size: reserve,
             reserve_pool_timeout_ms: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn reload_shrink_keeps_active_permits_and_retires_returns() {
+        let coord = PoolCoordinator::new("resize".into(), test_config(3, 0));
+        let mut held: Vec<_> = (0..3).map(|_| coord.try_acquire().unwrap()).collect();
+        coord.reconfigure(test_config(1, 0));
+        assert_eq!(coord.total_connections(), 3);
+        assert!(coord.try_acquire().is_none());
+        drop(held.pop());
+        drop(held.pop());
+        assert_eq!(coord.total_connections(), 1);
+        assert!(coord.try_acquire().is_none());
+        drop(held.pop());
+        let replacement = coord.try_acquire().unwrap();
+        assert!(coord.try_acquire().is_none());
+        drop(replacement);
+        assert_eq!(coord.available_main_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_repeated_shrink_grow_cancels_retirement_debt() {
+        let coord = PoolCoordinator::new("resize".into(), test_config(3, 0));
+        let held: Vec<_> = (0..3).map(|_| coord.try_acquire().unwrap()).collect();
+        for max in [1, 2, 1, 4] {
+            coord.reconfigure(test_config(max, 0));
+        }
+        assert_eq!(coord.available_main_permits(), 1);
+        let fourth = coord.try_acquire().unwrap();
+        assert!(coord.try_acquire().is_none());
+        drop(held);
+        drop(fourth);
+        assert_eq!(coord.available_main_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn reload_disabled_budget_tracks_creates_across_enable_disable() {
+        let coord = PoolCoordinator::new("resize".into(), test_config(0, 2));
+        assert!(!coord.is_enabled());
+        let mut held: Vec<_> = (0..3).map(|_| coord.try_acquire().unwrap()).collect();
+        assert!(held.iter().all(|p| !p.is_reserve));
+        coord.reconfigure(test_config(1, 0));
+        assert!(coord.is_enabled());
+        assert!(coord.try_acquire().is_none());
+        coord.reconfigure(test_config(0, 0));
+        held.push(coord.try_acquire().unwrap());
+        coord.reconfigure(test_config(2, 0));
+        assert_eq!(coord.total_connections(), 4);
+        assert!(coord.try_acquire().is_none());
+        drop(held);
+        assert_eq!(coord.available_main_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn reload_pending_reserve_grants_count_toward_shared_shrink_budget() {
+        let coord = PoolCoordinator::new("resize".into(), test_config(2, 2));
+        let mains: Vec<_> = (0..2).map(|_| coord.try_acquire().unwrap()).collect();
+        let first = coord.try_reserve_grant().unwrap();
+        let second = coord.try_reserve_grant().unwrap();
+        // Grants are issued reservations even before their receiver accepts them.
+        assert_eq!(coord.reserve_in_use(), 0);
+        coord.reconfigure(test_config(1, 1));
+        drop(mains);
+        assert_eq!(coord.available_main_permits(), 0);
+        assert!(coord.try_acquire().is_none());
+        assert!(coord.try_reserve_grant().is_none());
+        drop(first);
+        let main = coord.try_acquire().unwrap();
+        assert!(coord.try_reserve_grant().is_none());
+        drop(second);
+        let reserve = coord.try_reserve_grant().unwrap().into_permit();
+        assert_eq!(coord.total_connections(), 2);
+        assert_eq!(coord.reserve_in_use(), 1);
+        drop(main);
+        drop(reserve);
+        assert_eq!(coord.total_connections(), 0);
+        assert_eq!(coord.reserve_in_use(), 0);
+        assert_eq!(coord.available_main_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_reserve_to_main_upgrade_preserves_total_after_reshape() {
+        let coord = PoolCoordinator::new("resize".into(), test_config(1, 2));
+        let main = coord.try_acquire().unwrap();
+        let mut first = coord.try_reserve_grant().unwrap().into_permit();
+        let second = coord.try_reserve_grant().unwrap().into_permit();
+        coord.reconfigure(test_config(3, 0));
+        assert!(coord.try_acquire().is_none());
+        assert!(first.try_upgrade_to_main());
+        assert!(!first.is_reserve);
+        assert_eq!(coord.total_connections(), 3);
+        assert_eq!(coord.reserve_in_use(), 1);
+        assert!(coord.try_acquire().is_none());
+        drop(second);
+        let replacement = coord.try_acquire().unwrap();
+        assert!(coord.try_acquire().is_none());
+        drop((main, first, replacement));
+        assert_eq!(coord.available_main_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn reload_growth_wakes_main_and_newly_enabled_reserve_waiters() {
+        for reserve_growth in [false, true] {
+            let mut config = test_config(1, 0);
+            config.reserve_pool_timeout_ms = 30_000;
+            let coord = PoolCoordinator::new("resize".into(), config);
+            let main = coord.try_acquire().unwrap();
+            let waiter_coord = coord.clone();
+            let waiter = tokio::spawn(async move {
+                waiter_coord
+                    .acquire("resize", "waiter", &NoOpEviction)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            if reserve_growth {
+                config.reserve_pool_size = 1;
+            } else {
+                config.max_db_connections = 2;
+            }
+            coord.reconfigure(config);
+            let granted = tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("reload must wake before the old 30-second deadline")
+                .unwrap()
+                .unwrap();
+            assert_eq!(granted.is_reserve, reserve_growth);
+            drop((main, granted));
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_parallel_retirement_claims_close_only_the_excess() {
+        let coord = PoolCoordinator::new("resize".into(), test_config(16, 0));
+        let held: Vec<_> = (0..16).map(|_| coord.try_acquire().unwrap()).collect();
+        coord.reconfigure(test_config(2, 0));
+        let barrier = Arc::new(std::sync::Barrier::new(17));
+        let tasks: Vec<_> = held
+            .into_iter()
+            .map(|mut permit| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let claimed = permit.claim_retirement();
+                    barrier.wait();
+                    (claimed, permit)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let held: Vec<_> = tasks.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(held.iter().filter(|(claimed, _)| *claimed).count(), 14);
+        assert_eq!(
+            coord.total_connections(),
+            16,
+            "claims must retain physical accounting"
+        );
+        assert!(coord.try_acquire().is_none());
+        drop(held);
+        assert_eq!(coord.available_main_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn reload_growth_with_pending_retirements_does_not_duplicate_slots() {
+        let coord = PoolCoordinator::new("resize".into(), test_config(3, 0));
+        let mut first = coord.try_acquire().unwrap();
+        let mut second = coord.try_acquire().unwrap();
+        let mut survivor = coord.try_acquire().unwrap();
+        coord.reconfigure(test_config(1, 0));
+        assert!(first.claim_retirement());
+        assert!(second.claim_retirement());
+        assert!(!survivor.claim_retirement());
+        coord.reconfigure(test_config(4, 0));
+        let fresh = coord.try_acquire().unwrap();
+        assert!(coord.try_acquire().is_none());
+        drop((first, second));
+        assert_eq!(coord.available_main_permits(), 2);
+        drop((survivor, fresh));
+        assert_eq!(coord.available_main_permits(), 4);
     }
 
     #[tokio::test]
@@ -1239,7 +1580,7 @@ mod tests {
         let _m2 = coord.try_acquire().unwrap();
         let _m3 = coord.try_acquire().unwrap();
         let eviction = NoOpEviction;
-        let reserve_permit = coord
+        let mut reserve_permit = coord
             .acquire("testdb", "burster", &eviction)
             .await
             .expect("reserve grant under main saturation");
@@ -1255,7 +1596,7 @@ mod tests {
 
         // Upgrade: reserve slot returns to the reserve semaphore,
         // db_semaphore loses one permit, total_connections unchanged.
-        let ok = coord.try_upgrade_reserve_to_main();
+        let ok = reserve_permit.try_upgrade_to_main();
         assert!(ok, "upgrade must succeed when main has headroom");
         assert_eq!(
             coord.reserve_in_use(),
@@ -1268,11 +1609,8 @@ mod tests {
             "total_connections is the same backend, must not change"
         );
 
-        // The upgraded permit is still held by reserve_permit. If we
-        // flip is_reserve = false, Drop will release into main_semaphore.
-        let mut p = reserve_permit;
-        p.is_reserve = false;
-        drop(p);
+        assert!(!reserve_permit.is_reserve);
+        drop(reserve_permit);
         assert_eq!(coord.total_connections(), 1);
         // Reserve semaphore should be fully replenished.
         assert_eq!(coord.reserve_in_use(), 0);
@@ -1285,13 +1623,13 @@ mod tests {
         let coord = PoolCoordinator::new("test_db".to_string(), test_config(1, 1));
         let _main = coord.try_acquire().unwrap();
         let eviction = NoOpEviction;
-        let _reserve = coord.acquire("testdb", "user", &eviction).await.unwrap();
+        let mut reserve = coord.acquire("testdb", "user", &eviction).await.unwrap();
         assert_eq!(coord.reserve_in_use(), 1);
         assert_eq!(coord.total_connections(), 2);
 
         // Main is 1/1 — no room for upgrade.
         assert!(
-            !coord.try_upgrade_reserve_to_main(),
+            !reserve.try_upgrade_to_main(),
             "upgrade must fail when main is saturated"
         );
         // State unchanged.

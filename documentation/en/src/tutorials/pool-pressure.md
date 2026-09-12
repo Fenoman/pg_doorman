@@ -456,10 +456,13 @@ previous section is the only limit. With `max_db_connections = 80`,
 only 80 can exist at once regardless of pool configuration, and the
 coordinator decides which pools may grow.
 
-When `max_db_connections = 0` (the default), the coordinator does not
-exist. When set, every plain-mode mechanism described above still runs;
-the coordinator adds a single permit acquisition step on the
-new-connection path. Idle reuse never touches the coordinator.
+When `max_db_connections = 0` (the default), database admission is unlimited.
+The coordinator still accounts for connections so `RELOAD` can enable a shared
+limit across existing pool generations. Every plain-mode mechanism described
+above still runs. New connections acquire a budget permit under a short lock;
+idle reuse normally checks only an atomic retirement hint. After a limit reduction,
+excess idle connections retire before another lease. See the
+[reload contract](../reference/pool.md#max_db_connections).
 
 ### What the coordinator adds
 
@@ -681,8 +684,8 @@ wait to re-acquire the burst gate.
               | slot acquired
               v
    +---------------------------+
-   | JIT coordinator acquire   |  only when max_db_connections > 0
-   |  fast: try_acquire()      |  non-blocking CAS
+   | JIT coordinator acquire   |  tracks creates even when cap is disabled
+   |  fast: try_acquire()      |  short budget lock
    |  slow: release gate slot  |  wait on coordinator (evict/return)
    |        → re-acquire slot  |  then proceed to create
    +------------+--------------+
@@ -696,19 +699,16 @@ wait to re-acquire the burst gate.
 
 The phases are numbered identically to plain mode. The coordinator
 acquire is **not** a numbered phase: it runs inside the burst gate
-slot when `max_db_connections > 0`. In plain mode it does not run.
+slot. With `max_db_connections = 0`, it accounts for the connection without
+applying database-level pressure.
 
 ### When the coordinator is configured but the cap is not reached
 
 If `max_db_connections = 80` and current usage is 30, the coordinator's
-phase A always succeeds. Phases B–E never run. The behaviour is
-identical to plain mode plus one atomic semaphore increment per new
-connection. The hot path (idle reuse) does not touch the coordinator at
-all, so it has no measurable cost there. Only *new* connection creation
-does, and only by the duration of one atomic operation.
-
-By design, the coordinator is a *cap*, not a *queue*: it costs you
-only when you bump against the limit.
+phase A succeeds while that headroom remains available. The reserve,
+eviction and wait phases do not run. New connection admission takes a short
+budget lock; ordinary idle reuse checks an atomic retirement hint without
+taking that lock.
 
 ### Background replenish under coordinator
 
@@ -730,7 +730,7 @@ not supported.
 | `scaling_warm_pool_ratio` | `20` (percent) | `general`, per-pool | Threshold below which connections are created without anticipation. Below `pool_size × ratio / 100`, every new connection request goes straight to `connect()`. |
 | `scaling_fast_retries` | `10` | `general`, per-pool | Number of `yield_now` spin retries before entering the direct-handoff anticipation phase. Each retry costs ~1–5 µs. |
 | `scaling_max_parallel_creates` | `2` | `general` | Hard cap on concurrent backend `connect()` calls per pool. Tasks above the cap wait for an idle return or a peer create completion. Must be `>= 1`. |
-| `max_db_connections` | unset (disabled) | per-pool | Cap on total backend connections to a database across all user pools. When unset, the coordinator does not exist. |
+| `max_db_connections` | unset (disabled) | per-pool | Cap on total backend connections to a database across all user pools and generations. When unset, database admission is unlimited. |
 | `min_connection_lifetime` | `30000` (ms) | per-pool | Minimum age of an idle connection before the coordinator may evict it for another pool. The 30-second floor suppresses cyclic reconnect between peer pools that keep stealing slots from each other. |
 | `reserve_pool_size` | `0` (disabled) | per-pool | Extra coordinator permits above `max_db_connections`, granted by priority when the main pool is exhausted. |
 | `reserve_pool_timeout` | `3000` (ms) | per-pool | Maximum coordinator wait time before falling through to the reserve pool. |
