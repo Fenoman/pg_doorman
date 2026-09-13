@@ -475,7 +475,10 @@ fields:
       config:
         en: "Time to wait for active transactions to finish during graceful shutdown."
         ru: "Время ожидания завершения активных транзакций при корректном завершении работы."
-      doc: "During graceful shutdown (SIGTERM), pg_doorman waits up to this long for in-flight transactions to complete before forcibly closing connections."
+      doc: |-
+        Maximum time to wait for in-flight transactions during graceful shutdown or binary upgrade through `SIGINT` or `SIGUSR2`. See [Signals](../operations/signals.md) for how `SIGINT` depends on the launch mode.
+
+        `SIGTERM` exits immediately and does not wait for `shutdown_timeout`.
       default: "10000 (10 sec)"
 
     proxy_copy_data_timeout:
