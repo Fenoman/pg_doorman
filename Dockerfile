@@ -1,25 +1,35 @@
+FROM gcr.io/distroless/cc-debian13@sha256:9b615fff20e1a4fad29c2b30562580b212c7dd5e2225236735cca0070ed11c78 AS runtime-base
+
 FROM rust:1.88.0-slim-trixie AS builder
 
 RUN apt-get update && \
-    apt-get install -y build-essential pkg-config libssl-dev perl
+    apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev perl
+
+# Keep the complete Debian libc6 payload and its package inventory together.
+# The pinned distroless release still contains u3; u4 fixes CVE-2026-5450 and
+# CVE-2026-5928. Remove this overlay when updating to a base that includes u4.
+ARG LIBC6_VERSION=2.41-12+deb13u4
+RUN apt-get update && \
+    mkdir -p /tmp/runtime-debs /runtime-root/var/lib/dpkg/status.d && \
+    cd /tmp/runtime-debs && \
+    apt-get download "libc6=${LIBC6_VERSION}" && \
+    dpkg-deb --extract libc6_*.deb /runtime-root && \
+    dpkg-deb --control libc6_*.deb /tmp/libc6-control && \
+    cp /tmp/libc6-control/control /runtime-root/var/lib/dpkg/status.d/libc6 && \
+    cp /tmp/libc6-control/md5sums /runtime-root/var/lib/dpkg/status.d/libc6.md5sums
+
+# Embed the resolved Rust dependency inventory so image scanners cover both
+# application binaries as well as the operating-system packages.
+RUN cargo install cargo-auditable --version 0.7.5 --locked
 
 COPY . /app
 WORKDIR /app
-RUN cargo build --release
+RUN cargo auditable build --locked --release --bin pg_doorman --bin patroni_proxy
 
 # The runtime stage is distroless and has no shell, so everything that used to
 # be an in-image `RUN` has to be materialised here and copied in as files.
-#
-# Trivy on the old debian:*-slim runtime reported ~248 vulnerabilities
-# (77 HIGH/CRITICAL), none of them fixable: `apt-get upgrade` had already
-# pulled everything the security stream offers, and the remainder are
-# `will_not_fix`/`affected` entries against packages we never call —
-# postgresql-client alone accounted for +72 CVEs (24 HIGH/CRITICAL), and it
-# was only ever in the image for manual `psql` debugging. distroless/cc keeps
-# libc6, libssl3t64, libgcc-s1, zlib1g, libzstd1 and ca-certificates, which is
-# exactly the closure `ldd` reports for both binaries, and nothing else.
-COPY --from=gcr.io/distroless/cc-debian13:latest /etc/passwd /distroless/passwd
-COPY --from=gcr.io/distroless/cc-debian13:latest /etc/group /distroless/group
+COPY --from=runtime-base /etc/passwd /distroless/passwd
+COPY --from=runtime-base /etc/group /distroless/group
 
 # Keep uid/gid 999 rather than adopting distroless' own `nonroot` (65532):
 # operators already mount read-only configs owned by 999, and the daemon-mode
@@ -32,8 +42,9 @@ RUN cp /distroless/passwd /rootfs-passwd && \
     echo 'pgdoorman:x:999:' >> /rootfs-group && \
     install -d -m 0755 -o 999 -g 999 /rootfs-etc-pg_doorman
 
-FROM gcr.io/distroless/cc-debian13:latest
+FROM runtime-base
 
+COPY --from=builder /runtime-root/ /
 COPY --from=builder /rootfs-passwd /etc/passwd
 COPY --from=builder /rootfs-group /etc/group
 COPY --from=builder --chown=999:999 /rootfs-etc-pg_doorman /etc/pg_doorman
