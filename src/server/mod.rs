@@ -27,6 +27,9 @@ pub use prepared_statement_cache::{
 /// re-export the graceful-Terminate drain helper used by
 /// `app::server::binary_upgrade_and_shutdown`.
 pub use server_backend::wait_terminate_tasks_drained;
+/// Lets client-side tests shorten the drain of a query abandoned by its client.
+#[cfg(test)]
+pub(crate) use server_backend::AbandonedQueryTimeouts;
 pub use server_backend::Server;
 /// exported so client-side BufReader sites can mirror the
 /// backend `BufStream` capacity without duplicating the constant.

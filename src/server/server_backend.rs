@@ -143,6 +143,28 @@ const GRACEFUL_TERMINATE_TASK_TIMEOUT: Duration = Duration::from_secs(1);
 /// production traffic.
 pub(crate) const HOUSEKEEPING_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Deadlines for a query whose client disconnected while the pooler was
+/// waiting for its result. The backend stays checked out until the query
+/// ends, so its pool slot is not handed to another client while PostgreSQL
+/// still runs the abandoned query.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AbandonedQueryTimeouts {
+    /// How long the query may keep running before the pooler cancels it.
+    /// Short statements finish within it, keep the commit outcome they would
+    /// have without a pooler, and the backend is reused.
+    pub(crate) finish: Duration,
+    /// How long a canceled query then gets to reach ReadyForQuery before the
+    /// backend is closed anyway.
+    pub(crate) after_cancel: Duration,
+}
+
+impl AbandonedQueryTimeouts {
+    pub(crate) const DEFAULT: Self = Self {
+        finish: Duration::from_secs(1),
+        after_cancel: Duration::from_secs(10),
+    };
+}
+
 /// Historical iServ default for the per-checkin release query. Releases
 /// session-scoped state that PostgreSQL does not clear between transactions:
 /// advisory locks plus any session variables stored by the `pg_variables`
@@ -547,6 +569,10 @@ pub struct Server {
     /// construction path that does not go through the pool builder
     /// (e.g. ad-hoc admin probes, tests).
     intercept_discard_all: bool,
+
+    /// Deadlines for draining a query abandoned by its client, see
+    /// [`AbandonedQueryTimeouts`]. A field so tests can shorten them.
+    pub(crate) abandoned_query_timeouts: AbandonedQueryTimeouts,
 }
 
 impl std::fmt::Display for Server {
@@ -1068,6 +1094,120 @@ impl Server {
             }
         }
         self.finish_internal_round_trip();
+    }
+
+    /// Settles a backend whose client disconnected while the backend was
+    /// still executing the client's request. The backend, and with it its
+    /// pool slot, stays checked out until PostgreSQL stopped running the
+    /// abandoned query, so the pool never runs more queries than its size.
+    ///
+    /// - A query that ends within `finish` is drained and the backend passes
+    ///   the regular check-in (ROLLBACK, session cleanup, release_query) and
+    ///   is reused.
+    /// - A longer query is canceled. Once it has ended the backend is closed:
+    ///   the CancelRequest travels over its own connection and may reach
+    ///   PostgreSQL only after the next client's query started.
+    /// - A backend that is still busy `after_cancel` later, stopped mid-COPY
+    ///   or mid-Flush pipeline, or failed while draining is closed.
+    ///
+    /// `awaiting_response` is true when the request was sent and none of its
+    /// response has been read, false after a failed write to the client,
+    /// when only an unfinished response is left to drain.
+    pub(crate) async fn recover_after_client_gone(&mut self, awaiting_response: bool) {
+        let timeouts = self.abandoned_query_timeouts;
+        let host = self.address.host.clone();
+        let port = self.address.port;
+        let server_tls = Arc::clone(&self.address.server_tls);
+        let pool_name = self.address.pool_name.clone();
+        let username = self.address.username.clone();
+        let process_id = self.process_id;
+        let secret_key = self.secret_key;
+        let connected_with_tls = self.connected_with_tls;
+        let cancel_sent = std::sync::atomic::AtomicBool::new(false);
+
+        self.begin_internal_round_trip();
+        let drained = {
+            let drain = tokio::time::timeout(
+                timeouts.finish + timeouts.after_cancel,
+                self.discard_until_ready(awaiting_response),
+            );
+            tokio::pin!(drain);
+            let cancel_after_grace = async {
+                tokio::time::sleep(timeouts.finish).await;
+                cancel_sent.store(true, Ordering::Relaxed);
+                warn!(
+                    "[{username}@{pool_name}] canceling query abandoned by its client pid={process_id}"
+                );
+                if let Err(err) = startup_cancel::cancel(
+                    &host,
+                    port,
+                    process_id,
+                    secret_key,
+                    &server_tls,
+                    connected_with_tls,
+                    &pool_name,
+                )
+                .await
+                {
+                    warn!(
+                        "[{username}@{pool_name}] cancel of abandoned query failed pid={process_id}: {err}"
+                    );
+                }
+            };
+            tokio::select! {
+                drained = &mut drain => drained,
+                () = cancel_after_grace => drain.await,
+            }
+        };
+        self.finish_internal_round_trip();
+
+        let close_reason = match drained {
+            Err(_) => Some(format!(
+                "query abandoned by its client still running {:?} after cancel",
+                timeouts.after_cancel
+            )),
+            Ok(Err(err)) => Some(format!(
+                "failed to drain the response of a query abandoned by its client: {err}"
+            )),
+            Ok(Ok(())) if cancel_sent.load(Ordering::Relaxed) => {
+                Some("canceled a query abandoned by its client".to_string())
+            }
+            Ok(Ok(())) if self.in_copy_mode() || self.is_async() => Some(
+                "client disconnected inside COPY or a Flush pipeline; only closing the backend \
+                 rolls the unfinished work back"
+                    .to_string(),
+            ),
+            Ok(Ok(())) => None,
+        };
+        if let Some(reason) = close_reason {
+            if !self.bad {
+                self.mark_bad(&reason);
+            }
+            return;
+        }
+        debug!(
+            "[{}@{}] query abandoned by its client finished pid={}, returning backend",
+            self.address.username, self.address.pool_name, self.process_id
+        );
+        if let Err(err) = self.finalize_checkin().await {
+            if !self.bad {
+                self.mark_bad(&format!(
+                    "check-in after a query abandoned by its client failed: {err}"
+                ));
+            }
+        }
+    }
+
+    /// Reads and discards backend responses until the backend has nothing
+    /// more to send for the current request: ReadyForQuery, the last reply
+    /// of a Flush batch, or CopyInResponse.
+    async fn discard_until_ready(&mut self, awaiting_response: bool) -> Result<(), Error> {
+        let mut awaiting_response = awaiting_response;
+        while awaiting_response || self.is_data_available() {
+            self.recv(&mut tokio::io::sink(), None).await?;
+            awaiting_response = false;
+        }
+        Ok(())
     }
 
     /// Returns true if the server is in async mode (using Flush instead of Sync).
@@ -2695,6 +2835,7 @@ impl Server {
                         release_only_ok_cleanup_metric: None,
                         release_cleanup_pending: false,
                         intercept_discard_all: true,
+                        abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
                         internal_round_trip_in_flight: false,
                     };
                     server.stats.update_process_id(process_id);
@@ -2911,6 +3052,12 @@ impl Server {
         self.process_id = pid;
     }
 
+    /// Test-only mutator for the cancel key PostgreSQL sent at startup.
+    #[cfg(test)]
+    pub(crate) fn test_set_secret_key(&mut self, secret_key: i32) {
+        self.secret_key = secret_key;
+    }
+
     /// Test-only accessor for `release_cleanup_pending`, used by tests in
     /// other modules (the field itself is private to this file).
     #[cfg(test)]
@@ -3019,6 +3166,7 @@ impl Server {
             release_only_ok_cleanup_metric: None,
             release_cleanup_pending: false,
             intercept_discard_all: true,
+            abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
         };
         (server, b)
     }

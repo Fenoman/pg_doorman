@@ -491,6 +491,15 @@ enum TransactionAction {
     Break,
 }
 
+/// Why waiting for a backend response ended without one.
+enum ServerWaitError {
+    /// Reading from the backend failed; its protocol state is unknown.
+    Server(Error),
+    /// The client disconnected. The backend is already settled: back at a
+    /// clean check-in state, or marked bad.
+    ClientGone(Error),
+}
+
 enum DeferredExtendedBeginState {
     Parsed {
         parse: BytesMut,
@@ -1745,7 +1754,8 @@ where
         // client disconnects; HOUSEKEEPING_TIMEOUT applies only to pooler work.
         match self.recv_server_response_or_client_disconnect(server).await {
             Ok(response) => Ok(response),
-            Err(err) => {
+            Err(ServerWaitError::ClientGone(err)) => Err(err),
+            Err(ServerWaitError::Server(err)) => {
                 server.mark_bad(&format!("COPY FROM completion recv failed: {err}"));
                 Err(err)
             }
@@ -1815,14 +1825,16 @@ where
             match write_all_flush_timeout(&mut self.write, &response, write_timeout).await {
                 Ok(_) => self.stats.active_idle(),
                 Err(err) => {
-                    server.wait_available().await;
-                    server.mark_bad(
-                        format!(
-                            "failed to flush CopyDone response to client {}: {:?}",
-                            self.addr, err
-                        )
-                        .as_str(),
+                    warn!(
+                        "[{}@{} #c{}] write of COPY completion to client failed pid={}: {err}",
+                        self.username,
+                        self.pool_name,
+                        self.connection_id,
+                        server.get_process_id()
                     );
+                    if !server.is_bad() {
+                        server.recover_after_client_gone(false).await;
+                    }
                     return Err(err);
                 }
             }
@@ -2978,6 +2990,13 @@ where
                                 }
                             }
                             let client_timeout_error = backend_timeout_client_error(&err);
+                            // A healthy backend returns to the pool when the
+                            // Object drops, and Client::drop no longer owns
+                            // it: mark it idle now, or SHOW POOLS keeps
+                            // counting it as serving a client.
+                            if !server.is_bad() {
+                                server.stats.idle(0);
+                            }
                             self.release_after_inner_handler_error();
                             if let Some((message, code)) = client_timeout_error {
                                 let _ = server;
@@ -3130,7 +3149,7 @@ where
     async fn recv_server_response_or_client_disconnect(
         &mut self,
         server: &mut Server,
-    ) -> Result<BytesMut, Error> {
+    ) -> Result<BytesMut, ServerWaitError> {
         let defer_large_messages = self.prepared.skipped_parses.len()
             > self
                 .prepared
@@ -3145,7 +3164,8 @@ where
                         Some(&mut self.server_parameters),
                         defer_large_messages,
                     )
-                    .await;
+                    .await
+                    .map_err(ServerWaitError::Server);
             }
 
             tokio::select! {
@@ -3164,26 +3184,27 @@ where
                             Some(&mut self.server_parameters),
                             defer_large_messages,
                         )
-                        .await;
+                        .await
+                        .map_err(ServerWaitError::Server);
                 }
                 client_read = self.read.fill_buf() => {
-                    match client_read {
-                        Ok([]) => {
-                            server.mark_bad("client disconnected while waiting for server response");
-                            return Err(Error::SocketError(
-                                "client disconnected while waiting for server response".to_string(),
-                            ));
-                        }
+                    // PostgreSQL does not notice a closed socket until it
+                    // writes, so the abandoned query would keep running
+                    // outside the pool size. Keep the backend until it ended.
+                    let err = match client_read {
+                        Ok([]) => Error::SocketError(
+                            "client disconnected while waiting for server response".to_string(),
+                        ),
                         Ok(_) => {
                             watch_client = false;
+                            continue;
                         }
-                        Err(err) => {
-                            server.mark_bad("client read failed while waiting for server response");
-                            return Err(Error::SocketError(format!(
-                                "Error reading from client while waiting for server response: {err:?}"
-                            )));
-                        }
-                    }
+                        Err(err) => Error::SocketError(format!(
+                            "Error reading from client while waiting for server response: {err:?}"
+                        )),
+                    };
+                    server.recover_after_client_gone(true).await;
+                    return Err(ServerWaitError::ClientGone(err));
                 }
             }
         }
@@ -3213,7 +3234,8 @@ where
         loop {
             let mut response = match self.recv_server_response_or_client_disconnect(server).await {
                 Ok(msg) => msg,
-                Err(err) => {
+                Err(ServerWaitError::ClientGone(err)) => return Err(err),
+                Err(ServerWaitError::Server(err)) => {
                     if !server.is_bad() {
                         server.wait_available().await;
                     }
@@ -3306,33 +3328,14 @@ where
                     self.connection_id,
                     server.get_process_id()
                 );
-                if server.is_data_available() || server.is_async() || server.in_copy_mode() {
-                    server.mark_bad(
-                        format!(
-                            "failed to flush response to client {}: {:?}",
-                            self.addr, err_write
-                        )
-                        .as_str(),
-                    );
-                } else if !server.is_bad() {
-                    server.wait_available().await;
-                    // The backend produced a complete response and is parked
-                    // at ReadyForQuery - only the client write failed. Run
-                    // the checkin cleanup (including the release query) so
-                    // the healthy backend can be reused instead of being
-                    // closed by the recycle-safety check for an unconfirmed
-                    // release round trip. A cleanup failure marks the
-                    // backend bad; a cancellation mid-cleanup leaves the
-                    // pending flag armed so Object::drop closes the backend.
-                    if !server.is_bad() {
-                        if let Err(cleanup_err) = server.finalize_checkin().await {
-                            warn!(
-                                "finalize_checkin after client write failure failed pid={}: {}",
-                                server.get_process_id(),
-                                cleanup_err
-                            );
-                        }
-                    }
+                // The rest of the response is drained, a query still
+                // running after the grace period is canceled, and the
+                // backend passes the regular check-in (including the
+                // release query) or is closed. Closing it mid-response would
+                // leave a statement that pauses between flushes running on
+                // PostgreSQL outside the pool size.
+                if !server.is_bad() {
+                    server.recover_after_client_gone(false).await;
                 }
                 return Err(err_write);
             }
@@ -4578,10 +4581,9 @@ mod client_response_write_timeout_tests {
             "raw-socket readable() is blind to BufStream-buffered response bytes"
         );
         assert!(
-            helper_body.contains(
-                "server.mark_bad(\"client disconnected while waiting for server response\")"
-            ),
-            "client EOF/RST while waiting for backend bytes must evict the checked-out backend"
+            helper_body.contains("server.recover_after_client_gone(true).await"),
+            "client EOF/RST while waiting for backend bytes must keep the backend until the \
+             abandoned query ended, not free its slot while PostgreSQL still runs it"
         );
         assert!(
             helper_body.contains("watch_client = false"),
@@ -4624,49 +4626,6 @@ mod client_response_write_timeout_tests {
     }
 
     #[test]
-    fn relay_response_evicts_backend_when_failed_client_write_may_leave_unread_backend_bytes() {
-        let src = include_str!("transaction.rs");
-        let impl_src = {
-            let tests_start = src
-                .find("\n#[cfg(test)]")
-                .expect("at least one test module should follow the impl");
-            &src[..tests_start]
-        };
-        let relay_start = impl_src
-            .find("pub(crate) async fn relay_response(")
-            .expect("relay_response should exist");
-        let relay_body = &impl_src[relay_start..];
-        let write_error_start = relay_body
-            .find("if let Err(err_write)")
-            .expect("relay_response should handle client write failures");
-        let write_error_body = &relay_body[write_error_start..];
-        let write_error_end = write_error_body
-            .find("return Err(err_write);")
-            .expect("client write failure branch should stop the roundtrip");
-        let write_error_body = &write_error_body[..write_error_end];
-
-        assert!(
-            relay_body.contains(
-                "server.is_data_available() || server.is_async() || server.in_copy_mode()"
-            ),
-            "failed client writes must mark the backend bad when unread or async/COPY data may remain"
-        );
-        let mark_bad_idx = write_error_body
-            .find("server.mark_bad(")
-            .expect("failed client writes with unread data must mark the backend bad");
-        if let Some(wait_idx) = write_error_body.find("server.wait_available().await") {
-            assert!(
-                mark_bad_idx < wait_idx,
-                "failed client writes with unread backend data must mark bad before any drain"
-            );
-        }
-        assert!(
-            relay_body.contains("return Err(err_write);"),
-            "failed client writes must stop the client roundtrip instead of continuing to pin a backend"
-        );
-    }
-
-    #[test]
     fn relay_response_skips_drain_when_recv_error_already_marked_backend_bad() {
         let src = include_str!("transaction.rs");
         let impl_src = {
@@ -4680,7 +4639,7 @@ mod client_response_write_timeout_tests {
             .expect("relay_response should exist");
         let relay_body = &impl_src[relay_start..];
         let err_start = relay_body
-            .find("Err(err) =>")
+            .find("Err(ServerWaitError::Server(err)) =>")
             .expect("relay_response should handle receive errors");
         let err_body = &relay_body[err_start..];
         let err_end = err_body
@@ -5676,7 +5635,7 @@ mod relay_response_client_write_failure_tests {
     use crate::client::buffer_pool::PooledBuffer;
     use crate::client::core::{PreparedStatementState, SkippedParse};
     use crate::pool::PoolIdentifier;
-    use crate::server::ServerParameters;
+    use crate::server::{AbandonedQueryTimeouts, ServerParameters};
     use crate::stats::ClientStats;
     use dashmap::DashMap;
     use std::pin::Pin;
@@ -6166,6 +6125,13 @@ mod relay_response_client_write_failure_tests {
         let mut client =
             test_client_with_reader_and_writer(tokio::io::empty(), RecordingWriter::default());
         let (mut server, _peer) = Server::test_silent_socket();
+        // The backend ignores the cancel too: the pooler gives up after the
+        // cancel budget instead of waiting for the COPY forever.
+        let _cancel_listener = cancel_listener_for(&mut server).await;
+        server.abandoned_query_timeouts = AbandonedQueryTimeouts {
+            finish: Duration::from_millis(20),
+            after_cancel: Duration::from_millis(200),
+        };
         server.in_copy_mode = true;
         let done = BytesMut::from(&b"c\0\0\0\x04"[..]);
         let err = tokio::time::timeout(
@@ -6179,6 +6145,214 @@ mod relay_response_client_write_failure_tests {
         assert!(matches!(err, Error::SocketError(_)));
         assert!(server.is_bad());
         assert!(client.write.bytes.is_empty());
+    }
+
+    /// Points the cancel address of `server` at a local listener, so a test
+    /// can see whether the pooler sent a CancelRequest for the backend.
+    async fn cancel_listener_for(server: &mut Server) -> tokio::net::TcpListener {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        server.address.host = "127.0.0.1".to_string();
+        server.address.port = listener.local_addr().unwrap().port();
+        listener
+    }
+
+    /// Reads one simple Query on the backend side of the test socket and
+    /// returns its SQL without the trailing NUL.
+    async fn read_simple_query(peer: &mut tokio::net::UnixStream) -> Vec<u8> {
+        let mut header = [0_u8; 5];
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], b'Q');
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        let mut body = vec![0_u8; (len - 4) as usize];
+        peer.read_exact(&mut body).await.unwrap();
+        body.pop();
+        body
+    }
+
+    /// The ErrorResponse PostgreSQL sends when a CancelRequest interrupts
+    /// the running statement.
+    fn query_canceled_error() -> Vec<u8> {
+        let mut fields = Vec::new();
+        for (code, value) in [
+            (b'S', "ERROR"),
+            (b'V', "ERROR"),
+            (b'C', "57014"),
+            (b'M', "canceling statement due to user request"),
+        ] {
+            fields.push(code);
+            fields.extend_from_slice(value.as_bytes());
+            fields.push(0);
+        }
+        fields.push(0);
+        let mut message = vec![b'E'];
+        message.extend_from_slice(&(4 + fields.len() as i32).to_be_bytes());
+        message.extend_from_slice(&fields);
+        message
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_mid_query_returns_backend_once_query_finishes() {
+        let mut client =
+            test_client_with_reader_and_writer(tokio::io::empty(), RecordingWriter::default());
+        let (mut server, mut peer) = Server::test_silent_socket();
+        let cancel_listener = cancel_listener_for(&mut server).await;
+        server.abandoned_query_timeouts = AbandonedQueryTimeouts {
+            finish: Duration::from_secs(5),
+            after_cancel: Duration::from_secs(5),
+        };
+        // The abandoned statement finishes on its own, inside a transaction
+        // block that check-in must roll back before the backend is reused.
+        let backend = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            peer.write_all(&[&b"C\0\0\0\x0dSELECT 1\0"[..], b"Z\0\0\0\x05T"].concat())
+                .await
+                .unwrap();
+            let cleanup =
+                tokio::time::timeout(Duration::from_secs(2), read_simple_query(&mut peer))
+                    .await
+                    .ok();
+            if cleanup.is_some() {
+                peer.write_all(&[&b"C\0\0\0\x0dROLLBACK\0"[..], b"Z\0\0\0\x05I"].concat())
+                    .await
+                    .unwrap();
+            }
+            (cleanup, peer)
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(3), client.relay_response(&mut server))
+            .await
+            .expect("relay must end once the abandoned query finished")
+            .expect_err("a vanished client still ends the relay with an error");
+        let (cleanup, _peer) = backend.await.unwrap();
+
+        assert!(matches!(err, Error::SocketError(_)));
+        assert!(
+            !server.is_bad(),
+            "a backend whose abandoned query finished must be reused, not closed"
+        );
+        assert_eq!(cleanup.as_deref(), Some(&b"ROLLBACK;"[..]));
+        assert!(!server.in_transaction());
+        assert!(
+            client.write.bytes.is_empty(),
+            "nothing may be written to a vanished client"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cancel_listener.accept())
+                .await
+                .is_err(),
+            "a query that finished within the grace period must not be canceled"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_cancels_long_query_before_releasing_backend() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut client =
+            test_client_with_reader_and_writer(tokio::io::empty(), RecordingWriter::default());
+        let (mut server, mut peer) = Server::test_silent_socket();
+        let cancel_listener = cancel_listener_for(&mut server).await;
+        server.test_set_process_id(4242);
+        server.test_set_secret_key(77);
+        server.abandoned_query_timeouts = AbandonedQueryTimeouts {
+            finish: Duration::from_millis(50),
+            after_cancel: Duration::from_secs(5),
+        };
+        // The backend answers only once the CancelRequest arrives, like a
+        // query that would otherwise keep running on PostgreSQL.
+        let query_ended = Arc::new(AtomicBool::new(false));
+        let backend = tokio::spawn({
+            let query_ended = Arc::clone(&query_ended);
+            async move {
+                let request = tokio::time::timeout(Duration::from_secs(3), async {
+                    let (mut conn, _) = cancel_listener.accept().await.unwrap();
+                    let mut request = [0_u8; 16];
+                    conn.read_exact(&mut request).await.unwrap();
+                    request
+                })
+                .await
+                .ok();
+                if request.is_some() {
+                    query_ended.store(true, Ordering::SeqCst);
+                    peer.write_all(&[query_canceled_error(), b"Z\0\0\0\x05I".to_vec()].concat())
+                        .await
+                        .unwrap();
+                }
+                (request, peer)
+            }
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(5), client.relay_response(&mut server))
+            .await
+            .expect("relay must end once the canceled query stopped")
+            .expect_err("a vanished client still ends the relay with an error");
+        let released_after_query_ended = query_ended.load(Ordering::SeqCst);
+        let (request, _peer) = backend.await.unwrap();
+
+        assert!(matches!(err, Error::SocketError(_)));
+        assert_eq!(
+            request,
+            Some([0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 16, 146, 0, 0, 0, 77]),
+            "the abandoned query must be canceled on PostgreSQL"
+        );
+        assert!(
+            released_after_query_ended,
+            "the backend must stay checked out until the canceled query ended"
+        );
+        assert!(
+            server.is_bad(),
+            "a backend the pooler canceled is closed: a late cancel must not reach the next client"
+        );
+        assert!(client.write.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_during_copy_completion_returns_backend() {
+        let mut client =
+            test_client_with_reader_and_writer(tokio::io::empty(), RecordingWriter::default());
+        let (mut server, mut peer) = Server::test_silent_socket();
+        let cancel_listener = cancel_listener_for(&mut server).await;
+        server.abandoned_query_timeouts = AbandonedQueryTimeouts {
+            finish: Duration::from_secs(5),
+            after_cancel: Duration::from_secs(5),
+        };
+        server.in_copy_mode = true;
+        // COPY FROM finishes (triggers, commit) after the client vanished.
+        let backend = tokio::spawn(async move {
+            let mut copy_done = [0_u8; 5];
+            peer.read_exact(&mut copy_done).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            peer.write_all(&[&b"C\0\0\0\x0bCOPY 1\0"[..], b"Z\0\0\0\x05I"].concat())
+                .await
+                .unwrap();
+            (copy_done, peer)
+        });
+        let done = BytesMut::from(&b"c\0\0\0\x04"[..]);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.handle_copy_done_fail(&done, &mut server),
+        )
+        .await
+        .expect("COPY must end once the backend finished it")
+        .err()
+        .expect("client disconnect must end the COPY relay");
+        let (copy_done, _peer) = backend.await.unwrap();
+
+        assert!(matches!(err, Error::SocketError(_)));
+        assert_eq!(&copy_done, b"c\0\0\0\x04");
+        assert!(
+            !server.is_bad(),
+            "a backend that completed the COPY after the client vanished must be reused"
+        );
+        assert!(!server.in_copy_mode());
+        assert!(client.write.bytes.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cancel_listener.accept())
+                .await
+                .is_err(),
+            "a COPY that completed within the grace period must not be canceled"
+        );
     }
 
     #[tokio::test]
@@ -6314,6 +6488,173 @@ mod relay_response_client_write_failure_tests {
         assert!(
             !server.test_release_cleanup_pending(),
             "the confirmed release round trip must disarm the pending flag"
+        );
+    }
+
+    /// One DataRow of a single int4 column.
+    fn data_row(value: &[u8]) -> Vec<u8> {
+        let mut row = vec![b'D'];
+        row.extend_from_slice(&(4 + 2 + 4 + value.len() as i32).to_be_bytes());
+        row.extend_from_slice(&1_i16.to_be_bytes());
+        row.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        row.extend_from_slice(value);
+        row
+    }
+
+    #[tokio::test]
+    async fn client_write_failure_mid_response_drains_and_returns_backend() {
+        let mut client = test_client_with_broken_pipe_writer();
+        let (mut server, mut peer) = Server::test_silent_socket();
+        let cancel_listener = cancel_listener_for(&mut server).await;
+        server.abandoned_query_timeouts = AbandonedQueryTimeouts {
+            finish: Duration::from_secs(5),
+            after_cancel: Duration::from_secs(5),
+        };
+        // Hand the first row to the client on its own, like the first chunk
+        // of a result larger than the flush threshold.
+        server.response_flush_threshold = 1;
+        let backend = tokio::spawn(async move {
+            peer.write_all(&data_row(b"1")).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            peer.write_all(
+                &[
+                    data_row(b"2"),
+                    b"C\0\0\0\x0dSELECT 2\0".to_vec(),
+                    b"Z\0\0\0\x05I".to_vec(),
+                ]
+                .concat(),
+            )
+            .await
+            .unwrap();
+            peer
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(3), client.relay_response(&mut server))
+            .await
+            .expect("relay must end once the rest of the response was drained")
+            .expect_err("the client write error must be propagated");
+        let _peer = backend.await.unwrap();
+
+        assert!(matches!(err, Error::SocketError(_)));
+        assert!(
+            !server.is_bad(),
+            "a backend whose response finished after the client vanished must be reused"
+        );
+        assert!(!server.is_data_available());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cancel_listener.accept())
+                .await
+                .is_err(),
+            "a response that finished within the grace period must not be canceled"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_write_failure_mid_long_response_cancels_query() {
+        let mut client = test_client_with_broken_pipe_writer();
+        let (mut server, mut peer) = Server::test_silent_socket();
+        let cancel_listener = cancel_listener_for(&mut server).await;
+        server.test_set_process_id(4242);
+        server.test_set_secret_key(77);
+        server.abandoned_query_timeouts = AbandonedQueryTimeouts {
+            finish: Duration::from_millis(50),
+            after_cancel: Duration::from_secs(5),
+        };
+        server.response_flush_threshold = 1;
+        // After the first row the query stalls until it is canceled.
+        let backend = tokio::spawn(async move {
+            peer.write_all(&data_row(b"1")).await.unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(3), async {
+                let (mut conn, _) = cancel_listener.accept().await.unwrap();
+                let mut request = [0_u8; 16];
+                conn.read_exact(&mut request).await.unwrap();
+                request
+            })
+            .await
+            .ok();
+            if request.is_some() {
+                peer.write_all(&[query_canceled_error(), b"Z\0\0\0\x05I".to_vec()].concat())
+                    .await
+                    .unwrap();
+            }
+            (request, peer)
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(5), client.relay_response(&mut server))
+            .await
+            .expect("relay must end once the canceled query stopped")
+            .expect_err("the client write error must be propagated");
+        let (request, _peer) = backend.await.unwrap();
+
+        assert!(matches!(err, Error::SocketError(_)));
+        assert_eq!(
+            request,
+            Some([0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 16, 146, 0, 0, 0, 77]),
+            "a query still running after the client vanished must be canceled"
+        );
+        assert!(
+            server.is_bad(),
+            "a backend the pooler canceled is closed: a late cancel must not reach the next client"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_write_failure_after_copy_completion_returns_backend() {
+        let mut client = test_client_with_broken_pipe_writer();
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.in_copy_mode = true;
+        let backend = tokio::spawn(async move {
+            let mut copy_done = [0_u8; 5];
+            peer.read_exact(&mut copy_done).await.unwrap();
+            peer.write_all(&[&b"C\0\0\0\x0bCOPY 1\0"[..], b"Z\0\0\0\x05I"].concat())
+                .await
+                .unwrap();
+            peer
+        });
+        let done = BytesMut::from(&b"c\0\0\0\x04"[..]);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.handle_copy_done_fail(&done, &mut server),
+        )
+        .await
+        .expect("COPY completion must not hang after the client write failed")
+        .err()
+        .expect("the client write error must be propagated");
+        let _peer = backend.await.unwrap();
+
+        assert!(matches!(err, Error::SocketError(_)));
+        assert!(
+            !server.is_bad(),
+            "a backend that completed the COPY must be reused after the client vanished"
+        );
+        assert!(!server.in_copy_mode());
+    }
+
+    #[tokio::test]
+    async fn client_write_failure_in_copy_from_stdin_closes_backend() {
+        let mut client = test_client_with_broken_pipe_writer();
+        let (mut server, mut peer) = Server::test_silent_socket();
+        let cancel_listener = cancel_listener_for(&mut server).await;
+        // CopyInResponse: the backend now waits for COPY data that the
+        // vanished client will never send.
+        peer.write_all(b"G\0\0\0\x07\0\0\0").await.unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(3), client.relay_response(&mut server))
+            .await
+            .expect("relay must not wait for COPY data from a vanished client")
+            .expect_err("the client write error must be propagated");
+
+        assert!(matches!(err, Error::SocketError(_)));
+        assert!(
+            server.is_bad(),
+            "only closing the backend ends a COPY FROM STDIN nobody will finish"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cancel_listener.accept())
+                .await
+                .is_err(),
+            "closing the backend ends the COPY; no cancel is needed"
         );
     }
 }
