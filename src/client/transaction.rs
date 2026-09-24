@@ -5358,7 +5358,9 @@ mod app_name_set_discard_all_clears_pending_set_tests {
     /// fast if a refactor moves the SET flush after the BEGIN send.
     #[test]
     fn deferred_set_flushed_before_deferred_begin() {
+        // Production code only: the anchors below also appear in this test.
         let src = include_str!("transaction.rs");
+        let src = &src[..src.find("\n#[cfg(test)]").expect("test module")];
         let lines: Vec<&str> = src.lines().collect();
 
         // Locate the deferred-BEGIN block opener.
@@ -5380,8 +5382,8 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         // ...strictly BEFORE the BEGIN is sent to the backend.
         let begin_send_rel = lines[begin_guard_idx..]
             .iter()
-            .position(|l| l.contains("send_and_flush_timeout(&begin_msg"))
-            .expect("deferred-BEGIN block has no `send_and_flush_timeout(&begin_msg, ...)` send");
+            .position(|l| l.contains("server.send_and_flush(&begin_msg"))
+            .expect("deferred-BEGIN block has no `server.send_and_flush(&begin_msg)` send");
         let begin_send_idx = begin_guard_idx + begin_send_rel;
 
         assert!(
@@ -5455,7 +5457,9 @@ mod app_name_set_discard_all_clears_pending_set_tests {
 
     #[test]
     fn app_name_only_sync_clears_internal_set_cleanup_state() {
+        // Production code only: the anchors below also appear in this test.
         let src = include_str!("transaction.rs");
+        let src = &src[..src.find("\n#[cfg(test)]").expect("test module")];
         let lines: Vec<&str> = src.lines().collect();
 
         let piggy_idx = lines
@@ -5497,7 +5501,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         let begin_send_idx = begin_idx
             + lines[begin_idx..]
                 .iter()
-                .position(|l| l.contains("send_and_flush_timeout(&begin_msg"))
+                .position(|l| l.contains("server.send_and_flush(&begin_msg"))
                 .expect("deferred BEGIN send not found");
         assert!(
             lines[begin_small_query_idx..begin_send_idx]
