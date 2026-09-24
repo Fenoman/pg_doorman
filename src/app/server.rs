@@ -123,6 +123,10 @@ pub static MIGRATION_NOTIFY: std::sync::LazyLock<Notify> = std::sync::LazyLock::
 
 const MIGRATION_FRESH_ACCEPT_GRACE: Duration = Duration::from_millis(250);
 
+/// Worker stack of a debug build without `worker_stack_size`; see
+/// `run_server`.
+const DEBUG_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 async fn wait_for_migration_receiver_drain(
     migration_receiver_active: &AtomicBool,
     migration_fresh_accept_released: &AtomicBool,
@@ -756,6 +760,12 @@ pub fn run_server(args: Args, config: Config) -> Result<(), Box<dyn std::error::
     }
     if let Some(ref stack_size) = config.general.worker_stack_size {
         runtime_builder.thread_stack_size(stack_size.as_usize());
+    } else if cfg!(debug_assertions) {
+        // An unoptimized build keeps every local of an async fn in its poll
+        // frame. The deepest checkout, a client login that falls back through
+        // Patroni to another host, needs more than tokio's 2 MiB there; a
+        // release build takes less than 1 MiB on that path.
+        runtime_builder.thread_stack_size(DEBUG_WORKER_STACK_SIZE);
     }
     if let Some(max_threads) = config.general.max_blocking_threads {
         runtime_builder.max_blocking_threads(max_threads);
