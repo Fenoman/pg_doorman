@@ -4,9 +4,10 @@ Feature: Query interner admin surface and missing-anonymous SQLSTATE
   NAMED entries are bounded by passive Arc::strong_count GC; ANON entries
   are bounded by query_interner_anon_idle_ttl_seconds. The admin SHOW
   INTERNER family exposes the live state without scraping Prometheus, and
-  RESET INTERNER clears both halves for diagnostics. A Bind that references
-  an anonymous prepared statement which is not in any cache must return
-  SQLSTATE 26000 — the same code native PostgreSQL emits.
+  RESET INTERNER clears both halves for diagnostics. A Bind of an unnamed
+  prepared statement the client does not have must return SQLSTATE 26000,
+  the same code native PostgreSQL emits; an expired interner entry does not
+  count, because the client keeps its own statement.
 
   Background:
     Given PostgreSQL started with pg_hba.conf:
@@ -93,3 +94,22 @@ Feature: Query interner admin surface and missing-anonymous SQLSTATE
     And we send Bind "" to "no_such_stmt" with params "" to session "bad_named"
     And we send Sync to session "bad_named"
     Then session "bad_named" should receive ErrorResponse with SQLSTATE "26000"
+
+  Scenario: An expired anonymous interner entry does not break a later Bind
+    When we create admin session "admin0" to pg_doorman as "admin" with password "admin"
+    And we execute "reset interner" on admin session "admin0" and store response
+    And we create session "one" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send Parse "" with query "SELECT 41 + 1" to session "one"
+    And we send Sync to session "one"
+    And we create admin session "admin" to pg_doorman as "admin" with password "admin"
+    And we execute "show interner 5" on admin session "admin" and store row count
+    Then admin session "admin" row count should be 1
+    # TTL is 4 s and the GC sweeps every 0.5 s: the entry is gone well before 8 s.
+    When we sleep 8000ms
+    And we execute "show interner 5" on admin session "admin" and store row count
+    Then admin session "admin" row count should be 0
+    # The client still holds its unnamed statement: no new Parse, no 26000.
+    When we send Bind "" to "" with params "" to session "one"
+    And we send Execute "" to session "one"
+    And we send Sync to session "one"
+    Then session "one" should receive DataRow with "42"

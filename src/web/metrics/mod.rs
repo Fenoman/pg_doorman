@@ -773,18 +773,19 @@ pub(crate) static QUERY_INTERNER_EVICTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::ne
     counter
 });
 
-/// Counter for cases where pg_doorman returns SQLSTATE 26000 because an
-/// anonymous prepared statement state is no longer available when a
-/// later Bind/Describe refers to it. A persistently non-zero rate can
-/// come from client Anonymous LRU churn, interner TTL eviction, or a
-/// driver pattern that depends on cross-batch unnamed prepared statements.
+/// Counter for a Bind or Describe of the unnamed prepared statement after
+/// it stopped existing: after Close, a simple query or a failed unnamed
+/// Parse, or before any unnamed Parse. PostgreSQL rejects the same sequence
+/// with 26000; a binary upgrade can also lose the unnamed pointer. The name
+/// is historical: the query interner and its TTL do not affect this count.
 pub(crate) static QUERY_INTERNER_SYNTHETIC_MISSES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     let counter = IntCounter::new(
         "pg_doorman_query_interner_synthetic_misses_total",
-        "Times pg_doorman returned 26000 because anonymous prepared-statement \
-         state was no longer available when a later Bind or Describe referenced \
-         it. Causes include client Anonymous LRU churn, interner TTL eviction, \
-         or a driver depending on cross-batch unnamed prepared statements.",
+        "Times a client Bind or Describe referenced the unnamed prepared statement \
+         after it stopped existing (after Close, a simple query or a failed unnamed \
+         Parse, or before any unnamed Parse), so PostgreSQL returned 26000. PostgreSQL \
+         rejects the same sequence; a binary upgrade can also lose the unnamed pointer. \
+         The query interner and its TTL do not affect this count.",
     )
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();

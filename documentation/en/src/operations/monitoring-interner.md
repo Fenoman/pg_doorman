@@ -5,8 +5,9 @@ memory. Two halves run different policies: NAMED is bounded by
 passive `Arc::strong_count` GC, ANON by per-entry idle TTL
 (`query_interner_anon_idle_ttl_seconds`). Both expose Prometheus
 gauges, eviction counters, and a sweep duration histogram, plus a
-counter for the synthetic SQLSTATE 26000 returned to clients whose
-anonymous prepared statement is no longer in any cache.
+counter of SQLSTATE 26000 returned when a client refers to an unnamed
+prepared statement that no longer exists. That counter keeps the
+interner prefix for historical reasons; the interner does not affect it.
 
 This page is the operator companion to those metrics: dashboard
 recipe, alert rules, and tuning guidance.
@@ -26,9 +27,8 @@ recipe, alert rules, and tuning guidance.
    open the drill-down panels.
 3. **Time series — synthetic 26000 rate.**
    `rate(pg_doorman_query_interner_synthetic_misses_total[5m])`.
-   Flat zero is the normal case; any spike means TTL trimmed
-   something a client referenced or the driver depended on
-   cross-batch unnamed.
+   Flat zero is the normal case; a spike means clients refer to an
+   unnamed statement that no longer exists (see the runbook below).
 
 ### Drill-down
 
@@ -45,8 +45,9 @@ recipe, alert rules, and tuning guidance.
 
 7. Anon eviction rate vs total query rate. Linear correlation =
    normal traffic; non-linear = ORM dynamic-SQL explosion.
-8. Synthetic 26000 rate vs P99 query latency. Correlation = TTL is
-   killing real traffic; investigate the slow path.
+8. Synthetic 26000 rate vs application and pg_doorman releases. A
+   step that starts with a release points at the released driver
+   code or pooler version.
 
 ### Recommended dashboard variables
 
@@ -65,10 +66,9 @@ alerts:
 
 - **`PgDoormanAnonInternerMemoryHigh`** (critical) — ANON bytes
   > 1.5 GiB. Tighten TTL or check for ORM dynamic SQL.
-- **`PgDoormanAnonTTLTooShort`** (critical) — synthetic 26000 rate
-  > 1/s for 10 min. Find whether the misses come from client LRU
-  churn, anonymous TTL eviction, or the offending driver before
-  changing TTL.
+- **`PgDoormanUnnamedStatementMissing`** (warning) — synthetic 26000
+  rate > 1/s for 10 min. Clients refer to an unnamed statement that no
+  longer exists; changing the TTL does not help. See the runbook below.
 - **`PgDoormanAnonInternerNotShrinking`** (warning) — ANON keeps
   growing while TTL evictions are flat. Either TTL is set too long
   or the workload is pushing unique queries faster than they expire.
@@ -123,20 +123,23 @@ Action: drop `query_interner_anon_idle_ttl_seconds` in `general`
 config (e.g. 60 → 30). Reload pg_doorman. Watch the eviction rate
 catch up to the new threshold.
 
-### Investigate synthetic 26000 before raising TTL
+### Investigate synthetic 26000
 
-Trigger: `PgDoormanAnonTTLTooShort` fires.
+Trigger: `PgDoormanUnnamedStatementMissing` fires.
 
-Action: identify which client and what query — the synthetic-miss
-counter has no labels, so use the WARN log line emitted with each
-miss for client / pool / connection_id context. Check
-`pg_doorman_clients_prepared_anonymous_evictions_total` and
-`pg_doorman_query_interner_evictions_total{kind="anonymous"}` before
-changing config. If misses come from the client Anonymous LRU, increase
-`client_anonymous_prepared_cache_size`. If they come from anonymous TTL
-or from a driver that legitimately reuses unnamed Bind across batches,
-raise TTL to cover the gap (e.g. 60 → 300). If it is not, switch that
-client to named prepared.
+Action: identify which client and what query. The synthetic-miss
+counter has no labels; the WARN line (at most one per 10 seconds)
+names the user, pool and connection id. The client refers to the
+unnamed prepared statement after `Close`, a simple query or a failed
+unnamed `Parse`, or before any unnamed `Parse`; PostgreSQL rejects
+the same sequence with 26000, so fix the driver or the code path.
+Changing `query_interner_anon_idle_ttl_seconds` does not help: the
+client keeps its unnamed statement across batches regardless of the
+interner. A burst right after a binary upgrade comes from clients that
+lost the unnamed pointer (an older process does not send it, or the new
+config has a smaller `client_anonymous_prepared_cache_size`) and ends
+once they Parse again. A rise after a pg_doorman update without
+application changes points at the pooler.
 
 ### Run RESET INTERNER
 

@@ -18,20 +18,26 @@ groups:
             for ORM-generated dynamic SQL bypassing parameterization
             (e.g. WHERE id IN (1, 2, 3) without bind arrays).
 
-      # Synthetic 26000 storm — TTL is shorter than a real client gap or
-      # a driver pattern depends on cross-batch unnamed prepared.
-      - alert: PgDoormanAnonTTLTooShort
+      # A client Binds or Describes an unnamed prepared statement that no
+      # longer exists. PostgreSQL rejects the same client sequence; the
+      # anonymous interner TTL cannot cause it.
+      - alert: PgDoormanUnnamedStatementMissing
         expr: rate(pg_doorman_query_interner_synthetic_misses_total[5m]) > 1
         for: 10m
         labels:
-          severity: critical
+          severity: warning
           service: pg_doorman
         annotations:
-          summary: "Anon prepared expiring before next Bind ({{ $value | humanize }}/s)"
+          summary: "Clients bind a missing unnamed prepared statement ({{ $value | humanize }}/s)"
           runbook: |
-            Increase query_interner_anon_idle_ttl_seconds.
-            Identify the driver — most do not depend on cross-batch
-            unnamed; if yours does, switch the offender to named prepared.
+            A client refers to the unnamed prepared statement after Close,
+            a simple query or a failed unnamed Parse, or before any unnamed
+            Parse. PostgreSQL rejects the same sequence with 26000: find the
+            driver or code path from the WARN log (user, pool, connection id).
+            query_interner_anon_idle_ttl_seconds does not affect it. A burst
+            right after a binary upgrade comes from clients that lost the
+            unnamed pointer and ends once they Parse again; a rise after a
+            pg_doorman update without application changes points at the pooler.
 
       # ANON growing without TTL eviction — TTL is set too long for the
       # actual idle pattern, or the workload is genuinely accumulating

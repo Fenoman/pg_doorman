@@ -600,7 +600,7 @@ p_interner_synthetic_misses = ts_panel(
             "synthetic 26000/s",
         ),
     ], unit="ops", w=12,
-    desc="Bind referencing an anonymous prepared whose text is no longer in any cache. Flat zero is the normal case. Sustained > 1/s = TTL too short for the workload, or a driver depending on cross-batch unnamed prepared statements.",
+    desc="Bind or Describe of the unnamed prepared statement after it stopped existing (after Close, a simple query or a failed unnamed Parse, or before any unnamed Parse). PostgreSQL rejects the same sequence. Flat zero is the normal case; the interner TTL does not affect it.",
 )
 p_interner_gc_duration = ts_panel(
     "GC Sweep Duration", [
