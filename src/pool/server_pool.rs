@@ -201,6 +201,15 @@ fn build_resolved_startup(
     )
 }
 
+/// The default release query with `pgv_free()` taken from the schema the
+/// `pg_variables` extension was installed into.
+fn release_query_in_schema(schema: &str) -> String {
+    format!(
+        "SELECT pg_catalog.pg_advisory_unlock_all(), \"{}\".pgv_free();",
+        schema.replace('"', "\"\"")
+    )
+}
+
 /// Wrapper for the connection pool.
 pub struct ServerPool {
     /// Server address.
@@ -430,11 +439,12 @@ impl ServerPool {
         self
     }
 
-    /// The default release query calls `pgv_free()` from `pg_variables`. On a
-    /// database without that function every check-in would fail and close the
-    /// backend, so each transaction would open a new connection. Such a
-    /// backend only unlocks advisory locks, since no `pg_variables` state can
-    /// exist there.
+    /// The default release query calls `public.pgv_free()` from
+    /// `pg_variables`. Where that function is missing it would fail on every
+    /// check-in and close the backend, so each transaction would open a new
+    /// connection. Such a backend calls `pgv_free()` in the extension's own
+    /// schema, or, without the extension, only unlocks advisory locks. An
+    /// answer the probe cannot vouch for keeps the default.
     async fn backend_release_query(
         &self,
         conn: &mut Server,
@@ -442,28 +452,38 @@ impl ServerPool {
         if !self.release_query_is_default {
             return Ok(self.release_query.clone());
         }
-        match conn.small_simple_query_value(PGV_FREE_PROBE).await {
-            Ok(Some(found)) if found == "t" => Ok(self.release_query.clone()),
-            Ok(_) => {
-                if !self.warned_missing_pgv_free.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "[{}@{}] database {} has no public.pgv_free(): the default release_query \
-                         only unlocks advisory locks; install pg_variables or set release_query",
-                        self.address.username, self.address.pool_name, self.address.database,
-                    );
-                }
-                Ok(resolve_release_query(Some(RELEASE_WITHOUT_PG_VARIABLES)))
-            }
+        let row = match conn.small_simple_query_row(PGV_FREE_PROBE).await {
+            Ok(row) => row,
             Err(Error::QueryError(err)) => {
                 warn!(
                     "[{}@{}] could not check for public.pgv_free(), keeping the default \
                      release_query: {err}",
                     self.address.username, self.address.pool_name,
                 );
-                Ok(self.release_query.clone())
+                return Ok(self.release_query.clone());
             }
-            Err(err) => Err(err),
+            Err(err) => return Err(err),
+        };
+        let release_sql = match row.as_deref() {
+            Some([_, Some(has_public_pgv_free)]) if has_public_pgv_free == "t" => {
+                return Ok(self.release_query.clone());
+            }
+            Some([None, Some(has_public_pgv_free)]) if has_public_pgv_free == "f" => {
+                RELEASE_WITHOUT_PG_VARIABLES.to_string()
+            }
+            Some([Some(schema), Some(has_public_pgv_free)]) if has_public_pgv_free == "f" => {
+                release_query_in_schema(schema)
+            }
+            _ => return Ok(self.release_query.clone()),
+        };
+        if !self.warned_missing_pgv_free.swap(true, Ordering::Relaxed) {
+            warn!(
+                "[{}@{}] database {} has no public.pgv_free(); the default release_query \
+                 runs {release_sql}",
+                self.address.username, self.address.pool_name, self.address.database,
+            );
         }
+        Ok(resolve_release_query(Some(&release_sql)))
     }
 
     /// Builder-style override for the effective prewarm SQL. Callers must
@@ -1870,8 +1890,13 @@ mod tests {
         .with_prewarm_query(prewarm_query.to_string())
     }
 
-    /// Answers the pgv_free probe on the backend side of a test socket.
-    async fn answer_pgv_free_probe(mut peer: tokio::net::UnixStream, found: &str) {
+    /// Answers the pgv_free probe on the backend side of a test socket with
+    /// the extension's schema and whether `public.pgv_free()` exists.
+    async fn answer_pgv_free_probe(
+        mut peer: tokio::net::UnixStream,
+        schema: Option<&str>,
+        public_pgv_free: Option<&str>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut header = [0_u8; 5];
@@ -1880,39 +1905,63 @@ mod tests {
         let mut query = vec![0_u8; (len - 4) as usize];
         peer.read_exact(&mut query).await.unwrap();
         assert!(String::from_utf8_lossy(&query).contains("to_regprocedure"));
-        let mut response = crate::messages::protocol::row_description(&vec![(
-            "?column?",
-            crate::messages::DataType::Bool,
-        )]);
-        response.extend_from_slice(&crate::messages::protocol::data_row(&[found]));
+        let mut response = crate::messages::protocol::row_description(&vec![
+            ("nspname", crate::messages::DataType::Text),
+            ("?column?", crate::messages::DataType::Bool),
+        ]);
+        response.extend_from_slice(&crate::messages::protocol::data_row_nullable(&vec![
+            schema.map(str::to_string),
+            public_pgv_free.map(str::to_string),
+        ]));
         response.extend_from_slice(&crate::messages::protocol::command_complete("SELECT 1"));
         response.extend_from_slice(&crate::messages::protocol::ready_for_query(false));
         peer.write_all(&response).await.unwrap();
     }
 
-    /// Without `pgv_free()` the default release query would fail on every
-    /// check-in and close the backend; that backend unlocks advisory locks
-    /// only. With the function it keeps the default.
+    /// The default release query calls `public.pgv_free()`. Where it is
+    /// missing, a backend calls the function in the extension's schema, or
+    /// without the extension only unlocks advisory locks. A reply the probe
+    /// cannot read keeps the default, which then fails loudly.
     #[tokio::test]
     async fn default_release_query_follows_pgv_free() {
-        for (found, expected) in [
-            ("f", RELEASE_WITHOUT_PG_VARIABLES),
+        let default = "SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();";
+        for (schema, public_pgv_free, streamed, expected) in [
+            (Some("public"), Some("t"), false, default.to_string()),
             (
-                "t",
-                "SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();",
+                None,
+                Some("f"),
+                false,
+                RELEASE_WITHOUT_PG_VARIABLES.to_string(),
             ),
+            (
+                None,
+                Some("f"),
+                true,
+                RELEASE_WITHOUT_PG_VARIABLES.to_string(),
+            ),
+            (
+                Some("ext"),
+                Some("f"),
+                false,
+                "SELECT pg_catalog.pg_advisory_unlock_all(), \"ext\".pgv_free();".to_string(),
+            ),
+            (None, None, false, default.to_string()),
         ] {
             let pool = test_server_pool_with_prewarm("");
             let (mut server, peer) = Server::test_silent_socket();
-            let backend = tokio::spawn(answer_pgv_free_probe(peer, found));
+            if streamed {
+                // Every DataRow is longer than this and is streamed.
+                server.max_message_size = 10;
+            }
+            let backend = tokio::spawn(answer_pgv_free_probe(peer, schema, public_pgv_free));
 
             let release_query = pool.backend_release_query(&mut server).await.unwrap();
             backend.await.unwrap();
 
             assert_eq!(
                 release_query.as_deref(),
-                Some(expected),
-                "pgv_free found: {found}"
+                Some(expected.as_str()),
+                "{schema:?} {public_pgv_free:?} streamed={streamed}"
             );
             assert!(!server.is_bad());
         }

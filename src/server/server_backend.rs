@@ -177,28 +177,46 @@ const CHECKIN_CLEANUP_PATHS: [&str; 4] = ["release_only", "combined", "cleanup_o
 const RELEASE_SESSION_QUERY: &str =
     "SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();";
 
-/// The default release query on a database without `public.pgv_free()`:
-/// no `pg_variables` state can exist there, only advisory locks.
-pub(crate) const RELEASE_WITHOUT_PG_VARIABLES: &str = "SELECT pg_catalog.pg_advisory_unlock_all();";
+/// The default release query on a database without the `pg_variables`
+/// extension: no such state can exist there, only advisory locks. If the
+/// extension appears later, the query fails on the unknown setting it then
+/// reads (a stable function, so only at run time), the backend is closed
+/// and its replacement chooses again.
+pub(crate) const RELEASE_WITHOUT_PG_VARIABLES: &str =
+    "SELECT pg_catalog.pg_advisory_unlock_all(), \
+     CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'pg_variables') \
+     THEN pg_catalog.current_setting('pg_doorman.pg_variables_installed_reconnect') END;";
 
-/// Answers `t` when the database has `public.pgv_free()`.
-pub(crate) const PGV_FREE_PROBE: &str =
-    "SELECT pg_catalog.to_regprocedure('public.pgv_free()') IS NOT NULL";
+/// Answers the schema of the `pg_variables` extension (NULL without it)
+/// and whether `public.pgv_free()`, which the default release query
+/// calls, exists.
+pub(crate) const PGV_FREE_PROBE: &str = "SELECT (SELECT n.nspname FROM pg_catalog.pg_extension e \
+     JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pg_variables'), \
+     pg_catalog.to_regprocedure('public.pgv_free()') IS NOT NULL";
 
-/// Text of the first column of the first DataRow in a buffered response;
-/// `None` when there is no row or the value is NULL.
-fn first_data_row_value(response: &[u8]) -> Option<String> {
+/// Columns of the first DataRow in a response, as text; `None` for a NULL.
+/// The whole result is `None` when there is no row.
+fn first_data_row(response: &[u8]) -> Option<Vec<Option<String>>> {
     let mut rest = response;
     while rest.len() >= 5 {
         let len = i32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
         let body = rest.get(5..1 + len)?;
         if rest[0] == b'D' {
-            let value_len = i32::from_be_bytes(body.get(2..6)?.try_into().ok()?);
-            if value_len < 0 {
-                return None;
+            let columns = u16::from_be_bytes(body.get(..2)?.try_into().ok()?);
+            let mut values = Vec::with_capacity(columns as usize);
+            let mut at = 2;
+            for _ in 0..columns {
+                let value_len = i32::from_be_bytes(body.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                if value_len < 0 {
+                    values.push(None);
+                    continue;
+                }
+                let value = body.get(at..at + value_len as usize)?;
+                at += value_len as usize;
+                values.push(Some(String::from_utf8_lossy(value).into_owned()));
             }
-            let value = body.get(6..6 + value_len as usize)?;
-            return Some(String::from_utf8_lossy(value).into_owned());
+            return Some(values);
         }
         rest = &rest[1 + len..];
     }
@@ -754,22 +772,24 @@ impl Server {
         self.small_simple_query_exchange(query, None).await
     }
 
-    /// Runs a housekeeping query and returns the text of the first column of
-    /// its first row; `None` when there is no row or the value is NULL.
-    pub(crate) async fn small_simple_query_value(
+    /// Runs a housekeeping query and returns the columns of its first row;
+    /// `None` when there is no row.
+    pub(crate) async fn small_simple_query_row(
         &mut self,
         query: &str,
-    ) -> Result<Option<String>, Error> {
-        let mut response = BytesMut::new();
+    ) -> Result<Option<Vec<Option<String>>>, Error> {
+        let mut response = Vec::new();
         self.small_simple_query_exchange(&simple_query(query), Some(&mut response))
             .await?;
-        Ok(first_data_row_value(&response))
+        Ok(first_data_row(&response))
     }
 
+    /// With `response`, collects the whole reply in order, including a row
+    /// long enough to be streamed instead of buffered.
     async fn small_simple_query_exchange(
         &mut self,
         query: &[u8],
-        mut response: Option<&mut BytesMut>,
+        mut response: Option<&mut Vec<u8>>,
     ) -> Result<(), Error> {
         // Reset SQL-error capture for this round trip before reading a
         // new ReadyForQuery.
@@ -791,7 +811,13 @@ impl Server {
 
         let mut noop = tokio::io::sink();
         loop {
-            match tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await {
+            let received = match response.as_deref_mut() {
+                Some(collected) => {
+                    tokio::time::timeout_at(deadline, self.recv(&mut *collected, None)).await
+                }
+                None => tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await,
+            };
+            match received {
                 Ok(Ok(bytes)) => {
                     if let Some(response) = response.as_deref_mut() {
                         response.extend_from_slice(&bytes);

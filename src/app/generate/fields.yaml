@@ -1671,9 +1671,11 @@ fields:
           session-scoped state PostgreSQL does not reset between transactions
           (advisory locks, `pg_variables` session vars, etc.).
           * Omit  -> iServ-compatible default: `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`
-            (a backend whose database lacks `pgv_free()` only unlocks advisory locks)
+            (where `public.pgv_free()` is missing: `pgv_free()` of the extension's schema,
+            or only the advisory unlock without `pg_variables`)
           * `""`  -> release-query disabled, nothing is executed at checkin
-          * other -> exactly that SQL runs on every checkin
+          * other -> exactly that SQL runs on every checkin; it may call only
+            `pg_advisory_unlock_all()`, `public.pgv_free()` and LOCAL `set_config(..., true)`
           A SQL error in the release query marks the backend bad so a dirty
           session is never reused by another client.
         ru: |
@@ -1682,23 +1684,29 @@ fields:
           между транзакциями не сбрасывает (advisory-локи, session-переменные
           расширения `pg_variables` и т.п.).
           * не указано -> iServ-compatible default: `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`
-            (backend базы без `pgv_free()` только снимает advisory-локи)
+            (без `public.pgv_free()`: `pgv_free()` из схемы расширения, а без
+            `pg_variables` только снятие advisory-локов)
           * `""` -> release-query отключён, на checkin ничего не выполняется
-          * иначе -> ровно эта SQL выполняется на каждом checkin
+          * иначе -> ровно эта SQL выполняется на каждом checkin; вызывать в ней можно
+            только `pg_advisory_unlock_all()`, `public.pgv_free()` и LOCAL `set_config(..., true)`
           SQL-ошибка release-query помечает backend bad, чтобы грязная сессия
           не попала следующему клиенту.
       doc: |
         Per-pool checkin hook. By default pg_doorman runs the iServ-compatible
         statement (`pg_advisory_unlock_all()` plus `pg_variables`' `pgv_free()`)
-        on every backend before it goes back into the idle set. A new backend
-        whose database has no `public.pgv_free()` notices it once and only
-        unlocks advisory locks at check-in; pg_doorman logs a warning once per
-        pool. Set `release_query = ""` when the applications keep no
-        session-level advisory locks or `pg_variables` state across
-        transactions: it saves a round trip per transaction. Set to a custom statement
-        when you need different teardown (`DISCARD ALL`, project-specific
-        cleanup function, etc.). Maximum length 4096 bytes; whitespace-only
-        values are rejected.
+        on every backend before it goes back into the idle set. Where
+        `public.pgv_free()` is missing, a new backend calls `pgv_free()` in the
+        schema the `pg_variables` extension was installed into, or, without the
+        extension, only unlocks advisory locks; if the extension is installed
+        later, that backend's check-in fails and it is replaced. pg_doorman
+        logs a warning once per pool. Set `release_query = ""` when the
+        applications keep neither session-level advisory locks nor
+        `pg_variables` state across transactions: it saves a round trip per
+        transaction. A custom statement may call only
+        `pg_catalog.pg_advisory_unlock_all()`, `public.pgv_free()` and LOCAL
+        `set_config(..., true)`, for example
+        `SELECT pg_catalog.pg_advisory_unlock_all();`. Maximum length 4096
+        bytes; whitespace-only values are rejected.
       default: "None (uses iServ-compatible default)"
 
     prepared_statements_cache_size:
