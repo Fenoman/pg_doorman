@@ -34,6 +34,24 @@ A client that has sent `Flush` gets a new internal name on every later `Parse`.
 Its copies are bounded only by `server_prepared_statements_cache_size` on each
 backend. Binary upgrade migration restores the same naming.
 
+## Reserved statement names
+
+Internal names start with `DOORMAN_`. When a command must fail with PostgreSQL's
+own error in its place, such as a `Bind` of a statement the client never
+prepared, PgDoorman aims it at a `DOORMAN_missing_<N>` that does not exist.
+Applications should not create statements with this prefix:
+
+- A simple-query `DEALLOCATE "DOORMAN_..."` does not reach PostgreSQL under
+  that name, so a statement created with SQL `PREPARE "DOORMAN_..."` can be
+  removed only by `DEALLOCATE ALL`. With `prepared_statements = true` a
+  protocol `Close` does not reach it either.
+- A statement named `DOORMAN_missing_<N>` can answer a `Bind` of an unknown
+  statement instead of the `26000` error.
+- A `DEALLOCATE "DOORMAN_<N>"` inside a multi-statement simple query or sent
+  through the extended protocol reaches PostgreSQL and drops a statement other
+  clients share. The next client to use it on that backend gets a `26000`
+  error, and the backend's statements are reset when it returns to the pool.
+
 ## Schema changes
 
 A skipped `Parse` is not analyzed again. After DDL that changes the result
