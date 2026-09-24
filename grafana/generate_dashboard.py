@@ -442,7 +442,7 @@ p_client_named = ts_panel(
     "Client Named Entries", [
         prom(f'pg_doorman_clients_prepared_named_entries{{{S}}}', "{{user}}@{{database}}"),
     ], w=8,
-    desc="Sum of Named entries across all clients in the pool. Named is unbounded — drivers that mint per-query named statements (some pgjdbc / Hibernate / Npgsql configurations) drive this up without limit. Application is responsible for DEALLOCATE or name reuse.",
+    desc="Sum of Named entries across all clients in the pool. Each client keeps at most 2048 Named entries and evicts the oldest one at the cap (pg_doorman_clients_prepared_named_evictions_total). Drivers that mint per-query named statements (some pgjdbc / Hibernate / Npgsql configurations) keep clients at that cap. Application is responsible for DEALLOCATE or name reuse.",
 )
 p_client_anonymous = ts_panel(
     "Client Anonymous Entries", [

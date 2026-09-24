@@ -67,8 +67,8 @@ alerts:
   > 1.5 GiB. Tighten TTL or check for ORM dynamic SQL.
 - **`PgDoormanAnonTTLTooShort`** (critical) — synthetic 26000 rate
   > 1/s for 10 min. Find whether the misses come from client LRU
-  churn, `RESET INTERNER`, anonymous TTL eviction, or the offending
-  driver before changing TTL.
+  churn, anonymous TTL eviction, or the offending driver before
+  changing TTL.
 - **`PgDoormanAnonInternerNotShrinking`** (warning) — ANON keeps
   growing while TTL evictions are flat. Either TTL is set too long
   or the workload is pushing unique queries faster than they expire.
@@ -143,11 +143,13 @@ client to named prepared.
 Trigger: ad-hoc diagnostics or memory containment incident.
 
 Action: `psql "host=127.0.0.1 port=6432 user=admin dbname=pgdoorman" -c "RESET INTERNER"`. Returns
-`CommandComplete RESET`. In-flight clients re-Parse on next reuse;
-short-lived ones see no effect because their `last_anonymous_hash`
-remembers the hash they registered before the reset, and the next
-Bind discovers the missing entry and emits 26000 once before the
-client driver re-issues Parse.
+`CommandComplete RESET`. Clients do not notice: their prepared
+statements hold their own reference to the query text, so `Bind` needs
+no new `Parse` and no 26000 appears. Queries that stay in the pool cache
+are not interned again, so their counts and durations in
+`/api/top/queries` stop until the pool cache adds them anew, for example
+after an eviction or a restart. The text memory is released only when
+no pool or client cache references it any more.
 
 ## Recording rules
 

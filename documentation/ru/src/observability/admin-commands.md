@@ -54,7 +54,7 @@ psql "host=127.0.0.1 port=6432 user=admin dbname=pgdoorman"
 | `RELOAD` | То же, что и `SIGHUP` — перезагрузить конфиг с диска. |
 | `SHUTDOWN` | Отправляет `SIGINT` текущему процессу. Перед использованием в daemon mode см. [Сигналы](../operations/signals.md). |
 | `KILL <database>` | Сбросить всех клиентов, подключённых к конкретному пулу. |
-| `RESET INTERNER` | Очистить named- и anonymous-записи query interner. Диагностическая команда; активные клиенты заново делают `Parse` при следующем использовании. |
+| `RESET INTERNER` | Очистить named- и anonymous-записи query interner. Диагностическая команда: prepared statements продолжают работать без нового `Parse`, но запросы, которые остаются в кеше пула, заново в interner не попадают, и их статистика не собирается, пока кеш пула не добавит их снова. |
 | `SET log_level = '<level>'` | Изменить уровень логирования в рантайме (`error`, `warn`, `info`, `debug`, `trace`). |
 
 `PAUSE`/`RESUME` полезны при failover или окнах обслуживания. `RECONNECT` после ротации учётных данных в `pg_authid` гарантирует, что бэкенды используют новый пароль.

@@ -54,7 +54,7 @@ Admin commands are read with `SHOW <subcommand>` or executed with bare verbs (`P
 | `RELOAD` | Same as `SIGHUP` — reload config from disk. |
 | `SHUTDOWN` | Sends `SIGINT` to the current process. See [Signals](../operations/signals.md) before using it in daemon mode. |
 | `KILL <database>` | Drop all clients connected to a specific pool. |
-| `RESET INTERNER` | Clear named and anonymous query interner entries. Diagnostic command; active clients re-Parse on next reuse. |
+| `RESET INTERNER` | Clear named and anonymous query interner entries. Diagnostic command: prepared statements keep working without a new Parse, but queries that stay in the pool cache are not interned again, so their query statistics stop until the pool cache adds them anew. |
 | `SET log_level = '<level>'` | Change runtime log level (`error`, `warn`, `info`, `debug`, `trace`). |
 
 `PAUSE`/`RESUME` are useful during failovers or maintenance windows. `RECONNECT` after rotating credentials in `pg_authid` ensures backends use the new password.

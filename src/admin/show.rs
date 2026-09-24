@@ -375,8 +375,9 @@ where
     write_all_half(stream, &res).await
 }
 
-/// Force-clear both interners. Diagnostics-only — in-flight clients re-Parse
-/// on next reuse. Returns CommandComplete RESET.
+/// Force-clear both interners. Diagnostics-only: prepared statements keep
+/// working, but cached queries are not re-interned until their pool entry is
+/// created again. Returns CommandComplete RESET.
 pub async fn reset_interner<T>(stream: &mut T) -> Result<(), Error>
 where
     T: tokio::io::AsyncWrite + std::marker::Unpin,

@@ -1044,11 +1044,11 @@ fields:
       config:
         en: |
           Per-client Anonymous prepared-statement LRU size. When unset, inherits prepared_statements_cache_size.
-          Bounds the Anonymous part of the per-client cache; the Named part is always unbounded.
+          Bounds the Anonymous part of the per-client cache; the Named part has a fixed cap of 2048 entries per client.
           Set to 0 to disable the LRU and use an unlimited map.
         ru: |
           Размер LRU-кеша Anonymous prepared-запросов на каждого клиента. Если не задан, наследует prepared_statements_cache_size.
-          Ограничивает Anonymous-часть клиентского кеша; Named-часть всегда без ограничений.
+          Ограничивает Anonymous-часть клиентского кеша; у Named-части фиксированный лимит — 2048 записей на клиента.
           0 — отключить LRU и использовать неограниченную карту.
       doc: |
         Bounds the Anonymous part of the per-client prepared-statement cache. Anonymous statements are issued
@@ -1059,9 +1059,11 @@ fields:
         disable the LRU and fall back to an unlimited map for Anonymous entries; set to a number to bound the
         per-client cache independently of the pool size.
 
-        The Named part of the per-client cache (statements created with an explicit name via `PREPARE` or the
-        extended-query Parse) is **always unbounded** — this knob does not affect it. Named statements stay
-        cached for the lifetime of the client connection.
+        This knob does not affect the Named part of the per-client cache (statements created by an
+        extended-query Parse with an explicit name). Named has a fixed cap of 2048 entries per client: at the
+        cap a new name evicts the oldest one, schedules a backend `Close` for it and increments
+        `pg_doorman_clients_prepared_named_evictions_total`. Below the cap a Named statement stays cached until
+        the client closes or deallocates it or disconnects.
       default: "not set (inherits prepared_statements_cache_size)"
 
     query_interner_gc_interval_seconds:

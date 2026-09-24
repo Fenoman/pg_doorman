@@ -776,17 +776,15 @@ pub(crate) static QUERY_INTERNER_EVICTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::ne
 /// Counter for cases where pg_doorman returns SQLSTATE 26000 because an
 /// anonymous prepared statement state is no longer available when a
 /// later Bind/Describe refers to it. A persistently non-zero rate can
-/// come from client Anonymous LRU churn, RESET INTERNER, interner TTL
-/// eviction, or a driver pattern that depends on cross-batch unnamed
-/// prepared statements.
+/// come from client Anonymous LRU churn, interner TTL eviction, or a
+/// driver pattern that depends on cross-batch unnamed prepared statements.
 pub(crate) static QUERY_INTERNER_SYNTHETIC_MISSES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     let counter = IntCounter::new(
         "pg_doorman_query_interner_synthetic_misses_total",
         "Times pg_doorman returned 26000 because anonymous prepared-statement \
          state was no longer available when a later Bind or Describe referenced \
-         it. Causes include client Anonymous LRU churn, RESET INTERNER, interner \
-         TTL eviction, or a driver depending on cross-batch unnamed prepared \
-         statements.",
+         it. Causes include client Anonymous LRU churn, interner TTL eviction, \
+         or a driver depending on cross-batch unnamed prepared statements.",
     )
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();

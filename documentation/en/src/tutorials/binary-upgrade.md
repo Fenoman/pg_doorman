@@ -215,10 +215,14 @@ In the new process:
 **Limits:**
 
 - If the new config has a smaller `client_anonymous_prepared_cache_size`,
-  excess Anonymous entries are evicted (LRU). Named entries are unbounded
-  and survive in full. The remaining entries work normally.
+  excess Anonymous entries are evicted (LRU). Named entries have the same
+  fixed cap of 2048 per client in both processes and survive in full. The
+  remaining entries work normally.
 - Anonymous prepared statements (empty-name `Parse`) survive migration
-  but require a re-`Parse` before `Bind` in the new process.
+  together with the pointer to the current unnamed statement, so a `Bind`
+  to the empty name works in the new process without a new `Parse`. An old
+  process that does not send this pointer lets the new one restore it only
+  when a single Anonymous entry was transferred.
 - `DEALLOCATE ALL` after migration clears the transferred cache. Re-`Parse`
   with the same name uses the new query text.
 
@@ -459,7 +463,8 @@ enough to hold entries registered by migrated clients.
 Per-client Anonymous prepared statement LRU. The client's full cache
 (both Named and Anonymous) is serialized during migration. If the new
 config has a smaller value, only Anonymous entries are subject to LRU
-eviction; Named entries are unbounded and migrate intact.
+eviction; Named entries are not limited by this setting (their fixed cap
+is 2048 per client) and migrate intact.
 
 ## Rollback
 

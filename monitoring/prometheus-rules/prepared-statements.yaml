@@ -78,9 +78,11 @@ groups:
         annotations:
           summary: "pg_doorman named prepared entries growing for {{ $labels.user }}@{{ $labels.database }}"
           runbook: |
-            Named client prepared statements are unbounded until client
-            disconnect or DEALLOCATE. Check drivers/frameworks that mint a
-            unique prepared statement name per query.
+            Each client keeps at most 2048 Named prepared statements and
+            evicts the oldest one at the cap; the sum keeps growing while
+            clients accumulate names or their number grows. Check
+            drivers/frameworks that mint a unique prepared statement name
+            per query.
 
       - alert: PgDoormanPreparedHitRatioLow
         expr: |

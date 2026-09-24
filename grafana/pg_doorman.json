@@ -1592,7 +1592,7 @@
         }
       ],
       "title": "Client Named Entries",
-      "description": "Sum of Named entries across all clients in the pool. Named is unbounded \u2014 drivers that mint per-query named statements (some pgjdbc / Hibernate / Npgsql configurations) drive this up without limit. Application is responsible for DEALLOCATE or name reuse.",
+      "description": "Sum of Named entries across all clients in the pool. Each client keeps at most 2048 Named entries and evicts the oldest one at the cap (pg_doorman_clients_prepared_named_evictions_total). Drivers that mint per-query named statements (some pgjdbc / Hibernate / Npgsql configurations) keep clients at that cap. Application is responsible for DEALLOCATE or name reuse.",
       "datasource": {
         "uid": "prometheus"
       },

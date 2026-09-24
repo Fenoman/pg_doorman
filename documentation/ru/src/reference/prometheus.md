@@ -117,13 +117,14 @@ pg_doorman экспортирует следующие метрики:
 
 ### Метрики клиентского кеша prepared statements
 
-Клиентский кеш prepared statements делится на неограниченную Named-таблицу и Anonymous LRU, ограниченный `client_anonymous_prepared_cache_size`. Если этот параметр не задан, используется итоговый `prepared_statements_cache_size`.
+Клиентский кеш prepared statements делится на Named-таблицу с лимитом 2048 записей на клиента (первым вытесняется самое старое имя) и Anonymous LRU, ограниченный `client_anonymous_prepared_cache_size`. Если этот параметр не задан, используется итоговый `prepared_statements_cache_size`.
 
 | Метрика | Описание |
 |---------|----------|
-| `pg_doorman_clients_prepared_named_entries` | Gauge с лейблами `user` и `database`. Сумма Named-записей по кешам всех подключённых клиентов. Named-записи не имеют верхнего лимита и живут до отключения клиента или `DEALLOCATE`. Устойчивый рост часто означает, что драйвер или ORM создаёт новые имена statement на каждый запрос. |
+| `pg_doorman_clients_prepared_named_entries` | Gauge с лейблами `user` и `database`. Сумма Named-записей по кешам всех подключённых клиентов. Каждый клиент держит не больше 2048 Named-записей и при лимите вытесняет самое старое имя; иначе запись живёт, пока клиент не закроет её, не выполнит `DEALLOCATE` или не отключится, поэтому значение приближается максимум к `connected_clients * 2048`. Устойчивый рост часто означает, что драйвер или ORM создаёт новые имена statement на каждый запрос. |
 | `pg_doorman_clients_prepared_anonymous_entries` | Gauge с лейблами `user` и `database`. Сумма Anonymous-записей по кешам всех подключённых клиентов. Anonymous-часть каждого клиента ограничена `client_anonymous_prepared_cache_size`, поэтому значение приближается максимум к `connected_clients * cache_size`. |
 | `pg_doorman_clients_prepared_anonymous_evictions_total` | Накопительный счётчик вытеснений из Anonymous LRU, с лейблами `user` и `database`. Устойчивая ненулевая скорость означает, что `client_anonymous_prepared_cache_size` мал для нагрузки и LRU вытесняет записи быстрее, чем приложение успевает их повторно использовать. |
+| `pg_doorman_clients_prepared_named_evictions_total` | Накопительный счётчик вытеснений из Named-части по лимиту, с лейблами `user` и `database`. Устойчивая ненулевая скорость означает, что клиенты превышают 2048 уникальных имён Named statement: приложение теряет имена вместо повторного использования или создаёт слишком много уникальных statement. |
 
 ### Метрики query interner
 
@@ -134,7 +135,7 @@ Query interner общий для процесса. У этих метрик не
 | `pg_doorman_query_interner_entries` | Gauge по `kind` (`named` или `anonymous`). Число интернированных текстов запросов. Обновляется один раз за проход GC. |
 | `pg_doorman_query_interner_bytes` | Gauge по `kind` (`named` или `anonymous`). Суммарный объём интернированных текстов запросов в байтах. Обновляется один раз за проход GC. |
 | `pg_doorman_query_interner_evictions_total` | Counter по `kind` и `reason` (`gc_passive` или `ttl_expired`). Named-записи удаляются, когда их больше не держит ни один кеш вне interner; anonymous-записи удаляются после idle TTL. |
-| `pg_doorman_query_interner_synthetic_misses_total` | Counter синтетических ответов SQLSTATE `26000` для anonymous prepared statements, состояние которых уже недоступно при последующем `Bind` или `Describe`. Перед увеличением `query_interner_anon_idle_ttl_seconds` проверьте вытеснения из клиентского Anonymous LRU, WARN-логи, `RESET INTERNER` и TTL-вытеснения. |
+| `pg_doorman_query_interner_synthetic_misses_total` | Counter синтетических ответов SQLSTATE `26000` для anonymous prepared statements, состояние которых уже недоступно при последующем `Bind` или `Describe`. Перед увеличением `query_interner_anon_idle_ttl_seconds` проверьте вытеснения из клиентского Anonymous LRU, WARN-логи и TTL-вытеснения. |
 | `pg_doorman_query_interner_gc_duration_seconds` | Гистограмма времени одного прохода GC interner (named и anonymous вместе), в секундах. Помогает увидеть, когда большой interner делает обход заметным. |
 | `pg_doorman_pooler_check_query_backend_total` | Counter пробов `pooler_check_query`, отправленных в PostgreSQL (промах кеша или повторная проба после RELOAD). После прогрева значение должно быть стабильным; постоянно растущий rate означает, что популовый кеш не удерживает запись. |
 | `pg_doorman_pooler_check_query_cache_total` | Counter пробов `pooler_check_query`, обслуженных из популового кеша ответа без обращения к бэкенду. Hit rate = `cache_total / (cache_total + backend_total)`. |
