@@ -64,6 +64,9 @@ func TestLibPQPrepared(t *testing.T) {
 					&preparedCount, &backendPid); err != nil {
 					assert.NoError(t, err)
 				}
+				// Bounded by the distinct SQL of this test, not by
+				// server_prepared_statements_cache_size: a bound at the cache
+				// limit cannot fail even when every Parse leaks a backend copy.
 				assert.True(t, preparedCount < 7)
 				t.Logf("backend: %d prepared count: %d\n", backendPid, preparedCount)
 			}

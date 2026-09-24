@@ -60,6 +60,9 @@ func TestPgxV4Prepared(t *testing.T) {
 					&preparedCount, &backendPid); err != nil {
 					assert.NoError(t, err)
 				}
+				// Bounded by the distinct SQL of this test, not by
+				// server_prepared_statements_cache_size: a bound at the cache
+				// limit cannot fail even when every Parse leaks a backend copy.
 				assert.True(t, preparedCount < 10)
 				if err := tx.QueryRow(ctx, "select sum(used_bytes) from pg_backend_memory_contexts").Scan(&memory); err != nil {
 					assert.NoError(t, err)
