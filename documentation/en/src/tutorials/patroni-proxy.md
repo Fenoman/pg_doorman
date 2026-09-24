@@ -111,11 +111,18 @@ RUST_LOG=debug patroni_proxy /path/to/patroni_proxy.yaml
 
 ### Configuration Reload
 
-Reload configuration without restart (add/remove ports, update hosts):
+Reload configuration without restart:
 
 ```bash
 kill -HUP $(pidof patroni_proxy)
 ```
+
+A reload applies added or removed clusters and ports, changed Patroni hosts,
+and a port moved to a new `listen` address. It is rejected as a whole, and
+the running configuration stays, when it changes a top-level setting
+(`listen_address`, `cluster_update_interval`), a cluster's TLS settings, or
+anything else of a port that keeps its `listen` address (`roles`, `max_lag`,
+`host_port`); those need a restart, which drops the sessions on every port.
 
 ### Manual Cluster Update
 
