@@ -4,7 +4,7 @@
 
 ## What it does
 
-- **Discovers cluster members** by polling Patroni's `/cluster` endpoint at `cluster_update_interval` (default 3 s) and on demand via `GET /update_clusters`.
+- **Discovers cluster members** by polling Patroni's `/cluster` endpoint at `cluster_update_interval` (default 3 s) and on demand via `POST /update_clusters`.
 - **Routes by role.** Each listen port is bound to one or more roles (`leader`, `sync`, `async`, `any`). Connections to that port land on a member matching one of those roles.
 - **Balances by least connections.** For ports bound to multiple eligible members, the proxy keeps a connection counter per member and picks the one with the fewest live connections. Counters survive cluster updates.
 - **Drops replicas with stale data.** Per-port `max_lag_in_bytes` excludes members whose `replication_lag` (from `/cluster`) is over the threshold. Leader is never excluded by lag.
@@ -122,14 +122,23 @@ kill -HUP $(pidof patroni_proxy)
 Trigger immediate update of all cluster members via HTTP API:
 
 ```bash
-curl http://127.0.0.1:8009/update_clusters
+curl -fsS -X POST http://127.0.0.1:8009/update_clusters
 ```
+
+The refresh answers only `POST` (`405` for other methods). Without the
+`PATRONI_PROXY_ADMIN_TOKEN` environment variable only loopback callers are
+accepted; with it every caller must send the token in the
+`X-Patroni-Proxy-Token` header (`401` otherwise). At most one refresh runs
+per 5 seconds: a call inside that window, or while a refresh is running, gets
+`429` with a `Retry-After` header. `-f` makes `curl` exit non-zero on such
+answers, so a Patroni callback notices them; the periodic poll at
+`cluster_update_interval` applies changes either way.
 
 ## HTTP API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/update_clusters` | GET | Trigger immediate update of all cluster members |
+| `/update_clusters` | POST | Trigger immediate update of all cluster members |
 | `/` | GET | Health check (returns "OK") |
 
 ## Comparison with HAProxy + confd

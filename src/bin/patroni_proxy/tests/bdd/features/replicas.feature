@@ -98,7 +98,8 @@ Feature: Replica lag handling and connection management
     And API /update_clusters is called
     And wait for 1 seconds
     # Step 3: Verify session1 is still alive (connection counter preserved after update)
-    Then I execute ping on session 'session1' and receive pong
+    Then API /update_clusters rejects GET
+    And I execute ping on session 'session1' and receive pong
     And session 'session1' is connected to backend 'replica1'
     # Step 4: Set high lag on replica1 - session1 should be disconnected
     When mock Patroni server 'node1' response is updated to:
@@ -138,7 +139,9 @@ Feature: Replica lag handling and connection management
         ]
       }
       """
-    And API /update_clusters is called
-    And wait for 1 seconds
+    # A second refresh within 5 seconds is refused; the 1-second poll
+    # applies the change instead.
+    And API /update_clusters is rate limited
+    And wait for 2 seconds
     # Step 5: Verify session1 is closed due to high lag
     Then session 'session1' is closed

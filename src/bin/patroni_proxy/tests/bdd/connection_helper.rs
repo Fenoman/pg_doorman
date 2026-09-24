@@ -141,29 +141,51 @@ pub async fn ping_pong_session(world: &mut PatroniProxyWorld, session_name: Stri
     }
 }
 
-/// Call API /update_clusters endpoint
+/// Call API /update_clusters endpoint; the refresh must be accepted.
 #[when("API /update_clusters is called")]
 pub async fn call_update_clusters_api(world: &mut PatroniProxyWorld) {
-    let api_addr = world
-        .api_listen_address
-        .as_ref()
-        .expect("API listen address not set");
-
-    for attempt in 0..3 {
-        let response = send_update_clusters_request(api_addr);
-        if response.contains("200 OK") {
-            return;
-        }
-        if response.contains("429 Too Many Requests") && attempt < 2 {
-            let retry_after = retry_after_secs(&response).max(1);
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            continue;
-        }
-        panic!("API /update_clusters failed: {response}");
-    }
+    let response = send_update_clusters_request(api_addr(world), "POST");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "API /update_clusters failed: {response}"
+    );
 }
 
-fn send_update_clusters_request(api_addr: &str) -> String {
+/// A second refresh inside the rate-limit window is refused with a hint
+/// when to retry; the periodic poll still applies cluster changes.
+#[when("API /update_clusters is rate limited")]
+pub async fn update_clusters_api_is_rate_limited(world: &mut PatroniProxyWorld) {
+    let response = send_update_clusters_request(api_addr(world), "POST");
+    assert!(
+        response.starts_with("HTTP/1.1 429 Too Many Requests"),
+        "expected 429 inside the rate-limit window: {response}"
+    );
+    assert!(
+        response
+            .lines()
+            .any(|line| line.starts_with("Retry-After: ")),
+        "429 must carry Retry-After: {response}"
+    );
+}
+
+/// The refresh changes state, so it only answers POST.
+#[then("API /update_clusters rejects GET")]
+pub async fn update_clusters_api_rejects_get(world: &mut PatroniProxyWorld) {
+    let response = send_update_clusters_request(api_addr(world), "GET");
+    assert!(
+        response.starts_with("HTTP/1.1 405 Method Not Allowed"),
+        "GET /update_clusters must be refused: {response}"
+    );
+}
+
+fn api_addr(world: &PatroniProxyWorld) -> &str {
+    world
+        .api_listen_address
+        .as_ref()
+        .expect("API listen address not set")
+}
+
+fn send_update_clusters_request(api_addr: &str, method: &str) -> String {
     let mut stream = TcpStream::connect_timeout(
         &api_addr.parse().expect("Invalid API address"),
         Duration::from_secs(5),
@@ -174,9 +196,9 @@ fn send_update_clusters_request(api_addr: &str) -> String {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("Failed to set read timeout");
 
-    // Send HTTP POST request
-    let request =
-        format!("POST /update_clusters HTTP/1.1\r\nHost: {api_addr}\r\nConnection: close\r\n\r\n");
+    let request = format!(
+        "{method} /update_clusters HTTP/1.1\r\nHost: {api_addr}\r\nConnection: close\r\n\r\n"
+    );
     stream
         .write_all(request.as_bytes())
         .expect("Failed to send request");
@@ -188,14 +210,6 @@ fn send_update_clusters_request(api_addr: &str) -> String {
         .expect("Failed to read response");
 
     response
-}
-
-fn retry_after_secs(response: &str) -> u64 {
-    response
-        .lines()
-        .find_map(|line| line.strip_prefix("Retry-After: "))
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(5)
 }
 
 /// Check that session is closed (ping fails)
