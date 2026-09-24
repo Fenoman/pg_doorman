@@ -2047,6 +2047,64 @@ mod anonymous_close_tests {
         );
     }
 
+    /// PostgreSQL creates no statement for a Parse it rejects, so the entry
+    /// added to the client cache when the Parse was sent must be rolled back:
+    /// a later Bind of that name then reaches 26000 instead of a re-prepare
+    /// that would make the statement quietly start working.
+    #[tokio::test]
+    async fn rejected_parse_is_rolled_back_from_the_client_cache() {
+        let error = {
+            let mut fields = b"SERROR\0VERROR\0C42P01\0Mrelation does not exist\0\0".to_vec();
+            let mut frame = vec![b'E'];
+            frame.extend_from_slice(&(4 + fields.len() as u32).to_be_bytes());
+            frame.append(&mut fields);
+            frame.extend_from_slice(b"Z\0\0\0\x05I");
+            frame
+        };
+        for name in ["bad", ""] {
+            let pool = ConnectionPool::test_for_protocol();
+            let (mut server, _peer) = Server::test_silent_socket();
+            server.prepared_statement_cache = Some(LruCache::with_hasher(
+                NonZeroUsize::new(16).unwrap(),
+                RandomState::new(),
+            ));
+            let mut client = test_client();
+            let named_before = client.stats.prepared_named_count();
+            client
+                .process_parse_immediate(
+                    make_parse(name, "SELECT * FROM missing_table", &[]),
+                    &pool,
+                    &mut server,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    client.prepared.batch_operations.last(),
+                    Some(BatchOperation::ParseSent { .. })
+                ),
+                "{name:?}: the Parse must have been sent to the backend"
+            );
+
+            client.reconcile_prepared_namespace(&error, &mut server);
+
+            if name.is_empty() {
+                assert!(client.prepared.last_anonymous_hash.is_none());
+            } else {
+                assert!(client
+                    .prepared
+                    .cache
+                    .get(&PreparedStatementKey::Named(name.to_string()))
+                    .is_none());
+            }
+            assert_eq!(
+                client.stats.prepared_named_count(),
+                named_before,
+                "{name:?}: the stats must drop the rejected statement"
+            );
+        }
+    }
+
     /// Repeated Parse of one SQL shape must reuse the pool's backend statement.
     /// A fresh backend name per Parse left the previous copy on whichever
     /// transaction-pooled backend had run it, so every backend filled up to

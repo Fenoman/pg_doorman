@@ -182,6 +182,14 @@ pub async fn extended_error(world: &mut DoormanWorld, case: String) {
             Some("99".to_string()),
             "{endpoint}: successful prefix was lost"
         );
+        conn.send_describe('S', "bad").await.unwrap();
+        conn.send_sync().await.unwrap();
+        let rejected = read_ready(conn, endpoint).await;
+        assert_eq!(
+            sqlstate(&rejected),
+            Some("26000".to_string()),
+            "{endpoint}: the rejected Parse created a statement"
+        );
         let kept = execute(conn, endpoint, "keep").await;
         if case == "acknowledged Close" {
             assert_eq!(
