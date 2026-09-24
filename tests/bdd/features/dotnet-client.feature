@@ -21,6 +21,9 @@ Feature: .NET client tests
       admin_password = "admin"
       prepared_statements = true
       prepared_statements_cache_size = 10000
+      # The prepared-statement suites expect 8-64 KB responses to cross a
+      # flush boundary, which the 64 KB default would not.
+      response_flush_threshold = 8192
       tls_private_key = "${DOORMAN_SSL_KEY}"
       tls_certificate = "${DOORMAN_SSL_CERT}"
 
