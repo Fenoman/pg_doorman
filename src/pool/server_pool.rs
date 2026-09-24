@@ -1956,6 +1956,12 @@ mod tests {
                 false,
                 "SELECT pg_catalog.pg_advisory_unlock_all(), \"ext\".pgv_free();".to_string(),
             ),
+            (
+                Some("ext"),
+                Some("f"),
+                true,
+                "SELECT pg_catalog.pg_advisory_unlock_all(), \"ext\".pgv_free();".to_string(),
+            ),
             (None, None, false, default.to_string()),
         ] {
             let pool = test_server_pool_with_prewarm("");
