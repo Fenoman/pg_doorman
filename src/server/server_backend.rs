@@ -1774,6 +1774,52 @@ impl Server {
         Ok(())
     }
 
+    /// Send the session cleanup statements ahead of the release query, all
+    /// without waiting. The pooler's view of the session is reset now, as
+    /// the synchronous cleanup does once PostgreSQL confirms it: if any of
+    /// the statements fails, the backend is closed and that view unused.
+    async fn send_cleanup_and_release_prefix(
+        &mut self,
+        stmts: &[String],
+        release_sql: &str,
+    ) -> Result<(), Error> {
+        let session_state_was_dirty =
+            self.cleanup_state.needs_cleanup() && self.cleanup_connections;
+        let needs_cleanup_prepare = self.cleanup_state.needs_cleanup_prepare;
+        let messages = release_prefix(
+            stmts
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(release_sql)),
+        );
+        self.send_release_prefix(&messages).await?;
+
+        if needs_cleanup_prepare && session_state_was_dirty {
+            self.registering_prepared_statement.clear();
+            if let Some(cache) = self.prepared_statement_cache.as_mut() {
+                let cache_size = cache.len();
+                if cache_size > 0 {
+                    info!(
+                        "[{}@{}] clearing prepared statement cache pid={}: session state reset ({} entries)",
+                        self.address.username,
+                        self.address.pool_name,
+                        self.process_id,
+                        cache_size
+                    );
+                    cache.clear();
+                }
+            }
+        }
+        if session_state_was_dirty {
+            self.cleanup_state.reset();
+        }
+        if stmts.iter().any(|stmt| stmt == "RESET ALL") {
+            self.server_parameters
+                .remove_startup_only_params_after_session_reset();
+        }
+        Ok(())
+    }
+
     /// Whether the last check-in's release query still has its reply unread.
     #[inline(always)]
     pub(crate) fn release_reply_pending(&self) -> bool {
@@ -2111,6 +2157,20 @@ impl Server {
         // ReadyForQuery exchange `small_simple_query` understands.
         self.set_async_mode(false);
         self.set_expected_responses(0);
+
+        // Cleanup of a session left idle goes ahead of an unwaited release
+        // query; one left inside a transaction starts with ROLLBACK and keeps
+        // the round trip.
+        if let Some(release_query) = release_query
+            .as_ref()
+            .filter(|query| query.prefix().is_some())
+        {
+            if !self.in_transaction && !self.in_copy_mode {
+                return self
+                    .send_cleanup_and_release_prefix(&stmts, release_query.sql())
+                    .await;
+            }
+        }
 
         if let Some(ref release_query) = release_query {
             stmts.push(release_query.sql().to_string());
@@ -3572,6 +3632,79 @@ mod tests {
         let mut sent = Vec::new();
         peer.read_to_end(&mut sent).await.unwrap();
         assert!(sent.is_empty() || sent[0] == b'X', "{sent:?}");
+    }
+
+    /// A session a client changed is cleaned by statements that go ahead of
+    /// the default release query in the same unwaited messages; the pooler's
+    /// view of the session is reset at once, since a failure closes the
+    /// backend.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dirty_checkin_sends_cleanup_ahead_of_the_release_without_waiting() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut server, mut peer) = super::Server::test_silent_socket();
+        server.cleanup_connections = true;
+        server.cleanup_state.needs_cleanup_set = true;
+        server.cleanup_state.needs_cleanup_prepare = true;
+        server.set_release_query(None);
+        server.arm_release_cleanup();
+
+        tokio::time::timeout(Duration::from_secs(1), server.finalize_checkin())
+            .await
+            .expect("check-in must not wait for the cleanup reply")
+            .expect("check-in");
+
+        let mut expected = Vec::new();
+        for statement in [
+            "BEGIN",
+            "RESET ROLE",
+            "RESET ALL",
+            "DEALLOCATE ALL",
+            "SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();",
+            "COMMIT",
+        ] {
+            expected.extend_from_slice(&super::extended_statement(statement));
+        }
+        expected.extend_from_slice(&crate::messages::simple_query(";"));
+        let mut sent = vec![0_u8; expected.len()];
+        peer.read_exact(&mut sent).await.unwrap();
+        assert_eq!(sent, expected);
+        assert!(!server.cleanup_state.needs_cleanup());
+        assert!(server.release_reply_pending);
+        assert!(!server.release_cleanup_pending);
+    }
+
+    /// A backend returned inside a transaction (its client went away) keeps
+    /// the synchronous cleanup, which starts with ROLLBACK.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkin_inside_a_transaction_keeps_the_round_trip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = super::Server::test_silent_socket();
+        server.set_release_query(None);
+        server.arm_release_cleanup();
+        server.in_transaction = true;
+
+        let peer_task = tokio::spawn(async move {
+            let mut header = [0_u8; 5];
+            peer.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], b'Q');
+            let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+            let mut body = vec![0_u8; (len - 4) as usize];
+            peer.read_exact(&mut body).await.unwrap();
+            assert!(body.starts_with(b"ROLLBACK;"), "{body:?}");
+            let mut reply = crate::messages::command_complete("ROLLBACK").to_vec();
+            reply.extend_from_slice(&crate::messages::command_complete("SELECT 1"));
+            reply.extend_from_slice(&crate::messages::ready_for_query(false));
+            peer.write_all(&reply).await.unwrap();
+        });
+
+        server.finalize_checkin().await.expect("check-in");
+        peer_task.await.unwrap();
+        assert!(!server.release_reply_pending);
+        assert!(!server.release_cleanup_pending);
     }
 
     /// Check-in hands the default release query to PostgreSQL and returns

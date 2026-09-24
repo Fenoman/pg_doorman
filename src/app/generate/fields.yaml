@@ -1706,8 +1706,9 @@ fields:
         extension, only unlocks advisory locks; if the extension is installed
         later, that backend's release fails and it is replaced. pg_doorman
         logs a warning once per pool. The default and these variants go to
-        PostgreSQL as the backend returns to the pool, and pg_doorman does
-        not wait for them: PostgreSQL runs them at once and pg_doorman reads
+        PostgreSQL as the backend returns to the pool, after the session
+        cleanup statements, and pg_doorman does not wait for them:
+        PostgreSQL runs them at once and pg_doorman reads
         the result before the next exchange on that backend. If the query
         fails, PostgreSQL skips what the next client sent up to its Sync;
         that client gets SQLSTATE 08006 saying its query was not executed

@@ -509,6 +509,20 @@ fn pg_log_count(world: &DoormanWorld, needle: &str) -> usize {
     content.matches(needle).count()
 }
 
+/// Count the statements that logged `needle`, one per execution. The
+/// fixtures set `log_min_duration_statement = 0`, whose `duration:` lines
+/// repeat the text of an extended-protocol statement for its Parse, Bind
+/// and Execute; only the statement lines themselves are counted.
+fn pg_log_statement_count(world: &DoormanWorld, needle: &str) -> usize {
+    let path = pg_log_path(world);
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    content
+        .lines()
+        .filter(|line| !line.contains("duration: "))
+        .map(|line| line.matches(needle).count())
+        .sum()
+}
+
 /// Truncate `pg.log` so subsequent assertions only see log lines emitted from
 /// this point onward. PostgreSQL keeps its `stderr` file descriptor open past
 /// the truncation, which is exactly the behaviour we want (new lines are
@@ -526,7 +540,9 @@ pub async fn truncate_postgres_log(world: &mut DoormanWorld) {
     }
 }
 
-/// Assert an exact occurrence count of a literal substring in `pg.log`.
+/// Assert how many logged statements in `pg.log` contain a literal
+/// substring, counting a statement once however many `duration:` lines
+/// repeat it.
 ///
 /// Requires the scenario to start PostgreSQL with `log_statement = 'all'`
 /// (via `PostgreSQL started with options "-c log_statement=all"`), otherwise
@@ -539,7 +555,7 @@ pub async fn pg_log_should_contain_exactly(
     needle: String,
 ) {
     let expected: usize = expected.parse().expect("Invalid count");
-    let actual = pg_log_count(world, &needle);
+    let actual = pg_log_statement_count(world, &needle);
     if actual != expected {
         let path = pg_log_path(world);
         let content = std::fs::read_to_string(&path).unwrap_or_default();
@@ -553,7 +569,15 @@ pub async fn pg_log_should_contain_exactly(
 /// Assert that a literal substring is absent from `pg.log`.
 #[then(regex = r#"^PostgreSQL log should not contain "([^"]+)"$"#)]
 pub async fn pg_log_should_not_contain(world: &mut DoormanWorld, needle: String) {
-    pg_log_should_contain_exactly(world, "0".to_string(), needle).await;
+    let actual = pg_log_count(world, &needle);
+    if actual != 0 {
+        let path = pg_log_path(world);
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        panic!(
+            "PostgreSQL log expected no occurrences of {needle:?}, \
+             got {actual}. Full log:\n{content}"
+        );
+    }
 }
 
 /// Assert that a literal substring is present at least once.
