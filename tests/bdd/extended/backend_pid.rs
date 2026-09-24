@@ -111,6 +111,36 @@ pub async fn compare_named_backend_pids_different(
     );
 }
 
+#[then(
+    regex = r#"^named backend_pid "([^"]+)" from session "([^"]+)" is same as "([^"]+)" from session "([^"]+)"$"#
+)]
+pub async fn compare_named_backend_pids_across_sessions(
+    world: &mut DoormanWorld,
+    pid_name1: String,
+    session_name1: String,
+    pid_name2: String,
+    session_name2: String,
+) {
+    let pid1 = world
+        .named_backend_pids
+        .get(&(session_name1.clone(), pid_name1.clone()))
+        .unwrap_or_else(|| {
+            panic!("Named backend PID '{pid_name1}' for session '{session_name1}' not found")
+        });
+    let pid2 = world
+        .named_backend_pids
+        .get(&(session_name2.clone(), pid_name2.clone()))
+        .unwrap_or_else(|| {
+            panic!("Named backend PID '{pid_name2}' for session '{session_name2}' not found")
+        });
+
+    assert_eq!(
+        pid1, pid2,
+        "Backend PIDs should be the same: '{pid_name1}' of '{session_name1}' ({pid1}) vs \
+         '{pid_name2}' of '{session_name2}' ({pid2})"
+    );
+}
+
 #[then(regex = r#"^named backend_pid "([^"]+)" from session "([^"]+)" is same as "([^"]+)"$"#)]
 pub async fn compare_named_backend_pids_same(
     world: &mut DoormanWorld,

@@ -287,10 +287,13 @@ Feature: Client session reset batch suppresses doorman-side cleanup
   Scenario: a RESET ALL rolled back in a query its client abandoned leaves the cleanup armed
     When we create session "abandoning" to pg_doorman as "example_user_1" with password "" and database "reset_abandoned"
     And we send SimpleQuery "SET work_mem = '77MB'" to session "abandoning"
+    And we send SimpleQuery "SELECT pg_backend_pid()" to session "abandoning" and store backend_pid as "abandoned"
     And we send SimpleQuery "BEGIN; RESET ALL; SELECT pg_sleep(0.3); ROLLBACK" to session "abandoning" without waiting
     And we sleep 100ms
     And we abort TCP connection for session "abandoning"
     And we sleep 600ms
     And we create session "next" to pg_doorman as "example_user_1" with password "" and database "reset_abandoned"
+    And we send SimpleQuery "SELECT pg_backend_pid()" to session "next" and store backend_pid as "reused"
     And we send SimpleQuery "SELECT current_setting('work_mem') = '77MB'" to session "next" and store response
     Then session "next" should receive DataRow with "f"
+    And named backend_pid "reused" from session "next" is same as "abandoned" from session "abandoning"
