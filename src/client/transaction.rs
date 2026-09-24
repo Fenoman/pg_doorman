@@ -3585,6 +3585,86 @@ mod migration_idle_read_tests {
         }
     }
 
+    /// While no migration is in progress, the idle read polls the client once
+    /// before it registers on `MIGRATION_NOTIFY`. A message the client has
+    /// already sent comes back from that poll.
+    #[tokio::test]
+    #[serial_test::serial(migration_globals)]
+    async fn idle_read_fast_path_returns_message_already_sent() {
+        publish_migration_in_progress(false);
+
+        let message = simple_query("SELECT 1");
+        let (client, mut peer) = tokio::io::duplex(64);
+        peer.write_all(&message).await.unwrap();
+
+        let mut read = BufReader::new(client);
+        let mut read_buf = BytesMut::new();
+        let idle_read =
+            read_idle_message_or_migration_notice(&mut read, &mut read_buf, u64::MAX, false, true);
+        tokio::pin!(idle_read);
+
+        match futures::poll!(idle_read.as_mut()) {
+            Poll::Ready(Ok(IdleClientRead::Message(received))) => {
+                assert_eq!(&received[..], &message[..])
+            }
+            Poll::Ready(Ok(IdleClientRead::MigrationRequested)) => {
+                panic!("no migration is in progress")
+            }
+            Poll::Ready(Err(err)) => panic!("idle read failed: {err:?}"),
+            Poll::Pending => panic!("a message the client has already sent must not wait"),
+        }
+    }
+
+    /// The fast-path poll may read part of a message and is then dropped. The
+    /// bytes it read stay in the reuse buffer, so the read that follows
+    /// returns the whole message once the rest arrives.
+    #[tokio::test]
+    #[serial_test::serial(migration_globals)]
+    async fn idle_read_fast_path_keeps_bytes_of_partial_message() {
+        publish_migration_in_progress(false);
+
+        let message = simple_query("SELECT 1");
+        // Inside the length field, the whole header, the header and part of
+        // the body.
+        for split in [3, 5, 7] {
+            let (client, mut peer) = tokio::io::duplex(64);
+            peer.write_all(&message[..split]).await.unwrap();
+
+            let mut read = BufReader::new(client);
+            let mut read_buf = BytesMut::new();
+            let idle_read = read_idle_message_or_migration_notice(
+                &mut read,
+                &mut read_buf,
+                u64::MAX,
+                false,
+                true,
+            );
+            tokio::pin!(idle_read);
+            assert!(
+                futures::poll!(idle_read.as_mut()).is_pending(),
+                "split at {split}: part of a message must not complete the read"
+            );
+
+            let rest = message[split..].to_vec();
+            let writer = tokio::spawn(async move {
+                peer.write_all(&rest).await.unwrap();
+                peer
+            });
+            let Ok(result) = tokio::time::timeout(Duration::from_secs(1), idle_read).await else {
+                panic!("split at {split}: the rest of the message did not complete the read");
+            };
+            let _peer = writer.await.expect("writer task panicked");
+
+            match result {
+                Ok(IdleClientRead::Message(received)) => {
+                    assert_eq!(&received[..], &message[..], "split at {split}")
+                }
+                Ok(IdleClientRead::MigrationRequested) => panic!("no migration is in progress"),
+                Err(err) => panic!("split at {split}: idle read failed: {err:?}"),
+            }
+        }
+    }
+
     #[test]
     fn idle_migration_wake_call_site_excludes_deferred_begin() {
         let src = include_str!("transaction.rs");
