@@ -1379,6 +1379,34 @@ mod tests {
         );
     }
 
+    /// A shared DOORMAN_N parsed before a result-shape DDL fails every Bind
+    /// with 0A000, and a repeated client Parse is skipped while the backend
+    /// holds that name. DEALLOCATE ALL at checkin limits this to one error per
+    /// backend; without it the stale plan keeps failing until LRU eviction.
+    #[tokio::test]
+    async fn cached_plan_result_type_error_arms_prepared_cleanup() {
+        let (mut server, _peer) = crate::server::Server::test_silent_socket();
+        server.prepared_statement_cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(16).unwrap(),
+            RandomState::new(),
+        ));
+        server
+            .prepared_statement_cache
+            .as_mut()
+            .unwrap()
+            .put("DOORMAN_1".to_string(), ());
+        assert!(!server.cleanup_state.needs_cleanup_prepare);
+
+        let mut body =
+            BytesMut::from(&b"SERROR\0C0A000\0Mcached plan must not change result type\0\0"[..]);
+        handle_error_response(&mut server, &mut body);
+
+        assert!(
+            server.cleanup_state.needs_cleanup_prepare,
+            "0A000 must schedule DEALLOCATE ALL so the next Parse reaches PostgreSQL"
+        );
+    }
+
     #[tokio::test]
     async fn async_sql_error_keeps_backend_owned_until_sync_but_fatal_error_evicts() {
         for (severity, bad) in [("ERROR", false), ("FATAL", true)] {

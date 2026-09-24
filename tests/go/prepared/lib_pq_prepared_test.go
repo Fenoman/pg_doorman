@@ -64,9 +64,7 @@ func TestLibPQPrepared(t *testing.T) {
 					&preparedCount, &backendPid); err != nil {
 					assert.NoError(t, err)
 				}
-				// Fresh Parse has a distinct backend name even for equal SQL.
-				// This fixture sets server_prepared_statements_cache_size = 64.
-				assert.LessOrEqual(t, preparedCount, 64)
+				assert.True(t, preparedCount < 7)
 				t.Logf("backend: %d prepared count: %d\n", backendPid, preparedCount)
 			}
 			assert.NoError(t, stmt.Close())

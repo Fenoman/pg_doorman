@@ -211,12 +211,13 @@ Feature: Client migration during binary upgrade
     When we store foreground pg_doorman PID as "old_doorman"
     And we send SIGUSR2 to foreground pg_doorman
     And we wait for foreground binary upgrade to complete
+    # The old process must be gone so the Bind below reaches the new one
+    Then stored foreground PID "old_doorman" should not exist
     # Reuse the migrated anonymous statement without a fresh Parse
-    And we send Bind "" to "" with params "50" to session "anon"
+    When we send Bind "" to "" with params "50" to session "anon"
     And we send Execute "" to session "anon"
     And we send Sync to session "anon"
     Then session "anon" should receive DataRow with "100"
-    And stored foreground PID "old_doorman" should not exist
     When we close session "anon"
 
   Scenario: Client mid-transaction finishes then migrates

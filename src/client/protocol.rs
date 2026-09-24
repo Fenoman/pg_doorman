@@ -55,8 +55,8 @@ fn synthetic_miss_should_warn() -> bool {
 }
 
 use super::core::{
-    fresh_server_statement_name, BatchOperation, CachedStatement, Client, PreparedNamespaceChange,
-    PreparedStatementKey, PutOutcome,
+    BatchOperation, CachedStatement, Client, PreparedNamespaceChange, PreparedStatementKey,
+    PutOutcome, SkippedParse,
 };
 use super::PREPARED_STATEMENT_COUNTER;
 
@@ -419,21 +419,42 @@ where
             }
         };
 
-        // A new Parse must reach PostgreSQL even when its SQL and parameter
-        // OIDs are unchanged: DDL can change the result descriptor, including
-        // DDL executed on another connection. Keep the pool's Arc<Parse>
-        // shared, but never borrow another logical statement's backend name.
-        let server_stmt_name = fresh_server_statement_name();
+        // For async clients, generate a unique name to avoid "prepared statement already exists" errors
+        // The query text is still shared via Arc<Parse> from pool cache.
+        // build the name as `Arc<str>` directly so every downstream
+        // clone (CachedStatement.async_name, BatchOperation::*) is a
+        // refcount bump instead of a
+        // fresh String allocation per Bind/Describe/Close roundtrip.
+        let async_name: Option<Arc<str>> = if self.prepared.async_client {
+            Some(Arc::<str>::from(
+                format!(
+                    // Only uniqueness matters for the generated async name,
+                    // not inter-thread ordering, and fetch_add is atomic
+                    // under any ordering. Relaxed avoids the full SeqCst
+                    // fence on this per-Parse path (matches the sibling
+                    // counter use in messages/extended.rs).
+                    "DOORMAN_async_{}",
+                    PREPARED_STATEMENT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+                .as_str(),
+            ))
+        } else {
+            None
+        };
 
         if log_enabled!(Level::Debug) {
             debug!(
-                "[{}@{} #c{}] mapped statement `{}` -> `{}` (hash={:#x}) query=\"{}\"",
+                "[{}@{} #c{}] mapped statement `{}` -> `{}` (hash={:#x}{}) query=\"{}\"",
                 self.username,
                 self.pool_name,
                 self.connection_id,
                 client_given_name,
-                server_stmt_name,
+                shared_parse.name,
                 hash,
+                async_name
+                    .as_ref()
+                    .map(|n| format!(", async_name={n}"))
+                    .unwrap_or_default(),
                 truncate_query_for_log(shared_parse.query()),
             );
         }
@@ -446,6 +467,18 @@ where
         }
         let cache_key = PreparedStatementKey::from_name_or_hash(client_given_name, hash);
 
+        // Determine the server-side statement name.
+        // `Arc<str>` so every downstream `.clone()` (skipped_parses,
+        // batch_operations) is a refcount bump. Async path bumps the
+        // refcount of the cached async_name; non-async path still
+        // allocates once per Parse from shared_parse.name (a String) -
+        // that allocation disappears once Parse.name itself migrates
+        // to Arc<str>.
+        let server_stmt_name: Arc<str> = match &async_name {
+            Some(a) => Arc::clone(a),
+            None => Arc::<str>::from(shared_parse.name.as_str()),
+        };
+
         let cached = CachedStatement {
             shared_server_name: Arc::clone(&server_stmt_name),
             parse: shared_parse.clone(),
@@ -453,7 +486,7 @@ where
             intercepted_discard_all,
             set_cleanup_command: first_set_cleanup_command(parse.query().as_bytes()),
             reset_cleanup_command: first_reset_cleanup_command(parse.query().as_bytes()),
-            unique_name: Some(Arc::clone(&server_stmt_name)),
+            async_name: async_name.clone(),
         };
         // distinguish three real eviction modes:
         //   * Anonymous LRU eviction (normal capacity pressure, bump
@@ -516,9 +549,18 @@ where
                 change.close_on_success = Some(evicted_server_name);
                 change.evicted = Some((PreparedStatementKey::Named(evicted_client_name), evicted));
             }
-            // Replacing a logical entry retires its previous physical name
-            // after the new Parse succeeds. This also applies to a fresh
-            // anonymous Parse of the same SQL; it is not Named cap eviction.
+            // re-Parse with same client name but
+            // different query body returns Replaced(prev). The
+            // previous server-side name (DOORMAN_N) was NOT
+            // closed on the backend - without scheduling the
+            // deferred Close, repeated re-Parse cycles
+            // accumulated orphaned server-side prepared
+            // statements until DEALLOCATE ALL or session
+            // restart. When replacement reuses the same backend name
+            // (anonymous/same-query re-Parse), closing it would drop
+            // the statement the new cache entry still points at.
+            // Replacement is not Named cap eviction: a Flush client's
+            // anonymous re-Parse also lands here with a new async name.
             PutOutcome::Replaced(prev) => {
                 if let Some(evicted_server_name) =
                     replacement_close_target(&prev, server_stmt_name.as_ref())
@@ -547,31 +589,87 @@ where
         // Update prepared cache stats after modification
         self.update_prepared_cache_stats();
 
-        // Every new Parse reaches PostgreSQL. Only later Bind/Describe calls
-        // can reuse this logical statement's physical plan.
+        // Check if server already has this prepared statement
+        // For async clients with unique names, this will always be false (new unique name)
+        let server_has_it = server.has_prepared_statement(&server_stmt_name);
         if let Some(cache) = pool.prepared_statement_cache.as_ref() {
-            cache.record_miss(hash);
+            // Per-CacheEntry hit/miss for /api/top/prepared. Silent no-op
+            // when the entry was evicted between register_parse_to_cache and
+            // here — same lock-free policy as /api/top/queries.
+            if server_has_it {
+                cache.record_hit(hash);
+            } else {
+                cache.record_miss(hash);
+            }
         }
-        self.register_parse_to_server_cache(
-            false,
-            &hash,
-            &shared_parse,
-            &server_stmt_name,
-            pool,
-            server,
-        )
-        .await?;
+        if server_has_it {
+            // For async clients, always send Parse to get real ParseComplete from server
+            if self.prepared.async_client {
+                debug!(
+                    "[{}@{} #c{}] async client: sending Parse `{}` (unique per-session name requires server roundtrip)",
+                    self.username, self.pool_name, self.connection_id, server_stmt_name
+                );
 
-        let parse_bytes = shared_parse
-            .as_ref()
-            .to_bytes_with_name(&server_stmt_name)?;
-        self.buffer.put(&parse_bytes[..]);
-        self.prepared.parses_sent_in_batch += 1;
-        self.prepared
-            .batch_operations
-            .push(BatchOperation::ParseSent {
-                statement_name: server_stmt_name,
-            });
+                // Add parse message to buffer with the server statement name
+                let parse_bytes = shared_parse
+                    .as_ref()
+                    .to_bytes_with_name(&server_stmt_name)?;
+                self.buffer.put(&parse_bytes[..]);
+            } else {
+                // We don't want to send the parse message to the server
+                // Track this skipped Parse - ParseComplete will be inserted before BindComplete in response
+                debug!(
+                    "[{}@{} #c{}] parse skipped for `{}`: already on server pid={}, synthetic ParseComplete queued",
+                    self.username, self.pool_name, self.connection_id,
+                    server_stmt_name, server.get_process_id()
+                );
+                crate::client::transaction::enforce_extended_batch_metadata_cap(
+                    self.prepared.batch_operations.len(),
+                    self.prepared.skipped_parses.len(),
+                    1,
+                    1,
+                    "cached Parse",
+                )?;
+                self.prepared.skipped_parses.push(SkippedParse);
+                // Track operation order for correct ParseComplete insertion
+                self.prepared
+                    .batch_operations
+                    .push(BatchOperation::ParseSkipped {
+                        statement_name: server_stmt_name.clone(),
+                    });
+            }
+        } else {
+            debug!(
+                "[{}@{} #c{}] statement `{}` not in server connection cache, sending Parse to backend",
+                self.username, self.pool_name, self.connection_id, server_stmt_name
+            );
+            // Register to server cache (this may send eviction close to server)
+            self.register_parse_to_server_cache(
+                false,
+                &hash,
+                &shared_parse,
+                &server_stmt_name,
+                pool,
+                server,
+            )
+            .await?;
+
+            // Add parse message to buffer with the server statement name
+            let parse_bytes = shared_parse
+                .as_ref()
+                .to_bytes_with_name(&server_stmt_name)?;
+            self.buffer.put(&parse_bytes[..]);
+
+            // Track that we sent a Parse to server in this batch
+            self.prepared.parses_sent_in_batch += 1;
+
+            // Track operation order for correct ParseComplete insertion
+            self.prepared
+                .batch_operations
+                .push(BatchOperation::ParseSent {
+                    statement_name: server_stmt_name.clone(),
+                });
+        }
 
         Ok(())
     }
@@ -1233,6 +1331,34 @@ mod stats_refresh_invariant_tests {
 }
 
 #[cfg(test)]
+mod extended_batch_metadata_cap_tests {
+    #[test]
+    fn cached_parse_skip_path_enforces_metadata_cap_before_queueing() {
+        let src = include_str!("protocol.rs");
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let lines: Vec<&str> = impl_src.lines().collect();
+
+        let skip_idx = lines
+            .iter()
+            .position(|l| l.contains("if server_has_it {"))
+            .expect("server_has_it branch not found in Parse handler");
+        let queue_rel = lines[skip_idx..]
+            .iter()
+            .position(|l| l.contains("self.prepared.skipped_parses.push(SkippedParse"))
+            .expect("cached Parse skip queue not found");
+        let queue_idx = skip_idx + queue_rel;
+        let window = lines[skip_idx..queue_idx].join("\n");
+
+        assert!(
+            window.contains("enforce_extended_batch_metadata_cap"),
+            "cached Parse skip path must cap metadata before queueing SkippedParse; \
+             EXTENDED_BATCH_BUFFER_CAP only counts wire bytes and skipped Parse \
+             appends no bytes to self.buffer"
+        );
+    }
+}
+
+#[cfg(test)]
 mod discard_all_transaction_guard_tests {
     #[test]
     fn discard_all_transaction_guard_rejects_bind_before_backend_send() {
@@ -1366,7 +1492,7 @@ mod replacement_close_tests {
             intercepted_discard_all: false,
             set_cleanup_command: None,
             reset_cleanup_command: None,
-            unique_name: None,
+            async_name: None,
         }
     }
 
@@ -1460,7 +1586,7 @@ mod anonymous_close_tests {
             intercepted_discard_all: false,
             set_cleanup_command: None,
             reset_cleanup_command: None,
-            unique_name: None,
+            async_name: None,
         }
     }
 
@@ -1530,7 +1656,7 @@ mod anonymous_close_tests {
             intercepted_discard_all: false,
             set_cleanup_command: Some(SetCleanupCommand::SetSessionAuthorization),
             reset_cleanup_command: None,
-            unique_name: None,
+            async_name: None,
         };
         let _ = client
             .prepared
@@ -1574,7 +1700,7 @@ mod anonymous_close_tests {
             intercepted_discard_all: false,
             set_cleanup_command: Some(SetCleanupCommand::GenericSet),
             reset_cleanup_command: None,
-            unique_name: None,
+            async_name: None,
         };
         let _ = client
             .prepared
@@ -1641,65 +1767,6 @@ mod anonymous_close_tests {
             assert_eq!(sql, query.as_bytes());
             assert_eq!(declared, count);
         }
-    }
-
-    #[tokio::test]
-    async fn fresh_parses_share_metadata_but_keep_separate_backend_names() {
-        let mut client = test_client();
-        let pool = ConnectionPool::test_for_protocol();
-        let (mut server, _peer) = crate::server::Server::test_silent_socket();
-        server.prepared_statement_cache = Some(LruCache::with_hasher(
-            NonZeroUsize::new(16).unwrap(),
-            RandomState::new(),
-        ));
-        let query = "SELECT $1::int";
-        let hash = Parse::from_parts(query, &[23]).get_hash_with_planner_params(0);
-        let mut names = Vec::new();
-        let mut first_parse = None;
-        for client_name in ["old", "fresh", "", ""] {
-            client.buffer.clear();
-            client.prepared.reset_batch();
-            client
-                .process_parse_immediate(make_parse(client_name, query, &[23]), &pool, &mut server)
-                .await
-                .unwrap();
-            let forwarded = Parse::try_from(&BytesMut::from(&client.buffer[..])).unwrap();
-            let key = PreparedStatementKey::from_name_or_hash(client_name.to_string(), hash);
-            let cached = client.prepared.cache.get(&key).unwrap();
-            assert_eq!(forwarded.name, cached.server_name());
-            assert_eq!(forwarded.query(), query);
-            assert!(
-                !names.contains(&forwarded.name),
-                "fresh Parse reused a physical plan"
-            );
-            if let Some(first) = &first_parse {
-                assert!(
-                    Arc::ptr_eq(first, &cached.parse),
-                    "metadata must remain shared"
-                );
-            } else {
-                first_parse = Some(Arc::clone(&cached.parse));
-            }
-            names.push(forwarded.name);
-            assert_eq!(client.prepared.named_evictions, 0);
-            assert_eq!(client.prepared.anonymous_evictions, 0);
-        }
-        let old = client
-            .prepared
-            .cache
-            .get(&PreparedStatementKey::Named("old".into()))
-            .unwrap();
-        assert_eq!(old.server_name(), names[0]);
-        assert_eq!(
-            client
-                .prepared
-                .namespace_changes
-                .back()
-                .unwrap()
-                .close_on_success
-                .as_ref(),
-            Some(&names[2])
-        );
     }
 
     #[tokio::test]
@@ -1917,5 +1984,108 @@ mod anonymous_close_tests {
             2,
             "rollback must restore counts while retaining the confirmed alias"
         );
+    }
+
+    /// Repeated Parse of one SQL shape must reuse the pool's backend statement.
+    /// A fresh backend name per Parse left the previous copy on whichever
+    /// transaction-pooled backend had run it, so every backend filled up to
+    /// `server_prepared_statements_cache_size` duplicate plans of the same SQL.
+    #[tokio::test]
+    async fn repeated_parses_share_one_backend_statement() {
+        let pool = ConnectionPool::test_for_protocol();
+        let (mut server, _peer) = Server::test_silent_socket();
+        server.prepared_statement_cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(16).unwrap(),
+            RandomState::new(),
+        ));
+        let query = "SELECT $1::int";
+        let mut clients = [test_client(), test_client()];
+        clients[0]
+            .process_parse_immediate(make_parse("old", query, &[23]), &pool, &mut server)
+            .await
+            .unwrap();
+        let backend_name = Parse::try_from(&BytesMut::from(&clients[0].buffer[..]))
+            .unwrap()
+            .name;
+
+        for (idx, client_name) in [(0, "fresh"), (0, ""), (0, ""), (1, "other"), (1, "")] {
+            let client = &mut clients[idx];
+            client.buffer.clear();
+            client.prepared.reset_batch();
+            client
+                .process_parse_immediate(make_parse(client_name, query, &[23]), &pool, &mut server)
+                .await
+                .unwrap();
+            assert!(
+                client.buffer.is_empty(),
+                "Parse {client_name:?} was forwarded although the backend holds {backend_name}"
+            );
+            assert!(matches!(
+                client.prepared.batch_operations.last(),
+                Some(BatchOperation::ParseSkipped { statement_name })
+                    if statement_name.as_ref() == backend_name
+            ));
+            let key = client
+                .get_prepared_statement_lookup_key(client_name)
+                .unwrap();
+            assert_eq!(
+                client.prepared.cache.get(&key).unwrap().server_name(),
+                backend_name
+            );
+            assert!(
+                client
+                    .prepared
+                    .namespace_changes
+                    .iter()
+                    .all(|change| change.close_on_success.is_none()),
+                "re-Parse must not Close a backend statement other entries still use"
+            );
+        }
+        assert_eq!(server.prepared_statement_cache.as_ref().unwrap().len(), 1);
+    }
+
+    /// A Flush client gets a new async name on every Parse, so its anonymous
+    /// re-Parse replaces an entry that has another backend name. That retires
+    /// the previous name but is not Named cap eviction.
+    #[tokio::test]
+    async fn async_anonymous_reparse_is_not_counted_as_named_eviction() {
+        let mut client = test_client();
+        client.prepared.async_client = true;
+        let pool = ConnectionPool::test_for_protocol();
+        let (mut server, _peer) = Server::test_silent_socket();
+        server.prepared_statement_cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(16).unwrap(),
+            RandomState::new(),
+        ));
+        let mut names = Vec::new();
+        for _ in 0..2 {
+            client.buffer.clear();
+            client.prepared.reset_batch();
+            client
+                .process_parse_immediate(
+                    make_parse("", "SELECT $1::int", &[23]),
+                    &pool,
+                    &mut server,
+                )
+                .await
+                .unwrap();
+            names.push(
+                Parse::try_from(&BytesMut::from(&client.buffer[..]))
+                    .unwrap()
+                    .name,
+            );
+        }
+        assert_ne!(names[0], names[1]);
+        assert_eq!(
+            client
+                .prepared
+                .namespace_changes
+                .back()
+                .unwrap()
+                .close_on_success
+                .as_deref(),
+            Some(names[0].as_str())
+        );
+        assert_eq!(client.prepared.named_evictions, 0);
     }
 }

@@ -4,54 +4,67 @@ PgDoorman keeps a client's prepared statements usable when transactions move
 between PostgreSQL backends. Both named and anonymous frontend statements are
 mapped to internal `DOORMAN_<N>` names.
 
-## A new Parse creates a new backend statement
+## One backend statement per query shape
 
-Every frontend `Parse` handled by the prepared-statement cache is forwarded to
-PostgreSQL under a fresh internal name. PostgreSQL supplies `ParseComplete` and
-validates the query against the schema visible to that connection. Equal SQL,
-parameter OIDs and startup planner settings allow shared pool metadata; they do
-not justify reusing another statement's result descriptor.
-
-This distinction matters after `ALTER TABLE`, temporary-table recreation,
-function result changes, or DDL from another connection. A new named or anonymous
-`Parse` sees the new shape just as a direct PostgreSQL connection does. Rolling
-back DDL and preparing again also uses the restored schema.
-
-An existing statement keeps its original backend name. Binding it after an
-incompatible result-shape change can still produce PostgreSQL's `0A000`
-(`cached plan must not change result type`). A new Parse does not overwrite that
-old statement, and PgDoorman does not retry SQL execution to hide the error.
-
-An old Bind on a different backend, or after server-cache eviction, requires a
-new internal Parse. Its descriptor is then rebuilt against that backend's
-current schema. Transaction pooling cannot preserve a descriptor held only in
-a PostgreSQL backend that has been retired or whose statement was evicted.
-
-## Reuse and performance
-
-Repeated `Bind`/`Execute` calls without a new Parse reuse the same logical
-statement. If its internal name is already present on the selected backend,
-PostgreSQL can reuse its prepared plan. Otherwise PgDoorman prepares it there
-before forwarding the operation, preserving the frontend response order.
-
-A driver sending a new anonymous Parse on every call pays PostgreSQL's prepare
-cost on every call. PgDoorman no longer synthesizes ParseComplete to reuse a
-shared physical plan across fresh Parses or different clients. Prefer the
-driver's persistent named-statement API for repeated queries when appropriate
-for the application. Measure the effect with the actual driver and workload;
-cache size cannot restore the removed Parse-skipping behavior.
-
-The pool still shares immutable `Arc<Parse>` metadata, SQL text and parameter
-OID arrays across clients. Each logical statement owns only its separate
-backend alias and client bookkeeping. Migration reconstructs separate aliases
-while retaining shared metadata.
+Parses with the same SQL, parameter OIDs and startup planner settings share one
+pool entry and one internal name. When the checked-out backend already holds
+that name, PgDoorman answers the `Parse` with a synthetic `ParseComplete` and
+does not forward it; otherwise it forwards the `Parse` under that name. A later
+`Bind` or `Describe` on a backend that lacks the name first prepares it there,
+preserving the frontend response order. A backend therefore holds one statement
+per query shape it has served, not one per call or per client. A pool entry
+that is evicted and inserted again gets a new internal name; backends keep the
+old one until their own LRU or cleanup removes it.
 
 ```text
 Client A: Parse("old", SQL)   -> PostgreSQL: Parse("DOORMAN_42", SQL)
-Client B: Parse("new", SQL)   -> PostgreSQL: Parse("DOORMAN_43", SQL)
+Client B: Parse("new", SQL)   -> backend holds DOORMAN_42: synthetic ParseComplete
 Client A: Bind("old")         -> PostgreSQL: Bind("DOORMAN_42")
-Client B: Bind("new")         -> PostgreSQL: Bind("DOORMAN_43")
+Client B: Bind("new")         -> PostgreSQL: Bind("DOORMAN_42")
 ```
+
+Skipping a repeated `Parse` spares PostgreSQL the parse analysis of a query it
+has already prepared. PostgreSQL's choice between custom and generic plans for a
+statement on a backend is shared by all clients that use it there, so it can
+reflect their mixed parameter values. The pool shares
+immutable `Arc<Parse>` metadata, SQL text and parameter OID arrays across
+clients.
+
+A client that has sent `Flush` gets a new internal name on every later `Parse`.
+Its copies are bounded only by `server_prepared_statements_cache_size` on each
+backend. Binary upgrade migration restores the same naming.
+
+## Schema changes
+
+A skipped `Parse` is not analyzed again. After DDL that changes the result
+shape, such as `ALTER TABLE ... ADD COLUMN` under `SELECT *` or a changed
+function result type, the first `Bind` of a statement prepared before the DDL
+fails on each backend with `0A000` (`cached plan must not change result type`).
+A direct connection would analyze a fresh `Parse` against the new schema.
+
+Any PostgreSQL error schedules `DEALLOCATE ALL` for the moment the backend
+returns to the pool; with `cleanup_server_connections = false` the backend is
+closed instead. The next `Parse` on that backend is prepared against the new
+schema, so each backend reports the error once per such DDL. PgDoorman does not
+retry SQL execution to hide the error.
+
+The cleanup waits for the backend to return to the pool. Until then a `Parse`
+of that query is still answered from the stale statement, and its next `Bind` or
+`Describe` fails again: in the same transaction after a rollback to a savepoint
+(without one, the aborted transaction reports `25P02`), and in every later
+transaction of a session that ran SQL-level `PREPARE`, because such a session
+keeps its backend. `RECONNECT <database>` on the admin console closes idle backends at
+once and busy ones when they return to the pool.
+
+An old statement bound on a backend that no longer holds it is prepared there
+again, so its result shape follows that backend's current schema. Transaction
+pooling cannot preserve a descriptor held only in a backend that was cleaned or
+retired.
+
+Giving every `Parse` a fresh internal name avoided the `0A000` but left the
+previous copy on whichever backend had run it. In transaction pooling that
+filled every backend with duplicate plans up to
+`server_prepared_statements_cache_size`.
 
 ## Cache layers and limits
 
@@ -66,8 +79,13 @@ An unset client or backend cache size inherits the resolved pool prepared-cache
 size. A backend-cache eviction sends Close and later Bind can reprepare the
 statement. A pool-metadata eviction does not remove client-held statements.
 
-Replacing a client entry schedules closure of its previous backend name after
-the new Parse succeeds. A failed Parse restores the previous client namespace.
+Replacing a client entry whose backend name differs schedules closure of the
+previous name on the current backend after the new Parse succeeds. That happens
+when a named statement is re-Parsed with another query, on every re-Parse by a
+client that sent `Flush`, and after the pool entry was evicted and inserted
+again. Otherwise a re-Parse of the same query keeps the name and closes nothing.
+A failed named Parse restores the previous client entry; a failed unnamed Parse
+leaves no unnamed statement, as in PostgreSQL.
 Anonymous LRU eviction drops the local entry; backend LRU and backend retirement
 bound the lifetime of physical statements left on other connections. Named cap
 eviction is counted separately from replacement.
@@ -99,13 +117,14 @@ of named statements; it is not a substitute for measuring the configured mode.
 ## Observability
 
 `SHOW POOLS_MEMORY` reports pool/client cache state. `SHOW PREPARED_STATEMENTS`
-and the prepared-statements web views describe shared pool entries; their
-canonical metadata names need not be physical names on a backend.
+and the prepared-statements web views describe shared pool entries; their names
+are the physical backend names except for clients that sent `Flush`.
 
-The pool prepared-entry hit/miss counters describe Parse-time physical reuse.
-Fresh Parses now record misses. Backend cache hits still measure reuse by later
-Bind/Describe operations. Do not interpret a zero pool Parse-hit rate as a lack
-of prepared-plan reuse by persistent named statements.
+The pool prepared-entry hit/miss counters record the path chosen for each
+`Parse`: a hit means PgDoorman answered it without forwarding, because the
+backend holds the statement or an earlier `Parse` of the same batch prepares
+it; a miss means the `Parse` was forwarded. Backend cache hits also count later
+Bind/Describe operations.
 
 Use `pg_prepared_statements` on the backend being inspected to see its actual
 physical names and plan counts. The client Anonymous and Named eviction metrics
