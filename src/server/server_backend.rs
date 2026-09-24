@@ -398,6 +398,12 @@ pub struct Server {
     /// remain on the socket and the connection must not be reused.
     internal_round_trip_in_flight: bool,
 
+    /// True while the response to a vanished client's request is drained.
+    /// Like an internal round trip it keeps a cancelled drain from reaching
+    /// the pool, but the frames are the client's own: a cleanup disarm they
+    /// carry still needs the usual transaction check.
+    abandoned_response_drain: bool,
+
     /// Tracks whether the connection needs cleanup (RESET ALL, DEALLOCATE ALL, CLOSE ALL)
     /// before being returned to the pool. Set when SET, PREPARE, or DECLARE statements are executed.
     pub(crate) cleanup_state: CleanupState,
@@ -1032,7 +1038,7 @@ impl Server {
     /// Server & client are out of sync, we must discard this connection.
     /// This happens with clients that misbehave.
     pub fn is_bad(&self) -> bool {
-        self.bad || self.internal_round_trip_in_flight
+        self.bad || self.internal_round_trip_in_flight || self.abandoned_response_drain
     }
 
     /// Drains any remaining data from the server that hasn't been read yet.
@@ -1125,7 +1131,7 @@ impl Server {
         let connected_with_tls = self.connected_with_tls;
         let cancel_sent = std::sync::atomic::AtomicBool::new(false);
 
-        self.begin_internal_round_trip();
+        self.abandoned_response_drain = true;
         let drained = {
             let drain = tokio::time::timeout(
                 timeouts.finish + timeouts.after_cancel,
@@ -1159,7 +1165,7 @@ impl Server {
                 () = cancel_after_grace => drain.await,
             }
         };
-        self.finish_internal_round_trip();
+        self.abandoned_response_drain = false;
 
         let close_reason = match drained {
             Err(_) => Some(format!(
@@ -1269,6 +1275,9 @@ impl Server {
         }
         if self.internal_round_trip_in_flight {
             return Some("returned with internal round trip in flight");
+        }
+        if self.abandoned_response_drain {
+            return Some("returned while draining an abandoned response");
         }
         if self.in_transaction() {
             return Some("returned in transaction");
@@ -2837,6 +2846,7 @@ impl Server {
                         intercept_discard_all: true,
                         abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
                         internal_round_trip_in_flight: false,
+                        abandoned_response_drain: false,
                     };
                     server.stats.update_process_id(process_id);
                     server.stats.set_tls(connected_with_tls);
@@ -3058,6 +3068,12 @@ impl Server {
         self.secret_key = secret_key;
     }
 
+    /// Test-only mutator for `cleanup_server_connections`.
+    #[cfg(test)]
+    pub(crate) fn test_set_cleanup_connections(&mut self, cleanup_connections: bool) {
+        self.cleanup_connections = cleanup_connections;
+    }
+
     /// Test-only accessor for `release_cleanup_pending`, used by tests in
     /// other modules (the field itself is private to this file).
     #[cfg(test)]
@@ -3132,6 +3148,7 @@ impl Server {
             expected_response_sequence: VecDeque::new(),
             bad,
             internal_round_trip_in_flight: false,
+            abandoned_response_drain: false,
             cleanup_state: CleanupState::new(),
             pending_set_cleanup_commands: VecDeque::new(),
             pending_reset_cleanup_commands: VecDeque::new(),

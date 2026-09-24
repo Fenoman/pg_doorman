@@ -6347,6 +6347,76 @@ mod relay_response_client_write_failure_tests {
         );
     }
 
+    /// The drain after a vanished client parses the client's own response:
+    /// a RESET inside a transaction the client rolled back restores nothing,
+    /// so check-in must still run RESET ALL before the next client.
+    #[tokio::test]
+    async fn client_gone_drain_keeps_cleanup_armed_after_rolled_back_reset() {
+        let mut client =
+            test_client_with_reader_and_writer(tokio::io::empty(), RecordingWriter::default());
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.test_set_cleanup_connections(true);
+        server.cleanup_state.needs_cleanup_set = true;
+        // The client's query was `BEGIN; RESET ALL; ROLLBACK`.
+        server
+            .track_reset_cleanup_commands([crate::server::cleanup::ResetCleanupCommand::ResetAll]);
+        let backend = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            peer.write_all(
+                &[
+                    command_complete("BEGIN"),
+                    command_complete("RESET"),
+                    command_complete("ROLLBACK"),
+                    b"Z\0\0\0\x05I".to_vec(),
+                ]
+                .concat(),
+            )
+            .await
+            .unwrap();
+            let cleanup =
+                tokio::time::timeout(Duration::from_secs(2), read_simple_query(&mut peer))
+                    .await
+                    .ok();
+            if let Some(sql) = &cleanup {
+                let mut reply = Vec::new();
+                for statement in String::from_utf8_lossy(sql).split(';') {
+                    let statement = statement.trim();
+                    if !statement.is_empty() {
+                        let tag = if statement.starts_with("RESET") {
+                            "RESET"
+                        } else {
+                            "SELECT 1"
+                        };
+                        reply.extend_from_slice(&command_complete(tag));
+                    }
+                }
+                reply.extend_from_slice(b"Z\0\0\0\x05I");
+                peer.write_all(&reply).await.unwrap();
+            }
+            (cleanup, peer)
+        });
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), client.relay_response(&mut server))
+            .await
+            .expect("relay must end once the abandoned query finished");
+        let (cleanup, _peer) = backend.await.unwrap();
+
+        let cleanup =
+            String::from_utf8_lossy(&cleanup.expect("check-in cleanup was not sent")).into_owned();
+        assert!(
+            cleanup.contains("RESET ALL"),
+            "check-in must reset the SET that the rolled-back RESET did not undo: {cleanup:?}"
+        );
+    }
+
+    fn command_complete(tag: &str) -> Vec<u8> {
+        let mut frame = vec![b'C'];
+        frame.extend_from_slice(&((tag.len() + 1 + 4) as i32).to_be_bytes());
+        frame.extend_from_slice(tag.as_bytes());
+        frame.push(0);
+        frame
+    }
+
     #[tokio::test]
     async fn client_disconnect_cancels_long_query_before_releasing_backend() {
         use std::sync::atomic::{AtomicBool, Ordering};
