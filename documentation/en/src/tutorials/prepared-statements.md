@@ -64,8 +64,12 @@ This error, like a missing (`26000`) or duplicate (`42P05`) statement name,
 schedules `DEALLOCATE ALL` for the moment the backend returns to the pool; with
 `cleanup_server_connections = false` the backend is closed instead. Other SQL
 errors, such as a unique violation or a serialization failure, leave the
-backend's statements in place. The next `Parse` on that backend is prepared
-against the new schema, so each backend reports the error once per such DDL.
+backend's statements in place. The exception is such an error in a batch the
+client ended with `Flush` instead of `Sync`: it also schedules a reset of
+session settings, role and cursors, so with `cleanup_server_connections = false`
+this backend is closed too, statements included. After `DEALLOCATE ALL` the
+next `Parse` on that backend is prepared against the new schema, so each
+backend reports the error once per such DDL.
 PgDoorman does not retry SQL execution to hide the error.
 
 The cleanup waits for the backend to return to the pool. Until then a `Parse`
