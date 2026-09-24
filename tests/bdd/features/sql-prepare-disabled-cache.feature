@@ -40,3 +40,29 @@ Feature: Statements created with SQL PREPARE keep the backend with the statement
     And we send SimpleQuery "DEALLOCATE r" to session "owner"
     And we send SimpleQuery "EXECUTE p" to session "owner" and store response
     Then session "owner" should receive DataRow with "1"
+
+  Scenario: A DEALLOCATE ALL earlier in the pipeline does not hide a later named Parse
+    When we create session "owner" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "BEGIN" to session "owner"
+    And we send Parse "reset" with query "DEALLOCATE ALL" to session "owner"
+    And we send Bind "" to "reset" with params "" to session "owner"
+    And we send Execute "" to session "owner"
+    And we send Parse "r" with query "SELECT 2" to session "owner"
+    And we send Sync to session "owner"
+    And we send SimpleQuery "PREPARE p AS SELECT 1" to session "owner"
+    And we send SimpleQuery "DEALLOCATE r" to session "owner"
+    And we send SimpleQuery "COMMIT" to session "owner"
+    And we send SimpleQuery "EXECUTE p" to session "owner" and store response
+    Then session "owner" should receive DataRow with "1"
+
+  Scenario: A DEALLOCATE ALL earlier in the pipeline does not spare a later named Parse from cleanup
+    When we create session "owner" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send Parse "reset" with query "DEALLOCATE ALL" to session "owner"
+    And we send Bind "" to "reset" with params "" to session "owner"
+    And we send Execute "" to session "owner"
+    And we send Parse "r" with query "SELECT 2" to session "owner"
+    And we send Sync to session "owner"
+    And we create session "next" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "PREPARE r AS SELECT 3" to session "next"
+    And we send SimpleQuery "EXECUTE r" to session "next" and store response
+    Then session "next" should receive DataRow with "3"

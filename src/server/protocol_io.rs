@@ -867,14 +867,21 @@ fn handle_command_complete(server: &mut Server, message: &BytesMut) {
         CommandCompleteEffect::DisarmDeclare => {
             server.cleanup_state.needs_cleanup_declare = false;
         }
+        // A named Parse later in the same pipeline was forwarded before this
+        // reset was answered, and its statement outlives the reset: the mark
+        // of protocol statements under client names survives it, and the
+        // pooler's own DEALLOCATE ALL, which clears the mark, stays armed.
         CommandCompleteEffect::DisarmPrepare => {
-            server.cleanup_state.needs_cleanup_prepare = false;
+            server.cleanup_state.needs_cleanup_prepare =
+                server.cleanup_state.client_named_protocol_statements;
             server.cleanup_state.sql_prepared_statements = 0;
-            server.cleanup_state.client_named_protocol_statements = false;
             drop_prepared_statement_cache_on_reset(server, "DEALLOCATE ALL");
         }
         CommandCompleteEffect::DisarmAll => {
+            let named_protocol_statements = server.cleanup_state.client_named_protocol_statements;
             server.cleanup_state.reset();
+            server.cleanup_state.client_named_protocol_statements = named_protocol_statements;
+            server.cleanup_state.needs_cleanup_prepare = named_protocol_statements;
             server
                 .server_parameters
                 .remove_startup_only_params_after_session_reset();
@@ -1632,6 +1639,44 @@ mod tests {
         assert!(sent.is_ok(), "{sent:?}");
         assert_eq!(reader.await.unwrap(), data.len());
         assert!(!server.is_bad());
+    }
+
+    /// A named Parse later in the same pipeline was forwarded before the
+    /// client's DEALLOCATE ALL or DISCARD ALL was answered, so the reset does
+    /// not prove the client has no protocol statements under its own names.
+    #[tokio::test]
+    async fn client_reset_keeps_the_named_protocol_statement_mark() {
+        for tag in [&b"DEALLOCATE ALL\0"[..], &b"DISCARD ALL\0"[..]] {
+            let (mut server, _peer) = crate::server::Server::test_silent_socket();
+            server.cleanup_state.client_named_protocol_statements = true;
+
+            handle_command_complete(&mut server, &BytesMut::from(tag));
+
+            assert!(
+                server.cleanup_state.client_named_protocol_statements,
+                "{}",
+                String::from_utf8_lossy(tag)
+            );
+        }
+    }
+
+    /// A statement parsed under a client name after the reset in the same
+    /// pipeline still exists, so the pooler's DEALLOCATE ALL stays armed.
+    #[tokio::test]
+    async fn client_reset_leaves_later_named_statements_to_checkin_cleanup() {
+        for tag in [&b"DEALLOCATE ALL\0"[..], &b"DISCARD ALL\0"[..]] {
+            let (mut server, _peer) = crate::server::Server::test_silent_socket();
+            server.mark_dirty();
+            server.cleanup_state.client_named_protocol_statements = true;
+
+            handle_command_complete(&mut server, &BytesMut::from(tag));
+
+            assert!(
+                server.cleanup_state.needs_cleanup_prepare,
+                "{}",
+                String::from_utf8_lossy(tag)
+            );
+        }
     }
 
     /// A missing `DOORMAN_missing_*` statement is one the pooler named on
