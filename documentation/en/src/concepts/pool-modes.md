@@ -81,11 +81,13 @@ Useful when one user (operations tooling, migrations) needs session semantics bu
 
 ## Cleanup on checkin
 
-Cleanup in transaction mode is **mutation-tracked**, not unconditional. PgDoorman watches each transaction for `SET`, `PREPARE`, and `DECLARE CURSOR`, and only when the backend returns to the pool with one of those flags set does it issue `RESET ALL`, `DEALLOCATE ALL`, or `CLOSE ALL` respectively. A read-only transaction skips cleanup entirely — that's a measurable win on hot OLTP paths.
+Cleanup in transaction mode is **mutation-tracked**: PgDoorman watches each transaction for `SET`, `PREPARE`, and `DECLARE CURSOR`, and only when the backend returns to the pool with one of those flags set does it issue `RESET ALL`, `DEALLOCATE ALL`, or `CLOSE ALL` respectively.
+
+Session state that PostgreSQL does not report on the wire, such as advisory locks and `pg_variables` session variables, cannot be tracked this way. The pool's `release_query` clears it on every check-in, by default with `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`. That is one more round trip to PostgreSQL per transaction, and the backend stays checked out until it completes. Pools whose applications keep neither session-level advisory locks nor non-transactional `pg_variables` across transactions can set `release_query = ""`; transaction-level advisory locks (`pg_advisory_xact_lock`) are released by PostgreSQL at commit.
 
 What gets reset when a flag fires:
 
-- `SET` flag → `RESET ALL` drops session-level GUCs and runs `pg_advisory_unlock_all` implicitly.
+- `SET` flag → `RESET ALL` drops session-level GUCs.
 - `PREPARE` flag → `DEALLOCATE ALL` drops PostgreSQL-side prepared statements that the driver named explicitly. PgDoorman's own prepared-statement cache survives the reset because it is keyed by query text, not by backend name.
 - `DECLARE CURSOR` flag → `CLOSE ALL` drops cursors.
 
@@ -100,7 +102,7 @@ pools:
     cleanup_server_connections: false
 ```
 
-Only do this if you are sure your application never leaks session state. The mutation-tracked default is already cheap when no mutation happened, so the opt-out is rarely worth the risk.
+Only do this if you are sure your application never leaks session state. Mutation-tracked cleanup costs nothing when no mutation happened, so the opt-out is rarely worth the risk. It does not affect `release_query`, which is configured separately.
 
 ## Reference
 
