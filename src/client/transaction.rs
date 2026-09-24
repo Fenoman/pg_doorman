@@ -3376,6 +3376,14 @@ where
                 {
                     server.skipped_exchange_reply()
                 }
+                // The client went away mid-frame and the frame was still read:
+                // drain or cancel the rest with the slot held, as below.
+                Err(ServerWaitError::Server(err @ Error::ClientGoneMidStream(_))) => {
+                    if !server.is_bad() {
+                        server.recover_after_client_gone(false).await;
+                    }
+                    return Err(err);
+                }
                 Err(ServerWaitError::Server(err)) => {
                     if !server.is_bad() {
                         server.wait_available().await;

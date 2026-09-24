@@ -59,8 +59,8 @@ use crate::messages::socket::read_message_body_append;
 use crate::messages::PgErrorMsg;
 use crate::messages::MAX_MESSAGE_SIZE;
 use crate::messages::{
-    proxy_copy_data_with_timeout, read_message_body_reuse, read_message_header, write_all_flush,
-    write_all_flush_timeout, BytesMutReader,
+    read_message_body_reuse, read_message_header, write_all_flush, write_all_flush_timeout,
+    BytesMutReader,
 };
 
 use super::cleanup::{ResetCleanupCommand, SetCleanupCommand};
@@ -200,55 +200,113 @@ where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
     let copy_timeout = crate::config::proxy_copy_data_timeout();
-    // Send current buffer + header
+    let client_error = stream_large_frame(
+        server,
+        client_stream,
+        code_u8,
+        message_len,
+        copy_timeout,
+        "data_row",
+    )
+    .await?;
+    server.data_available = true;
+    streamed_frame_result(client_error)
+}
+
+/// The response to a streamed frame: nothing more to hand back, or the
+/// error of a client that went away mid-frame.
+fn streamed_frame_result(client_error: Option<Error>) -> Result<BytesMut, Error> {
+    match client_error {
+        None => Ok(BytesMut::new()),
+        Some(err) => Err(Error::ClientGoneMidStream(err.to_string())),
+    }
+}
+
+/// Streams a frame larger than `max_message_size` from the backend to the
+/// client: the response gathered so far with the frame header, then the
+/// body in chunks. A client that stops taking bytes (an error, or no
+/// progress for `timeout`) gets no more, but the rest of the frame is still
+/// read, so the backend stays in step with the protocol and its query can
+/// be drained or canceled while the pool slot is still held. Returns the
+/// client's error in that case; fails only when the backend does.
+async fn stream_large_frame<C>(
+    server: &mut Server,
+    client_stream: &mut C,
+    code_u8: u8,
+    message_len: i32,
+    timeout: Duration,
+    kind: &'static str,
+) -> Result<Option<Error>, Error>
+where
+    C: tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
     server.buffer.put_u8(code_u8);
     server.buffer.put_i32(message_len);
     let prev_bad = server.bad;
+    // A future dropped mid-frame leaves the stream inside it.
     server.bad = true;
-    write_all_flush_timeout(client_stream, &server.buffer, copy_timeout).await?;
+    let mut client_error = write_all_flush_timeout(client_stream, &server.buffer, timeout)
+        .await
+        .err();
 
-    // Header (1 byte type code + 4 byte length field) already left
-    // pg_doorman in the deadline-bound flush above; the payload is what
-    // `proxy_copy_data_with_timeout` streams. The counter is bumped
-    // by header + actually-forwarded payload so a partial copy is
-    // recorded as the bytes that actually reached the wire, not the
-    // declared frame size that promised more than was delivered.
     const HEADER_BYTES: u64 = 1 + mem::size_of::<i32>() as u64;
-    let mut payload_copied: usize = 0;
-    let res = proxy_copy_data_with_timeout(
-        copy_timeout,
-        &mut *server.stream,
-        client_stream,
-        message_len as usize - mem::size_of::<i32>(),
-        &mut payload_copied,
-    )
-    .await;
+    const MAX_CHUNK: usize = 65536;
+    let mut remaining = message_len as usize - mem::size_of::<i32>();
+    let mut chunk = vec![0_u8; remaining.min(MAX_CHUNK)];
+    let mut delivered: usize = 0;
+    let mut backend_error = None;
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        let read = match crate::utils::timeout::timeout_unless_ready(
+            timeout,
+            server.stream.read(&mut chunk[..want]),
+        )
+        .await
+        {
+            Ok(Ok(0)) => Err(Error::SocketError(
+                "Error reading from socket: connection closed".to_string(),
+            )),
+            Ok(Ok(read)) => Ok(read),
+            Ok(Err(err)) => Err(Error::SocketError(format!(
+                "Error reading from socket: {err:?}"
+            ))),
+            Err(_) => Err(Error::ProxyTimeout),
+        };
+        let read = match read {
+            Ok(read) => read,
+            Err(err) => {
+                backend_error = Some(err);
+                break;
+            }
+        };
+        remaining -= read;
+        if client_error.is_none() {
+            match write_all_flush_timeout(client_stream, &chunk[..read], timeout).await {
+                Ok(()) => delivered += read,
+                Err(err) => client_error = Some(err),
+            }
+        }
+    }
     record_streaming(
         server,
-        "data_row",
-        res.is_ok(),
-        HEADER_BYTES + payload_copied as u64,
+        kind,
+        backend_error.is_none() && client_error.is_none(),
+        HEADER_BYTES + delivered as u64,
     );
-    if let Err(err) = res {
+    if let Some(err) = backend_error {
         server.mark_bad(err.to_string().as_str());
         return Err(err);
     }
-
-    if !prev_bad {
-        server.bad = false;
-    }
-
+    server.bad = prev_bad;
     server
         .stats
         .data_received(server.buffer.len() + message_len as usize);
     server.touch_activity();
-    server.data_available = true;
     server.stats.wait_idle();
-    // zero-copy split - was `buffer.clear(); buffer.clone()` which
-    // returned an empty BytesMut after a full deep copy of the (now-empty)
-    // buffer. Just hand back a fresh empty BytesMut; semantics identical.
     server.buffer.clear();
-    Ok(BytesMut::new())
+    Ok(client_error)
 }
 
 /// Handles large FunctionCallResponse ('V') messages that exceed max_message_size.
@@ -263,46 +321,17 @@ where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
     let copy_timeout = crate::config::proxy_copy_data_timeout();
-    server.buffer.put_u8(code_u8);
-    server.buffer.put_i32(message_len);
-    let prev_bad = server.bad;
-    server.bad = true;
-    write_all_flush_timeout(client_stream, &server.buffer, copy_timeout).await?;
-
-    const HEADER_BYTES: u64 = 1 + mem::size_of::<i32>() as u64;
-    let mut payload_copied: usize = 0;
-    let res = proxy_copy_data_with_timeout(
-        copy_timeout,
-        &mut *server.stream,
-        client_stream,
-        message_len as usize - mem::size_of::<i32>(),
-        &mut payload_copied,
-    )
-    .await;
-    record_streaming(
+    let client_error = stream_large_frame(
         server,
+        client_stream,
+        code_u8,
+        message_len,
+        copy_timeout,
         "function_call_response",
-        res.is_ok(),
-        HEADER_BYTES + payload_copied as u64,
-    );
-    if let Err(err) = res {
-        server.mark_bad(err.to_string().as_str());
-        return Err(err);
-    }
-
-    if !prev_bad {
-        server.bad = false;
-    }
-
-    server
-        .stats
-        .data_received(server.buffer.len() + message_len as usize);
-    server.touch_activity();
+    )
+    .await?;
     server.data_available = true;
-    server.stats.wait_idle();
-    // Hand back a fresh empty BytesMut; matches the D/d streaming handlers.
-    server.buffer.clear();
-    Ok(BytesMut::new())
+    streamed_frame_result(client_error)
 }
 
 /// Handles large CopyData ('d') messages that exceed max_message_size.
@@ -333,55 +362,19 @@ async fn handle_large_copy_data_inner<C>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    // Send current buffer + header
-    server.buffer.put_u8(code_u8);
-    server.buffer.put_i32(message_len);
-    let prev_bad = server.bad;
-    server.bad = true;
-    write_all_flush_timeout(client_stream, &server.buffer, copy_timeout).await?;
-
-    // Same wire-bytes contract as in `handle_large_data_row`: header
-    // is on the wire after the buffer flush above, the payload is
-    // counted from what `proxy_copy_data_with_timeout` actually shipped.
-    const HEADER_BYTES: u64 = 1 + mem::size_of::<i32>() as u64;
-    let mut payload_copied: usize = 0;
-    // bound the COPY-OUT stream with
-    // `proxy_copy_data_timeout`, exactly like the sibling
-    // `handle_large_data_row`. Without the deadline a backend that stalls
-    // mid-frame on a live-but-silent socket pins this task and the
-    // checked-out backend forever (TCP keepalive cannot break an
-    // app-level stall; TCP_USER_TIMEOUT is Linux-only and fires only on
-    // un-ACKed in-flight data). On timeout the backend is marked bad so it
-    // is evicted instead of recycled with undrained bytes.
-    let res = proxy_copy_data_with_timeout(
-        copy_timeout,
-        &mut *server.stream,
-        client_stream,
-        message_len as usize - mem::size_of::<i32>(),
-        &mut payload_copied,
-    )
-    .await;
-    record_streaming(
+    // Bounded by `proxy_copy_data_timeout` like the other frames: a backend
+    // that stalls mid-frame on a live but silent socket fails the stream and
+    // is evicted instead of pinning this task.
+    let client_error = stream_large_frame(
         server,
+        client_stream,
+        code_u8,
+        message_len,
+        copy_timeout,
         "copy_data",
-        res.is_ok(),
-        HEADER_BYTES + payload_copied as u64,
-    );
-    if let Err(err) = res {
-        server.mark_bad(err.to_string().as_str());
-        return Err(err);
-    }
-
-    server.bad = prev_bad;
-    server
-        .stats
-        .data_received(server.buffer.len() + message_len as usize);
-    server.touch_activity();
-    server.stats.wait_idle();
-    // clone()-after-clear was copying an empty buffer. Hand back a fresh
-    // BytesMut directly.
-    server.buffer.clear();
-    Ok(BytesMut::new())
+    )
+    .await?;
+    streamed_frame_result(client_error)
 }
 
 /// Helper that bumps both streaming counters from the streaming handlers.
@@ -2637,6 +2630,85 @@ mod tests {
             !impl_src.contains("write_all_flush(client_stream, &server.buffer)"),
             "large-message handlers must not flush headers with an unbounded client write"
         );
+    }
+
+    /// Client write half that takes `limit` bytes, then fails like a
+    /// connection the client reset mid-frame.
+    struct FailAfter {
+        limit: usize,
+        taken: usize,
+    }
+
+    impl tokio::io::AsyncWrite for FailAfter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.taken >= self.limit {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            let n = buf.len().min(self.limit - self.taken);
+            self.taken += n;
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A client gone in the middle of a streamed frame leaves the backend in
+    /// step with the protocol: the rest of the frame is read, the exchange
+    /// reports the client, and the rest of the reply can still be drained,
+    /// so the query is stopped with its pool slot held.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_gone_mid_frame_leaves_the_backend_in_step() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.max_message_size = 1024;
+        let value = vec![b'x'; 200 * 1024];
+        let mut reply = BytesMut::new();
+        reply.put_u8(b'D');
+        reply.put_i32(4 + 2 + 4 + value.len() as i32);
+        reply.put_i16(1);
+        reply.put_i32(value.len() as i32);
+        reply.put_slice(&value);
+        let mut rest = crate::messages::command_complete("SELECT 1");
+        rest.put(crate::messages::ready_for_query(false));
+        reply.put_slice(&rest);
+        let writer = tokio::spawn(async move {
+            peer.write_all(&reply).await.unwrap();
+            peer
+        });
+
+        let mut client = FailAfter {
+            limit: 10_000,
+            taken: 0,
+        };
+        let result = server.recv(&mut client, None).await;
+
+        assert!(
+            matches!(result, Err(Error::ClientGoneMidStream(_))),
+            "{result:?}"
+        );
+        assert!(!server.is_bad(), "the backend is still in step");
+        assert!(server.is_data_available());
+        let drained = server.recv(tokio::io::sink(), None).await.unwrap();
+        assert_eq!(&drained[..], &rest[..]);
+        let _peer = writer.await.unwrap();
     }
 
     #[cfg(unix)]

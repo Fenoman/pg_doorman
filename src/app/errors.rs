@@ -70,6 +70,9 @@ pub enum Error {
     /// PostgreSQL skipped the exchange that followed it. Carries the
     /// SQLSTATE and the message as cut for the log.
     ReleaseQueryFailed(String),
+    /// The client stopped taking a frame streamed to it; the rest of the
+    /// frame was read, so the backend is still in step with the protocol.
+    ClientGoneMidStream(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -218,6 +221,9 @@ impl std::fmt::Display for Error {
                 write!(f, "Auth query execution error: {msg}")
             }
             Error::AuthQueryPoolClosed => write!(f, "Auth query executor pool is closed"),
+            Error::ClientGoneMidStream(msg) => {
+                write!(f, "client gone while a large frame streamed to it: {msg}")
+            }
             Error::ReleaseQueryFailed(msg) => write!(
                 f,
                 "release_query failed, the following exchange was skipped: {msg}"
