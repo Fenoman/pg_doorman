@@ -1838,6 +1838,9 @@ where
         if count == 0 {
             return Ok(());
         }
+        // A client that does not read may hold this write; the last client's
+        // release must not wait for it.
+        server.send_deferred_release().await?;
         debug!(
             "[{}@{} #c{}] flush: injecting {} synthetic ParseComplete for cached Parse",
             self.username, self.pool_name, self.connection_id, count
@@ -6102,6 +6105,77 @@ mod relay_response_client_write_failure_tests {
         ) -> Poll<Result<(), std::io::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// Client write half that never takes a byte: a client that stopped
+    /// reading with its socket buffer full.
+    struct StalledWriter;
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A first batch the pooler answers itself, a cached Parse and Flush,
+    /// may wait on a client that does not read. The last client's deferred
+    /// release goes to the backend before that wait.
+    #[tokio::test]
+    async fn a_synthetic_reply_to_a_stalled_client_does_not_hold_back_the_release() {
+        let mut client = test_client_with_writer(StalledWriter);
+        client.prepared.skipped_parses.push(SkippedParse);
+        client
+            .prepared
+            .batch_operations
+            .push(BatchOperation::ParseSkipped {
+                statement_name: Arc::from("cached"),
+            });
+        let (mut server, mut backend) = Server::test_silent_socket();
+        server.set_release_query(None);
+        server.release_statements_prepared = true;
+        server.deferred_release = true;
+        let prepared = crate::server::resolve_release_query(None)
+            .unwrap()
+            .prefix()
+            .unwrap()
+            .prepared()
+            .to_vec();
+
+        let flush = BytesMut::from(&b"H\0\0\0\x04"[..]);
+        {
+            let mut handled =
+                std::pin::pin!(client.handle_sync_flush(&flush, &mut server, now(), 'H'));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut handled)
+                    .await
+                    .is_err(),
+                "the client does not read"
+            );
+        }
+        let mut sent = vec![0_u8; prepared.len()];
+        tokio::time::timeout(Duration::from_secs(1), backend.read_exact(&mut sent))
+            .await
+            .expect("the release goes before the write to the client")
+            .unwrap();
+        assert_eq!(sent, prepared);
     }
 
     fn queue_cached_parse(client: &mut Client<SilentReader, RecordingWriter>) {
