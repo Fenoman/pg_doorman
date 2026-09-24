@@ -529,10 +529,11 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
             && !msg
                 .message
                 .contains(crate::client::util::UNREGISTERED_STATEMENT_PREFIX);
+        let logged_message = sanitize_for_log(&msg.message);
         let mut details = format!(
             "[{}@{}] server error pid={}: severity={}, code={}, message=\"{}\", in_transaction={}, in_copy={}",
             server.address.username, server.address.pool_name, server.get_process_id(),
-            msg.severity, msg.code, sanitize_for_log(&msg.message),
+            msg.severity, msg.code, logged_message,
             server.in_transaction, server.in_copy_mode,
         );
         if let Some(ref hint) = msg.hint {
@@ -550,8 +551,10 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
         // error_count to meaninglessness. Per-SQLSTATE breakdown via
         // `pg_doorman_pools_errors_total{sqlstate}` is the correct
         // surface for SQL-level errors.
-        // Let `small_simple_query` return SQL-level failures as `Err`.
-        server.last_sql_error = Some((msg.code.clone(), msg.message.clone()));
+        // Let `small_simple_query` return SQL-level failures as `Err`. Its
+        // callers only log the text or wrap it in their own errors and never
+        // send it to the client, so the text cut for the log is enough.
+        server.last_sql_error = Some((msg.code.clone(), logged_message));
     } else {
         error!(
             "[{}@{}] server error pid={}: could not parse error details",
@@ -1677,6 +1680,21 @@ mod tests {
                 String::from_utf8_lossy(tag)
             );
         }
+    }
+
+    /// The error kept for housekeeping queries ends up in their errors and
+    /// in the log lines built from them, so it is bounded the same way.
+    #[tokio::test]
+    async fn kept_sql_error_text_is_bounded() {
+        let (mut server, _peer) = crate::server::Server::test_silent_socket();
+        let body = format!(
+            "SERROR\0VERROR\0CP0001\0M{}\0\0",
+            "y".repeat(2 * 1024 * 1024)
+        );
+        handle_error_response(&mut server, &mut BytesMut::from(body.as_bytes()));
+        let (sqlstate, message) = server.last_sql_error.take().expect("SQL error kept");
+        assert_eq!(sqlstate, "P0001");
+        assert!(message.len() < 2048, "{} bytes kept", message.len());
     }
 
     /// A missing `DOORMAN_missing_*` statement is one the pooler named on

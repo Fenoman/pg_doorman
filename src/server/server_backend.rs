@@ -590,7 +590,8 @@ pub struct Server {
     /// Most recent PostgreSQL ErrorResponse for the current backend
     /// exchange. `small_simple_query` uses it to return SQL failures as
     /// `Err`, so callers do not mirror rejected SET/RESET operations
-    /// into the backend snapshot.
+    /// into the backend snapshot. The message is cut and escaped as in the
+    /// error's own log line.
     pub(crate) last_sql_error: Option<(String, String)>,
 
     /// Resolved release query shared by every backend in this pool. It carries
