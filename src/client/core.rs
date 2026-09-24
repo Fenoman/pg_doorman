@@ -814,6 +814,11 @@ pub struct PreparedStatementState {
     /// is the point where a later CommandComplete must be attributed.
     pub portal_set_cleanup_commands: AHashMap<String, SetCleanupCommand>,
     pub portal_reset_cleanup_commands: AHashMap<String, ResetCleanupCommand>,
+    /// Portals bound to a statement that drops every prepared statement
+    /// (DEALLOCATE ALL, or a DISCARD ALL the pooler forwards). The drop
+    /// happens when such a portal is executed, which inside a transaction
+    /// may be a later batch than its Bind.
+    pub(crate) portal_statement_resets: AHashSet<String>,
     pub portal_cleanup_attribution_bytes: usize,
     /// When client-side prepared statement caching is disabled, Parse frames
     /// still define statement names whose cleanup attribution must be copied
@@ -865,6 +870,7 @@ impl PreparedStatementState {
             ignore_until_sync: false,
             portal_set_cleanup_commands: AHashMap::new(),
             portal_reset_cleanup_commands: AHashMap::new(),
+            portal_statement_resets: AHashSet::new(),
             portal_cleanup_attribution_bytes: 0,
             disabled_statement_set_cleanup_commands: AHashMap::new(),
             disabled_statement_reset_cleanup_commands: AHashMap::new(),
@@ -936,6 +942,7 @@ impl PreparedStatementState {
     pub fn clear_portal_cleanup_commands(&mut self) {
         self.portal_set_cleanup_commands.clear();
         self.portal_reset_cleanup_commands.clear();
+        self.portal_statement_resets.clear();
         self.portal_cleanup_attribution_bytes = 0;
     }
 
@@ -1028,6 +1035,40 @@ impl PreparedStatementState {
     pub fn remove_portal_cleanup_command(&mut self, portal_name: &str) {
         self.remove_portal_set_cleanup_command(portal_name);
         self.remove_portal_reset_cleanup_command(portal_name);
+    }
+
+    /// Record whether `portal_name` is now bound to a statement that drops
+    /// every prepared statement; a Bind replaces the portal of that name.
+    #[inline]
+    pub(crate) fn track_portal_statement_reset(
+        &mut self,
+        portal_name: &str,
+        drops_prepared_statements: bool,
+    ) -> Result<(), Error> {
+        if !drops_prepared_statements {
+            self.take_portal_statement_reset(portal_name);
+            return Ok(());
+        }
+        if !self.portal_statement_resets.contains(portal_name) {
+            self.reserve_portal_cleanup_attribution(portal_name)?;
+            self.portal_statement_resets.insert(portal_name.to_string());
+        }
+        Ok(())
+    }
+
+    /// Whether running `portal_name` drops every prepared statement. Such a
+    /// portal runs once, and a closed one not at all, so the mark goes.
+    #[inline]
+    pub(crate) fn take_portal_statement_reset(&mut self, portal_name: &str) -> bool {
+        if self.portal_statement_resets.is_empty()
+            || !self.portal_statement_resets.remove(portal_name)
+        {
+            return false;
+        }
+        self.portal_cleanup_attribution_bytes = self
+            .portal_cleanup_attribution_bytes
+            .saturating_sub(Self::portal_cleanup_entry_bytes(portal_name));
+        true
     }
 
     #[inline(always)]

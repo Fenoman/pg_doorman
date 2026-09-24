@@ -850,11 +850,6 @@ where
                     server,
                 )
                 .await?;
-                if cached.drops_prepared_statements {
-                    // PostgreSQL drops every statement when it runs this
-                    // portal; later cache hits of the batch must prepare anew.
-                    server.queue_statements_reset();
-                }
 
                 if let Some(command) = cached.set_cleanup_command {
                     self.prepared
@@ -866,6 +861,10 @@ where
                     self.prepared
                         .remove_portal_cleanup_command(client_portal_name);
                 }
+                self.prepared.track_portal_statement_reset(
+                    client_portal_name,
+                    cached.drops_prepared_statements,
+                )?;
 
                 // Append directly after portal-attribution cap checks.
                 Bind::append_renamed(&message, &server_name, &mut self.buffer)?;
@@ -904,6 +903,11 @@ where
         let Some(portal_name) = execute_portal_name(message) else {
             return;
         };
+        if self.prepared.take_portal_statement_reset(portal_name) {
+            // PostgreSQL drops every statement when it runs this portal;
+            // later cache hits of the batch must prepare anew.
+            server.queue_statements_reset();
+        }
         if let Some(command) = self
             .prepared
             .portal_set_cleanup_commands
@@ -1100,6 +1104,8 @@ where
         if close.is_portal() {
             self.prepared
                 .remove_portal_cleanup_command(close.name.as_str());
+            self.prepared
+                .take_portal_statement_reset(close.name.as_str());
         }
         if close.is_prepared_statement() {
             self.prepared
@@ -1696,6 +1702,126 @@ mod anonymous_close_tests {
         buf.put_u8(0);
         buf.put_i32(0);
         buf
+    }
+
+    fn frame_codes(buffer: &[u8]) -> Vec<u8> {
+        let mut codes = Vec::new();
+        let mut rest = buffer;
+        while rest.len() >= 5 {
+            let len = i32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+            codes.push(rest[0]);
+            rest = &rest[1 + len..];
+        }
+        codes
+    }
+
+    fn close_portal(portal: &str) -> BytesMut {
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'C');
+        buf.put_i32((4 + 1 + portal.len() + 1) as i32);
+        buf.put_u8(b'P');
+        buf.put_slice(portal.as_bytes());
+        buf.put_u8(0);
+        buf
+    }
+
+    /// A client with a warm statement and a DEALLOCATE ALL statement, both
+    /// already on the backend.
+    fn client_with_warm_and_reset_statements() -> (
+        Client<Empty, Sink>,
+        crate::server::Server,
+        tokio::net::UnixStream,
+    ) {
+        let mut client = test_client();
+        let (mut server, peer) = crate::server::Server::test_silent_socket();
+        server.prepared_statement_cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(16).unwrap(),
+            RandomState::new(),
+        ));
+        for name in ["DOORMAN_reset", "DOORMAN_warm"] {
+            server
+                .prepared_statement_cache
+                .as_mut()
+                .unwrap()
+                .put(name.to_string(), ());
+        }
+        let mut reset = cached_with_server_name("DOORMAN_reset");
+        reset.drops_prepared_statements = true;
+        let _ = client
+            .prepared
+            .cache
+            .put(PreparedStatementKey::Named("reset".to_string()), reset);
+        let _ = client.prepared.cache.put(
+            PreparedStatementKey::Named("warm".to_string()),
+            cached_with_server_name("DOORMAN_warm"),
+        );
+        (client, server, peer)
+    }
+
+    /// DEALLOCATE ALL drops the statements when its portal runs, not when it
+    /// is bound: a second Bind of it before that still finds it on the
+    /// backend, and the Execute makes the rest of the batch prepare anew.
+    #[tokio::test]
+    async fn a_statements_reset_takes_effect_when_its_portal_runs() {
+        let pool = ConnectionPool::test_for_protocol();
+        let (mut client, mut server, _peer) = client_with_warm_and_reset_statements();
+
+        for portal in ["p1", "p2"] {
+            client
+                .process_bind_immediate(make_bind(portal, "reset"), &pool, &mut server)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            frame_codes(&client.buffer),
+            b"BB",
+            "no Parse of a statement still there"
+        );
+        assert!(server.has_prepared_statement("DOORMAN_warm"));
+
+        client.track_execute_cleanup_attribution(&mut server, &make_execute("p1"));
+        assert!(
+            !server.has_prepared_statement("DOORMAN_warm"),
+            "statements prepared before the reset ran are gone for the rest of the batch"
+        );
+    }
+
+    /// Inside a transaction a portal outlives the batch that bound it; the
+    /// reset happens in the batch that executes it. A closed portal, or an
+    /// unnamed one bound again to another statement, resets nothing.
+    #[tokio::test]
+    async fn a_statements_reset_follows_its_portal_across_batches() {
+        let pool = ConnectionPool::test_for_protocol();
+        let (mut client, mut server, _peer) = client_with_warm_and_reset_statements();
+
+        client
+            .process_bind_immediate(make_bind("later", "reset"), &pool, &mut server)
+            .await
+            .unwrap();
+        client
+            .process_bind_immediate(make_bind("closed", "reset"), &pool, &mut server)
+            .await
+            .unwrap();
+        client
+            .process_bind_immediate(make_bind("", "reset"), &pool, &mut server)
+            .await
+            .unwrap();
+        client
+            .process_bind_immediate(make_bind("", "warm"), &pool, &mut server)
+            .await
+            .unwrap();
+        client
+            .process_close_immediate(close_portal("closed"))
+            .unwrap();
+        client.prepared.reset_batch();
+        client.buffer.clear();
+
+        client.track_execute_cleanup_attribution(&mut server, &make_execute(""));
+        client.track_execute_cleanup_attribution(&mut server, &make_execute("closed"));
+        assert!(server.has_prepared_statement("DOORMAN_warm"));
+
+        client.track_execute_cleanup_attribution(&mut server, &make_execute("later"));
+        assert!(!server.has_prepared_statement("DOORMAN_warm"));
     }
 
     #[tokio::test]

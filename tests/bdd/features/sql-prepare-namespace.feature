@@ -114,6 +114,31 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     And we send Sync to both
     Then we should receive identical messages from both
 
+  Scenario: A DEALLOCATE ALL bound to two portals is not prepared again before it runs
+    When we send Parse "reset" with query "DEALLOCATE ALL" to both
+    And we send Bind "one" to "reset" with params "" to both
+    And we send Bind "two" to "reset" with params "" to both
+    And we send Execute "one" to both
+    And we send Sync to both
+    Then we should receive identical messages from both
+
+  Scenario: A DEALLOCATE ALL portal run in a later batch of the transaction hides a warm statement
+    When we send Parse "warm" with query "SELECT 1" to both
+    And we send Bind "" to "warm" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    And we send SimpleQuery "BEGIN" to both
+    And we send Parse "reset" with query "DEALLOCATE ALL" to both
+    And we send Bind "reset_portal" to "reset" with params "" to both
+    And we send Sync to both
+    And we send Execute "reset_portal" to both
+    And we send Parse "a" with query "SELECT 1" to both
+    And we send Bind "" to "a" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    And we send SimpleQuery "COMMIT" to both
+    Then we should receive identical messages from both
+
   Scenario: A Bind of an unknown statement keeps the backend's shared statements
     When we create session "one" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send Parse "q" with query "SELECT 1" to session "one"
