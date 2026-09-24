@@ -705,15 +705,13 @@ where
 
             // Release the SQL-level `PREPARE` pin here, on the path both
             // protocols go through. The pin is armed from `handle_simple_query`
-            // AND from the extended-protocol relay loop, but it used to be
-            // disarmed only in the former - while the backend flag it keys off
-            // is disarmed by the response parser regardless of protocol
-            // (`DEALLOCATE ALL` / `DISCARD ALL`). An extended-only client that
-            // dropped its prepared statements therefore stayed pinned forever
-            // and never gave its backend back.
+            // AND from the extended-protocol relay loop, and the response
+            // parser counts the client's SQL-level statements on the backend
+            // regardless of protocol (`PREPARE`, `DEALLOCATE`, `DEALLOCATE
+            // ALL`, `DISCARD ALL`). Once none is left the backend goes back.
             if self.transaction_mode
                 && self.sql_prepare_session_pinned
-                && !server.cleanup_state.needs_cleanup_prepare
+                && server.cleanup_state.sql_prepared_statements == 0
             {
                 self.sql_prepare_session_pinned = false;
             }
@@ -1464,7 +1462,7 @@ where
 
         if self.transaction_mode
             && self.sql_prepare_session_pinned
-            && !server.cleanup_state.needs_cleanup_prepare
+            && server.cleanup_state.sql_prepared_statements == 0
         {
             self.sql_prepare_session_pinned = false;
         }
@@ -3314,7 +3312,7 @@ where
 
             if self.transaction_mode
                 && !self.sql_prepare_session_pinned
-                && server.cleanup_state.needs_cleanup_prepare
+                && server.cleanup_state.sql_prepared_statements > 0
                 && response_contains_sql_prepare_command_complete(&response)
             {
                 self.sql_prepare_session_pinned = true;
@@ -6734,6 +6732,79 @@ mod relay_response_client_write_failure_tests {
             .unwrap()
     }
 
+    fn command_complete_idle(tag: &str) -> Vec<u8> {
+        let mut frame = vec![b'C'];
+        frame.extend_from_slice(&((tag.len() + 1 + 4) as i32).to_be_bytes());
+        frame.extend_from_slice(tag.as_bytes());
+        frame.push(0);
+        frame.extend_from_slice(b"Z\0\0\0\x05I");
+        frame
+    }
+
+    #[tokio::test]
+    async fn deallocating_the_last_sql_statement_releases_backend() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = true;
+        let (mut server, mut peer) = server_with_prepared_cache();
+
+        for (sql, tag) in [
+            ("PREPARE p AS SELECT 1", "PREPARE"),
+            ("PREPARE q AS SELECT 2", "PREPARE"),
+            ("DEALLOCATE p", "DEALLOCATE"),
+        ] {
+            let action = run_simple_query(
+                &mut client,
+                &mut server,
+                &mut peer,
+                sql,
+                &command_complete_idle(tag),
+            )
+            .await;
+            assert!(client.sql_prepare_session_pinned, "{sql}: q still exists");
+            assert!(matches!(action, TransactionAction::Continue), "{sql}");
+        }
+
+        let action = run_simple_query(
+            &mut client,
+            &mut server,
+            &mut peer,
+            "DEALLOCATE q",
+            &command_complete_idle("DEALLOCATE"),
+        )
+        .await;
+        assert!(!client.sql_prepare_session_pinned);
+        assert!(matches!(action, TransactionAction::Break));
+    }
+
+    #[tokio::test]
+    async fn deallocate_all_releases_sql_prepare_pin() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = true;
+        let (mut server, mut peer) = server_with_prepared_cache();
+
+        let first = run_simple_query(
+            &mut client,
+            &mut server,
+            &mut peer,
+            "PREPARE p AS SELECT 1",
+            &command_complete_idle("PREPARE"),
+        )
+        .await;
+        assert!(client.sql_prepare_session_pinned);
+        assert!(matches!(first, TransactionAction::Continue));
+
+        let second = run_simple_query(
+            &mut client,
+            &mut server,
+            &mut peer,
+            "DEALLOCATE ALL",
+            &command_complete_idle("DEALLOCATE ALL"),
+        )
+        .await;
+        assert!(!client.sql_prepare_session_pinned);
+        assert!(matches!(second, TransactionAction::Break));
+    }
+
     #[test]
     fn deallocate_of_pooler_alias_is_detected() {
         for (sql, expected) in [
@@ -7051,10 +7122,10 @@ mod flush_transaction_counter_tests {
 /// for as long as the statement exists — that part is deliberate. The pin
 /// is armed from the simple-query path AND from the extended-protocol
 /// relay loop, but it used to be disarmed only inside
-/// `handle_simple_query`. The backend-side flag it keys off,
-/// `cleanup_state.needs_cleanup_prepare`, is protocol-agnostic: the
-/// response parser disarms it on `DEALLOCATE ALL` / `DISCARD ALL` no
-/// matter which protocol carried them. So an extended-only client
+/// `handle_simple_query`. The backend-side count it keys off,
+/// `cleanup_state.sql_prepared_statements`, is protocol-agnostic: the
+/// response parser updates it on `PREPARE`, `DEALLOCATE`, `DEALLOCATE ALL`
+/// and `DISCARD ALL` no matter which protocol carried them. So an extended-only client
 /// (asyncpg, npgsql) that ran `PREPARE` and later dropped the statements
 /// kept the pin forever and held its backend until disconnect —
 /// transaction pooling silently degraded into session pooling for that
@@ -7072,9 +7143,9 @@ mod sql_prepare_pin_release_tests {
         // An extended-protocol `PREPARE` armed the pin in the relay loop.
         client.sql_prepare_session_pinned = true;
         let (mut server, _peer) = Server::test_silent_socket();
-        // A later `DEALLOCATE ALL` — extended protocol as well — disarmed
-        // the backend flag, so there is nothing left to stay pinned for.
-        server.cleanup_state.needs_cleanup_prepare = false;
+        // A later `DEALLOCATE ALL` — extended protocol as well — dropped
+        // the statements, so there is nothing left to stay pinned for.
+        server.cleanup_state.sql_prepared_statements = 0;
 
         assert!(
             client.complete_transaction_if_needed(&server, false),
@@ -7094,7 +7165,7 @@ mod sql_prepare_pin_release_tests {
         client.transaction_mode = true;
         client.sql_prepare_session_pinned = true;
         let (mut server, _peer) = Server::test_silent_socket();
-        server.cleanup_state.needs_cleanup_prepare = true;
+        server.cleanup_state.sql_prepared_statements = 1;
 
         assert!(
             !client.complete_transaction_if_needed(&server, false),
@@ -7113,7 +7184,7 @@ mod sql_prepare_pin_release_tests {
         client.transaction_mode = false;
         client.sql_prepare_session_pinned = true;
         let (mut server, _peer) = Server::test_silent_socket();
-        server.cleanup_state.needs_cleanup_prepare = false;
+        server.cleanup_state.sql_prepared_statements = 0;
 
         assert!(
             !client.complete_transaction_if_needed(&server, false),

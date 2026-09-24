@@ -21,6 +21,7 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
       admin_password = "admin"
       pg_hba.content = "host all all 127.0.0.1/32 trust"
       prepared_statements = true
+      query_wait_timeout = "2s"
       [pools.example_db]
       server_host = "127.0.0.1"
       server_port = ${PG_PORT}
@@ -38,3 +39,20 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     And we send Sync to both
     And we send SimpleQuery "PREPARE sql_prepared AS SELECT 2" to both
     Then we should receive identical messages from both
+
+  Scenario: Deallocating the last SQL statement returns the backend to the pool
+    When we create session "owner" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "PREPARE p AS SELECT 1" to session "owner"
+    And we send SimpleQuery "PREPARE q AS SELECT 2" to session "owner"
+    And we send SimpleQuery "DEALLOCATE p" to session "owner"
+    And we send SimpleQuery "DEALLOCATE q" to session "owner"
+    And we create session "other" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "SELECT 1" to session "other" and store response
+    Then session "other" should receive DataRow with "1"
+
+  Scenario: A failed SQL PREPARE does not keep the backend
+    When we create session "owner" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "PREPARE p AS SELECT * FROM missing_table" to session "owner" expecting error
+    And we create session "other" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "SELECT 1" to session "other" and store response
+    Then session "other" should receive DataRow with "1"

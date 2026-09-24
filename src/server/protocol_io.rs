@@ -88,6 +88,7 @@ const COMMAND_COMPLETE_BY_CLOSE_CURSOR_ALL: &[u8; 17] = b"CLOSE CURSOR ALL\0";
 /// `DEALLOCATE ALL` CommandComplete tag — clears prepared statement cache
 /// and disarms `needs_cleanup_prepare`.
 const COMMAND_COMPLETE_BY_DEALLOCATE_ALL: &[u8; 15] = b"DEALLOCATE ALL\0";
+const COMMAND_COMPLETE_BY_DEALLOCATE: &[u8; 11] = b"DEALLOCATE\0";
 /// `DISCARD ALL` CommandComplete tag — equivalent to `RESET ALL; DEALLOCATE ALL;
 /// CLOSE ALL; UNLISTEN *; ...`, so disarms every `needs_cleanup_*` flag.
 const COMMAND_COMPLETE_BY_DISCARD_ALL: &[u8; 12] = b"DISCARD ALL\0";
@@ -593,6 +594,8 @@ enum CommandCompleteEffect {
     ArmDeclare,
     /// SQL-level `PREPARE` - a server-side prepared statement may now exist.
     ArmPrepare,
+    /// SQL-level `DEALLOCATE <name>` - one prepared statement is gone.
+    DeallocateOne,
     /// Proven `RESET ALL` - every GUC tracked by SET cleanup has been restored.
     DisarmSet,
     /// `CLOSE CURSOR ALL` — no server-side cursors remain; disarm declare-cleanup.
@@ -658,6 +661,8 @@ fn classify_command_complete_with_attribution(
         CommandCompleteEffect::DisarmDeclare
     } else if tag == COMMAND_COMPLETE_BY_DEALLOCATE_ALL {
         CommandCompleteEffect::DisarmPrepare
+    } else if tag == COMMAND_COMPLETE_BY_DEALLOCATE {
+        CommandCompleteEffect::DeallocateOne
     } else if tag == COMMAND_COMPLETE_BY_DISCARD_ALL {
         CommandCompleteEffect::DisarmAll
     } else {
@@ -782,6 +787,16 @@ fn handle_command_complete(server: &mut Server, message: &BytesMut) {
         }
         CommandCompleteEffect::ArmPrepare => {
             server.cleanup_state.needs_cleanup_prepare = true;
+            server.cleanup_state.sql_prepared_statements = server
+                .cleanup_state
+                .sql_prepared_statements
+                .saturating_add(1);
+        }
+        CommandCompleteEffect::DeallocateOne => {
+            server.cleanup_state.sql_prepared_statements = server
+                .cleanup_state
+                .sql_prepared_statements
+                .saturating_sub(1);
         }
         CommandCompleteEffect::DisarmSet => {
             defer_set_cleanup_disarm_if_transactionally_safe(server);
@@ -791,6 +806,7 @@ fn handle_command_complete(server: &mut Server, message: &BytesMut) {
         }
         CommandCompleteEffect::DisarmPrepare => {
             server.cleanup_state.needs_cleanup_prepare = false;
+            server.cleanup_state.sql_prepared_statements = 0;
             drop_prepared_statement_cache_on_reset(server, "DEALLOCATE ALL");
         }
         CommandCompleteEffect::DisarmAll => {
@@ -1420,6 +1436,31 @@ mod tests {
             server.cleanup_state.needs_cleanup_prepare,
             "0A000 must schedule DEALLOCATE ALL so the next Parse reaches PostgreSQL"
         );
+    }
+
+    /// SQL-level PREPARE keeps a transaction-pool client on its backend only
+    /// while one of its statements exists there; the count follows the
+    /// CommandComplete tags PostgreSQL returns.
+    #[tokio::test]
+    async fn sql_prepare_and_deallocate_tags_count_backend_statements() {
+        let (mut server, _peer) = crate::server::Server::test_silent_socket();
+        for (tag, expected) in [
+            (&b"PREPARE\0"[..], 1),
+            (&b"PREPARE\0"[..], 2),
+            (&b"DEALLOCATE\0"[..], 1),
+            (&b"DEALLOCATE ALL\0"[..], 0),
+            (&b"PREPARE\0"[..], 1),
+            (&b"DISCARD ALL\0"[..], 0),
+            (&b"DEALLOCATE\0"[..], 0),
+        ] {
+            handle_command_complete(&mut server, &BytesMut::from(tag));
+            assert_eq!(
+                server.cleanup_state.sql_prepared_statements,
+                expected,
+                "after {}",
+                String::from_utf8_lossy(tag)
+            );
+        }
     }
 
     /// DEALLOCATE ALL drops every shared DOORMAN_N on the backend, so only

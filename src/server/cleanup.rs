@@ -60,6 +60,11 @@ pub(crate) struct CleanupState {
 
     /// If server connection requires CLOSE ALL before checkin because of declare statement
     pub(crate) needs_cleanup_declare: bool,
+
+    /// Statements created with SQL-level `PREPARE` that still exist on the
+    /// backend, counted from CommandComplete tags. A transaction-pool client
+    /// keeps its backend while any exist.
+    pub(crate) sql_prepared_statements: u32,
 }
 
 impl CleanupState {
@@ -70,6 +75,7 @@ impl CleanupState {
             needs_cleanup_session_authorization: false,
             needs_cleanup_prepare: false,
             needs_cleanup_declare: false,
+            sql_prepared_statements: 0,
         }
     }
 
@@ -98,6 +104,7 @@ impl CleanupState {
         self.needs_cleanup_session_authorization = false;
         self.needs_cleanup_prepare = false;
         self.needs_cleanup_declare = false;
+        self.sql_prepared_statements = 0;
     }
 }
 
