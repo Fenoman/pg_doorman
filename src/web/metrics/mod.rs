@@ -888,7 +888,10 @@ pub(crate) static SYNC_PARAMS_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 /// Duration and outcome of the backend check-in exchange after a client
 /// transaction has reached ReadyForQuery. Both labels have a fixed vocabulary:
 /// `path` is empty/release_only/cleanup_only/combined and `result` is
-/// ok/sql_error/transport_error/protocol_error/error.
+/// ok/sql_error/transport_error/protocol_error/error. A default
+/// `release_query` goes out without waiting for its reply: the duration is
+/// that of sending it, and the check-in is observed once the reply is read,
+/// so a backend closed before that leaves no observation.
 pub(crate) static CHECKIN_CLEANUP_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     let histogram = HistogramVec::new(
         HistogramOpts::new(

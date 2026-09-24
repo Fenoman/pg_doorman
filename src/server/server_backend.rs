@@ -829,6 +829,11 @@ pub struct Server {
     pub(crate) release_reply_resets_session: bool,
     pub(crate) release_reply_resets_all: bool,
 
+    /// Path and send time of the check-in whose release reply is pending.
+    /// Its outcome comes with the reply, and so does its observation in
+    /// `CHECKIN_CLEANUP_SECONDS`.
+    pub(crate) release_reply_metric: Option<(&'static str, f64)>,
+
     /// A statement that drops every prepared statement (DEALLOCATE ALL, or
     /// a DISCARD ALL the pooler forwards) is bound in the batch being
     /// assembled. Until PostgreSQL has run it, only the statements the batch
@@ -1948,9 +1953,9 @@ impl Server {
             Ok(result) => result,
             Err(_) => {
                 self.mark_bad("timeout reading the release_query reply");
-                Err(Error::SocketError(
-                    "timeout reading the release_query reply".to_string(),
-                ))
+                let err = Error::SocketError("timeout reading the release_query reply".to_string());
+                protocol_io::record_release_reply_metric(self, &Err(err.clone()));
+                Err(err)
             }
         }
     }
@@ -2187,10 +2192,10 @@ impl Server {
     }
 
     #[inline]
-    fn checkin_cleanup_metric_result(result: &Result<(), Error>) -> &'static str {
+    pub(crate) fn checkin_cleanup_metric_result(result: &Result<(), Error>) -> &'static str {
         match result {
             Ok(()) => "ok",
-            Err(Error::QueryError(_)) => "sql_error",
+            Err(Error::QueryError(_) | Error::ReleaseQueryFailed(_)) => "sql_error",
             Err(
                 Error::SocketError(_)
                 | Error::ConnectError(_)
@@ -2251,11 +2256,17 @@ impl Server {
         let path = self.checkin_cleanup_metric_path();
         let started = quanta::Instant::now();
         let result = self.finalize_checkin_inner().await;
-        self.record_checkin_cleanup_metric(
-            path,
-            Self::checkin_cleanup_metric_result(&result),
-            started.elapsed().as_secs_f64(),
-        );
+        let seconds = started.elapsed().as_secs_f64();
+        if result.is_ok() && self.release_reply_pending {
+            // Sent without waiting: observed once its reply is read.
+            self.release_reply_metric = Some((path, seconds));
+        } else {
+            self.record_checkin_cleanup_metric(
+                path,
+                Self::checkin_cleanup_metric_result(&result),
+                seconds,
+            );
+        }
         result
     }
 
@@ -3351,6 +3362,7 @@ impl Server {
                         release_statements_prepared: false,
                         release_reply_resets_session: false,
                         release_reply_resets_all: false,
+                        release_reply_metric: None,
                         statements_reset_queued: false,
                         prepared_after_statements_reset: HashSet::new(),
                         intercept_discard_all: true,
@@ -3697,6 +3709,7 @@ impl Server {
             release_statements_prepared: false,
             release_reply_resets_session: false,
             release_reply_resets_all: false,
+            release_reply_metric: None,
             statements_reset_queued: false,
             prepared_after_statements_reset: HashSet::new(),
             intercept_discard_all: true,
@@ -3878,6 +3891,96 @@ mod tests {
             !server.release_statements_prepared,
             "DEALLOCATE ALL drops the release statements too"
         );
+    }
+
+    /// An unwaited check-in is observed once, when its reply tells how it
+    /// went, under the path it took.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unwaited_checkin_is_observed_once_with_its_outcome() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let observed = |path: &str, result: &str| {
+            crate::web::metrics::CHECKIN_CLEANUP_SECONDS
+                .with_label_values(&["checkin_outcome_user", "checkin_outcome_db", path, result])
+                .get_sample_count()
+        };
+        let before = [
+            observed("combined", "ok"),
+            observed("combined", "sql_error"),
+            observed("release_only", "sql_error"),
+        ];
+        let (mut server, mut peer) = super::Server::test_silent_socket();
+        server.address.username = "checkin_outcome_user".to_string();
+        server.address.database = "checkin_outcome_db".to_string();
+        server.cleanup_connections = true;
+        server.cleanup_state.needs_cleanup_set = true;
+        server.set_release_query(None);
+        server.arm_release_cleanup();
+
+        server.finalize_checkin().await.expect("check-in");
+        assert_eq!(
+            observed("combined", "ok"),
+            before[0],
+            "the outcome is not known yet"
+        );
+        let mut sent = vec![0_u8; 4096];
+        let _ = tokio::time::timeout(Duration::from_millis(200), peer.read(&mut sent)).await;
+
+        let mut reply = crate::messages::parse_complete().to_vec();
+        reply.extend_from_slice(&crate::messages::nonfatal_error_message(
+            "release failed on purpose",
+            "57014",
+        ));
+        peer.write_all(&reply).await.unwrap();
+        let result = server.settle_release_reply_in_time().await;
+
+        assert!(matches!(
+            result,
+            Err(crate::errors::Error::ReleaseQueryFailed(_))
+        ));
+        assert_eq!(observed("combined", "ok"), before[0]);
+        assert_eq!(observed("combined", "sql_error"), before[1] + 1);
+        assert_eq!(observed("release_only", "sql_error"), before[2]);
+    }
+
+    /// A successful unwaited release is observed as such once its reply is
+    /// read.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unwaited_release_is_observed_ok_when_its_reply_is_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let ok = crate::web::metrics::CHECKIN_CLEANUP_SECONDS.with_label_values(&[
+            "checkin_ok_user",
+            "checkin_ok_db",
+            "release_only",
+            "ok",
+        ]);
+        let before = ok.get_sample_count();
+        let (mut server, mut peer) = super::Server::test_silent_socket();
+        server.address.username = "checkin_ok_user".to_string();
+        server.address.database = "checkin_ok_db".to_string();
+        server.set_release_query(None);
+        server.arm_release_cleanup();
+
+        server.finalize_checkin().await.expect("check-in");
+        assert_eq!(ok.get_sample_count(), before);
+        use bytes::BufMut;
+        let mut reply = bytes::BytesMut::new();
+        for tag in ["BEGIN", "SELECT 1", "COMMIT"] {
+            reply.put(crate::messages::parse_complete());
+            reply.put_slice(&[b'2', 0, 0, 0, 4]);
+            reply.put(crate::messages::command_complete(tag));
+        }
+        reply.put_slice(&[b'I', 0, 0, 0, 4]);
+        reply.put(crate::messages::ready_for_query(false));
+        peer.write_all(&reply).await.unwrap();
+        server.settle_release_reply_in_time().await.unwrap();
+
+        assert_eq!(ok.get_sample_count(), before + 1);
     }
 
     /// RESET ALL in the unwaited cleanup restores parameters the reply

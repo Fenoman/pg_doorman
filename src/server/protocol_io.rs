@@ -989,6 +989,24 @@ fn handle_parameter_status(
 /// that followed it up to a Sync, unexecuted. The backend is marked bad and
 /// the exchange fails with `ReleaseQueryFailed`; its own reply is not read.
 pub(crate) async fn settle_release_reply(server: &mut Server) -> Result<(), Error> {
+    let result = read_release_reply(server).await;
+    record_release_reply_metric(server, &result);
+    result
+}
+
+/// Observes the check-in whose release reply was just read, or failed to be,
+/// under the path it took and with the time its send took.
+pub(crate) fn record_release_reply_metric(server: &mut Server, result: &Result<(), Error>) {
+    if let Some((path, seconds)) = server.release_reply_metric.take() {
+        server.record_checkin_cleanup_metric(
+            path,
+            Server::checkin_cleanup_metric_result(result),
+            seconds,
+        );
+    }
+}
+
+async fn read_release_reply(server: &mut Server) -> Result<(), Error> {
     while server.release_reply_pending {
         let read = async {
             let (code, len) = read_message_header(&mut *server.stream).await?;
@@ -1030,7 +1048,6 @@ pub(crate) async fn settle_release_reply(server: &mut Server) -> Result<(), Erro
                 server.mark_bad(&format!(
                     "release_query failed, the following exchange was skipped: {summary}"
                 ));
-                server.record_checkin_cleanup_metric("release_only", "sql_error", 0.0);
                 return Err(Error::ReleaseQueryFailed(summary));
             }
             other => {
