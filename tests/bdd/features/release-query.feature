@@ -90,6 +90,18 @@ Feature: Configurable release query
       username = "example_user_1"
       password = ""
       pool_size = 1
+
+      [pools.release_sync]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      server_database = "example_db"
+      pool_mode = "transaction"
+      sync_server_parameters = true
+
+      [[pools.release_sync.users]]
+      username = "example_user_1"
+      password = ""
+      pool_size = 1
       """
 
   Scenario: custom release_query runs in transaction mode
@@ -208,3 +220,17 @@ Feature: Configurable release query
     Then session "app" should receive CommandComplete "INSERT 0 1"
     When we send SimpleQuery "SELECT pg_backend_pid()" to session "app" and store backend_pid as "second"
     Then named backend_pid "second" from session "app" is different from "first"
+
+  @release-query-pipelined-sync-parameters
+  Scenario: parameters RESET ALL restores are known before the next client's are synced
+    Given PostgreSQL database "example_db" has no pgv_free function
+    When we create session "pg" to postgres as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "CREATE FUNCTION public.pgv_free() RETURNS void LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.5); END $$" to session "pg" and store response
+    Then session "pg" should receive CommandComplete "CREATE FUNCTION"
+    When I run shell command:
+      """
+      psql "postgresql://example_user_1@127.0.0.1:${DOORMAN_PORT}/release_sync?application_name=first" -Atc "SET application_name = 'left_by_first'"
+      psql "postgresql://example_user_1@127.0.0.1:${DOORMAN_PORT}/release_sync?application_name=left_by_first" -Atc "SHOW application_name"
+      """
+    Then the command should succeed
+    And the command output should contain "left_by_first"

@@ -823,6 +823,12 @@ pub struct Server {
     /// pooler's.
     pub(crate) release_statements_prepared: bool,
 
+    /// The pending release reply follows RESET statements of the dirty
+    /// check-in, and with RESET ALL among them: see
+    /// `release_reply_resets_session`.
+    pub(crate) release_reply_resets_session: bool,
+    pub(crate) release_reply_resets_all: bool,
+
     /// A statement that drops every prepared statement (DEALLOCATE ALL, or
     /// a DISCARD ALL the pooler forwards) is bound in the batch being
     /// assembled. Until PostgreSQL has run it, only the statements the batch
@@ -1916,11 +1922,37 @@ impl Server {
         if session_state_was_dirty {
             self.cleanup_state.reset();
         }
-        if stmts.iter().any(|stmt| stmt == "RESET ALL") {
-            self.server_parameters
-                .remove_startup_only_params_after_session_reset();
-        }
+        // The parameters a RESET restores arrive in the reply; until it is
+        // read, the mirror still shows what the client left.
+        self.release_reply_resets_all = stmts.iter().any(|stmt| stmt == "RESET ALL");
+        self.release_reply_resets_session = stmts.iter().any(|stmt| stmt.starts_with("RESET "));
         Ok(())
+    }
+
+    /// The reply of the last check-in's release carries the parameters its
+    /// RESET statements restored; `server_parameters` is stale until read.
+    #[inline(always)]
+    pub(crate) fn release_reply_resets_session(&self) -> bool {
+        self.release_reply_pending && self.release_reply_resets_session
+    }
+
+    /// Read the release reply within `HOUSEKEEPING_TIMEOUT`; a backend that
+    /// does not answer in time is marked bad.
+    pub(crate) async fn settle_release_reply_in_time(&mut self) -> Result<(), Error> {
+        match tokio::time::timeout(
+            HOUSEKEEPING_TIMEOUT,
+            protocol_io::settle_release_reply(self),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.mark_bad("timeout reading the release_query reply");
+                Err(Error::SocketError(
+                    "timeout reading the release_query reply".to_string(),
+                ))
+            }
+        }
     }
 
     /// Whether the last check-in's release query still has its reply unread.
@@ -3323,6 +3355,8 @@ impl Server {
                         release_reply_pending: false,
                         release_failed: false,
                         release_statements_prepared: false,
+                        release_reply_resets_session: false,
+                        release_reply_resets_all: false,
                         statements_reset_queued: false,
                         prepared_after_statements_reset: HashSet::new(),
                         intercept_discard_all: true,
@@ -3667,6 +3701,8 @@ impl Server {
             release_reply_pending: false,
             release_failed: false,
             release_statements_prepared: false,
+            release_reply_resets_session: false,
+            release_reply_resets_all: false,
             statements_reset_queued: false,
             prepared_after_statements_reset: HashSet::new(),
             intercept_discard_all: true,
@@ -3847,6 +3883,42 @@ mod tests {
         assert!(
             !server.release_statements_prepared,
             "DEALLOCATE ALL drops the release statements too"
+        );
+    }
+
+    /// RESET ALL in the unwaited cleanup restores parameters the reply
+    /// reports; until it is read the mirror is stale, which the flag says.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pending_reset_reply_marks_the_parameter_mirror_stale() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = super::Server::test_silent_socket();
+        server.cleanup_connections = true;
+        server.cleanup_state.needs_cleanup_set = true;
+        server.set_release_query(None);
+        server.arm_release_cleanup();
+        server
+            .server_parameters
+            .set_param("TimeZone", "Asia/Tokyo", false);
+
+        server.finalize_checkin().await.expect("check-in");
+        assert!(server.release_reply_resets_session());
+        let mut sent = vec![0_u8; 4096];
+        let _ = tokio::time::timeout(Duration::from_millis(200), peer.read(&mut sent)).await;
+
+        let mut reply = crate::messages::server_parameter_message("TimeZone", "UTC").to_vec();
+        reply.extend_from_slice(&crate::messages::ready_for_query(false));
+        peer.write_all(&reply).await.unwrap();
+        server.settle_release_reply_in_time().await.unwrap();
+
+        assert!(!server.release_reply_resets_session());
+        assert_eq!(
+            server
+                .server_parameters_as_hashmap()
+                .get("TimeZone")
+                .map(String::as_str),
+            Some("UTC")
         );
     }
 

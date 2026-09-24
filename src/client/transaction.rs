@@ -2541,6 +2541,16 @@ where
                     // propagating, or the (connection_id, secret_key) row is
                     // orphaned until Client::Drop - a window where a parallel
                     // CancelRequest could fire at a recycled backend pid.
+                    // RESET statements of the last check-in report the
+                    // parameters they restored in the release reply; compare
+                    // against those, not against what the last client left.
+                    if server.release_reply_resets_session() {
+                        if let Err(err) = server.settle_release_reply_in_time().await {
+                            self.release_after_inner_handler_error();
+                            self.end_after_checkout_exchange_error(conn, &err).await;
+                            return Err(err);
+                        }
+                    }
                     let sync_plan = match server.compute_sync_plan(&self.server_parameters) {
                         Ok(plan) => plan,
                         Err(err) => {

@@ -1016,6 +1016,12 @@ pub(crate) async fn settle_release_reply(server: &mut Server) -> Result<(), Erro
             }
         }
     }
+    server.release_reply_resets_session = false;
+    if std::mem::take(&mut server.release_reply_resets_all) {
+        server
+            .server_parameters
+            .remove_startup_only_params_after_session_reset();
+    }
     server.touch_activity();
     Ok(())
 }
