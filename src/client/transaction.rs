@@ -421,6 +421,13 @@ pub(crate) fn simple_deallocate_action(
     }
 }
 
+/// True for a `DEALLOCATE` target naming one of the pooler's `DOORMAN_*`
+/// backend aliases, which other clients share. Only a quoted name reaches
+/// that case-sensitive namespace, and no client created such a statement.
+pub(crate) fn is_pooler_alias_target(target: &crate::client::util::DeallocateTarget) -> bool {
+    matches!(target, crate::client::util::DeallocateTarget::Named(name) if name.starts_with("DOORMAN_"))
+}
+
 #[inline]
 pub(crate) fn non_extended_protocol_can_forward(
     pending_buffer_len: usize,
@@ -1135,14 +1142,16 @@ where
         Ok(false)
     }
 
-    fn track_forwarded_simple_deallocate_cache_state(&mut self, message: &BytesMut) {
+    /// Returns true when the statement deallocates a pooler alias.
+    fn track_forwarded_simple_deallocate_cache_state(&mut self, message: &BytesMut) -> bool {
         if message.len() <= QUERY_DEALLOCATE.len() + 6 {
-            return;
+            return false;
         }
 
         let Some(target) = extract_deallocate_target(simple_query_body(message)) else {
-            return;
+            return false;
         };
+        let pooler_alias = is_pooler_alias_target(&target);
 
         match target {
             crate::client::util::DeallocateTarget::All => {
@@ -1164,6 +1173,7 @@ where
                 }
             }
         }
+        pooler_alias
     }
 
     /// Serve a `general.pooler_check_query` SimpleQuery. The first probe in
@@ -1325,7 +1335,19 @@ where
         // hash into the next Sync.
         self.prepared.last_bound_for_top = None;
 
-        self.track_forwarded_simple_deallocate_cache_state(message);
+        // Aim a DEALLOCATE of a pooler alias at an unused name instead:
+        // PostgreSQL answers 26000 with its own transaction semantics, and
+        // the statement other clients share on this backend survives.
+        let guarded_deallocate;
+        let message = if self.track_forwarded_simple_deallocate_cache_state(message) {
+            guarded_deallocate = crate::messages::simple_query(&format!(
+                "DEALLOCATE \"{}\"",
+                Self::unregistered_prepared_statement_name()
+            ));
+            &guarded_deallocate
+        } else {
+            message
+        };
 
         let query_body = simple_query_body(message);
         let starts_sql_prepare = simple_query_starts_with_prepare(query_body);
@@ -4937,7 +4959,7 @@ mod deallocate_fast_path_tests {
             .expect("discard response helper should follow handle_simple_query");
         let handle_body = &handle_body[..handle_end];
 
-        let call = "self.track_forwarded_simple_deallocate_cache_state(message);";
+        let call = "self.track_forwarded_simple_deallocate_cache_state(message)";
         assert!(
             handle_body.contains(call),
             "server-held SimpleQuery path must invalidate client prepared cache for DEALLOCATE before forwarding"
@@ -6710,6 +6732,68 @@ mod relay_response_client_write_failure_tests {
             .await
             .expect("simple query did not finish after the backend replied")
             .unwrap()
+    }
+
+    #[test]
+    fn deallocate_of_pooler_alias_is_detected() {
+        for (sql, expected) in [
+            ("DEALLOCATE \"DOORMAN_5\"", true),
+            ("deallocate prepare \"DOORMAN_missing_1\"", true),
+            ("DEALLOCATE DOORMAN_5", false),
+            ("DEALLOCATE s1", false),
+            ("DEALLOCATE ALL", false),
+        ] {
+            let target = extract_deallocate_target(sql.as_bytes()).expect(sql);
+            assert_eq!(is_pooler_alias_target(&target), expected, "{sql}");
+        }
+    }
+
+    /// Other clients share the DOORMAN_* aliases on a backend, so a SQL
+    /// DEALLOCATE naming one must not reach it; PostgreSQL still answers.
+    #[tokio::test]
+    async fn sql_deallocate_never_reaches_a_pooler_alias() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = true;
+        let (mut server, mut peer) = server_with_prepared_cache();
+        let query = crate::messages::simple_query("DEALLOCATE \"DOORMAN_5\"");
+        let mut fut =
+            Box::pin(client.handle_simple_query(&query, &mut server, quanta::Instant::now()));
+        let mut header = [0_u8; 5];
+        tokio::select! {
+            biased;
+            _ = &mut fut => panic!("simple query completed before the backend replied"),
+            read = peer.read_exact(&mut header) => { read.unwrap(); }
+        };
+        assert_eq!(header[0], b'Q');
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut body = vec![0_u8; len - 4];
+        peer.read_exact(&mut body).await.unwrap();
+        let sent = String::from_utf8(body).unwrap();
+        assert!(
+            sent.starts_with("DEALLOCATE \"DOORMAN_missing_"),
+            "backend received {sent:?}"
+        );
+        peer.write_all(&error_response_idle(
+            "26000",
+            "prepared statement does not exist",
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("DEALLOCATE did not finish after the backend replied")
+            .unwrap();
+        // Transaction pooling holds the final response until the backend is
+        // released; it reaches the client from there.
+        let delivered = [
+            &client.write.bytes[..],
+            &client.client_last_messages_in_tx[..],
+        ]
+        .concat();
+        assert!(
+            delivered.windows(5).any(|w| w == b"26000"),
+            "the client must receive PostgreSQL's 26000"
+        );
     }
 
     /// SQL-level PREPARE keeps the backend for the client only while one of

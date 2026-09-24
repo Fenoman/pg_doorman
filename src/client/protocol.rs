@@ -721,7 +721,7 @@ where
         Self::unregistered_prepared_statement_name()
     }
 
-    fn unregistered_prepared_statement_name() -> Arc<str> {
+    pub(crate) fn unregistered_prepared_statement_name() -> Arc<str> {
         // Never forward a cache-miss client name verbatim: it could coincide
         // with another logical statement's cached DOORMAN_* backend alias.
         // A fresh unregistered name makes PostgreSQL produce the error in
