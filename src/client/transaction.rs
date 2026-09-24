@@ -7177,7 +7177,8 @@ mod relay_response_client_write_failure_tests {
     }
 
     /// A DEALLOCATE the pooler answers itself counts as a query and a
-    /// transaction, like the DISCARD ALL it answers the same way.
+    /// transaction in the client and pool stats, like the DISCARD ALL it
+    /// answers the same way.
     #[tokio::test]
     async fn locally_answered_deallocate_is_counted() {
         use std::sync::atomic::Ordering;
@@ -7204,6 +7205,12 @@ mod relay_response_client_write_failure_tests {
                 .unwrap();
 
             assert!(handled, "{sql} is answered without a backend");
+            assert_eq!(client.stats.query_count.load(Ordering::Relaxed), 1, "{sql}");
+            assert_eq!(
+                client.stats.transaction_count.load(Ordering::Relaxed),
+                1,
+                "{sql}"
+            );
             let total = &pool.address.stats.total;
             assert_eq!(total.query_count.load(Ordering::Relaxed), 1, "{sql}");
             assert_eq!(total.xact_count.load(Ordering::Relaxed), 1, "{sql}");
