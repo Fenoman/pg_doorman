@@ -1368,117 +1368,148 @@ pub(crate) fn restart_only_general_pool_fields_changed(
     old: &General,
     new: &General,
 ) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if old.max_concurrent_creates != new.max_concurrent_creates {
-        fields.push("general.max_concurrent_creates");
-    }
-    if old.server_round_robin != new.server_round_robin {
-        fields.push("general.server_round_robin");
-    }
-    if old.scaling_warm_pool_ratio != new.scaling_warm_pool_ratio {
-        fields.push("general.scaling_warm_pool_ratio");
-    }
-    if old.scaling_fast_retries != new.scaling_fast_retries {
-        fields.push("general.scaling_fast_retries");
-    }
-    if old.scaling_max_parallel_creates != new.scaling_max_parallel_creates {
-        fields.push("general.scaling_max_parallel_creates");
-    }
-    if old.prepared_statements != new.prepared_statements {
-        fields.push("general.prepared_statements");
-    }
-    if old.prepared_statements_cache_size != new.prepared_statements_cache_size {
-        fields.push("general.prepared_statements_cache_size");
-    }
-    if old.server_prepared_statements_cache_size != new.server_prepared_statements_cache_size {
-        fields.push("general.server_prepared_statements_cache_size");
-    }
-    if old.patroni_api_urls != new.patroni_api_urls {
-        fields.push("general.patroni_api_urls");
-    }
-    if old.fallback_cooldown != new.fallback_cooldown {
-        fields.push("general.fallback_cooldown");
-    }
-    if old.patroni_api_timeout != new.patroni_api_timeout {
-        fields.push("general.patroni_api_timeout");
-    }
-    if old.fallback_connect_timeout != new.fallback_connect_timeout {
-        fields.push("general.fallback_connect_timeout");
-    }
-    if old.fallback_lifetime != new.fallback_lifetime {
-        fields.push("general.fallback_lifetime");
-    }
-    fields
+    changed_fields(RESTART_ONLY_GENERAL_POOL_FIELDS, old, new)
 }
+
+const RESTART_ONLY_GENERAL_POOL_FIELDS: &[(&str, FieldChanged<General>)] = &[
+    ("general.max_concurrent_creates", |old, new| {
+        old.max_concurrent_creates != new.max_concurrent_creates
+    }),
+    ("general.server_round_robin", |old, new| {
+        old.server_round_robin != new.server_round_robin
+    }),
+    ("general.scaling_warm_pool_ratio", |old, new| {
+        old.scaling_warm_pool_ratio != new.scaling_warm_pool_ratio
+    }),
+    ("general.scaling_fast_retries", |old, new| {
+        old.scaling_fast_retries != new.scaling_fast_retries
+    }),
+    ("general.scaling_max_parallel_creates", |old, new| {
+        old.scaling_max_parallel_creates != new.scaling_max_parallel_creates
+    }),
+    ("general.prepared_statements", |old, new| {
+        old.prepared_statements != new.prepared_statements
+    }),
+    ("general.prepared_statements_cache_size", |old, new| {
+        old.prepared_statements_cache_size != new.prepared_statements_cache_size
+    }),
+    (
+        "general.server_prepared_statements_cache_size",
+        |old, new| {
+            old.server_prepared_statements_cache_size != new.server_prepared_statements_cache_size
+        },
+    ),
+    ("general.patroni_api_urls", |old, new| {
+        old.patroni_api_urls != new.patroni_api_urls
+    }),
+    ("general.fallback_cooldown", |old, new| {
+        old.fallback_cooldown != new.fallback_cooldown
+    }),
+    ("general.patroni_api_timeout", |old, new| {
+        old.patroni_api_timeout != new.patroni_api_timeout
+    }),
+    ("general.fallback_connect_timeout", |old, new| {
+        old.fallback_connect_timeout != new.fallback_connect_timeout
+    }),
+    ("general.fallback_lifetime", |old, new| {
+        old.fallback_lifetime != new.fallback_lifetime
+    }),
+];
 
 pub(crate) fn restart_only_listener_fields_changed(
     old: &Config,
     new: &Config,
 ) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if old.general.host != new.general.host {
-        fields.push("general.host");
-    }
-    if old.general.port != new.general.port {
-        fields.push("general.port");
-    }
-    if old.general.unix_socket_dir != new.general.unix_socket_dir {
-        fields.push("general.unix_socket_dir");
-    }
-    if old.general.unix_socket_mode != new.general.unix_socket_mode {
-        fields.push("general.unix_socket_mode");
-    }
-    if old.general.backlog != new.general.backlog {
-        fields.push("general.backlog");
-    }
-    if old.general.tls_certificate != new.general.tls_certificate {
-        fields.push("general.tls_certificate");
-    }
-    if old.general.tls_private_key != new.general.tls_private_key {
-        fields.push("general.tls_private_key");
-    }
-    if old.general.tls_ca_cert != new.general.tls_ca_cert {
-        fields.push("general.tls_ca_cert");
-    }
-    if old.general.tls_mode != new.general.tls_mode {
-        fields.push("general.tls_mode");
-    }
-    if old.general.tls_rate_limit_per_second != new.general.tls_rate_limit_per_second {
-        fields.push("general.tls_rate_limit_per_second");
-    }
-    if old.general.worker_threads != new.general.worker_threads {
-        fields.push("general.worker_threads");
-    }
-    if old.general.worker_cpu_affinity_pinning != new.general.worker_cpu_affinity_pinning {
-        fields.push("general.worker_cpu_affinity_pinning");
-    }
-    if old.general.worker_stack_size != new.general.worker_stack_size {
-        fields.push("general.worker_stack_size");
-    }
-    if old.general.max_blocking_threads != new.general.max_blocking_threads {
-        fields.push("general.max_blocking_threads");
-    }
-    if old.general.tokio_global_queue_interval != new.general.tokio_global_queue_interval {
-        fields.push("general.tokio_global_queue_interval");
-    }
-    if old.general.tokio_event_interval != new.general.tokio_event_interval {
-        fields.push("general.tokio_event_interval");
-    }
-    if old.general.query_interner_gc_interval_seconds
-        != new.general.query_interner_gc_interval_seconds
-    {
-        fields.push("general.query_interner_gc_interval_seconds");
-    }
-    if old.web.enabled != new.web.enabled {
-        fields.push("web.enabled");
-    }
-    if old.web.host != new.web.host {
-        fields.push("web.host");
-    }
-    if old.web.port != new.web.port {
-        fields.push("web.port");
-    }
+    changed_fields(RESTART_ONLY_LISTENER_FIELDS, old, new)
+}
+
+/// Fields a reload rejects: the listener sockets, the Tokio runtime and the
+/// client-facing TLS acceptor are built once at process start.
+const RESTART_ONLY_LISTENER_FIELDS: &[(&str, FieldChanged<Config>)] = &[
+    ("general.host", |old, new| {
+        old.general.host != new.general.host
+    }),
+    ("general.port", |old, new| {
+        old.general.port != new.general.port
+    }),
+    ("general.unix_socket_dir", |old, new| {
+        old.general.unix_socket_dir != new.general.unix_socket_dir
+    }),
+    ("general.unix_socket_mode", |old, new| {
+        old.general.unix_socket_mode != new.general.unix_socket_mode
+    }),
+    ("general.backlog", |old, new| {
+        old.general.backlog != new.general.backlog
+    }),
+    ("general.tls_certificate", |old, new| {
+        old.general.tls_certificate != new.general.tls_certificate
+    }),
+    ("general.tls_private_key", |old, new| {
+        old.general.tls_private_key != new.general.tls_private_key
+    }),
+    ("general.tls_ca_cert", |old, new| {
+        old.general.tls_ca_cert != new.general.tls_ca_cert
+    }),
+    ("general.tls_mode", |old, new| {
+        old.general.tls_mode != new.general.tls_mode
+    }),
+    ("general.tls_rate_limit_per_second", |old, new| {
+        old.general.tls_rate_limit_per_second != new.general.tls_rate_limit_per_second
+    }),
+    ("general.worker_threads", |old, new| {
+        old.general.worker_threads != new.general.worker_threads
+    }),
+    ("general.worker_cpu_affinity_pinning", |old, new| {
+        old.general.worker_cpu_affinity_pinning != new.general.worker_cpu_affinity_pinning
+    }),
+    ("general.worker_stack_size", |old, new| {
+        old.general.worker_stack_size != new.general.worker_stack_size
+    }),
+    ("general.max_blocking_threads", |old, new| {
+        old.general.max_blocking_threads != new.general.max_blocking_threads
+    }),
+    ("general.tokio_global_queue_interval", |old, new| {
+        old.general.tokio_global_queue_interval != new.general.tokio_global_queue_interval
+    }),
+    ("general.tokio_event_interval", |old, new| {
+        old.general.tokio_event_interval != new.general.tokio_event_interval
+    }),
+    ("general.query_interner_gc_interval_seconds", |old, new| {
+        old.general.query_interner_gc_interval_seconds
+            != new.general.query_interner_gc_interval_seconds
+    }),
+    ("web.enabled", |old, new| old.web.enabled != new.web.enabled),
+    ("web.host", |old, new| old.web.host != new.web.host),
+    ("web.port", |old, new| old.web.port != new.web.port),
+];
+
+type FieldChanged<T> = fn(&T, &T) -> bool;
+
+fn changed_fields<T>(
+    fields: &[(&'static str, FieldChanged<T>)],
+    old: &T,
+    new: &T,
+) -> Vec<&'static str> {
     fields
+        .iter()
+        .filter(|(_, changed)| changed(old, new))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Whether a new value of `key`, a flattened path such as `general.host`,
+/// stays unapplied after RELOAD until the process restarts: the reload
+/// either rejects it or keeps the running pools on the old value.
+pub(crate) fn is_restart_only_field(key: &str) -> bool {
+    RESTART_ONLY_LISTENER_FIELDS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(
+            RESTART_ONLY_GENERAL_POOL_FIELDS
+                .iter()
+                .map(|(name, _)| *name),
+        )
+        .any(|name| name == key)
 }
 
 pub async fn reload_config(client_server_map: ClientServerMap) -> Result<bool, Error> {

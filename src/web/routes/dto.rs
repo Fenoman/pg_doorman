@@ -636,7 +636,7 @@ pub(crate) struct ConfigEntry {
     /// (e.g. user-defined pools).
     pub default: String,
     /// `"yes"` for keys that take effect on `RELOAD`, `"no"` for keys that
-    /// require a restart. Mirrors the `immutables` list inside `show_config`.
+    /// require a restart (`config::is_restart_only_field`).
     pub changeable: &'static str,
     /// EN-language description sourced from `fields.yaml`. Empty for
     /// fields without a documented surface (operator-defined sections,
