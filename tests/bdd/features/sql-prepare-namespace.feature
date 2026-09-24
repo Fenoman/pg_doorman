@@ -96,3 +96,16 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     And we send Execute "" to both
     And we send Sync to both
     Then we should receive identical messages from both
+
+  Scenario: A Bind of an unknown statement keeps the backend's shared statements
+    When we create session "one" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send Parse "q" with query "SELECT 1" to session "one"
+    And we send Bind "" to "q" with params "" to session "one"
+    And we send Execute "" to session "one"
+    And we send Sync to session "one"
+    And we send Bind "" to "unknown" with params "" to session "one"
+    And we send Execute "" to session "one"
+    And we send Sync to session "one"
+    Then session "one" should receive error containing "does not exist"
+    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "one" and store response
+    Then session "one" should receive DataRow with "1"

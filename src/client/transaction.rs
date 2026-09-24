@@ -6997,9 +6997,10 @@ mod relay_response_client_write_failure_tests {
             sent.starts_with("DEALLOCATE \"DOORMAN_missing_"),
             "backend received {sent:?}"
         );
+        let target = sent.split('"').nth(1).unwrap();
         peer.write_all(&error_response_idle(
             "26000",
-            "prepared statement does not exist",
+            &format!("prepared statement \"{target}\" does not exist"),
         ))
         .await
         .unwrap();
@@ -7017,6 +7018,10 @@ mod relay_response_client_write_failure_tests {
         assert!(
             delivered.windows(5).any(|w| w == b"26000"),
             "the client must receive PostgreSQL's 26000"
+        );
+        assert!(
+            !server.cleanup_state.needs_cleanup_prepare,
+            "the error the guard provoked must not drop the shared statements at check-in"
         );
     }
 

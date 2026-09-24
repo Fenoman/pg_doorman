@@ -10,6 +10,10 @@ use crate::server::cleanup::{ResetCleanupCommand, SetCleanupCommand};
 pub static PREPARED_STATEMENT_COUNTER: Lazy<Arc<AtomicUsize>> =
     Lazy::new(|| Arc::new(AtomicUsize::new(0)));
 
+/// Prefix of the names the pooler aims a command at when PostgreSQL must
+/// report a missing statement (26000); nothing is prepared under them.
+pub(crate) const UNREGISTERED_STATEMENT_PREFIX: &str = "DOORMAN_missing_";
+
 // Ignore deallocate queries from pgx.
 pub(crate) static QUERY_DEALLOCATE: &[u8] = "deallocate ".as_bytes();
 

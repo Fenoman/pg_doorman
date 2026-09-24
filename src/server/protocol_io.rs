@@ -479,7 +479,12 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
     if let Ok(msg) = PgErrorMsg::parse(message) {
         recoverable = msg.severity == "ERROR"
             || (msg.severity.is_empty() && msg.severity_localized == "ERROR");
-        invalidates_prepared_statements = error_invalidates_prepared_statements(&msg.code);
+        // A missing statement the pooler named on purpose, to get
+        // PostgreSQL's error in its place, says nothing about the others.
+        invalidates_prepared_statements = error_invalidates_prepared_statements(&msg.code)
+            && !msg
+                .message
+                .contains(crate::client::util::UNREGISTERED_STATEMENT_PREFIX);
         let mut details = format!(
             "[{}@{}] server error pid={}: severity={}, code={}, message=\"{}\", in_transaction={}, in_copy={}",
             server.address.username, server.address.pool_name, server.get_process_id(),
@@ -1545,6 +1550,25 @@ mod tests {
         ));
         handle_error_response(&mut server, &mut BytesMut::from(&b"garbage"[..]));
         assert!(server.cleanup_state.needs_cleanup_prepare);
+    }
+
+    /// A missing `DOORMAN_missing_*` statement is one the pooler named on
+    /// purpose; only a missing statement it believed present shows that its
+    /// view of the backend is stale.
+    #[tokio::test]
+    async fn only_a_missing_known_statement_schedules_statement_reset() {
+        for (name, arms) in [("DOORMAN_missing_7", false), ("DOORMAN_7", true)] {
+            let (mut server, _peer) = crate::server::Server::test_silent_socket();
+            server.prepared_statement_cache = Some(LruCache::with_hasher(
+                NonZeroUsize::new(16).unwrap(),
+                RandomState::new(),
+            ));
+            let body = format!(
+                "SERROR\0VERROR\0C26000\0Mprepared statement \"{name}\" does not exist\0\0"
+            );
+            handle_error_response(&mut server, &mut BytesMut::from(body.as_bytes()));
+            assert_eq!(server.cleanup_state.needs_cleanup_prepare, arms, "{name}");
+        }
     }
 
     /// An error in a Flush pipeline arms the SET/RESET cleanup, whose

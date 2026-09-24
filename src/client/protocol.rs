@@ -728,7 +728,8 @@ where
         // A fresh unregistered name makes PostgreSQL produce the error in
         // batch order and enter its normal skip-until-Sync state.
         Arc::from(format!(
-            "DOORMAN_missing_{}",
+            "{}{}",
+            crate::client::util::UNREGISTERED_STATEMENT_PREFIX,
             PREPARED_STATEMENT_COUNTER.fetch_add(1, Ordering::Relaxed)
         ))
     }
