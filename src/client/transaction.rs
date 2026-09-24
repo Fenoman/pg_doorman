@@ -6445,8 +6445,6 @@ mod relay_response_client_write_failure_tests {
 
     #[tokio::test]
     async fn client_disconnect_cancels_long_query_before_releasing_backend() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let mut client =
             test_client_with_reader_and_writer(tokio::io::empty(), RecordingWriter::default());
         let (mut server, mut peer) = Server::test_silent_socket();
@@ -6457,46 +6455,47 @@ mod relay_response_client_write_failure_tests {
             finish: Duration::from_millis(50),
             after_cancel: Duration::from_secs(5),
         };
-        // The backend answers only once the CancelRequest arrives, like a
-        // query that would otherwise keep running on PostgreSQL.
-        let query_ended = Arc::new(AtomicBool::new(false));
-        let backend = tokio::spawn({
-            let query_ended = Arc::clone(&query_ended);
-            async move {
-                let request = tokio::time::timeout(Duration::from_secs(3), async {
-                    let (mut conn, _) = cancel_listener.accept().await.unwrap();
-                    let mut request = [0_u8; 16];
-                    conn.read_exact(&mut request).await.unwrap();
-                    request
-                })
+        // The backend answers only when the test lets it, after the
+        // CancelRequest arrived, like a query PostgreSQL is still stopping.
+        let (cancel_seen_tx, cancel_seen_rx) = tokio::sync::oneshot::channel();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+        let backend = tokio::spawn(async move {
+            let (mut conn, _) = cancel_listener.accept().await.unwrap();
+            let mut request = [0_u8; 16];
+            conn.read_exact(&mut request).await.unwrap();
+            cancel_seen_tx.send(request).unwrap();
+            answer_rx.await.unwrap();
+            peer.write_all(&[query_canceled_error(), b"Z\0\0\0\x05I".to_vec()].concat())
                 .await
-                .ok();
-                if request.is_some() {
-                    query_ended.store(true, Ordering::SeqCst);
-                    peer.write_all(&[query_canceled_error(), b"Z\0\0\0\x05I".to_vec()].concat())
-                        .await
-                        .unwrap();
-                }
-                (request, peer)
-            }
+                .unwrap();
+            peer
         });
 
-        let err = tokio::time::timeout(Duration::from_secs(5), client.relay_response(&mut server))
+        let mut relay = Box::pin(client.relay_response(&mut server));
+        let request = tokio::select! {
+            _ = &mut relay => panic!("the relay must not end before the canceled query answers"),
+            request = tokio::time::timeout(Duration::from_secs(3), cancel_seen_rx) => {
+                request.expect("the abandoned query must be canceled").unwrap()
+            }
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut relay)
+                .await
+                .is_err(),
+            "the backend must stay checked out until the canceled query answers"
+        );
+        answer_tx.send(()).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), relay)
             .await
             .expect("relay must end once the canceled query stopped")
             .expect_err("a vanished client still ends the relay with an error");
-        let released_after_query_ended = query_ended.load(Ordering::SeqCst);
-        let (request, _peer) = backend.await.unwrap();
+        let _peer = backend.await.unwrap();
 
         assert!(matches!(err, Error::SocketError(_)));
         assert_eq!(
             request,
-            Some([0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 16, 146, 0, 0, 0, 77]),
-            "the abandoned query must be canceled on PostgreSQL"
-        );
-        assert!(
-            released_after_query_ended,
-            "the backend must stay checked out until the canceled query ended"
+            [0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 16, 146, 0, 0, 0, 77],
+            "the CancelRequest must carry the backend's pid and key"
         );
         assert!(
             server.is_bad(),
