@@ -33,12 +33,24 @@ impl Drop for WaitIdleOnDrop {
 }
 
 /// Replace newlines and carriage returns to keep log lines single-line.
+/// Characters of one PostgreSQL error field copied into a log line; the
+/// client still receives the whole message.
+const MAX_LOGGED_ERROR_CHARS: usize = 1024;
+
 fn sanitize_for_log(s: &str) -> String {
-    if s.contains(['\n', '\r']) {
-        s.replace('\n', "\\n").replace('\r', "\\r")
+    let (head, left_out) = match s.char_indices().nth(MAX_LOGGED_ERROR_CHARS) {
+        Some((end, _)) => (&s[..end], s.len() - end),
+        None => (s, 0),
+    };
+    let mut logged = if head.contains(['\n', '\r']) {
+        head.replace('\n', "\\n").replace('\r', "\\r")
     } else {
-        s.to_string()
+        head.to_string()
+    };
+    if left_out > 0 {
+        logged.push_str(&format!("... ({left_out} more bytes)"));
     }
+    logged
 }
 
 use tokio::time::timeout;
@@ -1550,6 +1562,17 @@ mod tests {
         ));
         handle_error_response(&mut server, &mut BytesMut::from(&b"garbage"[..]));
         assert!(server.cleanup_state.needs_cleanup_prepare);
+    }
+
+    /// A PostgreSQL error can carry megabytes (a RAISE of a large value, a
+    /// DETAIL quoting a long key); the log line keeps its start and says how
+    /// much was left out.
+    #[test]
+    fn logged_error_text_is_bounded() {
+        let logged = super::sanitize_for_log(&"y".repeat(2 * 1024 * 1024));
+        assert!(logged.len() < 2048, "{} bytes logged", logged.len());
+        assert!(logged.ends_with(&format!("... ({} more bytes)", 2 * 1024 * 1024 - 1024)));
+        assert_eq!(super::sanitize_for_log("line\nnext"), "line\\nnext");
     }
 
     /// A missing `DOORMAN_missing_*` statement is one the pooler named on
