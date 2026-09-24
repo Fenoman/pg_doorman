@@ -1471,6 +1471,27 @@ mod discard_all_transaction_guard_tests {
                 "{function_name} must not directly call bare error_response while a backend is checked out"
             );
         }
+
+        // Describe writes no local error today, but must not regain an
+        // unbounded one while a backend is checked out.
+        {
+            let function_name = "pub(crate) async fn process_describe_immediate";
+            let start = impl_src
+                .find(function_name)
+                .unwrap_or_else(|| panic!("{function_name} not found"));
+            let body = &impl_src[start..];
+            let end = body
+                .find("\n    pub(crate) ")
+                .or_else(|| body.find("\n    /// "))
+                .unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                !body
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("error_response(")),
+                "{function_name} must not directly call bare error_response while a backend is checked out"
+            );
+        }
     }
 
     #[test]
