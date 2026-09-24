@@ -2961,9 +2961,10 @@ mod tests {
         head.put_slice(&vec![b'x'; 16 * 1024]);
         let trickle = tokio::spawn(async move {
             peer.write_all(&head).await.unwrap();
-            // The rest comes a byte a second: slow, but never stalled.
+            // The rest comes a byte every 50 ms: slow, but more often than
+            // the whole budget, so no single read waits it out.
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 if peer.write_all(b"x").await.is_err() {
                     break;
                 }
