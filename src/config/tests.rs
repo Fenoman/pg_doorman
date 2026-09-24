@@ -1296,6 +1296,136 @@ async fn test_validate_pool_server_prepared_cache_upper_bound() {
     }
 }
 
+fn config_with_prepared_pool(mut pool: Pool) -> Config {
+    let mut config = Config::default();
+    use_strong_admin_password(&mut config);
+    config.general.prepared_statements = true;
+    config.general.prepared_statements_cache_size = 1024;
+    pool.users.push(User {
+        username: "test_user".to_string(),
+        password: "test_password".to_string(),
+        pool_size: 50,
+        ..User::default()
+    });
+    config.pools.insert("app_db".to_string(), pool);
+    config
+}
+
+fn bad_config_message(result: Result<(), Error>) -> String {
+    match result {
+        Err(Error::BadConfig(msg)) => msg,
+        other => panic!("expected BadConfig, got {other:?}"),
+    }
+}
+
+// A server cache that resolves to 0 makes every remapped Parse fail with
+// PreparedStatementError and drops the backend: it is not a disable switch.
+#[tokio::test]
+async fn test_validate_rejects_zero_server_prepared_cache_inherited_from_general() {
+    let mut config = config_with_prepared_pool(Pool::default());
+    config.general.server_prepared_statements_cache_size = Some(0);
+
+    let msg = bad_config_message(config.validate().await);
+    assert!(
+        msg.contains("general.server_prepared_statements_cache_size") && msg.contains("app_db"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_rejects_zero_pool_server_prepared_cache() {
+    let mut config = config_with_prepared_pool(Pool {
+        server_prepared_statements_cache_size: Some(0),
+        ..Pool::default()
+    });
+
+    let msg = bad_config_message(config.validate().await);
+    assert!(
+        msg.contains("pools.app_db.server_prepared_statements_cache_size"),
+        "unexpected error message: {msg}"
+    );
+}
+
+// With prepared statements enabled the pool keeps a remap cache even at size
+// 0, while the per-backend cache resolves to 0: the same failing Parse.
+#[tokio::test]
+async fn test_validate_rejects_zero_pool_prepared_cache() {
+    let mut config = config_with_prepared_pool(Pool {
+        prepared_statements_cache_size: Some(0),
+        ..Pool::default()
+    });
+
+    let msg = bad_config_message(config.validate().await);
+    assert!(
+        msg.contains("pools.app_db.prepared_statements_cache_size"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_allows_general_zero_server_cache_overridden_by_pool() {
+    let mut config = config_with_prepared_pool(Pool {
+        server_prepared_statements_cache_size: Some(64),
+        ..Pool::default()
+    });
+    config.general.server_prepared_statements_cache_size = Some(0);
+
+    config.validate().await.unwrap();
+}
+
+// Deployed configs disable prepared statements and zero the caches.
+#[tokio::test]
+async fn test_validate_allows_zero_prepared_caches_when_prepared_statements_disabled() {
+    let mut config = config_with_prepared_pool(Pool {
+        prepared_statements_cache_size: Some(0),
+        server_prepared_statements_cache_size: Some(0),
+        ..Pool::default()
+    });
+    config.general.prepared_statements = false;
+    config.general.prepared_statements_cache_size = 0;
+    config.general.server_prepared_statements_cache_size = Some(0);
+
+    config.validate().await.unwrap();
+}
+
+// Startup and RELOAD both read the file through parse_config.
+#[tokio::test]
+async fn test_parse_config_rejects_zero_server_prepared_cache() {
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file
+        .write_all(
+            br#"
+[general]
+host = "127.0.0.1"
+port = 6432
+admin_username = "admin"
+admin_password = "admin_password"
+prepared_statements = true
+server_prepared_statements_cache_size = 0
+
+[pools.example_db]
+server_host = "localhost"
+server_port = 5432
+
+[[pools.example_db.users]]
+username = "example_user_1"
+password = "password1"
+pool_size = 40
+"#,
+        )
+        .unwrap();
+    temp_file.flush().unwrap();
+
+    let err = parse_config(temp_file.path().to_str().unwrap())
+        .await
+        .expect_err("a zero server prepared cache must be rejected");
+    assert!(
+        err.to_string()
+            .contains("general.server_prepared_statements_cache_size"),
+        "unexpected error message: {err}"
+    );
+}
+
 // Test tls_certificate set but tls_private_key not set
 #[tokio::test]
 async fn test_validate_tls_certificate_without_private_key() {

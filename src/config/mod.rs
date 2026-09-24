@@ -989,6 +989,37 @@ impl Config {
             pool.validate().await?;
         }
 
+        // Prepared statements keep the remap cache even at size 0, so a
+        // per-backend cache that resolves to 0 makes every Parse fail with
+        // PreparedStatementError and drops the backend.
+        if self.general.prepared_statements {
+            for (pool_name, pool_config) in &self.pools {
+                let pool_cache_size = pool_config
+                    .prepared_statements_cache_size
+                    .unwrap_or(self.general.prepared_statements_cache_size);
+                if crate::pool::resolve_server_cache_size(
+                    pool_cache_size,
+                    pool_config.server_prepared_statements_cache_size,
+                    self.general.server_prepared_statements_cache_size,
+                ) > 0
+                {
+                    continue;
+                }
+                let source = if pool_cache_size == 0 {
+                    format!("pools.{pool_name}.prepared_statements_cache_size")
+                } else if pool_config.server_prepared_statements_cache_size.is_some() {
+                    format!("pools.{pool_name}.server_prepared_statements_cache_size")
+                } else {
+                    "general.server_prepared_statements_cache_size".to_string()
+                };
+                return Err(Error::BadConfig(format!(
+                    "{source} leaves pool {pool_name} without a per-backend prepared statement \
+                     cache while prepared_statements is enabled; every client Parse would fail. \
+                     Set a size greater than 0, or set prepared_statements = false"
+                )));
+            }
+        }
+
         // Cross-config validation: coordinator timeouts vs query_wait_timeout
         let qwt = self.general.query_wait_timeout.as_millis();
         for (pool_name, pool_config) in &self.pools {

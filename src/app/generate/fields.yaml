@@ -1021,9 +1021,11 @@ fields:
         en: |
           Per-backend prepared statement LRU size. When unset, inherits prepared_statements_cache_size.
           Lets operators bound DOORMAN_<N> rows on a single PostgreSQL backend without shrinking the pool-level cache.
+          Must be >0 when prepared_statements is true.
         ru: |
           Размер LRU подготовленных запросов на каждое серверное соединение. Если не задан, наследует prepared_statements_cache_size.
           Позволяет ограничить число DOORMAN_<N> на одном бэкенде PostgreSQL, не сужая пуловый кеш.
+          Должен быть >0, если prepared_statements=true.
       doc: |
         Sizes the per-backend `LruCache<String, ()>` of `DOORMAN_<N>` names independently of the pool-level cache.
         When unset (default), inherits the resolved `prepared_statements_cache_size` for that pool. A per-pool
@@ -1032,6 +1034,10 @@ fields:
         Lower this knob below the pool size when backends carry too many `DOORMAN_<N>` rows
         (`pg_prepared_statements` near the cap, plan memory ballooning) or when faster `Close` recycling is desired
         without shrinking pool-level hit rate. Forced to 0 when `prepared_statements: false`.
+
+        This is not the disable switch either. While `prepared_statements` is enabled, a value that leaves
+        any pool with a per-backend cache of `0` makes every client Parse fail, so pg_doorman rejects it at
+        startup and on reload. To disable prepared-statement remapping, set `prepared_statements: false`.
       default: "not set (inherits prepared_statements_cache_size)"
 
     client_anonymous_prepared_cache_size:
@@ -1685,19 +1691,26 @@ fields:
 
     prepared_statements_cache_size:
       config:
-        en: "Override global prepared_statements_cache_size for this pool."
-        ru: "Переопределить глобальный prepared_statements_cache_size для этого пула."
-      doc: "Override global prepared_statements_cache_size for this pool. If not specified, the global setting is used."
+        en: "Override global prepared_statements_cache_size for this pool. Must be >0 when prepared_statements is true."
+        ru: "Переопределить глобальный prepared_statements_cache_size для этого пула. Должен быть >0, если prepared_statements=true."
+      doc: |
+        Override global prepared_statements_cache_size for this pool. If not specified, the global setting is used.
+
+        While `prepared_statements` is enabled, `0` is rejected at startup and on reload: it leaves the pool's
+        backends without a prepared statement cache, and every client Parse would fail.
 
     server_prepared_statements_cache_size:
       config:
-        en: "Override the per-backend server-level prepared statement LRU for this pool."
-        ru: "Переопределить per-backend LRU подготовленных запросов для этого пула."
+        en: "Override the per-backend server-level prepared statement LRU for this pool. Must be >0 when prepared_statements is true."
+        ru: "Переопределить per-backend LRU подготовленных запросов для этого пула. Должен быть >0, если prepared_statements=true."
       doc: |
         Override the per-backend server-level prepared statement LRU for this pool. When unset, inherits
         `general.server_prepared_statements_cache_size`, which itself inherits from the resolved pool-level
         `prepared_statements_cache_size`. Use this to widen or tighten the per-backend cache for one pool
         with workload characteristics different from the rest of the instance.
+
+        While `prepared_statements` is enabled, `0` is rejected at startup and on reload for the same reason
+        as the general setting: every client Parse would fail.
 
     scaling_warm_pool_ratio:
       config:

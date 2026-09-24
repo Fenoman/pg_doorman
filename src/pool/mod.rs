@@ -1974,7 +1974,9 @@ fn build_fallback_state(
 ///    behaviour from before this knob existed.
 ///
 /// Returns 0 when `pool_cache_size` is 0: the pool-level cache is
-/// disabled, so a per-backend LRU adds no value.
+/// disabled, so a per-backend LRU adds no value. With prepared
+/// statements enabled the pool still remaps Parse and every Parse would
+/// fail, so `Config::validate` rejects any pool that resolves to 0 here.
 pub(crate) fn resolve_server_cache_size(
     pool_cache_size: usize,
     pool_override: Option<usize>,

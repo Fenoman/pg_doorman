@@ -527,6 +527,12 @@ TCP retransmission timeout, когда keepalive не помогает (напр
 или когда нужна более быстрая утилизация через `Close` без уменьшения hit rate
 на уровне пула. При `prepared_statements: false` принудительно равен `0`.
 
+Это тоже не выключатель. Пока `prepared_statements` включён, значение, при
+котором у какого-либо пула кеш на бэкенде равен `0`, приводит к ошибке каждого
+клиентского Parse, поэтому pg_doorman отклоняет его при запуске и при
+перезагрузке конфигурации. Чтобы отключить подмену prepared statements,
+задайте `prepared_statements: false`.
+
 По умолчанию: `not set (наследует prepared_statements_cache_size)`.
 
 ### client_anonymous_prepared_cache_size
