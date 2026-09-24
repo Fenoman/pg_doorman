@@ -44,11 +44,7 @@ sso_admin_groups = ["pg-doorman-admins"]
 server_host = "postgres"
 server_port = 5432
 pool_mode = "transaction"
-# The default release query calls public.pgv_free(), which ships with the
-# pg_variables extension. Stock postgres:16 does not have it, and a failing
-# release query marks the backend bad on every checkin — which shows up as
-# "Unable to retrieve server parameters" on the very first connection.
-# The demo holds no session state worth clearing, so run nothing.
+# The demo holds no session state worth clearing, so check-in runs nothing.
 release_query = ""
 
 [[pools.demo.users]]

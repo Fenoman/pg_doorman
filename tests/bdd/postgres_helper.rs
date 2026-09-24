@@ -14,11 +14,9 @@ use tokio::time::sleep;
 
 /// Fallback definition of `public.pgv_free()` for PostgreSQL instances that
 /// do not have the `pg_variables` extension available (vanilla pgcr installs,
-/// CI images, etc.). The iServ-compatible `release_query`
-/// (`pg_advisory_unlock_all() + pgv_free()`) panics on a missing function and
-/// would mark every test backend bad - making the entire `release-query.feature`
-/// suite red on machines without `pg_variables`. The no-op shim keeps the SQL
-/// well-formed without changing the contract.
+/// CI images, etc.), so the scenarios run the full iServ-compatible
+/// `release_query` (`pg_advisory_unlock_all() + pgv_free()`). A database
+/// without the function is covered by the step that drops it.
 const PGV_FREE_FALLBACK_SQL: &str = r#"
 DO $pg_doorman$
 BEGIN
@@ -382,6 +380,30 @@ pub async fn apply_fixtures(world: &mut DoormanWorld, file_path: String) {
     ensure_pgv_free_available(port, "postgres");
     if database_exists(port, "example_db") {
         ensure_pgv_free_available(port, "example_db");
+    }
+}
+
+/// Leaves `database` without `public.pgv_free()`, like a PostgreSQL without
+/// the `pg_variables` extension, which the fixtures otherwise stand in for.
+#[given(expr = "PostgreSQL database {string} has no pgv_free function")]
+pub async fn drop_pgv_free(world: &mut DoormanWorld, database: String) {
+    let port = world.pg_port.expect("PG not started");
+    let output = run_psql(
+        port,
+        &database,
+        &[
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            "DROP EXTENSION IF EXISTS pg_variables",
+            "-c",
+            "DROP FUNCTION IF EXISTS public.pgv_free()",
+        ],
+    );
+    if !output.status.success() {
+        eprintln!("psql stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("psql stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+        panic!("Failed to drop public.pgv_free() in {database}");
     }
 }
 

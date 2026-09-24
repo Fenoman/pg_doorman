@@ -693,7 +693,7 @@ log_client_parameter_status_changes = false
 # session-scoped state PostgreSQL does not reset between transactions
 # (advisory locks, `pg_variables` session vars, etc.).
 # * Omit  -> iServ-compatible default: `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`
-#   (requires the `pg_variables` extension to provide `pgv_free()`)
+#   (a backend whose database lacks `pgv_free()` only unlocks advisory locks)
 # * `""`  -> release-query disabled, nothing is executed at checkin
 # * other -> exactly that SQL runs on every checkin
 # A SQL error in the release query marks the backend bad so a dirty

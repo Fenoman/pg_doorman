@@ -168,11 +168,39 @@ impl AbandonedQueryTimeouts {
 /// Historical iServ default for the per-checkin release query. Releases
 /// session-scoped state that PostgreSQL does not clear between transactions:
 /// advisory locks plus any session variables stored by the `pg_variables`
-/// extension. Used when `release_query` is omitted from the pool config; if
-/// `pgv_free()` is not available on the target database the operator must
-/// either install `pg_variables` or set `release_query = ""` to disable.
+/// extension. Used when `release_query` is omitted from the pool config; a
+/// backend whose database lacks `pgv_free()` runs
+/// `RELEASE_WITHOUT_PG_VARIABLES` instead.
 const RELEASE_SESSION_QUERY: &str =
     "SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();";
+
+/// The default release query on a database without `public.pgv_free()`:
+/// no `pg_variables` state can exist there, only advisory locks.
+pub(crate) const RELEASE_WITHOUT_PG_VARIABLES: &str = "SELECT pg_catalog.pg_advisory_unlock_all();";
+
+/// Answers `t` when the database has `public.pgv_free()`.
+pub(crate) const PGV_FREE_PROBE: &str =
+    "SELECT pg_catalog.to_regprocedure('public.pgv_free()') IS NOT NULL";
+
+/// Text of the first column of the first DataRow in a buffered response;
+/// `None` when there is no row or the value is NULL.
+fn first_data_row_value(response: &[u8]) -> Option<String> {
+    let mut rest = response;
+    while rest.len() >= 5 {
+        let len = i32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+        let body = rest.get(5..1 + len)?;
+        if rest[0] == b'D' {
+            let value_len = i32::from_be_bytes(body.get(2..6)?.try_into().ok()?);
+            if value_len < 0 {
+                return None;
+            }
+            let value = body.get(6..6 + value_len as usize)?;
+            return Some(String::from_utf8_lossy(value).into_owned());
+        }
+        rest = &rest[1 + len..];
+    }
+    None
+}
 
 async fn finish_graceful_terminate<W>(
     mut stream: W,
@@ -719,6 +747,26 @@ impl Server {
     }
 
     async fn small_simple_query_frame(&mut self, query: &[u8]) -> Result<(), Error> {
+        self.small_simple_query_exchange(query, None).await
+    }
+
+    /// Runs a housekeeping query and returns the text of the first column of
+    /// its first row; `None` when there is no row or the value is NULL.
+    pub(crate) async fn small_simple_query_value(
+        &mut self,
+        query: &str,
+    ) -> Result<Option<String>, Error> {
+        let mut response = BytesMut::new();
+        self.small_simple_query_exchange(&simple_query(query), Some(&mut response))
+            .await?;
+        Ok(first_data_row_value(&response))
+    }
+
+    async fn small_simple_query_exchange(
+        &mut self,
+        query: &[u8],
+        mut response: Option<&mut BytesMut>,
+    ) -> Result<(), Error> {
         // Reset SQL-error capture for this round trip before reading a
         // new ReadyForQuery.
         self.last_sql_error = None;
@@ -740,7 +788,11 @@ impl Server {
         let mut noop = tokio::io::sink();
         loop {
             match tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await {
-                Ok(Ok(_)) => {}
+                Ok(Ok(bytes)) => {
+                    if let Some(response) = response.as_deref_mut() {
+                        response.extend_from_slice(&bytes);
+                    }
+                }
                 Ok(Err(err)) => {
                     // returned `Err(err)` WITHOUT
                     // `mark_bad`. The caller's `?` propagates but the

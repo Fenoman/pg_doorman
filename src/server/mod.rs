@@ -40,6 +40,6 @@ pub use server_backend::BUF_STREAM_CAPACITY;
 /// the re-export matches that visibility (a `pub use` would be E0365).
 pub(crate) use server_backend::{
     resolve_release_query, AsyncExpectedResponse, ResolvedReleaseQuery, SetResponseOutcome,
-    SyncPlan, HOUSEKEEPING_TIMEOUT,
+    SyncPlan, HOUSEKEEPING_TIMEOUT, PGV_FREE_PROBE, RELEASE_WITHOUT_PG_VARIABLES,
 };
 pub use stream::StreamInner;

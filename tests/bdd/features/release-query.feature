@@ -79,6 +79,17 @@ Feature: Configurable release query
       username = "example_user_1"
       password = ""
       pool_size = 1
+
+      [pools.release_default]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      server_database = "example_db"
+      pool_mode = "transaction"
+
+      [[pools.release_default.users]]
+      username = "example_user_1"
+      password = ""
+      pool_size = 1
       """
 
   Scenario: custom release_query runs in transaction mode
@@ -126,3 +137,15 @@ Feature: Configurable release query
     And we send SimpleQuery "COMMIT" to session "blocker" and store response
     And we send SimpleQuery "SELECT 43" to session "slow" and store response
     Then session "slow" should receive DataRow with "43"
+
+  @release-query-default-without-pg-variables
+  Scenario: the default release_query keeps backends on a database without pgv_free
+    Given PostgreSQL database "example_db" has no pgv_free function
+    When we create session "one" to pg_doorman as "example_user_1" with password "" and database "release_default"
+    And we send SimpleQuery "SELECT pg_advisory_lock(42)" to session "one"
+    And we send SimpleQuery "SELECT pg_backend_pid()" to session "one" and store backend_pid as "first"
+    And we send SimpleQuery "SELECT pg_backend_pid()" to session "one" and store backend_pid as "second"
+    Then named backend_pid "second" from session "one" is same as "first"
+    When we create session "pg" to postgres as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'" to session "pg" and store response
+    Then session "pg" should receive DataRow with "0"

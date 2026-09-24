@@ -1671,7 +1671,7 @@ fields:
           session-scoped state PostgreSQL does not reset between transactions
           (advisory locks, `pg_variables` session vars, etc.).
           * Omit  -> iServ-compatible default: `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`
-            (requires the `pg_variables` extension to provide `pgv_free()`)
+            (a backend whose database lacks `pgv_free()` only unlocks advisory locks)
           * `""`  -> release-query disabled, nothing is executed at checkin
           * other -> exactly that SQL runs on every checkin
           A SQL error in the release query marks the backend bad so a dirty
@@ -1682,7 +1682,7 @@ fields:
           между транзакциями не сбрасывает (advisory-локи, session-переменные
           расширения `pg_variables` и т.п.).
           * не указано -> iServ-compatible default: `SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free();`
-            (требуется расширение `pg_variables` для `pgv_free()`)
+            (backend базы без `pgv_free()` только снимает advisory-локи)
           * `""` -> release-query отключён, на checkin ничего не выполняется
           * иначе -> ровно эта SQL выполняется на каждом checkin
           SQL-ошибка release-query помечает backend bad, чтобы грязная сессия
@@ -1690,10 +1690,12 @@ fields:
       doc: |
         Per-pool checkin hook. By default pg_doorman runs the iServ-compatible
         statement (`pg_advisory_unlock_all()` plus `pg_variables`' `pgv_free()`)
-        on every backend before it goes back into the idle set. Set `release_query = ""`
-        when the target database does not have the `pg_variables` extension -
-        otherwise every checkin will fail with `function public.pgv_free() does
-        not exist` and the backend will be marked bad. Set to a custom statement
+        on every backend before it goes back into the idle set. A new backend
+        whose database has no `public.pgv_free()` notices it once and only
+        unlocks advisory locks at check-in; pg_doorman logs a warning once per
+        pool. Set `release_query = ""` when the applications keep no
+        session-level advisory locks or `pg_variables` state across
+        transactions: it saves a round trip per transaction. Set to a custom statement
         when you need different teardown (`DISCARD ALL`, project-specific
         cleanup function, etc.). Maximum length 4096 bytes; whitespace-only
         values are rejected.
