@@ -133,6 +133,17 @@ where
             MigrationNotice,
         }
 
+        // Every idle client shares the migration notice, and registering
+        // takes its lock. A client whose next message is already here does
+        // not need it.
+        if !migration_in_progress() {
+            let read_next = read_message_reuse_cancel_safe(read, read_buf, max_memory_usage);
+            tokio::pin!(read_next);
+            if let std::task::Poll::Ready(result) = futures::poll!(read_next.as_mut()) {
+                return result.map(IdleClientRead::Message);
+            }
+        }
+
         let race = {
             let migration_notice = MIGRATION_NOTIFY.notified();
             tokio::pin!(migration_notice);
