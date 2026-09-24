@@ -341,10 +341,25 @@ fn extract_cleanup_commands(
     SmallVec<[SetCleanupCommand; 2]>,
     SmallVec<[ResetCleanupCommand; 2]>,
 ) {
-    let scan_set = include_set && contains_ascii_ci(bytes, b"set");
-    let scan_reset = include_reset && contains_ascii_ci(bytes, b"reset");
     let mut set_commands = SmallVec::new();
     let mut reset_commands = SmallVec::new();
+
+    // Statements are separated by ';', so a text without one is a single
+    // statement, and only its start can make it a SET or RESET. A Parse
+    // holds one statement anyway; scanning its whole text costs about
+    // 1-2 ns per byte.
+    if !bytes.contains(&b';') {
+        if include_set {
+            set_commands.extend(parse_set_cleanup_command(bytes));
+        }
+        if include_reset {
+            reset_commands.extend(parse_reset_cleanup_command(bytes));
+        }
+        return (set_commands, reset_commands);
+    }
+
+    let scan_set = include_set && contains_ascii_ci(bytes, b"set");
+    let scan_reset = include_reset && contains_ascii_ci(bytes, b"reset");
     if !scan_set && !scan_reset {
         return (set_commands, reset_commands);
     }
@@ -1367,6 +1382,32 @@ mod tests {
 
     fn named(name: &str) -> DeallocateTarget {
         DeallocateTarget::Named(name.to_string())
+    }
+
+    /// A text without ';' skips the scan of the whole text. The same
+    /// statement with a trailing ';' goes through the full scanner and must
+    /// be classified the same way.
+    #[test]
+    fn single_statement_fast_path_matches_the_full_scan() {
+        for statement in [
+            "SET search_path = app",
+            "  /* hint */ set local work_mem = '64MB'",
+            "SET ROLE app_user",
+            "SET ROLE DEFAULT",
+            "RESET ALL",
+            "reset role",
+            "RESET SESSION AUTHORIZATION",
+            "SET SESSION AUTHORIZATION DEFAULT",
+            "SET CONSTRAINTS ALL DEFERRED",
+            "UPDATE t SET a = 1",
+            "SELECT 'set x = 1'",
+            "SELECT 1 /* unterminated",
+            "",
+        ] {
+            let fast = extract_set_and_reset_cleanup_commands(statement.as_bytes());
+            let full = extract_set_and_reset_cleanup_commands(format!("{statement};").as_bytes());
+            assert_eq!(fast, full, "{statement:?}");
+        }
     }
 
     #[test]

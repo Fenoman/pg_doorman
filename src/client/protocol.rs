@@ -10,9 +10,7 @@ use crate::pool::ConnectionPool;
 use crate::server::{now_monotonic_ms, Server};
 use crate::utils::strings::truncate_query_for_log;
 
-use super::util::{
-    contains_discard_all, extract_reset_cleanup_commands, extract_set_cleanup_commands,
-};
+use super::util::{contains_discard_all, extract_set_and_reset_cleanup_commands};
 
 /// Replacement query for extended-protocol `DISCARD ALL` interception
 /// Any zero-parameter, side-effect-free SQL that the
@@ -71,14 +69,18 @@ fn replacement_close_target(
     }
 }
 
-fn first_set_cleanup_command(query: &[u8]) -> Option<crate::server::cleanup::SetCleanupCommand> {
-    extract_set_cleanup_commands(query).first().copied()
-}
-
-fn first_reset_cleanup_command(
+/// The SET and RESET cleanup attribution of a Parse, found in one pass.
+fn first_cleanup_commands(
     query: &[u8],
-) -> Option<crate::server::cleanup::ResetCleanupCommand> {
-    extract_reset_cleanup_commands(query).first().copied()
+) -> (
+    Option<crate::server::cleanup::SetCleanupCommand>,
+    Option<crate::server::cleanup::ResetCleanupCommand>,
+) {
+    let (set_commands, reset_commands) = extract_set_and_reset_cleanup_commands(query);
+    (
+        set_commands.first().copied(),
+        reset_commands.first().copied(),
+    )
 }
 
 fn disabled_parse_name_and_query(message: &BytesMut) -> Option<(String, &[u8], usize)> {
@@ -273,9 +275,9 @@ where
                             && !server.in_copy_mode()
                             && num_params == 0
                             && contains_discard_all(query);
-                        let set_command = first_set_cleanup_command(query);
+                        let (set_command, reset_command) = first_cleanup_commands(query);
                         let reset_command = if set_command.is_none() {
-                            first_reset_cleanup_command(query)
+                            reset_command
                         } else {
                             None
                         };
@@ -479,13 +481,15 @@ where
             None => Arc::<str>::from(shared_parse.name.as_str()),
         };
 
+        let (set_cleanup_command, reset_cleanup_command) =
+            first_cleanup_commands(parse.query().as_bytes());
         let cached = CachedStatement {
             shared_server_name: Arc::clone(&server_stmt_name),
             parse: shared_parse.clone(),
             hash,
             intercepted_discard_all,
-            set_cleanup_command: first_set_cleanup_command(parse.query().as_bytes()),
-            reset_cleanup_command: first_reset_cleanup_command(parse.query().as_bytes()),
+            set_cleanup_command,
+            reset_cleanup_command,
             async_name: async_name.clone(),
         };
         // distinguish three real eviction modes:
