@@ -131,6 +131,15 @@ physical names and plan counts. The client Anonymous and Named eviction metrics
 measure their respective capacity pressure; repeated replacement of the same
 anonymous entry does not increment the Named eviction counter.
 
+After rolling out a new version, check `SHOW SERVERS` under production-like
+load. `prepare_cache_size` of each backend should settle near the number of
+distinct queries the application sends. A value that climbs towards
+`server_prepared_statements_cache_size` means backends accumulate duplicate
+plans at the cost of PostgreSQL memory. For drivers that Parse on every call the
+same defect lowers the server prepared hit ratio, which the
+**`PgDoormanPreparedHitRatioLow`** alert in
+`monitoring/prometheus-rules/prepared-statements.yaml` watches.
+
 ## Reference
 
 - [Pool Modes](../concepts/pool-modes.md)

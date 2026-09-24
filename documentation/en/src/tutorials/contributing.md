@@ -282,6 +282,10 @@ After modifying `flake.nix`, rebuild the image with `make local-build`.
 - Use meaningful variable and function names
 - Add comments for complex logic
 - Write tests for new functionality
+- Keep bounds in tests of resources (prepared statement counts, memory,
+  connections) below the configured cache or pool limit: a bound equal to the
+  limit can never fail. Do not relax such a test in the change that alters the
+  behavior it guards without explaining the new bound in the commit message
 
 ### Pull Request Process
 
