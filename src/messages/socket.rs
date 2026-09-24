@@ -228,6 +228,47 @@ where
     }
 }
 
+/// [`write_all_flush_timeout`] that adds to `written` every byte the writer
+/// took, also when it fails part-way through `buf`.
+pub async fn write_all_flush_timeout_counted<S>(
+    stream: &mut S,
+    buf: &[u8],
+    duration: Duration,
+    written: &mut usize,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    let mut remaining = buf;
+    while !remaining.is_empty() {
+        match crate::utils::timeout::timeout_unless_ready(duration, stream.write(remaining)).await {
+            Ok(Ok(0)) => {
+                return Err(Error::SocketError(
+                    "Error writing to socket: writer accepted no bytes".to_string(),
+                ))
+            }
+            Ok(Ok(taken)) => {
+                *written += taken;
+                remaining = &remaining[taken..];
+            }
+            Ok(Err(err)) => {
+                return Err(Error::SocketError(format!(
+                    "Error writing to socket: {err:?}"
+                )))
+            }
+            Err(_) => return Err(ProxyTimeout),
+        }
+    }
+
+    match crate::utils::timeout::timeout_unless_ready(duration, stream.flush()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(Error::SocketError(format!(
+            "Error flushing socket: {err:?}"
+        ))),
+        Err(_) => Err(ProxyTimeout),
+    }
+}
+
 /// Read message header.
 pub async fn read_message_header<S>(stream: &mut S) -> Result<(u8, i32), Error>
 where

@@ -247,9 +247,18 @@ where
     let prev_bad = server.bad;
     // A future dropped mid-frame leaves the stream inside it.
     server.bad = true;
-    let mut client_error = write_all_flush_timeout(client_stream, &server.buffer, timeout)
-        .await
-        .err();
+    const HEADER_BYTES: usize = 1 + mem::size_of::<i32>();
+    let mut written = 0;
+    let mut client_error = crate::messages::socket::write_all_flush_timeout_counted(
+        client_stream,
+        &server.buffer,
+        timeout,
+        &mut written,
+    )
+    .await
+    .err();
+    // Bytes of this frame the client took; its header ends the write.
+    let mut delivered = written.saturating_sub(server.buffer.len() - HEADER_BYTES);
     // Once the client has gone, the rest of the frame gets the time an
     // abandoned query gets. A backend sending it slower is closed; being in
     // the middle of a write, PostgreSQL notices that at once.
@@ -259,11 +268,9 @@ where
         .is_some()
         .then(|| tokio::time::Instant::now() + drain_budget);
 
-    const HEADER_BYTES: u64 = 1 + mem::size_of::<i32>() as u64;
     const MAX_CHUNK: usize = 65536;
     let mut remaining = message_len as usize - mem::size_of::<i32>();
     let mut chunk = vec![0_u8; remaining.min(MAX_CHUNK)];
-    let mut delivered: usize = 0;
     let mut backend_error = None;
     while remaining > 0 {
         let want = remaining.min(chunk.len());
@@ -294,8 +301,15 @@ where
         };
         remaining -= read;
         if client_error.is_none() {
-            match write_all_flush_timeout(client_stream, &chunk[..read], timeout).await {
-                Ok(()) => delivered += read,
+            match crate::messages::socket::write_all_flush_timeout_counted(
+                client_stream,
+                &chunk[..read],
+                timeout,
+                &mut delivered,
+            )
+            .await
+            {
+                Ok(()) => {}
                 Err(err) => {
                     client_error = Some(err);
                     drain_deadline = Some(tokio::time::Instant::now() + drain_budget);
@@ -307,7 +321,7 @@ where
         server,
         kind,
         backend_error.is_none() && client_error.is_none(),
-        HEADER_BYTES + delivered as u64,
+        delivered as u64,
     );
     if let Some(err) = backend_error {
         server.mark_bad(err.to_string().as_str());
@@ -2643,7 +2657,9 @@ mod tests {
         };
 
         assert!(
-            impl_src.contains("write_all_flush_timeout(client_stream, &server.buffer"),
+            impl_src.contains(
+                "write_all_flush_timeout_counted(\n        client_stream,\n        &server.buffer,"
+            ),
             "large-message header flushes to the client must be bounded by proxy_copy_data_timeout"
         );
         assert!(
@@ -2787,6 +2803,49 @@ mod tests {
         .expect("the rest of the reply is read")
         .unwrap();
         assert_eq!(&drained[..], &rest[..]);
+        let _peer = writer.await.unwrap();
+    }
+
+    /// The bytes of a streamed frame a client took before it failed count as
+    /// streamed, those of the chunk it failed in too.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn frame_bytes_a_client_took_before_it_failed_are_counted() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.address.username = "streaming_partial_user".to_string();
+        server.address.database = "streaming_partial_db".to_string();
+        server.max_message_size = 1024;
+        let value = vec![b'x'; 200 * 1024];
+        let mut reply = BytesMut::new();
+        reply.put_u8(b'D');
+        reply.put_i32(4 + 2 + 4 + value.len() as i32);
+        reply.put_i16(1);
+        reply.put_i32(value.len() as i32);
+        reply.put_slice(&value);
+        reply.put(crate::messages::command_complete("SELECT 1"));
+        reply.put(crate::messages::ready_for_query(false));
+        let writer = tokio::spawn(async move {
+            peer.write_all(&reply).await.unwrap();
+            peer
+        });
+        let counter = crate::web::metrics::STREAMING_BYTES_TOTAL.with_label_values(&[
+            "streaming_partial_user",
+            "streaming_partial_db",
+            "data_row",
+        ]);
+        let before = counter.get();
+
+        let mut client = FailAfter {
+            limit: 10_000,
+            taken: 0,
+        };
+        let result = server.recv(&mut client, None).await;
+
+        assert!(matches!(result, Err(Error::ClientGoneMidStream(_))));
+        assert_eq!(counter.get() - before, 10_000);
         let _peer = writer.await.unwrap();
     }
 
