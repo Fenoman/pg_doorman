@@ -121,8 +121,9 @@ A reload applies added or removed clusters and ports, changed Patroni hosts,
 and a port moved to a new `listen` address. It is rejected as a whole, and
 the running configuration stays, when it changes a top-level setting
 (`listen_address`, `cluster_update_interval`), a cluster's TLS settings, or
-anything else of a port that keeps its `listen` address (`roles`, `max_lag`,
-`host_port`); those need a restart, which drops the sessions on every port.
+anything else of a port that keeps its `listen` address (`roles`,
+`max_lag_in_bytes`, `host_port`); those need a restart, which drops the
+sessions on every port.
 
 ### Manual Cluster Update
 
