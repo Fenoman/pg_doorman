@@ -310,6 +310,7 @@ where
                 // This is a named prepared statement while prepared statements are disabled
                 // Server connection state will need to be cleared at checkin
                 server.mark_dirty();
+                server.cleanup_state.client_named_protocol_statements = true;
             }
             if let Some((statement_name, set_command, reset_command)) = cleanup_attribution {
                 if let Some(command) = set_command {
@@ -1803,6 +1804,32 @@ mod anonymous_close_tests {
             Some(SetCleanupCommand::SetSessionAuthorization),
             "prepared_statements=false must still attribute unnamed extended SET SESSION AUTHORIZATION"
         );
+    }
+
+    /// With prepared statements disabled a named Parse reaches the backend
+    /// under the client's own name, so a successful SQL DEALLOCATE may have
+    /// removed that statement rather than one created with SQL PREPARE, which
+    /// still keeps a transaction-pool client on its backend.
+    #[tokio::test]
+    async fn disabled_named_parse_keeps_sql_prepared_count_on_deallocate() {
+        use tokio::io::AsyncWriteExt;
+
+        let mut client = test_client();
+        client.prepared.enabled = false;
+        let pool = ConnectionPool::test_for_protocol();
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.cleanup_state.sql_prepared_statements = 1;
+
+        client
+            .process_parse_immediate(make_parse("r", "SELECT 2", &[]), &pool, &mut server)
+            .await
+            .expect("disabled prepared Parse should be forwarded");
+        peer.write_all(b"C\0\0\0\x0fDEALLOCATE\0Z\0\0\0\x05I")
+            .await
+            .unwrap();
+        server.recv(&mut sink(), None).await.unwrap();
+
+        assert_eq!(server.cleanup_state.sql_prepared_statements, 1);
     }
 
     #[test]

@@ -805,10 +805,12 @@ fn handle_command_complete(server: &mut Server, message: &BytesMut) {
                 .saturating_add(1);
         }
         CommandCompleteEffect::DeallocateOne => {
-            server.cleanup_state.sql_prepared_statements = server
-                .cleanup_state
-                .sql_prepared_statements
-                .saturating_sub(1);
+            if !server.cleanup_state.client_named_protocol_statements {
+                server.cleanup_state.sql_prepared_statements = server
+                    .cleanup_state
+                    .sql_prepared_statements
+                    .saturating_sub(1);
+            }
         }
         CommandCompleteEffect::DisarmSet => {
             defer_set_cleanup_disarm_if_transactionally_safe(server);
@@ -819,6 +821,7 @@ fn handle_command_complete(server: &mut Server, message: &BytesMut) {
         CommandCompleteEffect::DisarmPrepare => {
             server.cleanup_state.needs_cleanup_prepare = false;
             server.cleanup_state.sql_prepared_statements = 0;
+            server.cleanup_state.client_named_protocol_statements = false;
             drop_prepared_statement_cache_on_reset(server, "DEALLOCATE ALL");
         }
         CommandCompleteEffect::DisarmAll => {

@@ -65,6 +65,12 @@ pub(crate) struct CleanupState {
     /// backend, counted from CommandComplete tags. A transaction-pool client
     /// keeps its backend while any exist.
     pub(crate) sql_prepared_statements: u32,
+
+    /// A named protocol `Parse` reached the backend under the client's own
+    /// name (prepared statements disabled). A successful SQL `DEALLOCATE`
+    /// may then have removed one of those, so it no longer lowers
+    /// `sql_prepared_statements`.
+    pub(crate) client_named_protocol_statements: bool,
 }
 
 impl CleanupState {
@@ -76,6 +82,7 @@ impl CleanupState {
             needs_cleanup_prepare: false,
             needs_cleanup_declare: false,
             sql_prepared_statements: 0,
+            client_named_protocol_statements: false,
         }
     }
 
@@ -105,6 +112,7 @@ impl CleanupState {
         self.needs_cleanup_prepare = false;
         self.needs_cleanup_declare = false;
         self.sql_prepared_statements = 0;
+        self.client_named_protocol_statements = false;
     }
 }
 

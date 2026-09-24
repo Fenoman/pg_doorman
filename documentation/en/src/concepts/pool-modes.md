@@ -19,6 +19,7 @@ This is the mode that delivers PgDoorman's connection efficiency: a `pool_size` 
 What works in transaction mode (where most poolers fail):
 
 - Prepared statements. PgDoorman caches them per-pool, remaps statement names across backend connections, and replays preparation transparently. Drivers that pin to `unnamed` statement (Go pgx, .NET Npgsql, Python asyncpg) work without configuration.
+- SQL-level `PREPARE`. The client keeps its backend until the statements it created that way are gone (`DEALLOCATE`, `DEALLOCATE ALL`, `DISCARD ALL`). A protocol `Close` of such a statement does not release the backend, and with `prepared_statements = false` a client that also sent a named `Parse` keeps it until `DEALLOCATE ALL`, `DISCARD ALL` or disconnect: PgDoorman cannot tell which of the two kinds a `DEALLOCATE` removed.
 - Pipelined batches and async `Flush` flow.
 - Cancel requests over TLS.
 - `LISTEN` / `NOTIFY` — but only inside a transaction. A `LISTEN` issued and then committed releases the backend, and any notifications delivered to it after that go to whichever client checks it out next, not to the original `LISTEN`-er. PgBouncer behaves the same way; if you need cross-transaction `LISTEN`, use session mode for that client.
