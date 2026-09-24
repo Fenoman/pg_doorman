@@ -6836,15 +6836,16 @@ mod relay_response_client_write_failure_tests {
         // CancelRequest arrived, like a query PostgreSQL is still stopping.
         let (cancel_seen_tx, cancel_seen_rx) = tokio::sync::oneshot::channel();
         let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let backend = tokio::spawn(async move {
             let (mut conn, _) = cancel_listener.accept().await.unwrap();
             let mut request = [0_u8; 16];
             conn.read_exact(&mut request).await.unwrap();
             cancel_seen_tx.send(request).unwrap();
             answer_rx.await.unwrap();
-            peer.write_all(&[query_canceled_error(), b"Z\0\0\0\x05I".to_vec()].concat())
-                .await
-                .unwrap();
+            peer.write_all(&query_canceled_error()).await.unwrap();
+            ready_rx.await.unwrap();
+            peer.write_all(b"Z\0\0\0\x05I").await.unwrap();
             peer
         });
 
@@ -6862,6 +6863,13 @@ mod relay_response_client_write_failure_tests {
             "the backend must stay checked out until the canceled query answers"
         );
         answer_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut relay)
+                .await
+                .is_err(),
+            "the canceled query has not reached ReadyForQuery yet"
+        );
+        ready_tx.send(()).unwrap();
         let err = tokio::time::timeout(Duration::from_secs(5), relay)
             .await
             .expect("relay must end once the canceled query stopped")
