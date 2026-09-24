@@ -888,9 +888,11 @@ pub(crate) static SYNC_PARAMS_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 /// Duration and outcome of the backend check-in exchange after a client
 /// transaction has reached ReadyForQuery. Both labels have a fixed vocabulary:
 /// `path` is empty/release_only/cleanup_only/combined and `result` is
-/// ok/sql_error/transport_error/protocol_error/error. A default
-/// `release_query` goes out without waiting for its reply: the duration is
-/// that of sending it, and the check-in is observed once the reply is read,
+/// ok/sql_error/transport_error/protocol_error/error. The duration is that of
+/// the check-in itself. A default `release_query` goes out without waiting for
+/// its reply, so it counts the send; a release left for the next client's
+/// first write counts only the check-in's own work, and its send goes with
+/// that write. Either way the check-in is observed once the reply is read,
 /// so a backend closed before that leaves no observation.
 pub(crate) static CHECKIN_CLEANUP_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     let histogram = HistogramVec::new(
