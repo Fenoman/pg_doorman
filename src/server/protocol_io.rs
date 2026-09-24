@@ -564,7 +564,11 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
         // Keep cleanup attribution armed while the same client owns the
         // backend until Sync. An ordinary SQL error is recoverable and must
         // not discard the session's warm temp state at that later checkin.
+        // Prepared statements need no blanket reset: the decision above and
+        // the rolled-back registrations already cover them.
+        let needs_cleanup_prepare = server.cleanup_state.needs_cleanup_prepare;
         server.cleanup_state.set_true();
+        server.cleanup_state.needs_cleanup_prepare = needs_cleanup_prepare;
         if !recoverable && !server.session_mode {
             server.mark_bad("PostgreSQL error in asynchronous operation mode");
         }
@@ -1503,6 +1507,31 @@ mod tests {
         ));
         handle_error_response(&mut server, &mut BytesMut::from(&b"garbage"[..]));
         assert!(server.cleanup_state.needs_cleanup_prepare);
+    }
+
+    /// An error in a Flush pipeline arms the SET/RESET cleanup, whose
+    /// attribution the skipped suffix breaks, but prepared statements stay
+    /// valid unless the error itself says otherwise.
+    #[tokio::test]
+    async fn async_statement_error_keeps_prepared_statements() {
+        for (sqlstate, arms) in [("22012", false), ("0A000", true)] {
+            let (mut server, _peer) = crate::server::Server::test_silent_socket();
+            server.prepared_statement_cache = Some(LruCache::with_hasher(
+                NonZeroUsize::new(16).unwrap(),
+                RandomState::new(),
+            ));
+            server.set_async_mode(true);
+            let body = format!("SERROR\0VERROR\0C{sqlstate}\0Mfailed\0\0");
+            handle_error_response(&mut server, &mut BytesMut::from(body.as_bytes()));
+            assert!(
+                server.cleanup_state.needs_cleanup_set,
+                "SQLSTATE {sqlstate}"
+            );
+            assert_eq!(
+                server.cleanup_state.needs_cleanup_prepare, arms,
+                "SQLSTATE {sqlstate}"
+            );
+        }
     }
 
     #[tokio::test]

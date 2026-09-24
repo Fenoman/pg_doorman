@@ -68,3 +68,18 @@ Feature: An ordinary SQL error keeps the backend's prepared statements
     Then session "one" should receive error containing "division by zero"
     When we send SimpleQuery "SELECT pg_backend_pid()" to session "one" and store backend_pid as "after"
     Then named backend_pid "after" from session "one" is same as "before"
+
+  Scenario: A statement error in a Flush pipeline keeps the backend's prepared statements
+    When we create session "one" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send Parse "q" with query "SELECT 1" to session "one"
+    And we send Bind "" to "q" with params "" to session "one"
+    And we send Execute "" to session "one"
+    And we send Sync to session "one"
+    And we send Parse "" with query "SELECT 1/0" to session "one"
+    And we send Bind "" to "" with params "" to session "one"
+    And we send Execute "" to session "one"
+    And we send Flush to session "one"
+    And we send Sync to session "one"
+    Then session "one" should receive error containing "division by zero"
+    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE statement = 'SELECT 1'" to session "one" and store response
+    Then session "one" should receive DataRow with "1"
