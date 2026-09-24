@@ -5651,6 +5651,61 @@ mod tests {
         pool.inner.users.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// A checked-out backend whose deferred release cannot be sent: its
+    /// PostgreSQL side is gone.
+    fn checked_out_with_undeliverable_release(
+        pool: &Pool,
+        permit: pool_coordinator::CoordinatorPermit,
+    ) -> ObjectInner {
+        let (mut server, peer) = crate::server::Server::test_silent_socket();
+        server.set_release_query(None);
+        server.release_statements_prepared = true;
+        server.deferred_release = true;
+        drop(peer);
+        pool.inner.new_object_inner(server, Some(permit))
+    }
+
+    /// A backend whose deferred release fails on its way to the idle queue
+    /// is closed; its pool slot, checkout permit and database permit go back.
+    #[tokio::test]
+    async fn a_backend_whose_deferred_release_fails_is_closed_on_return() {
+        let pool = empty_test_pool_with_max_size(4);
+        let (database, permit) = database_permit();
+        let inner = checked_out_with_undeliverable_release(&pool, permit);
+        pool.semaphore().try_acquire_many(1).unwrap().forget();
+        pool.inner.slots.lock().size = 1;
+        let free_before = pool.semaphore().available_permits();
+
+        pool.inner.return_object(inner);
+
+        let slots = pool.inner.slots.lock();
+        assert!(slots.vec.is_empty(), "the backend is not kept");
+        assert_eq!(slots.size, 0);
+        drop(slots);
+        assert_eq!(pool.semaphore().available_permits(), free_before + 1);
+        assert_eq!(database.total_connections(), 0);
+    }
+
+    /// The same for a backend a cancelled waiter hands back: its checkout
+    /// permit was already restored and stays as it is.
+    #[tokio::test]
+    async fn a_handed_back_backend_whose_deferred_release_fails_is_closed() {
+        let pool = empty_test_pool_with_max_size(4);
+        let (database, permit) = database_permit();
+        let inner = checked_out_with_undeliverable_release(&pool, permit);
+        pool.inner.slots.lock().size = 1;
+        let free_before = pool.semaphore().available_permits();
+
+        pool.inner.requeue_handoff(inner);
+
+        let slots = pool.inner.slots.lock();
+        assert!(slots.vec.is_empty(), "the backend is not kept");
+        assert_eq!(slots.size, 0);
+        drop(slots);
+        assert_eq!(pool.semaphore().available_permits(), free_before);
+        assert_eq!(database.total_connections(), 0);
+    }
+
     /// A database budget with one backend's permit taken from it.
     fn database_permit() -> (
         Arc<pool_coordinator::PoolCoordinator>,
