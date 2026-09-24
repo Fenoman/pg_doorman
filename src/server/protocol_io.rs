@@ -55,7 +55,6 @@ fn sanitize_for_log(s: &str) -> String {
 
 use tokio::time::timeout;
 
-use crate::config::config_arc;
 use crate::errors::Error;
 use crate::errors::Error::MaxMessageSize;
 use crate::messages::socket::read_message_body_append;
@@ -167,7 +166,7 @@ async fn handle_large_data_row<C>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    let copy_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
+    let copy_timeout = crate::config::proxy_copy_data_timeout();
     // Send current buffer + header
     server.buffer.put_u8(code_u8);
     server.buffer.put_i32(message_len);
@@ -230,7 +229,7 @@ async fn handle_large_function_call_response<C>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    let copy_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
+    let copy_timeout = crate::config::proxy_copy_data_timeout();
     server.buffer.put_u8(code_u8);
     server.buffer.put_i32(message_len);
     let prev_bad = server.bad;
@@ -284,7 +283,7 @@ async fn handle_large_copy_data<C>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    let copy_timeout = config_arc().general.proxy_copy_data_timeout.as_std();
+    let copy_timeout = crate::config::proxy_copy_data_timeout();
     handle_large_copy_data_inner(server, client_stream, code_u8, message_len, copy_timeout).await
 }
 
@@ -925,7 +924,7 @@ where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
     let idle_timeout = if ONE_MESSAGE {
-        config_arc().general.proxy_copy_data_timeout.as_std()
+        crate::config::proxy_copy_data_timeout()
     } else {
         Duration::ZERO
     };

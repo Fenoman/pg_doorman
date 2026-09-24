@@ -1109,6 +1109,13 @@ pub fn config_arc() -> Arc<Config> {
     CONFIG.load_full()
 }
 
+/// `general.proxy_copy_data_timeout`, which bounds every write to a client
+/// and is read several times per transaction. `CONFIG.load()` touches no
+/// reference count shared by all worker threads, unlike `config_arc()`.
+pub fn proxy_copy_data_timeout() -> std::time::Duration {
+    CONFIG.load().general.proxy_copy_data_timeout.as_std()
+}
+
 async fn load_file(path: &str) -> Result<String, Error> {
     let mut contents = String::new();
     let mut file = match File::open(path).await {
