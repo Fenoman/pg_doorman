@@ -1108,25 +1108,16 @@ mod tests {
         let mut stream = Cursor::new(data);
         let mut buf = BytesMut::with_capacity(READ_BUF_DEFAULT_CAPACITY);
 
-        let before = CURRENT_MEMORY.load(Ordering::SeqCst);
         let result = read_message_reuse(&mut stream, &mut buf, u64::MAX).await;
-        let after = CURRENT_MEMORY.load(Ordering::SeqCst);
 
+        // Only the length check before any allocation returns this error: a
+        // claim that passed it would reserve 256 MiB and then fail on EOF.
+        // The memory counter cannot show that, the reservation is released
+        // when the call returns.
         assert!(
-            result.is_err(),
-            "len exactly MAX_MESSAGE_SIZE must be rejected as malformed \
-             (no legit protocol traffic sends single message of the defensive maximum)"
-        );
-        // CURRENT_MEMORY is a process-global counter shared by every parallel
-        // test (see the sibling tests above), so its absolute delta is noisy.
-        // The regression this guards is a synchronous 256MB allocation on the
-        // reject path, so assert the reject did not grow the budget by anywhere
-        // near MAX_MESSAGE_SIZE rather than requiring an exact match.
-        let grew = after - before;
-        assert!(
-            grew < MAX_MESSAGE_SIZE as i64 / 2,
-            "rejected message must bail before any allocation or budget \
-             accounting; CURRENT_MEMORY grew by {grew} bytes"
+            matches!(result, Err(Error::ProtocolSyncError(ref m)) if m.contains("too large")),
+            "len exactly MAX_MESSAGE_SIZE must be rejected as malformed before \
+             allocation, got {result:?}"
         );
     }
 
@@ -1136,7 +1127,10 @@ mod tests {
     async fn read_message_data_len_equals_max_returns_error() {
         let mut stream = Cursor::new(Vec::<u8>::new());
         let result = read_message_data(&mut stream, b'Q', MAX_MESSAGE_SIZE).await;
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(Error::ProtocolSyncError(ref m)) if m.contains("too large")),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
