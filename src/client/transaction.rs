@@ -1872,6 +1872,14 @@ where
         match self.recv_server_response_or_client_disconnect(server).await {
             Ok(response) => Ok(response),
             Err(ServerWaitError::ClientGone(err)) => Err(err),
+            // The client went away mid-frame and the frame was still read:
+            // drain or cancel the rest with the slot held, as the relay does.
+            Err(ServerWaitError::Server(err @ Error::ClientGoneMidStream(_))) => {
+                if !server.is_bad() {
+                    server.recover_after_client_gone(false).await;
+                }
+                Err(err)
+            }
             Err(ServerWaitError::Server(err)) => {
                 server.mark_bad(&format!("COPY FROM completion recv failed: {err}"));
                 Err(err)
@@ -6557,6 +6565,92 @@ mod relay_response_client_write_failure_tests {
         assert!(matches!(err, Error::SocketError(_)));
         assert!(server.is_bad());
         assert!(client.write.bytes.is_empty());
+    }
+
+    /// Client write half that takes `limit` bytes, then fails like a
+    /// connection the client reset.
+    struct FailAfterWriter {
+        limit: usize,
+        taken: usize,
+    }
+
+    impl tokio::io::AsyncWrite for FailAfterWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            if self.taken >= self.limit {
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            let n = buf.len().min(self.limit - self.taken);
+            self.taken += n;
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A Simple Query may go on after its COPY FROM with more statements. A
+    /// client gone in the middle of a large row of theirs leaves the backend
+    /// in step: the rest of the reply is read with the slot held, and the
+    /// backend is returned instead of closed while its query may still run.
+    #[tokio::test]
+    async fn a_client_gone_mid_frame_after_copy_leaves_the_backend_recovered() {
+        let mut client = test_client_with_writer(FailAfterWriter {
+            limit: 10_000,
+            taken: 0,
+        });
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.max_message_size = 1024;
+        server.in_copy_mode = true;
+        let value = vec![b'x'; 64 * 1024];
+        let mut reply = crate::messages::command_complete("COPY 1").to_vec();
+        reply.extend(backend_frame(
+            b'T',
+            b"\0\x01v\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        ));
+        let mut row = vec![0, 1];
+        row.extend((value.len() as i32).to_be_bytes());
+        row.extend(&value);
+        reply.extend(backend_frame(b'D', &row));
+        reply.extend(crate::messages::command_complete("SELECT 1"));
+        reply.extend(crate::messages::ready_for_query(false));
+        let writer = tokio::spawn(async move {
+            peer.write_all(&reply).await.unwrap();
+            peer
+        });
+
+        let done = BytesMut::from(&b"c\0\0\0\x04"[..]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.handle_copy_done_fail(&done, &mut server),
+        )
+        .await
+        .expect("the rest of the reply is read");
+        let err = result.err();
+        assert!(
+            matches!(err, Some(Error::ClientGoneMidStream(_))),
+            "{err:?}"
+        );
+        assert!(
+            !server.is_bad(),
+            "the query finished, the backend is returned"
+        );
+        assert!(!server.is_data_available());
+        let _peer = writer.await.unwrap();
     }
 
     /// Points the cancel address of `server` at a local listener, so a test
