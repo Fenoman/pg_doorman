@@ -3549,6 +3549,38 @@ mod tests {
         );
     }
 
+    /// With `cleanup_server_connections = false` a scheduled DEALLOCATE ALL
+    /// cannot be sent and closes the backend instead, so an ordinary SQL
+    /// error must not schedule it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_sql_error_keeps_backend_when_cleanup_is_disabled() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.cleanup_connections = false;
+        server.prepared_statement_cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(16).unwrap(),
+            ahash::RandomState::new(),
+        ));
+        let mut error = b"E\0\0\0\0SERROR\0VERROR\0C23505\0Mduplicate key\0\0".to_vec();
+        let len = (error.len() - 1) as i32;
+        error[1..5].copy_from_slice(&len.to_be_bytes());
+        peer.write_all(&[error, b"Z\0\0\0\x05I".to_vec()].concat())
+            .await
+            .unwrap();
+        server.recv(&mut tokio::io::sink(), None).await.unwrap();
+
+        server
+            .checkin_cleanup()
+            .await
+            .expect("check-in after an ordinary SQL error must succeed");
+        assert!(
+            !server.is_bad(),
+            "an ordinary SQL error must not close the backend"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn finalize_checkin_keeps_backend_after_rollback_leading_cleanup_batch() {

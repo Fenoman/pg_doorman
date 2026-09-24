@@ -460,14 +460,25 @@ fn track_command_complete_transaction_state(server: &mut Server, message: &[u8])
     }
 }
 
+/// SQLSTATEs showing that the backend's prepared statements no longer match
+/// what the pooler believes: a cached plan whose result shape changed under
+/// DDL (0A000), a statement missing (26000) or already present (42P05). An
+/// error without a SQLSTATE proves nothing about them and counts as stale.
+fn error_invalidates_prepared_statements(sqlstate: &str) -> bool {
+    sqlstate.len() != 5 || matches!(sqlstate, "0A000" | "26000" | "42P05")
+}
+
 /// Handles ErrorResponse ('E') message from the server.
 /// Logs the error and updates server state accordingly.
 fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
     server.response_cycle_had_error = true;
     let mut recoverable = false;
+    // An unreadable error proves nothing about the statements: keep the reset.
+    let mut invalidates_prepared_statements = true;
     if let Ok(msg) = PgErrorMsg::parse(message) {
         recoverable = msg.severity == "ERROR"
             || (msg.severity.is_empty() && msg.severity_localized == "ERROR");
+        invalidates_prepared_statements = error_invalidates_prepared_statements(&msg.code);
         let mut details = format!(
             "[{}@{}] server error pid={}: severity={}, code={}, message=\"{}\", in_transaction={}, in_copy={}",
             server.address.username, server.address.pool_name, server.get_process_id(),
@@ -518,8 +529,12 @@ fn handle_error_response(server: &mut Server, message: &mut BytesMut) {
         server.in_copy_mode = false;
     }
 
-    // Reset prepared statements cache on error
-    if server.prepared_statement_cache.is_some() {
+    // DEALLOCATE ALL at check-in drops every statement on the backend,
+    // including the DOORMAN_N other clients share, and with cleanup disabled
+    // closes the backend instead. An ordinary statement error (unique
+    // violation, serialization failure) leaves the statements valid; a
+    // rejected Parse is rolled back precisely below.
+    if server.prepared_statement_cache.is_some() && invalidates_prepared_statements {
         server.cleanup_state.needs_cleanup_prepare = true;
     }
 
@@ -1405,6 +1420,48 @@ mod tests {
             server.cleanup_state.needs_cleanup_prepare,
             "0A000 must schedule DEALLOCATE ALL so the next Parse reaches PostgreSQL"
         );
+    }
+
+    /// DEALLOCATE ALL drops every shared DOORMAN_N on the backend, so only
+    /// errors showing that the pooler's view of the backend's statements is
+    /// stale may schedule it. An ordinary statement error leaves them valid.
+    #[tokio::test]
+    async fn only_stale_statement_errors_arm_prepared_cleanup() {
+        for (sqlstate, arms) in [
+            ("23505", false), // unique_violation
+            ("40001", false), // serialization_failure
+            ("22012", false), // division_by_zero
+            ("57014", false), // query_canceled
+            ("42P01", false), // undefined_table
+            ("0A000", true),  // cached plan must not change result type
+            ("26000", true),  // prepared statement does not exist
+            ("42P05", true),  // prepared statement already exists
+        ] {
+            let (mut server, _peer) = crate::server::Server::test_silent_socket();
+            server.prepared_statement_cache = Some(LruCache::with_hasher(
+                NonZeroUsize::new(16).unwrap(),
+                RandomState::new(),
+            ));
+            let body = format!("SERROR\0VERROR\0C{sqlstate}\0Mfailed\0\0");
+            handle_error_response(&mut server, &mut BytesMut::from(body.as_bytes()));
+            assert_eq!(
+                server.cleanup_state.needs_cleanup_prepare, arms,
+                "SQLSTATE {sqlstate}"
+            );
+        }
+    }
+
+    /// An ErrorResponse without a readable SQLSTATE keeps the conservative
+    /// reset: nothing proves the statements are still valid.
+    #[tokio::test]
+    async fn unparseable_error_arms_prepared_cleanup() {
+        let (mut server, _peer) = crate::server::Server::test_silent_socket();
+        server.prepared_statement_cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(16).unwrap(),
+            RandomState::new(),
+        ));
+        handle_error_response(&mut server, &mut BytesMut::from(&b"garbage"[..]));
+        assert!(server.cleanup_state.needs_cleanup_prepare);
     }
 
     #[tokio::test]

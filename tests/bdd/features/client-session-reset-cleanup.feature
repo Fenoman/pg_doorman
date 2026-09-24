@@ -199,10 +199,24 @@ Feature: Client session reset batch suppresses doorman-side cleanup
     And PostgreSQL log should contain "CLOSE ALL"
 
   @client-session-reset-cleanup-error-arms-prepare
-  Scenario: PostgreSQL error arms prepare-cleanup, forcing DEALLOCATE ALL on checkin
-    # Baseline for the prepare-cleanup path: an ErrorResponse while the
-    # prepared-statement cache is enabled sets `needs_cleanup_prepare`, and
+  Scenario: A missing prepared statement arms prepare-cleanup, forcing DEALLOCATE ALL on checkin
+    # Baseline for the prepare-cleanup path: an error showing that the
+    # backend's prepared statements differ from the pooler's view (26000
+    # here, also 0A000 and 42P05) sets `needs_cleanup_prepare`, and
     # pg_doorman must still issue `DEALLOCATE ALL` on checkin.
+    When we create session "seven" to pg_doorman as "example_user_1" with password "" and database "example_db_session"
+    And we send SimpleQuery "SELECT 1" to session "seven"
+    And we sleep 100ms
+    When we truncate PostgreSQL log
+    And we send SimpleQuery "EXECUTE doorman_missing_stmt" to session "seven" expecting error
+    And we close session "seven"
+    And we sleep 300ms
+    Then PostgreSQL log should contain "DEALLOCATE ALL"
+
+  @client-session-reset-cleanup-ordinary-error-keeps-prepare
+  Scenario: An ordinary PostgreSQL error does not arm prepare-cleanup
+    # A statement error leaves the backend's prepared statements valid;
+    # DEALLOCATE ALL would drop the DOORMAN_N shared by other clients.
     When we create session "seven" to pg_doorman as "example_user_1" with password "" and database "example_db_session"
     And we send SimpleQuery "SELECT 1" to session "seven"
     And we sleep 100ms
@@ -210,7 +224,8 @@ Feature: Client session reset batch suppresses doorman-side cleanup
     And we send SimpleQuery "SELECT 1/0" to session "seven" expecting error
     And we close session "seven"
     And we sleep 300ms
-    Then PostgreSQL log should contain "DEALLOCATE ALL"
+    Then PostgreSQL log should contain "division by zero"
+    And PostgreSQL log should contain exactly 0 occurrences of "DEALLOCATE ALL"
 
   @client-session-reset-cleanup-discard-after-error
   Scenario: DISCARD ALL after a PostgreSQL error disarms prepare-cleanup
@@ -220,7 +235,7 @@ Feature: Client session reset batch suppresses doorman-side cleanup
     And we send SimpleQuery "SELECT 1" to session "eight"
     And we sleep 100ms
     When we truncate PostgreSQL log
-    And we send SimpleQuery "SELECT 1/0" to session "eight" expecting error
+    And we send SimpleQuery "EXECUTE doorman_missing_stmt" to session "eight" expecting error
     And we send SimpleQuery "DISCARD ALL" to session "eight"
     And we close session "eight"
     And we sleep 300ms

@@ -6657,6 +6657,81 @@ mod relay_response_client_write_failure_tests {
             "closing the backend ends the COPY; no cancel is needed"
         );
     }
+
+    fn error_response_idle(sqlstate: &str, message: &str) -> Vec<u8> {
+        let mut fields = Vec::new();
+        for (code, value) in [
+            (b'S', "ERROR"),
+            (b'V', "ERROR"),
+            (b'C', sqlstate),
+            (b'M', message),
+        ] {
+            fields.push(code);
+            fields.extend_from_slice(value.as_bytes());
+            fields.push(0);
+        }
+        fields.push(0);
+        let mut frame = vec![b'E'];
+        frame.extend_from_slice(&((fields.len() + 4) as i32).to_be_bytes());
+        frame.extend_from_slice(&fields);
+        frame.extend_from_slice(b"Z\0\0\0\x05I");
+        frame
+    }
+
+    fn server_with_prepared_cache() -> (Server, tokio::net::UnixStream) {
+        let (mut server, peer) = Server::test_silent_socket();
+        server.prepared_statement_cache = Some(lru::LruCache::with_hasher(
+            std::num::NonZeroUsize::new(4).unwrap(),
+            ahash::RandomState::new(),
+        ));
+        (server, peer)
+    }
+
+    /// Runs one simple query in transaction mode against a scripted backend
+    /// and returns whether the client let go of the backend afterwards.
+    async fn run_simple_query(
+        client: &mut Client<SilentReader, RecordingWriter>,
+        server: &mut Server,
+        peer: &mut tokio::net::UnixStream,
+        sql: &str,
+        response: &[u8],
+    ) -> TransactionAction {
+        let query = crate::messages::simple_query(sql);
+        let mut request = vec![0; query.len()];
+        let mut fut = Box::pin(client.handle_simple_query(&query, server, quanta::Instant::now()));
+        tokio::select! {
+            biased;
+            _ = &mut fut => panic!("simple query completed before the backend replied"),
+            read = peer.read_exact(&mut request) => { read.unwrap(); }
+        };
+        assert_eq!(&request[..], &query[..]);
+        peer.write_all(response).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("simple query did not finish after the backend replied")
+            .unwrap()
+    }
+
+    /// SQL-level PREPARE keeps the backend for the client only while one of
+    /// its statements exists there: a failed PREPARE creates none.
+    #[tokio::test]
+    async fn failed_sql_prepare_releases_backend() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = true;
+        let (mut server, mut peer) = server_with_prepared_cache();
+
+        let action = run_simple_query(
+            &mut client,
+            &mut server,
+            &mut peer,
+            "PREPARE p AS SELECT * FROM missing_table",
+            &error_response_idle("42P01", "relation \"missing_table\" does not exist"),
+        )
+        .await;
+
+        assert!(!client.sql_prepare_session_pinned);
+        assert!(matches!(action, TransactionAction::Break));
+    }
 }
 
 /// `query_time` accuracy lock for the transaction loop.

@@ -42,11 +42,13 @@ function result type, the first `Bind` of a statement prepared before the DDL
 fails on each backend with `0A000` (`cached plan must not change result type`).
 A direct connection would analyze a fresh `Parse` against the new schema.
 
-Any PostgreSQL error schedules `DEALLOCATE ALL` for the moment the backend
-returns to the pool; with `cleanup_server_connections = false` the backend is
-closed instead. The next `Parse` on that backend is prepared against the new
-schema, so each backend reports the error once per such DDL. PgDoorman does not
-retry SQL execution to hide the error.
+This error, like a missing (`26000`) or duplicate (`42P05`) statement name,
+schedules `DEALLOCATE ALL` for the moment the backend returns to the pool; with
+`cleanup_server_connections = false` the backend is closed instead. Other SQL
+errors, such as a unique violation or a serialization failure, leave the
+backend's statements in place. The next `Parse` on that backend is prepared
+against the new schema, so each backend reports the error once per such DDL.
+PgDoorman does not retry SQL execution to hide the error.
 
 The cleanup waits for the backend to return to the pool. Until then a `Parse`
 of that query is still answered from the stale statement, and its next `Bind` or
