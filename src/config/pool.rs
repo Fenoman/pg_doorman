@@ -341,9 +341,9 @@ pub struct Pool {
     /// When `true` (the default), a standalone `DISCARD ALL` simple-query sent
     /// in **transaction mode** outside of an open transaction is answered
     /// locally with a synthetic `CommandComplete` + `ReadyForQuery` and is
-    /// **never forwarded** to PostgreSQL. The per-client prepared-statement
-    /// cache is cleared at the same moment so the next `Bind` cannot reach
-    /// a backend that does not know the statement.
+    /// **never forwarded** to PostgreSQL. The client's prepared statements
+    /// stay usable: a `Bind` on a backend that lacks the statement prepares
+    /// it there first.
     ///
     /// Trade-off: real `DISCARD ALL` also performs `UNLISTEN *`, drops
     /// session-temp tables, releases two-phase commits, and clears

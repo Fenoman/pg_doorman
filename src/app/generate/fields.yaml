@@ -1580,18 +1580,19 @@ fields:
           transaction and outside COPY mode, a `DISCARD ALL` (optionally
           wrapped in leading or trailing `--` line / `/* */` block comments
           - common ORM and bench tagging) is replaced with a synthetic
-          `CommandComplete` + `ReadyForQuery`. The per-client prepared-
-          statement cache is cleared at the same instant so the next `Bind`
-          cannot reach a backend that does not know the statement.
+          `CommandComplete` + `ReadyForQuery`. Nothing reaches PostgreSQL,
+          and the client's prepared statements stay usable: a `Bind` on a
+          backend that lacks the statement prepares it there first.
 
           An extended-protocol `DISCARD ALL` (a zero-parameter `Parse`
           whose text is `DISCARD ALL`) is intercepted too: its `Parse`
           query is rewritten to `SELECT 1` and forwarded, so the backend
           keeps its prepared-statement cache, planner state, advisory
-          locks, session-temp tables and `pg_variables` state. The only
-          client-visible difference is the `CommandComplete` tag, which
-          reads `SELECT 1` instead of `DISCARD ALL`; a driver that
-          strictly checks that tag should set this switch `false`.
+          locks, session-temp tables and `pg_variables` state. The client
+          receives the result of `SELECT 1` - one row and the tag
+          `SELECT 1` - instead of no rows and the tag `DISCARD ALL`; a
+          driver that checks the tag or rejects a result here (JDBC
+          `executeUpdate`) needs this switch `false`.
 
           NOT intercepted (these still reach PostgreSQL):
           - multi-statement batches containing `DISCARD ALL`
@@ -1612,18 +1613,19 @@ fields:
           вне COPY mode, `DISCARD ALL` (с опциональными `--`-строчными или
           `/* */`-блочными комментариями вокруг - стандартный ORM/бенч
           tagging) подменяется синтетическим `CommandComplete` +
-          `ReadyForQuery`. Per-client prepared-statement cache сбрасывается
-          одновременно, чтобы следующий `Bind` не попал на backend,
-          который не знает этого statement'а.
+          `ReadyForQuery`. До PostgreSQL ничего не доходит, а prepared
+          statements клиента остаются рабочими: `Bind` на backend, где
+          statement'а нет, сначала готовит его там.
 
           `DISCARD ALL` через extended-протокол (`Parse` без параметров,
           текст которого - `DISCARD ALL`) тоже перехватывается: его
           `Parse`-запрос переписывается в `SELECT 1` и форвардится, так
           что backend сохраняет prepared-statement cache, planner state,
           advisory locks, session-temp таблицы и состояние `pg_variables`.
-          Единственное видимое клиенту отличие - тег `CommandComplete`:
-          он равен `SELECT 1`, а не `DISCARD ALL`; драйверу, который
-          строго проверяет этот тег, стоит выставить switch в `false`.
+          Клиент получает результат `SELECT 1` - одну строку и тег
+          `SELECT 1` - вместо пустого результата с тегом `DISCARD ALL`;
+          драйверу, который проверяет тег или не ждёт здесь результата
+          (JDBC `executeUpdate`), нужен switch в `false`.
 
           НЕ перехватывается (эти случаи доходят до PostgreSQL):
           - multi-statement пакеты, содержащие `DISCARD ALL`
@@ -1647,11 +1649,14 @@ fields:
         query to `SELECT 1`; only multi-statement batches that embed
         `DISCARD ALL` (`SELECT 1; DISCARD ALL`) still reach PostgreSQL,
         since extracting one statement's effect from a batch is ambiguous.
-        On the extended-protocol path the client's `CommandComplete` tag
-        reads `SELECT 1`, so a driver that strictly checks the tag - or an
-        application that relies on real DISCARD ALL side effects - should
-        set this switch false and accept the cache-amortisation loss for
-        the whole pool. Disable per
+        On the extended-protocol path the client receives the one-row
+        result of `SELECT 1` with the tag `SELECT 1`, so a driver that
+        checks the tag or rejects a result there (JDBC `executeUpdate`) -
+        or an application that relies on real DISCARD ALL side effects -
+        should set this switch false and accept the cache-amortisation
+        loss for the whole pool. The intercepted simple query keeps the
+        client's prepared statements usable; a `Bind` on a backend that
+        lacks one prepares it there first. Disable per
         pool when the application uses LISTEN/NOTIFY, ON COMMIT DROP temp
         tables, or two-phase commits - those need real backend-side
         DISCARD ALL semantics that pg_doorman does not emulate. Session

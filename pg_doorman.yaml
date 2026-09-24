@@ -775,18 +775,19 @@ pools:
     # transaction and outside COPY mode, a `DISCARD ALL` (optionally
     # wrapped in leading or trailing `--` line / `/* */` block comments
     # - common ORM and bench tagging) is replaced with a synthetic
-    # `CommandComplete` + `ReadyForQuery`. The per-client prepared-
-    # statement cache is cleared at the same instant so the next `Bind`
-    # cannot reach a backend that does not know the statement.
+    # `CommandComplete` + `ReadyForQuery`. Nothing reaches PostgreSQL,
+    # and the client's prepared statements stay usable: a `Bind` on a
+    # backend that lacks the statement prepares it there first.
     #
     # An extended-protocol `DISCARD ALL` (a zero-parameter `Parse`
     # whose text is `DISCARD ALL`) is intercepted too: its `Parse`
     # query is rewritten to `SELECT 1` and forwarded, so the backend
     # keeps its prepared-statement cache, planner state, advisory
-    # locks, session-temp tables and `pg_variables` state. The only
-    # client-visible difference is the `CommandComplete` tag, which
-    # reads `SELECT 1` instead of `DISCARD ALL`; a driver that
-    # strictly checks that tag should set this switch `false`.
+    # locks, session-temp tables and `pg_variables` state. The client
+    # receives the result of `SELECT 1` - one row and the tag
+    # `SELECT 1` - instead of no rows and the tag `DISCARD ALL`; a
+    # driver that checks the tag or rejects a result here (JDBC
+    # `executeUpdate`) needs this switch `false`.
     #
     # NOT intercepted (these still reach PostgreSQL):
     # - multi-statement batches containing `DISCARD ALL`

@@ -79,7 +79,7 @@ What gets reset when a flag fires:
 - `PREPARE` flag → `DEALLOCATE ALL` drops PostgreSQL-side prepared statements that the driver named explicitly. PgDoorman's own prepared-statement cache survives the reset because it is keyed by query text, not by backend name.
 - `DECLARE CURSOR` flag → `CLOSE ALL` drops cursors.
 
-`DEALLOCATE ALL` and `DISCARD ALL` issued by the client clear that client's prepared-statement cache (so the next `Parse` registers anew). The pool-level shared cache is not affected; other clients keep their entries. A client that holds no backend (outside a transaction, no SQL-level `PREPARE` statements) gets its `DEALLOCATE ALL` answered by PgDoorman itself: the statements on the backends are shared by every client.
+`DEALLOCATE ALL` issued by the client clears that client's prepared-statement cache (so the next `Parse` registers anew); `DISCARD ALL` keeps it, and a `Bind` on a backend that lacks a statement prepares it there first. The pool-level shared cache is not affected; other clients keep their entries. A client that holds no backend (outside a transaction, no SQL-level `PREPARE` statements) gets its `DEALLOCATE ALL` answered by PgDoorman itself: the statements on the backends are shared by every client.
 
 To opt out of cleanup entirely (for performance, in tightly-controlled deployments):
 
