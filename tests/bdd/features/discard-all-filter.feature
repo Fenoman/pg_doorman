@@ -85,6 +85,8 @@ Feature: DISCARD ALL fast-path in transaction pooling
   @discard-all-precheckout
   Scenario: standalone DISCARD ALL does not check out a backend
     When we create session "precheckout" to pg_doorman as "example_user_1" with password "" and database "discard_precheckout"
+    # A check-in while the session logs in may leave its release for up to 5 ms.
+    And we sleep 100ms
     And we truncate PostgreSQL log
     And we send SimpleQuery "DISCARD ALL" to session "precheckout"
     And we sleep 300ms

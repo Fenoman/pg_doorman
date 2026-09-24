@@ -292,7 +292,15 @@ struct PoolInner {
     /// backend, not only those idle past the skip-recent window. Cleared once
     /// a full pass finds no dead backend.
     force_dead_sweep: AtomicBool,
+    /// This pool, for the flush `schedule_deferred_release_flush` starts.
+    me: Weak<PoolInner>,
+    /// A flush of the releases still deferred on idle backends is scheduled.
+    deferred_release_flush_scheduled: AtomicBool,
 }
+
+/// How long an idle backend may keep the release its last check-in left
+/// for a client that was about to take it; see `return_object`.
+const DEFERRED_RELEASE_GRACE: Duration = Duration::from_millis(5);
 
 enum RecycleOutcome {
     Reused(Box<ObjectInner>),
@@ -804,10 +812,96 @@ impl PoolInner {
             Some(returned_inner) => inner = returned_inner,
         }
 
-        // No waiters — normal path.
+        // No waiters — normal path. A release the check-in left for the
+        // next client's first write waits in the idle queue only while a
+        // checkout is about to take this backend; otherwise it goes now, as
+        // an idle backend writes nothing. The pool may change meanwhile, so
+        // the return then starts over.
+        let deferred = inner.obj.has_deferred_release();
+        if deferred && !self.checkout_imminent() {
+            drop(slots);
+            inner.obj.flush_deferred_release();
+            if inner.obj.is_bad() {
+                self.close_returned(inner, true);
+            } else {
+                self.return_object(inner);
+            }
+            return;
+        }
         push_idle(self.config.queue_mode, &mut slots.vec, inner);
         drop(slots);
         self.semaphore.add_permits(1);
+        if deferred {
+            self.schedule_deferred_release_flush();
+        }
+        self.notify_return_observers();
+    }
+
+    /// Sends, after `DEFERRED_RELEASE_GRACE`, the releases still deferred on
+    /// idle backends: the checkout expected to take them went elsewhere, and
+    /// the last clients' locks must not wait for the next one.
+    fn schedule_deferred_release_flush(&self) {
+        if self
+            .deferred_release_flush_scheduled
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.deferred_release_flush_scheduled
+                .store(false, Ordering::Release);
+            self.flush_idle_deferred_releases();
+            return;
+        };
+        let pool = self.me.clone();
+        runtime.spawn(async move {
+            tokio::time::sleep(DEFERRED_RELEASE_GRACE).await;
+            if let Some(pool) = pool.upgrade() {
+                pool.deferred_release_flush_scheduled
+                    .store(false, Ordering::Release);
+                pool.flush_idle_deferred_releases();
+            }
+        });
+    }
+
+    /// Sends the releases deferred on idle backends. A backend the write
+    /// fails on is marked bad and discarded by the next checkout's recycle.
+    fn flush_idle_deferred_releases(&self) {
+        let mut slots = self.slots.lock();
+        for inner in slots.vec.iter_mut() {
+            if inner.obj.has_deferred_release() {
+                inner.obj.flush_deferred_release();
+            }
+        }
+    }
+
+    /// Whether a checkout is under way to take a backend returned now. A
+    /// release deferred to it then goes with its first write; one it did
+    /// not take gets the release after `DEFERRED_RELEASE_GRACE`.
+    fn checkout_imminent(&self) -> bool {
+        self.users.load(Ordering::Relaxed) > 0
+    }
+
+    /// Closes a returned backend that failed on its way to the idle queue,
+    /// freeing its slot as for a bad backend returned by a client; see
+    /// `Object::drop`. `restore_permit` is false where the returning
+    /// checkout's permit was already restored.
+    fn close_returned(&self, inner: ObjectInner, restore_permit: bool) {
+        let (waker_to_close, retire_permit) = {
+            let mut slots = self.slots.lock();
+            let retire_slot = slots.size > slots.max_size;
+            slots.size = slots.size.saturating_sub(1);
+            let retire_permit = retire_slot && slots.permits_to_retire > 0;
+            if retire_permit {
+                slots.permits_to_retire -= 1;
+            }
+            (pop_live_waiter(&mut slots), retire_permit)
+        };
+        drop(waker_to_close);
+        drop(inner);
+        if restore_permit && !retire_permit {
+            self.semaphore.add_permits(1);
+        }
         self.notify_return_observers();
     }
 
@@ -828,9 +922,23 @@ impl PoolInner {
             self.notify_return_observers();
             return;
         }
-        if let Some(inner) = send_handoff(&mut slots, inner) {
+        if let Some(mut inner) = send_handoff(&mut slots, inner) {
+            let deferred = inner.obj.has_deferred_release();
+            if deferred && !self.checkout_imminent() {
+                drop(slots);
+                inner.obj.flush_deferred_release();
+                if inner.obj.is_bad() {
+                    self.close_returned(inner, false);
+                } else {
+                    self.requeue_handoff(inner);
+                }
+                return;
+            }
             push_idle(self.config.queue_mode, &mut slots.vec, inner);
             drop(slots);
+            if deferred {
+                self.schedule_deferred_release_flush();
+            }
             self.notify_return_observers();
         }
     }
@@ -1605,7 +1713,7 @@ impl Pool {
 
     fn from_builder(builder: PoolBuilder) -> Self {
         Self {
-            inner: Arc::new(PoolInner {
+            inner: Arc::new_cyclic(|me| PoolInner {
                 server_pool: builder.server_pool,
                 slots: Mutex::new(Slots {
                     vec: VecDeque::with_capacity(builder.config.max_size),
@@ -1625,6 +1733,8 @@ impl Pool {
                 scaling_stats: ScalingStats::default(),
                 pre_replacements_in_flight: AtomicUsize::new(0),
                 force_dead_sweep: AtomicBool::new(false),
+                me: me.clone(),
+                deferred_release_flush_scheduled: AtomicBool::new(false),
             }),
         }
     }
@@ -5465,6 +5575,80 @@ mod tests {
             max_size,
             "one pre-replacement must leave the pool at max_size"
         );
+    }
+
+    /// A checked-out backend whose check-in deferred the prepared release,
+    /// and the backend side of its socket.
+    fn checked_out_with_deferred_release(
+        pool: &Pool,
+    ) -> (ObjectInner, tokio::net::UnixStream, Vec<u8>) {
+        let (mut server, peer) = crate::server::Server::test_silent_socket();
+        server.set_release_query(None);
+        server.release_statements_prepared = true;
+        server.deferred_release = true;
+        let prepared = crate::server::resolve_release_query(None)
+            .unwrap()
+            .prefix()
+            .unwrap()
+            .prepared()
+            .to_vec();
+        let inner = pool.inner.new_object_inner(server, None);
+        pool.semaphore().try_acquire_many(1).unwrap().forget();
+        pool.inner.slots.lock().size = 1;
+        (inner, peer, prepared)
+    }
+
+    /// With no checkout under way, a backend returned with its release
+    /// deferred sends it at once and goes idle with its reply pending.
+    #[tokio::test]
+    async fn a_deferred_release_goes_at_once_when_nobody_takes_the_backend() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let (inner, mut peer, prepared) = checked_out_with_deferred_release(&pool);
+
+        pool.inner.return_object(inner);
+
+        let mut sent = vec![0_u8; prepared.len()];
+        tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut sent))
+            .await
+            .expect("sent on return")
+            .unwrap();
+        assert_eq!(sent, prepared);
+        let slots = pool.inner.slots.lock();
+        assert_eq!(slots.vec.len(), 1);
+        assert!(!slots.vec[0].obj.has_deferred_release());
+        assert!(slots.vec[0].obj.release_reply_pending());
+    }
+
+    /// While a checkout is under way the release stays deferred for it; if
+    /// the backend is still idle after the grace, it is sent anyway.
+    #[tokio::test]
+    async fn a_deferred_release_left_for_a_checkout_is_sent_after_the_grace() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let (inner, mut peer, prepared) = checked_out_with_deferred_release(&pool);
+        pool.inner.users.fetch_add(1, Ordering::Relaxed);
+
+        pool.inner.return_object(inner);
+        assert!(pool.inner.slots.lock().vec[0].obj.has_deferred_release());
+        let mut nothing = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), peer.read(&mut nothing))
+                .await
+                .is_err(),
+            "kept for the checkout under way"
+        );
+
+        let mut sent = vec![0_u8; prepared.len()];
+        tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut sent))
+            .await
+            .expect("sent after the grace")
+            .unwrap();
+        assert_eq!(sent, prepared);
+        assert!(!pool.inner.slots.lock().vec[0].obj.has_deferred_release());
+        pool.inner.users.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// A database budget with one backend's permit taken from it.

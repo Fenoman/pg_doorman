@@ -101,6 +101,20 @@ impl StreamInner {
         }
     }
 
+    /// Writes `buf` to a plain socket at once, without a runtime and
+    /// regardless of the write readiness the runtime last saw: the socket is
+    /// non-blocking, so a full send buffer answers `WouldBlock`. Not
+    /// available over TLS, whose records need the stream's own writer.
+    pub fn send_now(&self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            StreamInner::TCPPlain { stream } => socket2::SockRef::from(stream).send(buf),
+            StreamInner::UnixSocket { stream } => socket2::SockRef::from(stream).send(buf),
+            StreamInner::TCPTls { .. } => {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            }
+        }
+    }
+
     /// Async write that properly handles TLS back-pressure.
     /// Use this instead of try_write() when in an async context
     /// (e.g., server authentication). try_write() uses a noop waker

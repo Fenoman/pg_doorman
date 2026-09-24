@@ -198,6 +198,40 @@ Feature: Configurable release query
     And we send Sync to session "app"
     Then session "app" should receive DataRow with "42"
 
+  @release-query-coalesced
+  Scenario: the default release_query runs ahead of the first query of a client waiting for the backend
+    When we create session "holder" to pg_doorman as "example_user_1" with password "" and database "release_default"
+    And we create session "waiter" to pg_doorman as "example_user_1" with password "" and database "release_default"
+    And we send SimpleQuery "SELECT 1" to session "holder"
+    And we send SimpleQuery "BEGIN" to session "holder"
+    And we send SimpleQuery "SELECT pg_advisory_lock(42)" to session "holder"
+    And we send SimpleQuery "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()" to session "waiter" without waiting
+    And we sleep 200ms
+    And we send SimpleQuery "COMMIT" to session "holder"
+    Then we read SimpleQuery response from session "waiter" within 2000ms
+    And session "waiter" should receive DataRow with "0"
+
+  @release-query-coalesced
+  Scenario: the first query of a client waiting for the backend is not executed behind a failed release
+    Given PostgreSQL database "example_db" has no pgv_free function
+    When we create session "pg" to postgres as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "CREATE TABLE release_victim(id integer)" to session "pg"
+    And we send SimpleQuery "CREATE SEQUENCE release_failures MINVALUE 0 START 1" to session "pg"
+    And we send SimpleQuery "CREATE FUNCTION public.pgv_free() RETURNS void LANGUAGE plpgsql AS $$ BEGIN IF nextval('release_failures') = 0 THEN RAISE EXCEPTION 'release failed on purpose'; END IF; END $$" to session "pg" and store response
+    Then session "pg" should receive CommandComplete "CREATE FUNCTION"
+    When we create session "holder" to pg_doorman as "example_user_1" with password "" and database "release_default"
+    And we create session "waiter" to pg_doorman as "example_user_1" with password "" and database "release_default"
+    And we send SimpleQuery "SELECT 1" to session "holder"
+    And we send SimpleQuery "BEGIN" to session "holder"
+    And we send SimpleQuery "SELECT setval('release_failures', 0, false)" to session "holder"
+    And we send SimpleQuery "INSERT INTO release_victim VALUES (1)" to session "waiter" without waiting
+    And we sleep 200ms
+    And we send SimpleQuery "COMMIT" to session "holder"
+    Then we read SimpleQuery response from session "waiter" within 2000ms
+    And session "waiter" should receive error containing "was not executed" with code "08006"
+    When we send SimpleQuery "SELECT count(*) FROM release_victim" to session "waiter" and store response
+    Then session "waiter" should receive DataRow with "0"
+
   @release-query-pipelined-failure
   Scenario: a query sent behind a failed default release_query is not executed and the client stays connected
     Given PostgreSQL database "example_db" has no pgv_free function

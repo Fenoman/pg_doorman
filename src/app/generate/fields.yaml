@@ -1676,11 +1676,12 @@ fields:
           * `""`  -> release-query disabled, nothing is executed at checkin
           * other -> exactly that SQL runs on every checkin; it may call only
             `pg_advisory_unlock_all()`, `public.pgv_free()` and LOCAL `set_config(..., true)`
-          The default is sent without waiting for its result, which is read before the
-          next exchange on the backend; if it fails, PostgreSQL skips that exchange and the
-          client gets SQLSTATE 08006 (the query was not executed). A custom query keeps its
-          round trip. A SQL error in the release query marks the backend bad so a dirty
-          session is never reused by another client.
+          The default is sent without waiting for its result (under load, in one write with
+          the first messages of the client that takes the backend next), which is read
+          before the next exchange on the backend; if it fails, PostgreSQL skips that
+          exchange and the client gets SQLSTATE 08006 (the query was not executed). A
+          custom query keeps its round trip. A SQL error in the release query marks the
+          backend bad so a dirty session is never reused by another client.
         ru: |
           SQL, выполняемый на каждом backend-соединении непосредственно перед его
           возвратом в пул. Очищает session-scoped состояние, которое PostgreSQL сам
@@ -1692,11 +1693,12 @@ fields:
           * `""` -> release-query отключён, на checkin ничего не выполняется
           * иначе -> ровно эта SQL выполняется на каждом checkin; вызывать в ней можно
             только `pg_advisory_unlock_all()`, `public.pgv_free()` и LOCAL `set_config(..., true)`
-          Запрос по умолчанию уходит без ожидания результата, результат читается перед
-          следующим обменом с backend; при ошибке PostgreSQL пропускает этот обмен, а клиент
-          получает SQLSTATE 08006 (запрос не выполнен). Свой запрос сохраняет отдельное
-          обращение. SQL-ошибка release-query помечает backend bad, чтобы грязная сессия
-          не попала следующему клиенту.
+          Запрос по умолчанию уходит без ожидания результата (под нагрузкой — в одной записи
+          с первыми сообщениями клиента, который возьмёт backend следующим), результат
+          читается перед следующим обменом с backend; при ошибке PostgreSQL пропускает
+          этот обмен, а клиент получает SQLSTATE 08006 (запрос не выполнен). Свой запрос
+          сохраняет отдельное обращение. SQL-ошибка release-query помечает backend bad,
+          чтобы грязная сессия не попала следующему клиенту.
       doc: |
         Per-pool checkin hook. By default pg_doorman runs the iServ-compatible
         statement (`pg_advisory_unlock_all()` plus `pg_variables`' `pgv_free()`)
@@ -1709,7 +1711,10 @@ fields:
         PostgreSQL as the backend returns to the pool, after the session
         cleanup statements, and pg_doorman does not wait for them:
         PostgreSQL runs them at once and pg_doorman reads
-        the result before the next exchange on that backend. If the query
+        the result before the next exchange on that backend. While another
+        client is already taking a backend, a clean backend's query goes
+        instead in one write with the first messages of the client that
+        takes it, and at most 5 ms later if no client does. If the query
         fails, PostgreSQL skips what the next client sent up to its Sync;
         that client gets SQLSTATE 08006 saying its query was not executed
         (in session mode the connection is then closed), and the backend is

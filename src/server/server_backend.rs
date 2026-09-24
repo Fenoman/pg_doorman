@@ -265,9 +265,17 @@ pub(crate) struct ReleasePrefix {
     first: Bytes,
     /// Runs the statements already prepared on the backend.
     prepared: Bytes,
+    /// `prepared` without the empty Query, to go in one write with the next
+    /// client's first messages: they end the block's reply in its stead.
+    coalesced: Bytes,
 }
 
 impl ReleasePrefix {
+    #[inline]
+    pub(crate) fn coalesced(&self) -> &Bytes {
+        &self.coalesced
+    }
+
     #[inline]
     pub(crate) fn first(&self) -> &[u8] {
         &self.first
@@ -318,7 +326,7 @@ pub(crate) enum ReleaseReplyCheck {
 
 /// Whether the received bytes hold the whole reply to the release prefix,
 /// through its ReadyForQuery, or an ErrorResponse that ends it early.
-fn release_reply_arrived(received: &[u8]) -> bool {
+fn release_reply_arrived(received: &[u8], mut commands: u8) -> bool {
     let mut at = 0;
     while let Some(header) = received.get(at..at + 5) {
         let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
@@ -330,8 +338,16 @@ fn release_reply_arrived(received: &[u8]) -> bool {
         if at > received.len() {
             return false;
         }
-        if matches!(header[0], b'Z' | b'E') {
-            return true;
+        match header[0] {
+            b'Z' | b'E' => return true,
+            // A reply without the empty Query ends at its last CommandComplete.
+            b'C' if commands > 0 => {
+                commands -= 1;
+                if commands == 0 {
+                    return true;
+                }
+            }
+            _ => {}
         }
     }
     false
@@ -349,10 +365,12 @@ fn release_reply_arrived(received: &[u8]) -> bool {
 /// in a session the release did not clean.
 fn release_prefix(sql: &str) -> ReleasePrefix {
     let statements = ["BEGIN", sql, "COMMIT"];
-    let mut prepared = BytesMut::new();
+    let mut coalesced = BytesMut::new();
     for name in RELEASE_STATEMENT_NAMES {
-        prepared.put(bind_execute(name));
+        coalesced.put(bind_execute(name));
     }
+    let coalesced = coalesced.freeze();
+    let mut prepared = BytesMut::from(&coalesced[..]);
     prepared.put(simple_query(";"));
     let mut first = BytesMut::new();
     for (name, statement) in RELEASE_STATEMENT_NAMES.into_iter().zip(statements) {
@@ -362,8 +380,13 @@ fn release_prefix(sql: &str) -> ReleasePrefix {
     ReleasePrefix {
         first: first.freeze(),
         prepared: prepared.freeze(),
+        coalesced,
     }
 }
+
+/// CommandCompletes that end the reply to [`ReleasePrefix::coalesced`]:
+/// BEGIN, the release query and COMMIT.
+pub(crate) const COALESCED_RELEASE_COMMANDS: u8 = 3;
 
 /// The same form built for one check-in with unnamed statements: BEGIN, the
 /// statements and COMMIT, then an empty Query.
@@ -833,6 +856,18 @@ pub struct Server {
     /// Its outcome comes with the reply, and so does its observation in
     /// `CHECKIN_CLEANUP_SECONDS`.
     pub(crate) release_reply_metric: Option<(&'static str, f64)>,
+
+    /// The last check-in left its prepared release to go in one write with
+    /// the next client's first messages ([`ReleasePrefix::coalesced`]),
+    /// which saves a write and a packet each way. PostgreSQL runs it before
+    /// them. A backend going idle instead gets it at once
+    /// (`flush_deferred_release`), and so does a client that pauses before
+    /// anything reached the backend.
+    pub(crate) deferred_release: bool,
+
+    /// The pending release reply went without the empty Query and ends
+    /// after this many CommandCompletes instead of at ReadyForQuery.
+    pub(crate) release_reply_commands: u8,
 
     /// A statement that drops every prepared statement (DEALLOCATE ALL, or
     /// a DISCARD ALL the pooler forwards) is bound in the batch being
@@ -1878,11 +1913,103 @@ impl Server {
                 }
             }
         }
+        // This release covers the one a check-in may have deferred.
+        self.deferred_release = false;
         self.send_and_flush_timeout(prefix, HOUSEKEEPING_TIMEOUT)
             .await?;
         self.release_reply_pending = true;
+        self.release_reply_commands = 0;
         self.release_cleanup_pending = false;
         Ok(())
+    }
+
+    /// Whether this check-in's release may wait for the next client's first
+    /// write: its statements are prepared, no older reply is unread, and a
+    /// backend going idle instead can still get it at once without a TLS
+    /// record (`flush_deferred_release`).
+    fn can_defer_release(&self) -> bool {
+        self.deferred_release
+            || (self.release_statements_prepared
+                && !self.release_reply_pending
+                && !matches!(self.stream.get_ref(), StreamInner::TCPTls { .. }))
+    }
+
+    /// The last check-in's release still waits for this client's first
+    /// write; see `deferred_release`.
+    #[inline(always)]
+    pub(crate) fn has_deferred_release(&self) -> bool {
+        self.deferred_release
+    }
+
+    /// The release the last check-in left for this first write, to go ahead
+    /// of it in the same write. Its reply is pending from then on and ends
+    /// after its CommandCompletes; the messages after it answer as usual.
+    /// Fails, marking the backend bad, when the release cannot be sent: the
+    /// write must then not go either.
+    #[inline]
+    pub(crate) fn take_deferred_release(&mut self) -> Result<Option<Bytes>, Error> {
+        if !self.deferred_release {
+            return Ok(None);
+        }
+        self.deferred_release = false;
+        let Some(prefix) = self
+            .release_prefix()
+            .map(|prefix| prefix.coalesced().clone())
+        else {
+            self.mark_bad("deferred release_query has no prefix");
+            return Err(Error::ProtocolSyncError(
+                "deferred release_query has no prefix".to_string(),
+            ));
+        };
+        self.release_reply_pending = true;
+        self.release_reply_commands = COALESCED_RELEASE_COMMANDS;
+        Ok(Some(prefix))
+    }
+
+    fn release_prefix(&self) -> Option<&ReleasePrefix> {
+        self.release_query
+            .as_ref()
+            .and_then(ResolvedReleaseQuery::prefix)
+    }
+
+    /// Sends the release a check-in left for the next client's first write,
+    /// for a backend going idle instead, without waiting and without a
+    /// runtime: the socket is idle and takes the few bytes at once. A write
+    /// that does not go through whole marks the backend bad.
+    pub(crate) fn flush_deferred_release(&mut self) {
+        if !std::mem::take(&mut self.deferred_release) {
+            return;
+        }
+        let messages = self.release_prefix().map(|prefix| prefix.prepared.clone());
+        let Some(messages) = messages else {
+            self.mark_bad("deferred release_query has no prefix");
+            return;
+        };
+        match self.stream.get_ref().send_now(&messages) {
+            Ok(written) if written == messages.len() => {
+                self.stats.data_sent(written);
+                self.release_reply_pending = true;
+                self.release_reply_commands = 0;
+            }
+            Ok(_) | Err(_) => self.mark_bad("could not send the deferred release_query"),
+        }
+    }
+
+    /// Sends the release a check-in left for this client's first write on
+    /// its own: the client paused before anything reached the backend, and
+    /// the last client's locks must not wait for it.
+    pub(crate) async fn send_deferred_release(&mut self) -> Result<(), Error> {
+        if !std::mem::take(&mut self.deferred_release) {
+            return Ok(());
+        }
+        let messages = self.release_prefix().map(|prefix| prefix.prepared.clone());
+        let Some(messages) = messages else {
+            self.mark_bad("deferred release_query has no prefix");
+            return Err(Error::ProtocolSyncError(
+                "deferred release_query has no prefix".to_string(),
+            ));
+        };
+        self.send_release_prefix(&messages).await
     }
 
     /// Send the session cleanup statements ahead of the release query, all
@@ -1975,7 +2102,9 @@ impl Server {
 
         let arrived = match self.stream.fill_buf().now_or_never() {
             None => false,
-            Some(Ok(received)) => received.is_empty() || release_reply_arrived(received),
+            Some(Ok(received)) => {
+                received.is_empty() || release_reply_arrived(received, self.release_reply_commands)
+            }
             Some(Err(_)) => true,
         };
         if !arrived {
@@ -2009,6 +2138,10 @@ impl Server {
             self.cleanup_state.needs_cleanup() && self.cleanup_connections;
         let needs_cleanup_prepare = self.cleanup_state.needs_cleanup_prepare;
         let mut internal_reset_all_sent = false;
+        if release_query_appended.is_some() {
+            // This release covers the one a check-in may have deferred.
+            self.deferred_release = false;
+        }
 
         if !stmts.is_empty() {
             let internal_stmt_count = stmts.len() - usize::from(release_query_appended.is_some());
@@ -2257,7 +2390,7 @@ impl Server {
         let started = quanta::Instant::now();
         let result = self.finalize_checkin_inner().await;
         let seconds = started.elapsed().as_secs_f64();
-        if result.is_ok() && self.release_reply_pending {
+        if result.is_ok() && (self.release_reply_pending || self.deferred_release) {
             // Sent without waiting: observed once its reply is read.
             self.release_reply_metric = Some((path, seconds));
         } else {
@@ -2284,6 +2417,11 @@ impl Server {
             return match release_query.as_ref() {
                 Some(release_query) => match release_query.prefix() {
                     Some(prefix) => {
+                        if self.can_defer_release() {
+                            self.deferred_release = true;
+                            self.release_cleanup_pending = false;
+                            return Ok(());
+                        }
                         let messages = if self.release_statements_prepared {
                             prefix.prepared()
                         } else {
@@ -3363,6 +3501,8 @@ impl Server {
                         release_reply_resets_session: false,
                         release_reply_resets_all: false,
                         release_reply_metric: None,
+                        deferred_release: false,
+                        release_reply_commands: 0,
                         statements_reset_queued: false,
                         prepared_after_statements_reset: HashSet::new(),
                         intercept_discard_all: true,
@@ -3710,6 +3850,8 @@ impl Server {
             release_reply_resets_session: false,
             release_reply_resets_all: false,
             release_reply_metric: None,
+            deferred_release: false,
+            release_reply_commands: 0,
             statements_reset_queued: false,
             prepared_after_statements_reset: HashSet::new(),
             intercept_discard_all: true,
@@ -3891,6 +4033,203 @@ mod tests {
             !server.release_statements_prepared,
             "DEALLOCATE ALL drops the release statements too"
         );
+    }
+
+    /// The reply to the prepared release run ahead of a client's messages:
+    /// no ParseComplete and no empty Query.
+    fn coalesced_release_reply(failed: bool) -> Vec<u8> {
+        use bytes::BufMut;
+        let mut reply = bytes::BytesMut::new();
+        reply.put_slice(&[b'2', 0, 0, 0, 4]);
+        reply.put(crate::messages::command_complete("BEGIN"));
+        reply.put_slice(&[b'2', 0, 0, 0, 4]);
+        if failed {
+            reply.put(crate::messages::nonfatal_error_message(
+                "release failed on purpose",
+                "57014",
+            ));
+            return reply.to_vec();
+        }
+        reply.put_slice(&[b'D', 0, 0, 0, 10, 0, 1, 0xff, 0xff, 0xff, 0xff]);
+        reply.put(crate::messages::command_complete("SELECT 1"));
+        reply.put_slice(&[b'2', 0, 0, 0, 4]);
+        reply.put(crate::messages::command_complete("COMMIT"));
+        reply.to_vec()
+    }
+
+    /// A backend whose release statements are prepared, checked in.
+    async fn checked_in_with_prepared_release() -> (super::Server, tokio::net::UnixStream) {
+        let (mut server, peer) = super::Server::test_silent_socket();
+        server.set_release_query(None);
+        server.release_statements_prepared = true;
+        server.arm_release_cleanup();
+        server.finalize_checkin().await.expect("check-in");
+        (server, peer)
+    }
+
+    /// The prepared release waits for the next client's first write and
+    /// goes in the same write, ahead of it. Its reply ends at the last
+    /// CommandComplete and is read away; the client gets only its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prepared_release_goes_with_the_next_clients_first_write() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = checked_in_with_prepared_release().await;
+        assert!(server.has_deferred_release());
+        let mut nothing = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), peer.read(&mut nothing))
+                .await
+                .is_err(),
+            "nothing is sent at check-in"
+        );
+
+        let query = crate::messages::simple_query("SELECT 42");
+        server
+            .send_and_flush_timeout(&query, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let prefix = resolve_release_query(None)
+            .unwrap()
+            .prefix()
+            .unwrap()
+            .clone();
+        let expected = [&prefix.coalesced()[..], &query[..]].concat();
+        let mut sent = vec![0_u8; expected.len()];
+        peer.read_exact(&mut sent).await.unwrap();
+        assert_eq!(sent, expected);
+        assert!(server.release_reply_pending());
+        assert!(!server.has_deferred_release());
+
+        let mut own = crate::messages::command_complete("SELECT 1").to_vec();
+        own.extend_from_slice(&crate::messages::ready_for_query(false));
+        peer.write_all(&[coalesced_release_reply(false), own.clone()].concat())
+            .await
+            .unwrap();
+        let reply =
+            tokio::time::timeout(Duration::from_secs(1), server.recv(tokio::io::sink(), None))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&reply[..], &own[..]);
+        assert!(!server.release_reply_pending());
+        assert!(!server.is_bad());
+    }
+
+    /// A checkout that sent nothing and needs a full cleanup at check-in
+    /// sends a release with it; the deferred one is covered and not sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_full_cleanup_covers_a_deferred_release() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut server, mut peer) = checked_in_with_prepared_release().await;
+        server.arm_release_cleanup();
+        server.cleanup_connections = true;
+        server.cleanup_state.needs_cleanup_set = true;
+        server.finalize_checkin().await.expect("check-in");
+
+        assert!(!server.has_deferred_release());
+        let mut sent = vec![0_u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut sent))
+            .await
+            .unwrap()
+            .unwrap();
+        let prefix = resolve_release_query(None)
+            .unwrap()
+            .prefix()
+            .unwrap()
+            .clone();
+        assert!(
+            !sent[..read].starts_with(prefix.coalesced()),
+            "the deferred release is not sent ahead of the cleanup"
+        );
+        assert_eq!(sent[0], b'P', "the cleanup block starts with its own Parse");
+    }
+
+    /// A large first write is not copied to put the release in front: the
+    /// release goes in a write of its own just before it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_large_first_write_gets_the_deferred_release_just_before_it() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut server, mut peer) = checked_in_with_prepared_release().await;
+        let query = crate::messages::simple_query(&format!("SELECT '{}'", "x".repeat(100_000)));
+        let reader = tokio::spawn(async move {
+            let prefix = resolve_release_query(None)
+                .unwrap()
+                .prefix()
+                .unwrap()
+                .clone();
+            let mut sent = vec![0_u8; prefix.coalesced().len() + query.len()];
+            peer.read_exact(&mut sent).await.unwrap();
+            (sent, [&prefix.coalesced()[..], &query[..]].concat())
+        });
+        let query = crate::messages::simple_query(&format!("SELECT '{}'", "x".repeat(100_000)));
+        server
+            .send_and_flush_timeout(&query, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let (sent, expected) = reader.await.unwrap();
+        assert_eq!(sent, expected);
+        assert!(server.release_reply_pending());
+    }
+
+    /// A release that fails ahead of a client's messages makes PostgreSQL
+    /// skip them; the exchange reports it and the backend is not reused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_release_ahead_of_a_client_write_skips_it() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = checked_in_with_prepared_release().await;
+        let query = crate::messages::simple_query("INSERT INTO t VALUES (1)");
+        server
+            .send_and_flush_timeout(&query, Duration::from_secs(1))
+            .await
+            .unwrap();
+        peer.write_all(&coalesced_release_reply(true))
+            .await
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), server.recv(tokio::io::sink(), None))
+                .await
+                .expect("nothing follows the error");
+        assert!(matches!(
+            result,
+            Err(crate::errors::Error::ReleaseQueryFailed(_))
+        ));
+        assert!(server.is_bad());
+    }
+
+    /// A backend going idle with the release still deferred sends the whole
+    /// prepared form at once, and its reply is pending as after a check-in
+    /// that sent it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deferred_release_is_flushed_for_an_idle_backend() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut server, mut peer) = checked_in_with_prepared_release().await;
+        server.flush_deferred_release();
+
+        let prefix = resolve_release_query(None)
+            .unwrap()
+            .prefix()
+            .unwrap()
+            .clone();
+        let mut sent = vec![0_u8; prefix.prepared().len()];
+        tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut sent))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&sent[..], prefix.prepared());
+        assert!(server.release_reply_pending());
+        assert!(!server.has_deferred_release());
+        assert!(!server.is_bad());
     }
 
     /// Without pg_variables the default release only unlocks advisory locks.
@@ -4129,6 +4468,9 @@ mod tests {
             }
             server.arm_release_cleanup();
             server.finalize_checkin().await.expect("check-in");
+            // The prepared form waits for the next client's first write; a
+            // backend going idle sends it at once.
+            server.flush_deferred_release();
             let mut sent = vec![0_u8; expected.len()];
             tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut sent))
                 .await

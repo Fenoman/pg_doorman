@@ -823,6 +823,12 @@ where
             return result.map(NextClientMessage::Message);
         }
 
+        // The client pauses before anything reached the backend: the last
+        // client's release goes now instead of with this client's first write.
+        if server.has_deferred_release() && server.send_deferred_release().await.is_err() {
+            return Ok(NextClientMessage::ServerDead);
+        }
+
         if !monitor_backend {
             if let Ok(result) =
                 tokio::time::timeout(Duration::from_millis(100), &mut read_fut).await
@@ -6327,6 +6333,49 @@ mod relay_response_client_write_failure_tests {
         );
         assert!(!server.release_reply_pending());
         assert!(!server.is_bad());
+    }
+
+    /// A client that pauses before anything of its reached the backend does
+    /// not hold back the last client's release: it goes on its own at once.
+    #[tokio::test]
+    async fn a_client_pause_before_its_first_write_sends_the_deferred_release() {
+        let query = backend_frame(b'Q', b"SELECT 42\0");
+        let (read, mut frontend) = tokio::io::duplex(256);
+        let mut client = test_client_with_reader_and_writer(read, tokio::io::sink());
+        let (mut server, mut backend) = Server::test_silent_socket();
+        server.set_release_query(None);
+        server.release_statements_prepared = true;
+        server.deferred_release = true;
+        let prepared = crate::server::resolve_release_query(None)
+            .unwrap()
+            .prefix()
+            .unwrap()
+            .prepared()
+            .to_vec();
+        frontend.write_all(&query[..3]).await.unwrap();
+
+        let message = {
+            let mut wait = std::pin::pin!(client.wait_for_next_message(&mut server, false));
+            assert!(tokio::time::timeout(Duration::from_millis(100), &mut wait)
+                .await
+                .is_err());
+            let mut sent = vec![0_u8; prepared.len()];
+            tokio::time::timeout(Duration::from_secs(1), backend.read_exact(&mut sent))
+                .await
+                .expect("the release is sent while the client pauses")
+                .unwrap();
+            assert_eq!(sent, prepared);
+            frontend.write_all(&query[3..]).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), wait)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            matches!(message, NextClientMessage::Message(ref bytes) if bytes.as_ref() == query.as_slice())
+        );
+        assert!(server.release_reply_pending());
+        assert!(!server.has_deferred_release());
     }
 
     /// A release that failed while the client is idle leaves nothing to

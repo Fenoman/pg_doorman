@@ -104,11 +104,51 @@ const COMMAND_COMPLETE_BY_DISCARD_ALL: &[u8; 12] = b"DISCARD ALL\0";
 
 /// Flushes messages, allowing at most `duration` without the backend
 /// accepting more bytes; a stall marks the server bad.
+/// A write this large gets the release deferred to it in a write of its
+/// own instead of a copy with the release in front.
+const DEFERRED_RELEASE_COPY_LIMIT: usize = 64 * 1024;
+
+/// The release the last check-in deferred to this write, if any: copied in
+/// front of a small write (`Joined`), or to go alone just before a large one.
+enum DeferredRelease<'a> {
+    None(&'a [u8]),
+    Joined(Vec<u8>),
+    Ahead(bytes::Bytes, &'a [u8]),
+}
+
+impl<'a> DeferredRelease<'a> {
+    fn take(server: &mut Server, messages: &'a [u8]) -> Result<Self, Error> {
+        Ok(match server.take_deferred_release()? {
+            None => Self::None(messages),
+            Some(release) if messages.len() <= DEFERRED_RELEASE_COPY_LIMIT => {
+                let mut joined = Vec::with_capacity(release.len() + messages.len());
+                joined.extend_from_slice(&release);
+                joined.extend_from_slice(messages);
+                Self::Joined(joined)
+            }
+            Some(release) => Self::Ahead(release, messages),
+        })
+    }
+
+    fn parts(&self) -> (Option<&[u8]>, &[u8]) {
+        match self {
+            Self::None(messages) => (None, messages),
+            Self::Joined(joined) => (None, joined),
+            Self::Ahead(release, messages) => (Some(release), messages),
+        }
+    }
+}
+
 pub(crate) async fn send_and_flush_timeout(
     server: &mut Server,
     messages: &[u8],
     duration: Duration,
 ) -> Result<(), Error> {
+    let deferred = DeferredRelease::take(server, messages)?;
+    let (release_ahead, messages) = deferred.parts();
+    if let Some(release) = release_ahead {
+        server.stats.data_sent(release.len());
+    }
     server.stats.data_sent(messages.len());
     server.stats.wait_writing();
 
@@ -125,6 +165,9 @@ pub(crate) async fn send_and_flush_timeout(
                 )))
             }
             Err(_) => return Err(Error::ProxyTimeout),
+        }
+        if let Some(release) = release_ahead {
+            write_all_flush_timeout(server.stream.get_mut(), release, duration).await?;
         }
         write_all_flush_timeout(server.stream.get_mut(), messages, duration).await
     }
@@ -160,10 +203,21 @@ pub(crate) async fn send_and_flush_timeout(
 
 /// Flushes messages and records write stats/activity.
 pub(crate) async fn send_and_flush(server: &mut Server, messages: &[u8]) -> Result<(), Error> {
+    let deferred = DeferredRelease::take(server, messages)?;
+    let (release_ahead, messages) = deferred.parts();
+    if let Some(release) = release_ahead {
+        server.stats.data_sent(release.len());
+    }
     server.stats.data_sent(messages.len());
     server.stats.wait_writing();
 
-    match write_all_flush(&mut *server.stream, messages).await {
+    let written = async {
+        if let Some(release) = release_ahead {
+            write_all_flush(&mut *server.stream, release).await?;
+        }
+        write_all_flush(&mut *server.stream, messages).await
+    };
+    match written.await {
         Ok(_) => {
             // Successfully sent to server
             server.stats.wait_idle();
@@ -1027,8 +1081,25 @@ async fn read_release_reply(server: &mut Server) -> Result<(), Error> {
         let code = message.get_u8();
         let _len = message.get_i32();
         match code {
-            b'1' | b'2' | b'D' | b'C' | b'I' | b'N' | b'A' => {}
+            b'1' | b'2' | b'D' | b'I' | b'N' | b'A' => {}
+            b'C' => {
+                // Sent ahead of a client's messages, the release ends with
+                // its last CommandComplete; theirs follow.
+                if server.release_reply_commands > 0 {
+                    server.release_reply_commands -= 1;
+                    if server.release_reply_commands == 0 {
+                        server.release_reply_pending = false;
+                    }
+                }
+            }
             b'S' => handle_parameter_status(server, &mut message, &mut None)?,
+            b'Z' if server.release_reply_commands > 0 => {
+                server.release_reply_pending = false;
+                server.mark_bad("ReadyForQuery inside the release_query reply");
+                return Err(Error::ProtocolSyncError(
+                    "ReadyForQuery inside the release_query reply".to_string(),
+                ));
+            }
             b'Z' => {
                 server.release_reply_pending = false;
                 if message.first() != Some(&b'I') {
