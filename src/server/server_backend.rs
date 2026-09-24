@@ -165,6 +165,9 @@ impl AbandonedQueryTimeouts {
     };
 }
 
+/// Values of the `path` label of `CHECKIN_CLEANUP_SECONDS`.
+const CHECKIN_CLEANUP_PATHS: [&str; 4] = ["release_only", "combined", "cleanup_only", "empty"];
+
 /// Historical iServ default for the per-checkin release query. Releases
 /// session-scoped state that PostgreSQL does not clear between transactions:
 /// advisory locks plus any session variables stored by the `pg_variables`
@@ -576,10 +579,11 @@ pub struct Server {
     /// both the configured SQL and its pre-encoded release-only Query frame.
     release_query: Option<ResolvedReleaseQuery>,
 
-    /// Pre-bound observer for the common release-only successful check-in.
-    /// Binding once per backend avoids a four-label MetricVec lookup on every
-    /// transaction while keeping uncommon path/result combinations dynamic.
-    release_only_ok_cleanup_metric: Option<prometheus::Histogram>,
+    /// Pre-bound observers for successful check-ins, one per
+    /// `CHECKIN_CLEANUP_PATHS` entry. Every transaction records one of them;
+    /// binding once per backend avoids a four-label MetricVec lookup each
+    /// time, while failed check-ins stay dynamic.
+    ok_cleanup_metrics: Option<Box<[prometheus::Histogram; 4]>>,
 
     /// True while the current checkout still owes a successful
     /// `release_query` round trip. Armed by [`Server::arm_release_cleanup`]
@@ -1742,14 +1746,14 @@ impl Server {
         &mut self,
         release_query: Option<ResolvedReleaseQuery>,
     ) {
-        self.release_only_ok_cleanup_metric = release_query.as_ref().map(|_| {
-            crate::web::metrics::CHECKIN_CLEANUP_SECONDS.with_label_values(&[
-                self.address.username.as_str(),
-                self.address.database.as_str(),
-                "release_only",
-                "ok",
-            ])
-        });
+        let (username, database) = (
+            self.address.username.as_str(),
+            self.address.database.as_str(),
+        );
+        self.ok_cleanup_metrics = Some(Box::new(CHECKIN_CLEANUP_PATHS.map(|path| {
+            crate::web::metrics::CHECKIN_CLEANUP_SECONDS
+                .with_label_values(&[username, database, path, "ok"])
+        })));
         self.release_query = release_query;
     }
 
@@ -1781,6 +1785,7 @@ impl Server {
 
     #[inline]
     fn checkin_cleanup_metric_path(&self) -> &'static str {
+        // Keep in step with `CHECKIN_CLEANUP_PATHS`.
         let has_release = self.release_query.is_some();
         let has_cleanup = self.in_transaction()
             || (self.cleanup_connections
@@ -1823,9 +1828,14 @@ impl Server {
         result: &'static str,
         seconds: f64,
     ) {
-        if path == "release_only" && result == "ok" {
-            if let Some(metric) = self.release_only_ok_cleanup_metric.as_ref() {
-                metric.observe(seconds);
+        if result == "ok" {
+            if let (Some(metrics), Some(index)) = (
+                self.ok_cleanup_metrics.as_ref(),
+                CHECKIN_CLEANUP_PATHS
+                    .iter()
+                    .position(|known| *known == path),
+            ) {
+                metrics[index].observe(seconds);
                 return;
             }
         }
@@ -2893,7 +2903,7 @@ impl Server {
                         operator_managed_startup_keys,
                         last_sql_error: None,
                         release_query: None,
-                        release_only_ok_cleanup_metric: None,
+                        ok_cleanup_metrics: None,
                         release_cleanup_pending: false,
                         intercept_discard_all: true,
                         abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
@@ -3232,7 +3242,7 @@ impl Server {
             operator_managed_startup_keys: Arc::new(HashSet::new()),
             last_sql_error: None,
             release_query: None,
-            release_only_ok_cleanup_metric: None,
+            ok_cleanup_metrics: None,
             release_cleanup_pending: false,
             intercept_discard_all: true,
             abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
@@ -3287,23 +3297,27 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn release_query_prebinds_common_cleanup_metric() {
+    async fn release_query_prebinds_successful_cleanup_metrics() {
         let mut server = super::Server::test_zombie_marked_bad();
-        assert!(server.release_only_ok_cleanup_metric.is_none());
+        assert!(server.ok_cleanup_metrics.is_none());
 
-        server.set_release_query(None);
-        let metric = server
-            .release_only_ok_cleanup_metric
-            .as_ref()
-            .expect("default release query should bind the common metric")
-            .clone();
-        let before = metric.get_sample_count();
+        for configured in [None, Some("")] {
+            server.set_release_query(configured);
+            for path in super::CHECKIN_CLEANUP_PATHS {
+                let metric = crate::web::metrics::CHECKIN_CLEANUP_SECONDS.with_label_values(&[
+                    server.address.username.as_str(),
+                    server.address.database.as_str(),
+                    path,
+                    "ok",
+                ]);
+                let before = metric.get_sample_count();
 
-        server.record_checkin_cleanup_metric("release_only", "ok", 0.000_025);
+                server.record_checkin_cleanup_metric(path, "ok", 0.000_025);
 
-        assert_eq!(metric.get_sample_count(), before + 1);
-        server.set_release_query(Some(""));
-        assert!(server.release_only_ok_cleanup_metric.is_none());
+                assert_eq!(metric.get_sample_count(), before + 1, "{path}");
+            }
+        }
+        assert!(server.ok_cleanup_metrics.is_some());
     }
 
     #[test]
