@@ -250,6 +250,14 @@ where
     let mut client_error = write_all_flush_timeout(client_stream, &server.buffer, timeout)
         .await
         .err();
+    // Once the client has gone, the rest of the frame gets the time an
+    // abandoned query gets. A backend sending it slower is closed; being in
+    // the middle of a write, PostgreSQL notices that at once.
+    let abandoned = server.abandoned_query_timeouts;
+    let drain_budget = abandoned.finish + abandoned.after_cancel;
+    let mut drain_deadline = client_error
+        .is_some()
+        .then(|| tokio::time::Instant::now() + drain_budget);
 
     const HEADER_BYTES: u64 = 1 + mem::size_of::<i32>() as u64;
     const MAX_CHUNK: usize = 65536;
@@ -259,8 +267,11 @@ where
     let mut backend_error = None;
     while remaining > 0 {
         let want = remaining.min(chunk.len());
+        let wait = drain_deadline.map_or(timeout, |deadline| {
+            timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        });
         let read = match crate::utils::timeout::timeout_unless_ready(
-            timeout,
+            wait,
             server.stream.read(&mut chunk[..want]),
         )
         .await
@@ -285,7 +296,10 @@ where
         if client_error.is_none() {
             match write_all_flush_timeout(client_stream, &chunk[..read], timeout).await {
                 Ok(()) => delivered += read,
-                Err(err) => client_error = Some(err),
+                Err(err) => {
+                    client_error = Some(err);
+                    drain_deadline = Some(tokio::time::Instant::now() + drain_budget);
+                }
             }
         }
     }
@@ -2774,6 +2788,56 @@ mod tests {
         .unwrap();
         assert_eq!(&drained[..], &rest[..]);
         let _peer = writer.await.unwrap();
+    }
+
+    /// Once its client has gone, the rest of a streamed frame is read within
+    /// the time an abandoned query gets, however steadily the backend keeps
+    /// sending it; a backend slower than that is closed. Being in the middle
+    /// of writing the frame, PostgreSQL notices that at once.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn the_rest_of_a_frame_its_client_left_is_read_in_bounded_time() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.max_message_size = 1024;
+        server.abandoned_query_timeouts = crate::server::AbandonedQueryTimeouts {
+            finish: std::time::Duration::from_millis(20),
+            after_cancel: std::time::Duration::from_millis(200),
+        };
+        let value_len: usize = 20 * 1024;
+        let mut head = BytesMut::new();
+        head.put_u8(b'D');
+        head.put_i32(4 + 2 + 4 + value_len as i32);
+        head.put_i16(1);
+        head.put_i32(value_len as i32);
+        head.put_slice(&vec![b'x'; 16 * 1024]);
+        let trickle = tokio::spawn(async move {
+            peer.write_all(&head).await.unwrap();
+            // The rest comes a byte a second: slow, but never stalled.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if peer.write_all(b"x").await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut client = FailAfter {
+            limit: 10_000,
+            taken: 0,
+        };
+        let started = tokio::time::Instant::now();
+        let result = server.recv(&mut client, None).await;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "read for {:?}",
+            started.elapsed()
+        );
+        assert!(result.is_err());
+        assert!(server.is_bad());
+        trickle.abort();
     }
 
     #[cfg(unix)]
