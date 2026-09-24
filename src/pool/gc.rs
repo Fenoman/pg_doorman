@@ -13,29 +13,36 @@ use super::{ConnectionPool, PoolIdentifier, Status, AUTH_QUERY_STATE, DYNAMIC_PO
 ///
 /// This is a no-op when DYNAMIC_POOLS is empty (no passthrough auth_query).
 pub fn spawn_dynamic_pool_gc(interval: Duration) {
-    tokio::spawn(async move {
-        let mut current_interval = interval;
-        let mut ticker = tokio::time::interval(interval);
-        // Skip - runtime stalls should not trigger a burst
-        // of GC sweeps that all race against `from_config` reloads.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            gc_idle_dynamic_pools();
-            // Follow a RELOAD of retain_connections_time, like the retain
-            // loop; the next sweep comes a full new period later.
-            let configured = crate::config::get_config()
-                .general
-                .retain_connections_time
-                .as_std();
-            if configured != current_interval && !configured.is_zero() {
-                current_interval = configured;
-                ticker =
-                    tokio::time::interval_at(tokio::time::Instant::now() + configured, configured);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            }
+    tokio::spawn(run_dynamic_pool_gc(interval, gc_idle_dynamic_pools, || {
+        crate::config::get_config()
+            .general
+            .retain_connections_time
+            .as_std()
+    }));
+}
+
+/// Sweeps once per period and follows a RELOAD of `retain_connections_time`
+/// like the retain loop: the next sweep comes a full new period later.
+async fn run_dynamic_pool_gc(
+    interval: Duration,
+    mut sweep: impl FnMut(),
+    configured_interval: impl Fn() -> Duration,
+) {
+    let mut current_interval = interval;
+    let mut ticker = tokio::time::interval(interval);
+    // Skip - runtime stalls should not trigger a burst
+    // of GC sweeps that all race against `from_config` reloads.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        sweep();
+        let configured = configured_interval();
+        if configured != current_interval && !configured.is_zero() {
+            current_interval = configured;
+            ticker = tokio::time::interval_at(tokio::time::Instant::now() + configured, configured);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
-    });
+    }
 }
 
 fn gc_idle_dynamic_pools() {
@@ -200,6 +207,56 @@ mod tests {
     use crate::pool::{CheckQueryCache, Pool, PoolSettings, ServerPool};
     use dashmap::DashMap;
     use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    #[tokio::test(start_paused = true)]
+    async fn gc_follows_a_reload_of_retain_connections_time() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex;
+
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let configured = Arc::new(Mutex::new(Duration::from_secs(10)));
+        let gc = tokio::spawn(run_dynamic_pool_gc(
+            Duration::from_secs(10),
+            {
+                let sweeps = Arc::clone(&sweeps);
+                move || {
+                    sweeps.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+            {
+                let configured = Arc::clone(&configured);
+                move || *configured.lock().unwrap()
+            },
+        ));
+        let after = |seconds: u64| async move {
+            for _ in 0..seconds {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+
+        after(0).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sweeps.load(Ordering::SeqCst), 1, "first sweep at start");
+        after(10).await;
+        assert_eq!(sweeps.load(Ordering::SeqCst), 2);
+        *configured.lock().unwrap() = Duration::from_secs(1);
+        after(10).await;
+        assert_eq!(
+            sweeps.load(Ordering::SeqCst),
+            3,
+            "the old period ends first"
+        );
+        after(3).await;
+        assert_eq!(
+            sweeps.load(Ordering::SeqCst),
+            6,
+            "then one sweep per new period"
+        );
+        gc.abort();
+    }
 
     fn pool(init_complete: bool, min_pool_size: u32) -> ConnectionPool {
         let server_pool = ServerPool::new(
