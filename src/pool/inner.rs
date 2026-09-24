@@ -4178,6 +4178,45 @@ mod tests {
         );
     }
 
+    /// A bad backend dropped at check-in is closed and wakes one waiter by
+    /// closing its channel. The wake must skip the sender of a waiter that
+    /// gave up and reach a live waiter.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bad_drop_wakes_a_live_waiter_behind_abandoned_ones() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(1);
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = 1;
+        }
+        let permit = pool.semaphore().try_acquire().unwrap();
+        let bad_object = pool.wrap_checkout(
+            pool.inner
+                .new_object_inner(Server::test_zombie_marked_bad(), None),
+            permit,
+        );
+        let (dead_tx, dead_rx) = oneshot::channel::<ObjectInner>();
+        drop(dead_rx);
+        let (live_tx, mut live_rx) = oneshot::channel::<ObjectInner>();
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.waiters.push_back(dead_tx);
+            slots.waiters.push_back(live_tx);
+        }
+
+        drop(bad_object);
+
+        assert!(
+            matches!(
+                live_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "the live waiter must be woken"
+        );
+    }
+
     #[tokio::test]
     async fn direct_handoff_enqueue_prunes_cancelled_waiters() {
         let mut slots = Slots {
