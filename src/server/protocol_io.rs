@@ -676,13 +676,18 @@ fn classify_command_complete_with_attribution(
 
 /// Drop the pg_doorman-side prepared statement LRU after the server confirms it
 /// just executed an equivalent of `DEALLOCATE ALL` or `DISCARD ALL`.
+///
+/// Parses confirmed before the reset have already left
+/// `registering_prepared_statement`; what is still pending comes later in
+/// the same pipeline and creates its statement after the reset, so those
+/// registrations and their cache entries stay.
 fn drop_prepared_statement_cache_on_reset(server: &mut Server, reason: &'static str) {
-    server.registering_prepared_statement.clear();
     let Some(cache_size) = server
         .prepared_statement_cache
         .as_ref()
         .map(|cache| cache.len())
     else {
+        server.registering_prepared_statement.clear();
         return;
     };
     warn!(
@@ -693,6 +698,9 @@ fn drop_prepared_statement_cache_on_reset(server: &mut Server, reason: &'static 
     );
     if let Some(cache) = server.prepared_statement_cache.as_mut() {
         cache.clear();
+        for pending in &server.registering_prepared_statement {
+            cache.put(pending.name.clone(), ());
+        }
     }
 }
 
@@ -1440,6 +1448,33 @@ mod tests {
             server.cleanup_state.needs_cleanup_prepare,
             "0A000 must schedule DEALLOCATE ALL so the next Parse reaches PostgreSQL"
         );
+    }
+
+    /// A reset in the middle of a pipeline drops the statements confirmed
+    /// before it, but the Parses that follow it still reach PostgreSQL:
+    /// forgetting them makes the next Parse of the same alias hit 42P05.
+    #[tokio::test]
+    async fn reset_keeps_registrations_of_later_parses() {
+        let (mut server, _peer) = crate::server::Server::test_silent_socket();
+        let mut cache = LruCache::with_hasher(NonZeroUsize::new(16).unwrap(), RandomState::new());
+        cache.put("DOORMAN_old".to_string(), ());
+        cache.put("DOORMAN_later".to_string(), ());
+        server.prepared_statement_cache = Some(cache);
+        server.registering_prepared_statement.push_back(
+            super::super::server_backend::PendingPreparedStatement {
+                name: "DOORMAN_later".to_string(),
+                suppress_complete: false,
+            },
+        );
+
+        handle_command_complete(&mut server, &BytesMut::from(&b"DEALLOCATE ALL\0"[..]));
+
+        assert!(!server.has_prepared_statement("DOORMAN_old"));
+        assert!(
+            server.has_prepared_statement("DOORMAN_later"),
+            "a Parse after the reset still creates its statement"
+        );
+        assert_eq!(server.registering_prepared_statement.len(), 1);
     }
 
     /// SQL-level PREPARE keeps a transaction-pool client on its backend only

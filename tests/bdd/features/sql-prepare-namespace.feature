@@ -69,3 +69,30 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     Then session "one" should receive CommandComplete "DEALLOCATE ALL"
     When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "one" and store response
     Then session "one" should receive DataRow with "1"
+
+  Scenario: A DEALLOCATE ALL inside a pipeline keeps the statements prepared after it
+    When we send Parse "reset" with query "DEALLOCATE ALL" to both
+    And we send Bind "" to "reset" with params "" to both
+    And we send Execute "" to both
+    And we send Parse "a" with query "SELECT 1" to both
+    And we send Bind "" to "a" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    And we send Bind "" to "a" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    Then we should receive identical messages from both
+
+  Scenario: A DEALLOCATE ALL inside a pipeline that ends in an error keeps the statements prepared after it
+    When we send Parse "reset" with query "DEALLOCATE ALL" to both
+    And we send Bind "" to "reset" with params "" to both
+    And we send Execute "" to both
+    And we send Parse "a" with query "SELECT 1" to both
+    And we send Bind "" to "a" with params "" to both
+    And we send Execute "" to both
+    And we send Parse "bad" with query "SELECT * FROM sql_prepare_namespace_missing" to both
+    And we send Sync to both
+    And we send Bind "" to "a" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    Then we should receive identical messages from both
