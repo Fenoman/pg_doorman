@@ -7085,7 +7085,8 @@ mod relay_response_client_write_failure_tests {
     }
 
     /// SQL-level PREPARE keeps the backend for the client only while one of
-    /// its statements exists there: a failed PREPARE creates none.
+    /// its statements exists there: a failed PREPARE creates none. Its
+    /// ordinary error also leaves the statements other clients share alone.
     #[tokio::test]
     async fn failed_sql_prepare_releases_backend() {
         let mut client = test_client_with_writer(RecordingWriter::default());
@@ -7103,6 +7104,10 @@ mod relay_response_client_write_failure_tests {
 
         assert!(!client.sql_prepare_session_pinned);
         assert!(matches!(action, TransactionAction::Break));
+        assert!(
+            !server.cleanup_state.needs_cleanup_prepare,
+            "an ordinary error must not schedule DEALLOCATE ALL at check-in"
+        );
     }
 }
 
