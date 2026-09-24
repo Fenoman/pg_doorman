@@ -778,7 +778,9 @@ fields:
         [Tokio runtime settings](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.thread_stack_size).
         Sets the stack size for worker threads.
         Modern tokio versions handle this well by default, so this parameter is optional.
-      default: "not set (uses tokio's default)"
+        When it is not set, a release build uses tokio's default of 2 MiB and a debug
+        build 8 MiB: an unoptimized build needs more stack on its deepest paths.
+      default: "not set (tokio's 2 MiB; 8 MiB in a debug build)"
 
     max_blocking_threads:
       config:

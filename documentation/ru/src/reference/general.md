@@ -274,8 +274,9 @@ TCP backlog для входящих соединений. При значени�
 
 [Настройки Tokio runtime](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.thread_stack_size).
 Размер стека для worker-потоков.
+Если параметр не задан, релизная сборка берет стандартные для tokio 2 МиБ, а отладочная 8 МиБ: неоптимизированной сборке на самых глубоких путях нужно больше стека.
 
-По умолчанию: `not set (uses tokio's default)`.
+По умолчанию: `not set (tokio's 2 MiB; 8 MiB in a debug build)`.
 
 ### max_blocking_threads
 

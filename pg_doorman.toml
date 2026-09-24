@@ -227,7 +227,7 @@ worker_cpu_affinity_pinning = false
 # Uncomment only if you need to override tokio's defaults.
 
 # Stack size for each worker thread (in bytes).
-# Default: not set (uses tokio's default)
+# Default: not set (tokio's 2 MiB; 8 MiB in a debug build)
 # worker_stack_size = 8388608
 
 # Maximum number of threads for blocking operations.

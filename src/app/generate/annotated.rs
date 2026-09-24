@@ -788,8 +788,8 @@ fn write_general_section(w: &mut ConfigWriter, config: &Config) {
             w.comment(
                 fi,
                 w.t(
-                    "Default: not set (uses tokio's default)",
-                    "По умолчанию: не задан (используется значение tokio)",
+                    "Default: not set (tokio's 2 MiB; 8 MiB in a debug build)",
+                    "По умолчанию: не задан (2 МиБ tokio; 8 МиБ в отладочной сборке)",
                 ),
             );
         }
@@ -802,8 +802,8 @@ fn write_general_section(w: &mut ConfigWriter, config: &Config) {
             w.comment(
                 fi,
                 w.t(
-                    "Default: not set (uses tokio's default)",
-                    "По умолчанию: не задан (используется значение tokio)",
+                    "Default: not set (tokio's 2 MiB; 8 MiB in a debug build)",
+                    "По умолчанию: не задан (2 МиБ tokio; 8 МиБ в отладочной сборке)",
                 ),
             );
         }

@@ -268,7 +268,7 @@ general:
 
   # Stack size for each worker thread.
   # Supports human-readable format: "8MB", "8M", or 8388608 (bytes)
-  # Default: not set (uses tokio's default)
+  # Default: not set (tokio's 2 MiB; 8 MiB in a debug build)
   # worker_stack_size: "8MB"
 
   # Maximum number of threads for blocking operations.
