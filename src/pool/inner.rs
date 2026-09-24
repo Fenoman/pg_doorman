@@ -1367,6 +1367,11 @@ impl Pool {
         F: FnMut(),
     {
         loop {
+            // Every checkout passes here; only a paused pool needs the
+            // registered waiter and its lock.
+            if !self.inner.server_pool.is_paused() {
+                return Ok(());
+            }
             let resume_notify = self.inner.server_pool.resume_notified();
             tokio::pin!(resume_notify);
             resume_notify.as_mut().enable();
