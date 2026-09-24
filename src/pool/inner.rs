@@ -5467,6 +5467,24 @@ mod tests {
         );
     }
 
+    /// A database budget with one backend's permit taken from it.
+    fn database_permit() -> (
+        Arc<pool_coordinator::PoolCoordinator>,
+        pool_coordinator::CoordinatorPermit,
+    ) {
+        let coordinator = pool_coordinator::PoolCoordinator::new(
+            "test_db".to_string(),
+            pool_coordinator::CoordinatorConfig {
+                max_db_connections: 2,
+                min_connection_lifetime_ms: 0,
+                reserve_pool_size: 0,
+                reserve_pool_timeout_ms: 0,
+            },
+        );
+        let permit = coordinator.try_acquire().expect("database permit");
+        (coordinator, permit)
+    }
+
     /// Closing a pool must not read its closed semaphore as permits held by
     /// active checkouts: only the backends still checked out retire on
     /// return, and nothing is reported missing.
@@ -5475,9 +5493,10 @@ mod tests {
         use crate::server::Server;
 
         let pool = empty_test_pool_with_max_size(4);
+        let (database, permit) = database_permit();
         let checked_out = pool
             .inner
-            .new_object_inner(Server::test_dead_socket(), None);
+            .new_object_inner(Server::test_dead_socket(), Some(permit));
         pool.semaphore().try_acquire_many(1).unwrap().forget();
         pool.inner.slots.lock().size = 1;
 
@@ -5492,6 +5511,11 @@ mod tests {
         let slots = pool.inner.slots.lock();
         assert_eq!(slots.size, 0);
         assert_eq!(slots.permits_to_retire, 0);
+        assert_eq!(
+            database.total_connections(),
+            0,
+            "its database permit is free"
+        );
     }
 
     /// A health scan owns the idle backends it checks. When the pool closes
@@ -5502,9 +5526,10 @@ mod tests {
         use crate::server::Server;
 
         let pool = empty_test_pool_with_max_size(4);
+        let (database, permit) = database_permit();
         let survivor = pool
             .inner
-            .new_object_inner(Server::test_dead_socket(), None);
+            .new_object_inner(Server::test_dead_socket(), Some(permit));
         pool.semaphore().try_acquire_many(1).unwrap().forget();
         pool.inner.slots.lock().size = 1;
         let scan = EvictGuard::new(&pool.inner, 1);
@@ -5516,6 +5541,11 @@ mod tests {
         assert!(slots.vec.is_empty(), "a closed pool keeps no idle backend");
         assert_eq!(slots.size, 0);
         assert_eq!(slots.permits_to_retire, 0);
+        assert_eq!(
+            database.total_connections(),
+            0,
+            "its database permit is free"
+        );
     }
 
     /// A backend whose handoff receiver went away is requeued; if the pool
@@ -5525,9 +5555,10 @@ mod tests {
         use crate::server::Server;
 
         let pool = empty_test_pool_with_max_size(4);
+        let (database, permit) = database_permit();
         let delivered = pool
             .inner
-            .new_object_inner(Server::test_dead_socket(), None);
+            .new_object_inner(Server::test_dead_socket(), Some(permit));
         pool.inner.slots.lock().size = 1;
 
         pool.close();
@@ -5537,6 +5568,11 @@ mod tests {
         assert!(slots.vec.is_empty(), "a closed pool keeps no idle backend");
         assert_eq!(slots.size, 0);
         assert_eq!(slots.permits_to_retire, 0);
+        assert_eq!(
+            database.total_connections(),
+            0,
+            "its database permit is free"
+        );
     }
 
     #[test]
