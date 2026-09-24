@@ -823,6 +823,13 @@ pub struct Server {
     /// pooler's.
     pub(crate) release_statements_prepared: bool,
 
+    /// A statement that drops every prepared statement (DEALLOCATE ALL, or
+    /// a DISCARD ALL the pooler forwards) is bound in the batch being
+    /// assembled. Until PostgreSQL has run it, only the statements the batch
+    /// prepares after it count as present on the backend.
+    statements_reset_queued: bool,
+    prepared_after_statements_reset: HashSet<String>,
+
     /// Whether the DISCARD ALL synthetic-response fast path is allowed for
     /// this backend. Mirrors `Pool.intercept_discard_all`. Installed by
     /// `ServerPool::create` right after startup; queried from
@@ -2414,7 +2421,27 @@ impl Server {
     }
 
     fn add_prepared_statement_to_cache(&mut self, name: &str) -> Option<String> {
+        if self.statements_reset_queued {
+            self.prepared_after_statements_reset
+                .insert(name.to_string());
+        }
         prepared_statements::add_to_cache(&mut self.prepared_statement_cache, &self.stats, name)
+    }
+
+    /// The batch being assembled binds a statement that drops every prepared
+    /// statement; see `statements_reset_queued`.
+    pub(crate) fn queue_statements_reset(&mut self) {
+        self.statements_reset_queued = true;
+        self.prepared_after_statements_reset.clear();
+    }
+
+    /// The queued reset ran, or the batch ended without running it; the cache
+    /// is again what the backend holds.
+    pub(crate) fn clear_queued_statements_reset(&mut self) {
+        if self.statements_reset_queued {
+            self.statements_reset_queued = false;
+            self.prepared_after_statements_reset.clear();
+        }
     }
 
     pub(crate) fn remove_prepared_statement_from_cache(&mut self, name: &str) {
@@ -2649,6 +2676,9 @@ impl Server {
     /// from LRU but not yet Closed on PostgreSQL — they still exist there).
     #[inline]
     pub fn has_prepared_statement(&mut self, name: &str) -> bool {
+        if self.statements_reset_queued {
+            return self.prepared_after_statements_reset.contains(name);
+        }
         // O(1) HashSet lookup (was O(N) Vec linear scan).
         if self.deferred_eviction_closes.contains(name) {
             self.stats.prepared_cache_hit();
@@ -3293,6 +3323,8 @@ impl Server {
                         release_reply_pending: false,
                         release_failed: false,
                         release_statements_prepared: false,
+                        statements_reset_queued: false,
+                        prepared_after_statements_reset: HashSet::new(),
                         intercept_discard_all: true,
                         abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
                         internal_round_trip_in_flight: false,
@@ -3635,6 +3667,8 @@ impl Server {
             release_reply_pending: false,
             release_failed: false,
             release_statements_prepared: false,
+            statements_reset_queued: false,
+            prepared_after_statements_reset: HashSet::new(),
             intercept_discard_all: true,
             abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
         };

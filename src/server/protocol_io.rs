@@ -490,6 +490,7 @@ fn handle_ready_for_query(server: &mut Server, message: &mut BytesMut) -> Result
 
     // No more data available from the server after ReadyForQuery
     server.data_available = false;
+    server.clear_queued_statements_reset();
     server.clear_set_cleanup_commands();
     server.clear_reset_cleanup_commands();
     Ok(())
@@ -735,6 +736,7 @@ fn classify_command_complete_with_attribution(
 /// registrations and their cache entries stay.
 fn drop_prepared_statement_cache_on_reset(server: &mut Server, reason: &'static str) {
     server.release_statements_prepared = false;
+    server.clear_queued_statements_reset();
     let Some(cache_size) = server
         .prepared_statement_cache
         .as_ref()
@@ -1918,6 +1920,50 @@ mod tests {
             handle_error_response(&mut server, &mut BytesMut::from(body.as_bytes()));
             assert_eq!(server.cleanup_state.needs_cleanup_prepare, arms, "{name}");
         }
+    }
+
+    /// A DEALLOCATE ALL bound earlier in the batch drops every statement when
+    /// PostgreSQL runs it, so while the batch is assembled only statements
+    /// prepared after it count as present; once it ran, the cache holds just
+    /// those.
+    #[tokio::test]
+    async fn a_queued_statements_reset_hides_statements_prepared_before_it() {
+        let (mut server, _peer) = crate::server::Server::test_silent_socket();
+        server.prepared_statement_cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(16).unwrap(),
+            RandomState::new(),
+        ));
+        let parse = crate::messages::Parse::from_parts("SELECT 1", &[]);
+        assert!(server
+            .prepare_statement_for_frontend(&parse, "DOORMAN_warm")
+            .unwrap()
+            .is_some());
+        server.registering_prepared_statement.clear();
+        assert!(server.has_prepared_statement("DOORMAN_warm"));
+
+        server.queue_statements_reset();
+        assert!(
+            !server.has_prepared_statement("DOORMAN_warm"),
+            "the reset drops it before the rest of the batch runs"
+        );
+        assert!(server
+            .prepare_statement_for_frontend(&parse, "DOORMAN_warm")
+            .unwrap()
+            .is_some());
+        assert!(server.has_prepared_statement("DOORMAN_warm"));
+
+        handle_command_complete(&mut server, &BytesMut::from(&b"DEALLOCATE ALL\0"[..]));
+        assert!(
+            server.has_prepared_statement("DOORMAN_warm"),
+            "prepared again after the reset"
+        );
+        server.queue_statements_reset();
+        let mut ready = BytesMut::from(&b"I"[..]);
+        handle_ready_for_query(&mut server, &mut ready).unwrap();
+        assert!(
+            server.has_prepared_statement("DOORMAN_warm"),
+            "a batch that ended without running the reset changed nothing"
+        );
     }
 
     /// An error in a Flush pipeline arms the SET/RESET cleanup, whose

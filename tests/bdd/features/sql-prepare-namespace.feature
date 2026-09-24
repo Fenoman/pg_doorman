@@ -97,6 +97,23 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     And we send Sync to both
     Then we should receive identical messages from both
 
+  Scenario: A DEALLOCATE ALL inside a pipeline does not hide a statement already on the backend
+    When we send Parse "warm" with query "SELECT 1" to both
+    And we send Bind "" to "warm" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    And we send Parse "reset" with query "DEALLOCATE ALL" to both
+    And we send Bind "" to "reset" with params "" to both
+    And we send Execute "" to both
+    And we send Parse "a" with query "SELECT 1" to both
+    And we send Bind "" to "a" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    And we send Bind "" to "a" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    Then we should receive identical messages from both
+
   Scenario: A Bind of an unknown statement keeps the backend's shared statements
     When we create session "one" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send Parse "q" with query "SELECT 1" to session "one"

@@ -135,6 +135,16 @@ pub(crate) fn contains_discard_all(bytes: &[u8]) -> bool {
     idx == len
 }
 
+/// True for a single statement that drops every prepared statement when it
+/// runs: `DEALLOCATE [PREPARE] ALL` or `DISCARD ALL`.
+pub(crate) fn drops_prepared_statements(bytes: &[u8]) -> bool {
+    contains_discard_all(bytes)
+        || matches!(
+            extract_deallocate_target(bytes),
+            Some(DeallocateTarget::All)
+        )
+}
+
 /// True when any SimpleQuery statement is a standalone `DISCARD ALL`.
 /// Unlike [`contains_discard_all`], this handles multi-statement SQL bodies
 /// while still ignoring semicolons inside literals, identifiers, and comments.

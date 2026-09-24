@@ -10,7 +10,9 @@ use crate::pool::ConnectionPool;
 use crate::server::{now_monotonic_ms, Server};
 use crate::utils::strings::truncate_query_for_log;
 
-use super::util::{contains_discard_all, extract_set_and_reset_cleanup_commands};
+use super::util::{
+    contains_discard_all, drops_prepared_statements, extract_set_and_reset_cleanup_commands,
+};
 
 /// Replacement query for extended-protocol `DISCARD ALL` interception
 /// Any zero-parameter, side-effect-free SQL that the
@@ -490,6 +492,7 @@ where
             intercepted_discard_all,
             set_cleanup_command,
             reset_cleanup_command,
+            drops_prepared_statements: drops_prepared_statements(parse.query().as_bytes()),
             async_name: async_name.clone(),
         };
         // distinguish three real eviction modes:
@@ -847,6 +850,11 @@ where
                     server,
                 )
                 .await?;
+                if cached.drops_prepared_statements {
+                    // PostgreSQL drops every statement when it runs this
+                    // portal; later cache hits of the batch must prepare anew.
+                    server.queue_statements_reset();
+                }
 
                 if let Some(command) = cached.set_cleanup_command {
                     self.prepared
@@ -1548,6 +1556,7 @@ mod replacement_close_tests {
             intercepted_discard_all: false,
             set_cleanup_command: None,
             reset_cleanup_command: None,
+            drops_prepared_statements: false,
             async_name: None,
         }
     }
@@ -1642,6 +1651,7 @@ mod anonymous_close_tests {
             intercepted_discard_all: false,
             set_cleanup_command: None,
             reset_cleanup_command: None,
+            drops_prepared_statements: false,
             async_name: None,
         }
     }
@@ -1712,6 +1722,7 @@ mod anonymous_close_tests {
             intercepted_discard_all: false,
             set_cleanup_command: Some(SetCleanupCommand::SetSessionAuthorization),
             reset_cleanup_command: None,
+            drops_prepared_statements: false,
             async_name: None,
         };
         let _ = client
@@ -1756,6 +1767,7 @@ mod anonymous_close_tests {
             intercepted_discard_all: false,
             set_cleanup_command: Some(SetCleanupCommand::GenericSet),
             reset_cleanup_command: None,
+            drops_prepared_statements: false,
             async_name: None,
         };
         let _ = client

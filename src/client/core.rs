@@ -717,6 +717,9 @@ pub struct CachedStatement {
     pub(crate) set_cleanup_command: Option<SetCleanupCommand>,
     /// Cleanup attribution for successful extended-protocol RESET executions.
     pub(crate) reset_cleanup_command: Option<ResetCleanupCommand>,
+    /// Running it drops every prepared statement on the backend
+    /// (DEALLOCATE ALL, or a DISCARD ALL the pooler forwards).
+    pub(crate) drops_prepared_statements: bool,
     /// Unique statement name for async clients (e.g., "DOORMAN_async_12345").
     /// None for non-async clients (they use `parse.name` directly).
     ///
@@ -732,6 +735,8 @@ impl CachedStatement {
     /// Build a plain cached statement entry with no cleanup attribution.
     #[must_use]
     pub fn new(parse: Arc<Parse>, hash: u64, async_name: Option<Arc<str>>) -> Self {
+        let drops_prepared_statements =
+            crate::client::util::drops_prepared_statements(parse.query().as_bytes());
         Self {
             shared_server_name: async_name
                 .clone()
@@ -741,6 +746,7 @@ impl CachedStatement {
             intercepted_discard_all: false,
             set_cleanup_command: None,
             reset_cleanup_command: None,
+            drops_prepared_statements,
             async_name,
         }
     }
@@ -1592,7 +1598,29 @@ mod cache_split_tests {
             intercepted_discard_all: false,
             set_cleanup_command: None,
             reset_cleanup_command: None,
+            drops_prepared_statements: false,
             async_name: None,
+        }
+    }
+
+    /// Statements that drop every prepared statement when they run; a Bind
+    /// of one makes the rest of the batch stop trusting the backend cache.
+    #[test]
+    fn cached_statement_knows_whether_it_drops_prepared_statements() {
+        for (query, drops) in [
+            ("DEALLOCATE ALL", true),
+            ("deallocate prepare all;", true),
+            ("DISCARD ALL", true),
+            ("DEALLOCATE s1", false),
+            ("SELECT 1", false),
+            ("DISCARD PLANS", false),
+        ] {
+            let cached = CachedStatement::new(
+                Arc::new(crate::messages::Parse::from_parts(query, &[])),
+                1,
+                None,
+            );
+            assert_eq!(cached.drops_prepared_statements, drops, "{query}");
         }
     }
 
