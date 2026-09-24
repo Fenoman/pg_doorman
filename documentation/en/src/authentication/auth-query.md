@@ -46,10 +46,21 @@ When a client connects as `alice`:
 Each such user gets its own pool, and a database accepts at most 1024 of
 them. The 1025th distinct user is refused with SQLSTATE 58000 ("Unable to
 create authenticated dynamic pool"), a WARN line `dynamic pool limit reached`
-and an auth failure in the metrics. The pool of a user that disconnected
-is garbage-collected once it has no backend connections left, unless
-`min_pool_size > 0`; `RELOAD` starts the count over. For more users per
-database use dedicated mode.
+and an auth failure in the metrics.
+
+A slot is freed when the garbage collector removes a user's pool. It does
+so once the user has no clients connected and the pool has no backend
+connections left. Idle backends are closed after `idle_timeout` or
+`server_lifetime`, at most `retain_connections_max` of them per
+`retain_connections_time` across all pools, and the collector also runs
+every `retain_connections_time`. Pools with `min_pool_size > 0` and paused
+pools are not collected. `RELOAD` frees slots only if it changes the
+database's section of the config (`pools.mydb` above),
+`general.startup_parameters` or `general.sync_server_parameters`: it then
+removes every dynamic pool of the database, and their clients in
+transaction mode are disconnected at their next transaction. A `RELOAD` of
+an unchanged config frees nothing. A restart starts the count over. For
+more users per database use dedicated mode.
 
 ## Dedicated mode
 
