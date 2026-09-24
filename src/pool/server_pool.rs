@@ -17,8 +17,8 @@ use crate::config::{Address, User};
 use crate::errors::Error;
 use crate::patroni::types::Role;
 use crate::server::{
-    resolve_release_query, ResolvedReleaseQuery, Server, PGV_FREE_PROBE,
-    RELEASE_WITHOUT_PG_VARIABLES,
+    resolve_pooler_release_query, resolve_release_query, ReleaseReplyCheck, ResolvedReleaseQuery,
+    Server, PGV_FREE_PROBE, RELEASE_WITHOUT_PG_VARIABLES,
 };
 use crate::stats::{AddressStats, ServerStats};
 use crate::utils::format_duration_ms;
@@ -483,7 +483,7 @@ impl ServerPool {
                 self.address.username, self.address.pool_name, self.address.database,
             );
         }
-        Ok(resolve_release_query(Some(&release_sql)))
+        Ok(Some(resolve_pooler_release_query(&release_sql)))
     }
 
     /// Builder-style override for the effective prewarm SQL. Callers must
@@ -1468,6 +1468,17 @@ impl ServerPool {
             return Err(RecycleError::StaticMessage("Connection exceeded lifetime"));
         }
 
+        // A release query that failed after the last check-in flushed its
+        // error at once. Discard a backend whose error has already arrived
+        // before any client sends to it; a reply still on its way is read
+        // by the first exchange.
+        if conn.release_reply_pending() {
+            if let ReleaseReplyCheck::Failed(reason) = conn.check_release_reply_now() {
+                conn.close_reason = Some(reason);
+                return Err(RecycleError::StaticMessage("release_query failed"));
+            }
+        }
+
         // Probe long-idle connections before reuse.
         if let Some(idle_time_ms) = inline_alive_check_needed(metrics, self.idle_check_timeout_ms) {
             debug!("Connection {conn} idle for {idle_time_ms}ms, checking alive...");
@@ -1963,7 +1974,153 @@ mod tests {
                 Some(expected.as_str()),
                 "{schema:?} {public_pgv_free:?} streamed={streamed}"
             );
+            assert!(
+                release_query
+                    .as_ref()
+                    .and_then(|query| query.prefix())
+                    .is_some(),
+                "the pooler's own choice is sent without waiting: {schema:?} {public_pgv_free:?}"
+            );
             assert!(!server.is_bad());
+        }
+    }
+
+    /// PostgreSQL's reply to the release prefix of the default query.
+    fn release_ok_reply() -> Vec<u8> {
+        let mut reply = Vec::new();
+        for (tag, row) in [("BEGIN", false), ("SELECT 1", true), ("COMMIT", false)] {
+            reply.extend_from_slice(&crate::messages::parse_complete());
+            reply.extend_from_slice(&[b'2', 0, 0, 0, 4]);
+            if row {
+                reply.extend_from_slice(&[b'D', 0, 0, 0, 14, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+            }
+            reply.extend_from_slice(&crate::messages::command_complete(tag));
+        }
+        reply.extend_from_slice(&[b'I', 0, 0, 0, 4]);
+        reply.extend_from_slice(&crate::messages::ready_for_query(false));
+        reply
+    }
+
+    /// Let the runtime see the bytes the peer wrote as readable.
+    async fn let_bytes_arrive() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    /// A release that failed after the last check-in flushed its error at
+    /// once. A backend with that error already received is discarded at
+    /// checkout, before any client sends to it.
+    #[tokio::test]
+    async fn recycle_discards_a_backend_whose_release_failed() {
+        use tokio::io::AsyncWriteExt;
+
+        let pool = test_server_pool_with_prewarm("");
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.release_reply_pending = true;
+        let mut reply = crate::messages::parse_complete().to_vec();
+        let error = b"SERROR\0VERROR\0C57014\0Mcanceling statement due to user request\0\0";
+        reply.push(b'E');
+        reply.extend_from_slice(&(error.len() as i32 + 4).to_be_bytes());
+        reply.extend_from_slice(error);
+        peer.write_all(&reply).await.unwrap();
+        let_bytes_arrive().await;
+
+        let result = pool.recycle(&mut server, &Metrics::default(), false).await;
+
+        assert!(result.is_err());
+        assert!(
+            server
+                .close_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("57014")),
+            "{:?}",
+            server.close_reason
+        );
+    }
+
+    /// A release reply that has arrived whole is read at checkout, so the
+    /// client's first exchange reads only its own reply.
+    #[tokio::test]
+    async fn recycle_reads_a_release_reply_that_has_arrived() {
+        use tokio::io::AsyncWriteExt;
+
+        let pool = test_server_pool_with_prewarm("");
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.release_reply_pending = true;
+        peer.write_all(&release_ok_reply()).await.unwrap();
+        let_bytes_arrive().await;
+
+        pool.recycle(&mut server, &Metrics::default(), false)
+            .await
+            .expect("recycle");
+
+        assert!(!server.release_reply_pending());
+        let mut own = crate::messages::command_complete("SELECT 1").to_vec();
+        own.extend_from_slice(&crate::messages::ready_for_query(false));
+        peer.write_all(&own).await.unwrap();
+        let reply = server.recv(tokio::io::sink(), None).await.unwrap();
+        assert_eq!(&reply[..], &own[..]);
+    }
+
+    /// RESET ALL ahead of the release reports the parameters it restores;
+    /// a reply that has arrived whole is read at checkout with them applied.
+    #[tokio::test]
+    async fn recycle_reads_a_release_reply_with_parameter_status() {
+        use tokio::io::AsyncWriteExt;
+
+        let pool = test_server_pool_with_prewarm("");
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.release_reply_pending = true;
+        let mut reply = crate::messages::parse_complete().to_vec();
+        reply.extend_from_slice(&[b'2', 0, 0, 0, 4]);
+        reply.extend_from_slice(&crate::messages::command_complete("RESET"));
+        reply.extend_from_slice(&crate::messages::server_parameter_message(
+            "application_name",
+            "restored",
+        ));
+        reply.extend_from_slice(&release_ok_reply());
+        peer.write_all(&reply).await.unwrap();
+        let_bytes_arrive().await;
+
+        pool.recycle(&mut server, &Metrics::default(), false)
+            .await
+            .expect("recycle");
+
+        assert!(!server.release_reply_pending());
+        assert_eq!(
+            server
+                .server_parameters_as_hashmap()
+                .get("application_name")
+                .map(String::as_str),
+            Some("restored")
+        );
+    }
+
+    /// Under load the backend is handed out before PostgreSQL has run the
+    /// release; the client's first exchange then reads the reply.
+    #[tokio::test]
+    async fn recycle_leaves_a_release_reply_still_on_its_way() {
+        use tokio::io::AsyncWriteExt;
+
+        // Inside a message header, inside the DataRow body.
+        for split in [7, 43] {
+            let pool = test_server_pool_with_prewarm("");
+            let (mut server, mut peer) = Server::test_silent_socket();
+            server.release_reply_pending = true;
+            let reply = release_ok_reply();
+            peer.write_all(&reply[..split]).await.unwrap();
+            let_bytes_arrive().await;
+
+            pool.recycle(&mut server, &Metrics::default(), false)
+                .await
+                .expect("recycle");
+
+            assert!(server.release_reply_pending(), "split at {split}");
+            peer.write_all(&reply[split..]).await.unwrap();
+            let mut own = crate::messages::command_complete("SELECT 1").to_vec();
+            own.extend_from_slice(&crate::messages::ready_for_query(false));
+            peer.write_all(&own).await.unwrap();
+            let received = server.recv(tokio::io::sink(), None).await.unwrap();
+            assert_eq!(&received[..], &own[..], "split at {split}");
         }
     }
 

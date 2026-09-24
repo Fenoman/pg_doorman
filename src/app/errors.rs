@@ -66,6 +66,10 @@ pub enum Error {
     AuthQueryQueryError(String),
     /// Executor pool is closed (shutting down).
     AuthQueryPoolClosed,
+    /// The release query sent at the backend's last check-in failed, so
+    /// PostgreSQL skipped the exchange that followed it. Carries the
+    /// SQLSTATE and the message as cut for the log.
+    ReleaseQueryFailed(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -214,6 +218,10 @@ impl std::fmt::Display for Error {
                 write!(f, "Auth query execution error: {msg}")
             }
             Error::AuthQueryPoolClosed => write!(f, "Auth query executor pool is closed"),
+            Error::ReleaseQueryFailed(msg) => write!(
+                f,
+                "release_query failed, the following exchange was skipped: {msg}"
+            ),
         }
     }
 }

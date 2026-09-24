@@ -698,7 +698,10 @@ log_client_parameter_status_changes = false
 # * `""`  -> release-query disabled, nothing is executed at checkin
 # * other -> exactly that SQL runs on every checkin; it may call only
 #   `pg_advisory_unlock_all()`, `public.pgv_free()` and LOCAL `set_config(..., true)`
-# A SQL error in the release query marks the backend bad so a dirty
+# The default is sent without waiting for its result, which is read before the
+# next exchange on the backend; if it fails, PostgreSQL skips that exchange and the
+# client gets SQLSTATE 08006 (the query was not executed). A custom query keeps its
+# round trip. A SQL error in the release query marks the backend bad so a dirty
 # session is never reused by another client.
 # Default: None (uses iServ-compatible default)
 # release_query = ""

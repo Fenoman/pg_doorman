@@ -130,6 +130,13 @@ where
                     err,
                 ).await
             }
+            // The release query before this exchange failed and PostgreSQL
+            // skipped the exchange; where it cannot be answered in place,
+            // the client learns that its query did not run.
+            Error::ReleaseQueryFailed(_) => {
+                self.send_error_response(crate::server::SKIPPED_EXCHANGE_MESSAGE, "08006", err)
+                    .await
+            }
             // every other Error variant used to fall
             // through to a silent `Err(err)`. We now emit an ErrorResponse
             // so drivers get a proper PG-protocol message AND log the

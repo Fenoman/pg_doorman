@@ -251,6 +251,10 @@ where
 pub(crate) struct ResolvedReleaseQuery {
     sql: Arc<str>,
     frame: Bytes,
+    /// Messages sent at check-in without waiting for the reply, for the
+    /// release queries the pooler itself chose; see [`release_prefix`].
+    /// `None` for an operator's query, which keeps its round trip.
+    prefix: Option<Bytes>,
 }
 
 impl ResolvedReleaseQuery {
@@ -263,6 +267,87 @@ impl ResolvedReleaseQuery {
     pub(crate) fn frame(&self) -> &[u8] {
         &self.frame
     }
+
+    #[inline]
+    pub(crate) fn prefix(&self) -> Option<&[u8]> {
+        self.prefix.as_deref()
+    }
+}
+
+/// What the bytes already received say about the reply to the release
+/// query the last check-in sent without waiting.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReleaseReplyCheck {
+    /// The whole reply arrived, the release succeeded; it has been read.
+    Settled,
+    /// The release failed, so PostgreSQL skips what is sent next up to a
+    /// Sync, or the reply could not be read; the backend is marked bad.
+    Failed(String),
+    /// The reply is still on its way; the next exchange reads it.
+    NotYet,
+}
+
+/// Whether the received bytes hold the whole reply to the release prefix,
+/// through its ReadyForQuery, or an ErrorResponse that ends it early.
+fn release_reply_arrived(received: &[u8]) -> bool {
+    let mut at = 0;
+    while let Some(header) = received.get(at..at + 5) {
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        let Ok(len) = usize::try_from(len) else {
+            // Malformed; the regular reader reports it.
+            return true;
+        };
+        at += 1 + len;
+        if at > received.len() {
+            return false;
+        }
+        if matches!(header[0], b'Z' | b'E') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Wire form of statements whose reply is read only before the next exchange
+/// on the backend: BEGIN, the statements and COMMIT as unnamed Parse, Bind
+/// and Execute, then an empty Query. PostgreSQL answers at once, and the
+/// committed block leaves the backend idle, as after a simple Query; without
+/// the explicit block PostgreSQL 18 keeps the implicit transaction open across
+/// the empty Query. If a statement fails, PostgreSQL skips every message up
+/// to the next Sync, the empty Query and the next client's messages
+/// included, so nothing runs in a session the release did not clean.
+fn release_prefix<'a>(statements: impl IntoIterator<Item = &'a str>) -> Bytes {
+    let mut prefix = extended_statement("BEGIN");
+    for statement in statements {
+        prefix.put(extended_statement(statement));
+    }
+    prefix.put(extended_statement("COMMIT"));
+    prefix.put(simple_query(";"));
+    prefix.freeze()
+}
+
+/// One statement as unnamed Parse, Bind and Execute, without Sync.
+fn extended_statement(sql: &str) -> BytesMut {
+    let statement = sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    let mut messages = BytesMut::with_capacity(statement.len() + 34);
+    messages.put_u8(b'P');
+    messages.put_i32(4 + 1 + statement.len() as i32 + 1 + 2);
+    messages.put_u8(0);
+    messages.put_slice(statement.as_bytes());
+    messages.put_u8(0);
+    messages.put_i16(0);
+    messages.put_u8(b'B');
+    messages.put_i32(4 + 1 + 1 + 2 + 2 + 2);
+    messages.put_u8(0);
+    messages.put_u8(0);
+    messages.put_i16(0);
+    messages.put_i16(0);
+    messages.put_i16(0);
+    messages.put_u8(b'E');
+    messages.put_i32(4 + 1 + 4);
+    messages.put_u8(0);
+    messages.put_i32(0);
+    messages
 }
 
 impl std::ops::Deref for ResolvedReleaseQuery {
@@ -282,17 +367,35 @@ impl std::ops::Deref for ResolvedReleaseQuery {
 ///
 /// The SQL and frame use reference-counted storage so every backend in the
 /// pool can reuse them without rebuilding or copying either representation.
+/// Only the default is sent without waiting for its reply: an operator's
+/// query may hold several statements, which one Parse cannot carry.
 pub(crate) fn resolve_release_query(configured: Option<&str>) -> Option<ResolvedReleaseQuery> {
-    let sql: Arc<str> = match configured {
-        None => Arc::from(RELEASE_SESSION_QUERY),
-        Some("") => return None,
-        Some(query) => Arc::from(query),
-    };
+    match configured {
+        None => Some(resolve_pooler_release_query(RELEASE_SESSION_QUERY)),
+        Some("") => None,
+        Some(query) => Some(ResolvedReleaseQuery {
+            sql: Arc::from(query),
+            frame: release_query_frame(query),
+            prefix: None,
+        }),
+    }
+}
+
+/// A release query the pooler chose itself: a single statement, sent at
+/// check-in without waiting for the reply.
+pub(crate) fn resolve_pooler_release_query(sql: &str) -> ResolvedReleaseQuery {
+    ResolvedReleaseQuery {
+        sql: Arc::from(sql),
+        frame: release_query_frame(sql),
+        prefix: Some(release_prefix([sql])),
+    }
+}
+
+fn release_query_frame(sql: &str) -> Bytes {
     let mut wire_sql = String::with_capacity(sql.len() + 1);
-    wire_sql.push_str(&sql);
+    wire_sql.push_str(sql);
     wire_sql.push(';');
-    let frame = simple_query(&wire_sql).freeze();
-    Some(ResolvedReleaseQuery { sql, frame })
+    simple_query(&wire_sql).freeze()
 }
 
 fn combined_sql_preview(combined: &str, max_bytes: usize) -> String {
@@ -617,6 +720,16 @@ pub struct Server {
     /// its checkin cleanup yet.
     release_cleanup_pending: bool,
 
+    /// The release query of the last check-in went out without waiting for
+    /// its reply (`ResolvedReleaseQuery::prefix`). The reply is read before
+    /// anything else from this backend; if the query failed, PostgreSQL
+    /// skipped whatever was sent after it.
+    pub(crate) release_reply_pending: bool,
+
+    /// That release failed: PostgreSQL aborted the transaction block it
+    /// opened, which the client never did. The backend is marked bad.
+    pub(crate) release_failed: bool,
+
     /// Whether the DISCARD ALL synthetic-response fast path is allowed for
     /// this backend. Mirrors `Pool.intercept_discard_all`. Installed by
     /// `ServerPool::create` right after startup; queried from
@@ -889,9 +1002,12 @@ impl Server {
             match tokio::time::timeout_at(deadline, self.recv(&mut noop, None)).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) => {
-                    self.mark_bad(&format!(
-                        "transport error in swallow_set_response recv: {err}"
-                    ));
+                    // A failed release has already marked the backend bad.
+                    if !matches!(err, Error::ReleaseQueryFailed(_)) {
+                        self.mark_bad(&format!(
+                            "transport error in swallow_set_response recv: {err}"
+                        ));
+                    }
                     self.finish_internal_round_trip();
                     return Err(err);
                 }
@@ -1634,6 +1750,74 @@ impl Server {
         Ok(())
     }
 
+    /// Hand the release query to PostgreSQL without waiting for its reply,
+    /// which the next exchange reads first. A reply still unread means this
+    /// checkout exchanged nothing with the backend; it is read now, so at
+    /// most one release is ever outstanding.
+    async fn send_release_prefix(&mut self, prefix: &[u8]) -> Result<(), Error> {
+        if self.release_reply_pending {
+            let deadline = tokio::time::Instant::now() + HOUSEKEEPING_TIMEOUT;
+            match tokio::time::timeout_at(deadline, protocol_io::settle_release_reply(self)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.mark_bad("timeout reading the reply to the previous release_query");
+                    return Err(Error::SocketError(
+                        "timeout reading the reply to the previous release_query".to_string(),
+                    ));
+                }
+            }
+        }
+        self.send_and_flush_timeout(prefix, HOUSEKEEPING_TIMEOUT)
+            .await?;
+        self.release_reply_pending = true;
+        self.release_cleanup_pending = false;
+        Ok(())
+    }
+
+    /// Whether the last check-in's release query still has its reply unread.
+    #[inline(always)]
+    pub(crate) fn release_reply_pending(&self) -> bool {
+        self.release_reply_pending
+    }
+
+    /// Read the reply to the release query of the last check-in; see
+    /// [`protocol_io::settle_release_reply`].
+    pub(crate) async fn settle_release_reply(&mut self) -> Result<(), Error> {
+        protocol_io::settle_release_reply(self).await
+    }
+
+    /// Reads the reply to the last check-in's release query if it has
+    /// already arrived whole, without waiting for any of it. A reply still
+    /// on its way stays for the next exchange to read.
+    pub(crate) fn check_release_reply_now(&mut self) -> ReleaseReplyCheck {
+        use futures::FutureExt;
+        use tokio::io::AsyncBufReadExt;
+
+        let arrived = match self.stream.fill_buf().now_or_never() {
+            None => false,
+            Some(Ok(received)) => received.is_empty() || release_reply_arrived(received),
+            Some(Err(_)) => true,
+        };
+        if !arrived {
+            return ReleaseReplyCheck::NotYet;
+        }
+        // Every byte the reply needs is buffered, so the reader never waits.
+        match protocol_io::settle_release_reply(self).now_or_never() {
+            Some(Ok(())) => ReleaseReplyCheck::Settled,
+            Some(Err(err)) => ReleaseReplyCheck::Failed(err.to_string()),
+            None => {
+                self.mark_bad("the buffered release_query reply was incomplete");
+                ReleaseReplyCheck::Failed("incomplete release_query reply".to_string())
+            }
+        }
+    }
+
+    /// The answer to an exchange PostgreSQL skipped after a failed release;
+    /// see [`protocol_io::skipped_exchange_reply`].
+    pub(crate) fn skipped_exchange_reply(&mut self) -> BytesMut {
+        protocol_io::skipped_exchange_reply(self)
+    }
+
     /// Send combined housekeeping statements in one round trip and update
     /// local cleanup and prepared-statement state after PostgreSQL confirms it.
     async fn send_checkin_cleanup(
@@ -1849,7 +2033,7 @@ impl Server {
     }
 
     #[inline]
-    fn record_checkin_cleanup_metric(
+    pub(crate) fn record_checkin_cleanup_metric(
         &self,
         path: &'static str,
         result: &'static str,
@@ -1883,6 +2067,12 @@ impl Server {
     /// is forced off before the housekeeping statement, otherwise `small_simple_query`'s
     /// recv loop would not match the synchronous Sync/ReadyForQuery exchange.
     pub async fn finalize_checkin(&mut self) -> Result<(), Error> {
+        if self.bad {
+            // Closed on return, which ends its session state. After a failed
+            // release it may be skipping everything up to a Sync, so a
+            // cleanup query would wait for a reply that never comes.
+            return Ok(());
+        }
         let path = self.checkin_cleanup_metric_path();
         let started = quanta::Instant::now();
         let result = self.finalize_checkin_inner().await;
@@ -1906,7 +2096,10 @@ impl Server {
             self.in_transaction = false;
             self.in_copy_mode = false;
             return match release_query.as_ref() {
-                Some(release_query) => self.send_release_query_only(release_query).await,
+                Some(release_query) => match release_query.prefix() {
+                    Some(prefix) => self.send_release_prefix(prefix).await,
+                    None => self.send_release_query_only(release_query).await,
+                },
                 None => {
                     debug_assert!(!self.release_cleanup_pending);
                     Ok(())
@@ -1914,14 +2107,14 @@ impl Server {
             };
         }
 
-        if let Some(ref release_query) = release_query {
-            stmts.push(release_query.sql().to_string());
-        }
-
         // Housekeeping queries must travel through the synchronous Sync /
         // ReadyForQuery exchange `small_simple_query` understands.
         self.set_async_mode(false);
         self.set_expected_responses(0);
+
+        if let Some(ref release_query) = release_query {
+            stmts.push(release_query.sql().to_string());
+        }
 
         if let Err(err) = self
             .send_checkin_cleanup(stmts, release_query.as_ref().map(ResolvedReleaseQuery::sql))
@@ -2932,6 +3125,8 @@ impl Server {
                         release_query: None,
                         ok_cleanup_metrics: None,
                         release_cleanup_pending: false,
+                        release_reply_pending: false,
+                        release_failed: false,
                         intercept_discard_all: true,
                         abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
                         internal_round_trip_in_flight: false,
@@ -3271,6 +3466,8 @@ impl Server {
             release_query: None,
             ok_cleanup_metrics: None,
             release_cleanup_pending: false,
+            release_reply_pending: false,
+            release_failed: false,
             intercept_discard_all: true,
             abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
         };
@@ -3320,6 +3517,90 @@ mod tests {
             resolved.frame(),
             &crate::messages::simple_query("SELECT 1;")[..]
         );
+        assert!(
+            resolved.prefix().is_none(),
+            "an operator's release query may hold several statements"
+        );
+    }
+
+    /// The default goes out as unnamed Parse, Bind and Execute of the
+    /// statement without its trailing semicolon, then an empty Query.
+    #[test]
+    fn default_release_query_is_encoded_as_the_skip_until_sync_prefix() {
+        let resolved = resolve_release_query(None).expect("default release query");
+        let mut expected = Vec::new();
+        for statement in [
+            &b"BEGIN"[..],
+            b"SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free()",
+            b"COMMIT",
+        ] {
+            expected.push(b'P');
+            expected.extend_from_slice(&(4 + 1 + statement.len() as i32 + 1 + 2).to_be_bytes());
+            expected.push(0);
+            expected.extend_from_slice(statement);
+            expected.extend_from_slice(&[0, 0, 0]);
+            expected.extend_from_slice(&[b'B', 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0]);
+            expected.extend_from_slice(&[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0]);
+        }
+        expected.extend_from_slice(&crate::messages::simple_query(";"));
+
+        assert_eq!(resolved.prefix(), Some(&expected[..]));
+    }
+
+    /// A backend already marked bad is closed on return, which ends its
+    /// session state; its check-in sends nothing. After a failed release it
+    /// may be skipping every message up to a Sync, so a cleanup query would
+    /// wait for a reply that never comes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkin_of_a_bad_backend_sends_nothing() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut server, mut peer) = super::Server::test_silent_socket();
+        server.cleanup_connections = true;
+        server.cleanup_state.needs_cleanup_set = true;
+        server.set_release_query(None);
+        server.arm_release_cleanup();
+        server.mark_bad("test");
+
+        tokio::time::timeout(Duration::from_secs(1), server.finalize_checkin())
+            .await
+            .expect("the check-in of a bad backend must not wait")
+            .expect("check-in");
+
+        drop(server);
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty() || sent[0] == b'X', "{sent:?}");
+    }
+
+    /// Check-in hands the default release query to PostgreSQL and returns
+    /// the backend at once; the reply is read before the next exchange.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_release_query_does_not_wait_for_its_reply() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut server, mut peer) = super::Server::test_silent_socket();
+        server.set_release_query(None);
+        server.arm_release_cleanup();
+
+        tokio::time::timeout(Duration::from_secs(1), server.finalize_checkin())
+            .await
+            .expect("check-in must not wait for the release reply")
+            .expect("check-in");
+
+        let expected = resolve_release_query(None)
+            .unwrap()
+            .prefix()
+            .unwrap()
+            .to_vec();
+        let mut sent = vec![0_u8; expected.len()];
+        peer.read_exact(&mut sent).await.unwrap();
+        assert_eq!(sent, expected);
+        assert!(!server.release_cleanup_pending);
+        assert!(server.release_reply_pending);
+        assert!(!server.is_bad());
     }
 
     #[cfg(unix)]

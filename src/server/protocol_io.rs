@@ -37,7 +37,7 @@ impl Drop for WaitIdleOnDrop {
 /// client still receives the whole message.
 const MAX_LOGGED_ERROR_CHARS: usize = 1024;
 
-fn sanitize_for_log(s: &str) -> String {
+pub(crate) fn sanitize_for_log(s: &str) -> String {
     let (head, left_out) = match s.char_indices().nth(MAX_LOGGED_ERROR_CHARS) {
         Some((end, _)) => (&s[..end], s.len() - end),
         None => (s, 0),
@@ -955,6 +955,103 @@ fn handle_parameter_status(
     Ok(())
 }
 
+/// Reads the reply to the release query the last check-in sent without
+/// waiting for it: ParseComplete, BindComplete, rows and CommandComplete for
+/// BEGIN, each statement and COMMIT, then EmptyQueryResponse and
+/// ReadyForQuery. PostgreSQL sends it before it reads anything sent later,
+/// so it comes ahead of every other reply.
+///
+/// An ErrorResponse means the release failed and PostgreSQL skipped all
+/// that followed it up to a Sync, unexecuted. The backend is marked bad and
+/// the exchange fails with `ReleaseQueryFailed`; its own reply is not read.
+pub(crate) async fn settle_release_reply(server: &mut Server) -> Result<(), Error> {
+    while server.release_reply_pending {
+        let read = async {
+            let (code, len) = read_message_header(&mut *server.stream).await?;
+            if len >= MAX_MESSAGE_SIZE {
+                return Err(MaxMessageSize);
+            }
+            read_message_body_reuse(&mut *server.stream, &mut server.read_buf, code, len).await
+        };
+        let mut message = match read.await {
+            Ok(message) => message,
+            Err(err) => {
+                server.release_reply_pending = false;
+                server.mark_bad(&format!("failed to read the release_query reply: {err}"));
+                return Err(err);
+            }
+        };
+        server.stats.data_received(message.len());
+        let code = message.get_u8();
+        let _len = message.get_i32();
+        match code {
+            b'1' | b'2' | b'D' | b'C' | b'I' | b'N' | b'A' => {}
+            b'S' => handle_parameter_status(server, &mut message, &mut None)?,
+            b'Z' => {
+                server.release_reply_pending = false;
+                if message.first() != Some(&b'I') {
+                    server.mark_bad("release_query left the backend inside a transaction");
+                    return Err(Error::ProtocolSyncError(
+                        "release_query left the backend inside a transaction".to_string(),
+                    ));
+                }
+            }
+            b'E' => {
+                server.release_reply_pending = false;
+                server.release_failed = true;
+                let summary = match PgErrorMsg::parse(&message) {
+                    Ok(msg) => format!("SQLSTATE {}: {}", msg.code, sanitize_for_log(&msg.message)),
+                    Err(_) => "unparseable ErrorResponse".to_string(),
+                };
+                server.mark_bad(&format!(
+                    "release_query failed, the following exchange was skipped: {summary}"
+                ));
+                server.record_checkin_cleanup_metric("release_only", "sql_error", 0.0);
+                return Err(Error::ReleaseQueryFailed(summary));
+            }
+            other => {
+                server.release_reply_pending = false;
+                let reason = format!(
+                    "unexpected message '{}' in the release_query reply",
+                    other as char
+                );
+                server.mark_bad(&reason);
+                return Err(Error::ProtocolSyncError(reason));
+            }
+        }
+    }
+    server.touch_activity();
+    Ok(())
+}
+
+/// What a client is told about an exchange PostgreSQL skipped because the
+/// release query before it failed.
+pub(crate) const SKIPPED_EXCHANGE_MESSAGE: &str =
+    "server connection cleanup after the previous transaction failed; the query was not executed";
+
+/// The answer to an exchange PostgreSQL skipped because the release query
+/// before it failed (`Error::ReleaseQueryFailed`): an ERROR, and
+/// ReadyForQuery unless the exchange ended in Flush, whose Sync the client
+/// still sends and PostgreSQL answers. The query was not executed and the
+/// client is not in a transaction; the backend is already marked bad.
+pub(crate) fn skipped_exchange_reply(server: &mut Server) -> BytesMut {
+    let mut reply = crate::messages::nonfatal_error_message(SKIPPED_EXCHANGE_MESSAGE, "08006");
+    server.response_cycle_had_error = true;
+    server.in_copy_mode = false;
+    if server.is_async() {
+        server.reset_expected_responses();
+        server.data_available = false;
+    } else {
+        let ready = crate::messages::ready_for_query(false);
+        let mut state = BytesMut::from(&ready[5..]);
+        if let Err(err) = handle_ready_for_query(server, &mut state) {
+            error!("idle ReadyForQuery was rejected: {err}");
+        }
+        reply.put(ready);
+    }
+    reply
+}
+
 /// Receive data from the server in response to a client request.
 /// Must be called multiple times while `server.is_data_available()` is true.
 pub(crate) async fn recv<C, const ONE_MESSAGE: bool>(
@@ -966,6 +1063,9 @@ pub(crate) async fn recv<C, const ONE_MESSAGE: bool>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
+    if server.release_reply_pending {
+        settle_release_reply(server).await?;
+    }
     let idle_timeout = if ONE_MESSAGE {
         crate::config::proxy_copy_data_timeout()
     } else {
@@ -1222,6 +1322,13 @@ where
         match code {
             // ReadyForQuery - server is ready for a new query
             'Z' => {
+                // After a failed release the aborted block is the release's
+                // own; the client never opened one.
+                if server.release_failed && message.first() == Some(&b'E') {
+                    let status = server.buffer.len() - 1;
+                    server.buffer[status] = b'I';
+                    message = BytesMut::from(&b"I"[..]);
+                }
                 handle_ready_for_query(server, &mut message)?;
                 break;
             }
@@ -1445,9 +1552,10 @@ mod tests {
         CommandCompleteEffect,
     };
     use crate::client::util::extract_set_cleanup_commands;
+    use crate::errors::Error;
     use crate::server::cleanup::ResetCleanupCommand;
     use ahash::RandomState;
-    use bytes::BytesMut;
+    use bytes::{BufMut, BytesMut};
     use lru::LruCache;
     use std::num::NonZeroUsize;
 
@@ -1642,6 +1750,101 @@ mod tests {
         assert!(sent.is_ok(), "{sent:?}");
         assert_eq!(reader.await.unwrap(), data.len());
         assert!(!server.is_bad());
+    }
+
+    /// PostgreSQL's reply to the release prefix of the default query.
+    fn release_ok_reply() -> BytesMut {
+        let mut reply = BytesMut::new();
+        for (tag, row) in [("BEGIN", false), ("SELECT 1", true), ("COMMIT", false)] {
+            reply.put(crate::messages::parse_complete());
+            reply.put_slice(&[b'2', 0, 0, 0, 4]);
+            if row {
+                reply.put_slice(&[b'D', 0, 0, 0, 14, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+            }
+            reply.put(crate::messages::command_complete(tag));
+        }
+        reply.put_slice(&[b'I', 0, 0, 0, 4]);
+        reply.put(crate::messages::ready_for_query(false));
+        reply
+    }
+
+    /// The release reply precedes the reply to the exchange sent after it
+    /// and is read away; the caller gets only its own reply.
+    #[tokio::test]
+    async fn the_release_reply_is_read_before_the_next_reply() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        let mut own = crate::messages::command_complete("SELECT 1");
+        own.put(crate::messages::ready_for_query(false));
+        peer.write_all(&release_ok_reply()).await.unwrap();
+        peer.write_all(&own).await.unwrap();
+
+        let reply = server.recv(tokio::io::sink(), None).await.unwrap();
+
+        assert_eq!(&reply[..], &own[..]);
+        assert!(!server.release_reply_pending);
+        assert!(!server.is_bad());
+    }
+
+    /// A failed release makes PostgreSQL skip the next exchange up to a
+    /// Sync: nothing more is read, the exchange fails and the backend,
+    /// whose session the release did not clean, is not reused.
+    #[tokio::test]
+    async fn a_failed_release_fails_the_skipped_exchange() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        let mut reply = BytesMut::from(&crate::messages::parse_complete()[..]);
+        let mut error = BytesMut::new();
+        error.put_slice(b"SERROR\0VERROR\0C57014\0Mcanceling statement due to user request\0\0");
+        reply.put_u8(b'E');
+        reply.put_i32(error.len() as i32 + 4);
+        reply.put(error);
+        peer.write_all(&reply).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.recv(tokio::io::sink(), None),
+        )
+        .await
+        .expect("the skipped exchange has no reply to wait for");
+
+        match result {
+            Err(Error::ReleaseQueryFailed(summary)) => {
+                assert!(summary.contains("57014"), "{summary}")
+            }
+            other => panic!("expected ReleaseQueryFailed, got {other:?}"),
+        }
+        assert!(!server.release_reply_pending);
+        assert!(server.is_bad());
+    }
+
+    /// After a failed release, the transaction block PostgreSQL reports as
+    /// aborted at the client's next Sync is the release's own; the client
+    /// never opened one, so it is told the session is idle.
+    #[tokio::test]
+    async fn the_ready_for_query_after_a_failed_release_reports_idle() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        let mut reply = BytesMut::from(&crate::messages::parse_complete()[..]);
+        let mut error = BytesMut::new();
+        error.put_slice(b"SERROR\0VERROR\0C57014\0Mcanceling statement due to user request\0\0");
+        reply.put_u8(b'E');
+        reply.put_i32(error.len() as i32 + 4);
+        reply.put(error);
+        peer.write_all(&reply).await.unwrap();
+        assert!(server.recv(tokio::io::sink(), None).await.is_err());
+
+        peer.write_all(&[b'Z', 0, 0, 0, 5, b'E']).await.unwrap();
+        let ready = server.recv(tokio::io::sink(), None).await.unwrap();
+
+        assert_eq!(&ready[..], &[b'Z', 0, 0, 0, 5, b'I']);
+        assert!(!server.in_transaction());
     }
 
     /// A named Parse later in the same pipeline was forwarded before the

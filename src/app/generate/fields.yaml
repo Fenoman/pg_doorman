@@ -1676,7 +1676,10 @@ fields:
           * `""`  -> release-query disabled, nothing is executed at checkin
           * other -> exactly that SQL runs on every checkin; it may call only
             `pg_advisory_unlock_all()`, `public.pgv_free()` and LOCAL `set_config(..., true)`
-          A SQL error in the release query marks the backend bad so a dirty
+          The default is sent without waiting for its result, which is read before the
+          next exchange on the backend; if it fails, PostgreSQL skips that exchange and the
+          client gets SQLSTATE 08006 (the query was not executed). A custom query keeps its
+          round trip. A SQL error in the release query marks the backend bad so a dirty
           session is never reused by another client.
         ru: |
           SQL, выполняемый на каждом backend-соединении непосредственно перед его
@@ -1689,7 +1692,10 @@ fields:
           * `""` -> release-query отключён, на checkin ничего не выполняется
           * иначе -> ровно эта SQL выполняется на каждом checkin; вызывать в ней можно
             только `pg_advisory_unlock_all()`, `public.pgv_free()` и LOCAL `set_config(..., true)`
-          SQL-ошибка release-query помечает backend bad, чтобы грязная сессия
+          Запрос по умолчанию уходит без ожидания результата, результат читается перед
+          следующим обменом с backend; при ошибке PostgreSQL пропускает этот обмен, а клиент
+          получает SQLSTATE 08006 (запрос не выполнен). Свой запрос сохраняет отдельное
+          обращение. SQL-ошибка release-query помечает backend bad, чтобы грязная сессия
           не попала следующему клиенту.
       doc: |
         Per-pool checkin hook. By default pg_doorman runs the iServ-compatible
@@ -1698,11 +1704,19 @@ fields:
         `public.pgv_free()` is missing, a new backend calls `pgv_free()` in the
         schema the `pg_variables` extension was installed into, or, without the
         extension, only unlocks advisory locks; if the extension is installed
-        later, that backend's check-in fails and it is replaced. pg_doorman
-        logs a warning once per pool. Set `release_query = ""` when the
-        applications keep neither session-level advisory locks nor
-        `pg_variables` state across transactions: it saves a round trip per
-        transaction. A custom statement may call only
+        later, that backend's release fails and it is replaced. pg_doorman
+        logs a warning once per pool. The default and these variants go to
+        PostgreSQL as the backend returns to the pool, and pg_doorman does
+        not wait for them: PostgreSQL runs them at once and pg_doorman reads
+        the result before the next exchange on that backend. If the query
+        fails, PostgreSQL skips what the next client sent up to its Sync;
+        that client gets SQLSTATE 08006 saying its query was not executed
+        (in session mode the connection is then closed), and the backend is
+        closed. A custom statement keeps a round trip per transaction. Set
+        `release_query = ""` when the applications keep neither
+        session-level advisory locks nor `pg_variables` state across
+        transactions: PostgreSQL then runs nothing on check-in. A custom
+        statement may call only
         `pg_catalog.pg_advisory_unlock_all()`, `public.pgv_free()` and LOCAL
         `set_config(..., true)`, for example
         `SELECT pg_catalog.pg_advisory_unlock_all();`. Maximum length 4096

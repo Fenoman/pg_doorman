@@ -24,6 +24,11 @@ pub use prepared_statement_cache::{
 pub use prepared_statement_cache::{
     anon_entry_for_test, named_entry_for_test, reset_interners_for_test,
 };
+/// re-exported so the client checkout path can dispatch on the
+/// parameter-sync classifier (`Server::compute_sync_plan`) without reaching
+/// into the private `server_backend` module. `SyncPlan` is `pub(crate)`, so
+/// the re-export matches that visibility (a `pub use` would be E0365).
+pub(crate) use protocol_io::SKIPPED_EXCHANGE_MESSAGE;
 /// re-export the graceful-Terminate drain helper used by
 /// `app::server::binary_upgrade_and_shutdown`.
 pub use server_backend::wait_terminate_tasks_drained;
@@ -34,12 +39,9 @@ pub use server_backend::Server;
 /// exported so client-side BufReader sites can mirror the
 /// backend `BufStream` capacity without duplicating the constant.
 pub use server_backend::BUF_STREAM_CAPACITY;
-/// re-exported so the client checkout path can dispatch on the
-/// parameter-sync classifier (`Server::compute_sync_plan`) without reaching
-/// into the private `server_backend` module. `SyncPlan` is `pub(crate)`, so
-/// the re-export matches that visibility (a `pub use` would be E0365).
 pub(crate) use server_backend::{
-    resolve_release_query, AsyncExpectedResponse, ResolvedReleaseQuery, SetResponseOutcome,
-    SyncPlan, HOUSEKEEPING_TIMEOUT, PGV_FREE_PROBE, RELEASE_WITHOUT_PG_VARIABLES,
+    resolve_pooler_release_query, resolve_release_query, AsyncExpectedResponse, ReleaseReplyCheck,
+    ResolvedReleaseQuery, SetResponseOutcome, SyncPlan, HOUSEKEEPING_TIMEOUT, PGV_FREE_PROBE,
+    RELEASE_WITHOUT_PG_VARIABLES,
 };
 pub use stream::StreamInner;

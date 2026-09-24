@@ -471,6 +471,27 @@ pub fn error_message(message: &str, code: &str) -> BytesMut {
     res
 }
 
+/// An ErrorResponse of severity ERROR: the statement failed, the session
+/// goes on. `error_message` builds a FATAL one.
+pub fn nonfatal_error_message(message: &str, code: &str) -> BytesMut {
+    let mut error = BytesMut::new();
+    error.put_u8(b'S');
+    error.put_slice(b"ERROR\0");
+    error.put_u8(b'V');
+    error.put_slice(b"ERROR\0");
+    error.put_u8(b'C');
+    error.put_slice(format!("{code}\0").as_bytes());
+    error.put_u8(b'M');
+    error.put_slice(format!("{message}\0").as_bytes());
+    error.put_u8(0);
+
+    let mut res = BytesMut::with_capacity(error.len() + 5);
+    res.put_u8(b'E');
+    res.put_i32(error.len() as i32 + 4);
+    res.put(error);
+    res
+}
+
 pub async fn error_response_terminal<S>(
     stream: &mut S,
     message: &str,

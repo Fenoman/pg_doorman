@@ -691,6 +691,9 @@ fn backend_timeout_client_error(err: &Error) -> Option<(&'static str, &'static s
                 "58006",
             ))
         }
+        // The release query before the exchange failed and PostgreSQL
+        // skipped it; where it ends the connection, say the query did not run.
+        Error::ReleaseQueryFailed(_) => Some((crate::server::SKIPPED_EXCHANGE_MESSAGE, "08006")),
         _ => None,
     }
 }
@@ -1458,17 +1461,24 @@ where
             // Consume the SET response through its ReadyForQuery. Transport
             // failures still invalidate the backend; a complete SQL rejection
             // leaves the following client query intact on the same stream.
-            let set_outcome = server.swallow_set_response().await?;
+            let set_outcome = match server.swallow_set_response().await {
+                // The release query of the backend's last check-in failed:
+                // PostgreSQL skipped the SET and the client's query alike.
+                Err(Error::ReleaseQueryFailed(_)) if self.transaction_mode => None,
+                result => Some(result?),
+            };
             server.clear_internal_set_cleanup_state();
+            let skipped = set_outcome.is_none();
 
             match set_outcome {
-                SetResponseOutcome::Applied => {
+                None => {}
+                Some(SetResponseOutcome::Applied) => {
                     crate::web::metrics::inc_sync_params_applied();
                     crate::web::metrics::observe_sync_params_rtt_seconds(
                         started.elapsed().as_secs_f64(),
                     );
                 }
-                SetResponseOutcome::Rejected { sqlstate, .. } => {
+                Some(SetResponseOutcome::Rejected { sqlstate, .. }) => {
                     let (reason, action) = if sqlstate == "57014" {
                         match server.reissue_cancel_if_marked().await {
                             Some(Ok(())) => ("query_canceled", "cancel_reissued"),
@@ -1510,10 +1520,17 @@ where
                 server.track_reset_cleanup_commands(reset_cleanup_commands);
             }
 
-            // Relay the CLIENT query's own response (we already sent the
-            // combined frames above, so this is relay-only - NOT a fresh
-            // execute_server_roundtrip which would re-send).
-            self.relay_response(server).await?;
+            if skipped {
+                let reply = server.skipped_exchange_reply();
+                self.stats.active_write();
+                let write_timeout = crate::config::proxy_copy_data_timeout();
+                write_all_flush_timeout(&mut self.write, &reply, write_timeout).await?;
+            } else {
+                // Relay the CLIENT query's own response (we already sent the
+                // combined frames above, so this is relay-only - NOT a fresh
+                // execute_server_roundtrip which would re-send).
+                self.relay_response(server).await?;
+            }
         } else {
             if !set_cleanup_commands.is_empty() {
                 server.track_set_cleanup_commands(set_cleanup_commands);
@@ -1969,6 +1986,24 @@ where
     }
 
     /// Handle a connected and authenticated client.
+    /// A checkout-time exchange failed and the connection ends. If
+    /// PostgreSQL skipped it because the release query before it failed,
+    /// the client first learns that its query did not run. The backend is
+    /// let go before the write, so a slow client does not hold it.
+    async fn end_after_checkout_exchange_error<C>(&mut self, conn: C, err: &Error) {
+        drop(conn);
+        if matches!(err, Error::ReleaseQueryFailed(_)) {
+            let write_timeout = crate::config::proxy_copy_data_timeout();
+            let _ = error_response_timeout(
+                &mut self.write,
+                crate::server::SKIPPED_EXCHANGE_MESSAGE,
+                "08006",
+                write_timeout,
+            )
+            .await;
+        }
+    }
+
     pub async fn handle(&mut self) -> Result<(), Error> {
         // The client wants to cancel a query it has issued earlier.
         if self.cancel_mode {
@@ -2527,6 +2562,7 @@ where
                             crate::web::metrics::inc_sync_params_plan("complex", "standalone");
                             if let Err(err) = server.sync_parameter_diff(parameter_diff).await {
                                 self.release_after_inner_handler_error();
+                                self.end_after_checkout_exchange_error(conn, &err).await;
                                 return Err(err);
                             }
                         }
@@ -2560,6 +2596,7 @@ where
                         let started = quanta::Instant::now();
                         if let Err(err) = server.small_simple_query(&set_sql).await {
                             self.release_after_inner_handler_error();
+                            self.end_after_checkout_exchange_error(conn, &err).await;
                             return Err(err);
                         }
                         server.clear_internal_set_cleanup_state();
@@ -2623,6 +2660,7 @@ where
                             Ok(Err(err)) => {
                                 server.mark_bad(&format!("deferred BEGIN failed: {err}"));
                                 self.release_after_inner_handler_error();
+                                self.end_after_checkout_exchange_error(conn, &err).await;
                                 return Err(err);
                             }
                             Err(_) => {
@@ -2804,6 +2842,7 @@ where
                             let started = quanta::Instant::now();
                             if let Err(err) = server.small_simple_query(&set_sql).await {
                                 self.release_after_inner_handler_error();
+                                self.end_after_checkout_exchange_error(conn, &err).await;
                                 return Err(err);
                             }
                             server.clear_internal_set_cleanup_state();
@@ -3234,6 +3273,15 @@ where
         &mut self,
         server: &mut Server,
     ) -> Result<BytesMut, ServerWaitError> {
+        // The reply to the release query of the backend's last check-in
+        // comes first. Reading it here keeps the wait for this exchange's
+        // own reply, however long the query runs, watching the client.
+        if server.release_reply_pending() {
+            server
+                .settle_release_reply()
+                .await
+                .map_err(ServerWaitError::Server)?;
+        }
         let defer_large_messages = self.prepared.skipped_parses.len()
             > self
                 .prepared
@@ -3319,6 +3367,15 @@ where
             let mut response = match self.recv_server_response_or_client_disconnect(server).await {
                 Ok(msg) => msg,
                 Err(ServerWaitError::ClientGone(err)) => return Err(err),
+                // PostgreSQL skipped this exchange unexecuted: answer it like
+                // one whose first message failed. Session pooling would keep
+                // the client on the backend the release did not clean, so it
+                // ends the connection instead.
+                Err(ServerWaitError::Server(Error::ReleaseQueryFailed(_)))
+                    if self.transaction_mode =>
+                {
+                    server.skipped_exchange_reply()
+                }
                 Err(ServerWaitError::Server(err)) => {
                     if !server.is_bad() {
                         server.wait_available().await;
@@ -5572,7 +5629,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         let swallow_idx = piggy_idx
             + lines[piggy_idx..]
                 .iter()
-                .position(|l| l.contains("swallow_set_response().await?"))
+                .position(|l| l.contains("swallow_set_response().await"))
                 .expect("piggyback branch must swallow the internal SET response");
         let track_set_idx = piggy_idx
             + lines[piggy_idx..]
@@ -5626,7 +5683,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         let swallow_idx = piggy_idx
             + lines[piggy_idx..]
                 .iter()
-                .position(|l| l.contains("swallow_set_response().await?"))
+                .position(|l| l.contains("swallow_set_response().await"))
                 .expect("piggyback branch must swallow internal SET response");
         let track_set_idx = piggy_idx
             + lines[piggy_idx..]
@@ -7121,6 +7178,161 @@ mod relay_response_client_write_failure_tests {
             let target = extract_deallocate_target(sql.as_bytes()).expect(sql);
             assert_eq!(is_pooler_alias_target(&target), expected, "{sql}");
         }
+    }
+
+    /// PostgreSQL's reply when the release query of the backend's last
+    /// check-in was canceled: it then skips everything up to a Sync.
+    fn failed_release_reply() -> Vec<u8> {
+        let mut reply = backend_frame(b'1', b"");
+        reply.extend(backend_frame(
+            b'E',
+            b"SERROR\0VERROR\0C57014\0Mcanceling statement due to user request\0\0",
+        ));
+        reply
+    }
+
+    fn assert_skipped_query_answered(delivered: &[u8], server: &crate::server::Server) {
+        assert_eq!(delivered.first(), Some(&b'E'), "{delivered:?}");
+        assert!(delivered.windows(5).any(|w| w == b"08006"), "{delivered:?}");
+        assert!(
+            delivered.ends_with(&[b'Z', 0, 0, 0, 5, b'I']),
+            "{delivered:?}"
+        );
+        assert!(server.is_bad(), "the release did not clean this session");
+        assert!(!server.in_transaction());
+    }
+
+    /// A query sent right behind a release that failed was skipped by
+    /// PostgreSQL. The client gets an error and ReadyForQuery for it and
+    /// stays connected; the backend is not reused.
+    #[tokio::test]
+    async fn a_query_skipped_after_a_failed_release_is_answered_with_an_error() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = true;
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        peer.write_all(&failed_release_reply()).await.unwrap();
+
+        let query = crate::messages::simple_query("INSERT INTO t VALUES (1)");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.handle_simple_query(&query, &mut server, quanta::Instant::now()),
+        )
+        .await
+        .expect("the skipped query has no reply to wait for")
+        .expect("the client stays connected");
+
+        let delivered = [
+            &client.write.bytes[..],
+            &client.client_last_messages_in_tx[..],
+        ]
+        .concat();
+        assert_skipped_query_answered(&delivered, &server);
+    }
+
+    /// Session pooling would keep the client on the backend the release did
+    /// not clean, so there the skipped exchange ends the connection instead.
+    #[tokio::test]
+    async fn a_skipped_exchange_in_session_mode_is_not_answered_in_place() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = false;
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        peer.write_all(&failed_release_reply()).await.unwrap();
+
+        let query = crate::messages::simple_query("INSERT INTO t VALUES (1)");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.handle_simple_query(&query, &mut server, quanta::Instant::now()),
+        )
+        .await
+        .expect("the skipped query has no reply to wait for");
+
+        assert!(matches!(result, Err(Error::ReleaseQueryFailed(_))));
+        assert!(client.write.bytes.is_empty());
+        assert!(server.is_bad());
+    }
+
+    /// A checkout-time exchange (the parameter sync, a deferred BEGIN) that
+    /// PostgreSQL skipped after a failed release ends the connection; the
+    /// client is first told its query did not run. Other errors end it as
+    /// before, without a message.
+    #[tokio::test]
+    async fn a_skipped_checkout_exchange_tells_the_client() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client
+            .end_after_checkout_exchange_error((), &Error::SocketError("reset".to_string()))
+            .await;
+        assert!(client.write.bytes.is_empty());
+
+        client
+            .end_after_checkout_exchange_error(
+                (),
+                &Error::ReleaseQueryFailed("SQLSTATE 57014: canceled".to_string()),
+            )
+            .await;
+        let sent = String::from_utf8_lossy(&client.write.bytes);
+        assert!(sent.contains("08006"), "{sent}");
+        assert!(sent.contains("was not executed"), "{sent}");
+    }
+
+    /// When a skipped exchange ends the connection, the client is first told
+    /// that its query did not run.
+    #[test]
+    fn a_skipped_exchange_is_reported_before_the_connection_closes() {
+        let (message, code) = backend_timeout_client_error(&Error::ReleaseQueryFailed(
+            "SQLSTATE 57014: canceling statement due to user request".to_string(),
+        ))
+        .expect("the client must hear why the connection closes");
+        assert_eq!(code, "08006");
+        assert!(message.contains("was not executed"), "{message}");
+    }
+
+    /// Where the client cannot be answered in place (a deferred BEGIN it was
+    /// already told had run), it is told its query did not run before the
+    /// connection closes, not given the generic internal error.
+    #[tokio::test]
+    async fn a_skipped_exchange_that_ends_the_connection_says_so() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+
+        let result = client
+            .process_error(Error::ReleaseQueryFailed(
+                "SQLSTATE 57014: canceling statement due to user request".to_string(),
+            ))
+            .await;
+
+        assert!(result.is_err());
+        let sent = String::from_utf8_lossy(&client.write.bytes);
+        assert!(sent.contains("08006"), "{sent}");
+        assert!(sent.contains("was not executed"), "{sent}");
+    }
+
+    /// PostgreSQL skipped the SET application_name sent ahead of the
+    /// client's query as well as the query; the client gets one answer.
+    #[tokio::test]
+    async fn a_piggybacked_query_skipped_after_a_failed_release_is_answered_with_an_error() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = true;
+        client.pending_app_name_set = Some("SET application_name = 'app'".to_string());
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        peer.write_all(&failed_release_reply()).await.unwrap();
+
+        let query = crate::messages::simple_query("INSERT INTO t VALUES (1)");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.handle_simple_query(&query, &mut server, quanta::Instant::now()),
+        )
+        .await
+        .expect("the skipped queries have no reply to wait for")
+        .expect("the client stays connected");
+
+        let delivered = [
+            &client.write.bytes[..],
+            &client.client_last_messages_in_tx[..],
+        ]
+        .concat();
+        assert_skipped_query_answered(&delivered, &server);
     }
 
     /// Other clients share the DOORMAN_* aliases on a backend, so a SQL
