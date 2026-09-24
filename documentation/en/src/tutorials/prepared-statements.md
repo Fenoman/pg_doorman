@@ -85,6 +85,16 @@ again, so its result shape follows that backend's current schema. Transaction
 pooling cannot preserve a descriptor held only in a backend that was cleaned or
 retired.
 
+A `DEALLOCATE ALL`, or a `DISCARD ALL` that PgDoorman forwards, run from a portal
+in the middle of an extended-protocol batch makes the rest of that batch prepare
+its statements anew. PgDoorman follows such a portal from its `Bind` to its
+`Close` or the end of the transaction, but loses it in two cases: a second
+`Bind` of the same portal name, which PostgreSQL rejects, and a `Close` that
+PostgreSQL skips after an error in the batch. If the client then rolls back to a
+savepoint and runs that portal again, the next `Bind` of a statement prepared
+before it fails with `26000`, and the check-in cleanup repairs the backend as
+above.
+
 Giving every `Parse` a fresh internal name avoided the `0A000` but left the
 previous copy on whichever backend had run it. In transaction pooling that
 filled every backend with duplicate plans up to
