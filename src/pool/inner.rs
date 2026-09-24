@@ -114,7 +114,7 @@ impl Drop for Object {
                         if retire_permit {
                             slots.permits_to_retire -= 1;
                         }
-                        (slots.waiters.pop_front(), retire_permit)
+                        (pop_live_waiter(&mut slots), retire_permit)
                     };
                     // Dropping the sender wakes the waiter via Closed.
                     drop(waker_to_close);
@@ -388,6 +388,19 @@ fn prune_closed_handoff_waiters(slots: &mut Slots) {
 fn push_handoff_waiter(slots: &mut Slots, sender: oneshot::Sender<ObjectInner>) {
     prune_closed_handoff_waiters(slots);
     slots.waiters.push_back(sender);
+}
+
+/// Takes the oldest waiter still listening, dropping the senders of those
+/// that gave up but were not pruned yet. Dropping the returned sender wakes
+/// that waiter.
+#[inline(always)]
+fn pop_live_waiter(slots: &mut Slots) -> Option<oneshot::Sender<ObjectInner>> {
+    while let Some(sender) = slots.waiters.pop_front() {
+        if !sender.is_closed() {
+            return Some(sender);
+        }
+    }
+    None
 }
 
 /// Deliver to the oldest live waiter without changing semaphore accounting.
@@ -767,7 +780,7 @@ impl PoolInner {
             if retire_pool_slot {
                 slots.permits_to_retire -= 1;
             }
-            let waker_to_close = slots.waiters.pop_front();
+            let waker_to_close = pop_live_waiter(&mut slots);
             drop(slots);
             drop(waker_to_close);
             drop(inner);
@@ -4128,6 +4141,40 @@ mod tests {
         let waiters: VecDeque<oneshot::Sender<u32>> = VecDeque::new();
         assert!(waiters.is_empty());
         // return_object would push to vec + add_permits here.
+    }
+
+    /// A retiring return wakes one waiter by closing its channel. A waiter
+    /// that gives up drops its receiver before it prunes its sender, so the
+    /// wake must skip such a sender and reach a live waiter.
+    #[tokio::test]
+    async fn retiring_return_wakes_a_live_waiter_behind_abandoned_ones() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let returning = pool
+            .inner
+            .new_object_inner(Server::test_dead_socket(), None);
+        let (dead_tx, dead_rx) = oneshot::channel::<ObjectInner>();
+        drop(dead_rx);
+        let (live_tx, mut live_rx) = oneshot::channel::<ObjectInner>();
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size = 2;
+            slots.max_size = 1;
+            slots.permits_to_retire = 1;
+            slots.waiters.push_back(dead_tx);
+            slots.waiters.push_back(live_tx);
+        }
+
+        pool.inner.return_object(returning);
+
+        assert!(
+            matches!(
+                live_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "the live waiter must be woken"
+        );
     }
 
     #[tokio::test]
