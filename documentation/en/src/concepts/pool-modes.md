@@ -38,7 +38,7 @@ If a client disconnects while PostgreSQL still runs its query, PgDoorman keeps t
 Two cases are not covered:
 
 - A DataRow, CopyData or function call result larger than `message_size_to_be_stream` is streamed to the client in parts. If the client disconnects in the middle, the backend is closed at once and its slot is freed. PostgreSQL notices the closed connection only on its next write, so the rest of the query can run next to the backend that takes the slot.
-- Once PostgreSQL has sent part of the response, for example a NOTICE, PgDoorman notices the disconnect only with the next message. Until then the backend stays with the gone client, and the query is not canceled.
+- Once PostgreSQL has sent part of the response, for example a NOTICE, PgDoorman does not watch the client until it has read that response to the end, or until received rows fill the buffer to `response_flush_threshold`. Only after that can it notice the disconnect. Further NOTICEs are buffered with the rest and do not end the read. Until then the backend stays with the gone client, and the query is not canceled.
 
 ## Session mode
 
