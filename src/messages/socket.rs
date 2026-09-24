@@ -203,7 +203,7 @@ where
 {
     let mut remaining = buf;
     while !remaining.is_empty() {
-        match timeout(duration, stream.write(remaining)).await {
+        match crate::utils::timeout::timeout_unless_ready(duration, stream.write(remaining)).await {
             Ok(Ok(0)) => {
                 return Err(Error::SocketError(
                     "Error writing to socket: writer accepted no bytes".to_string(),
@@ -219,7 +219,7 @@ where
         }
     }
 
-    match timeout(duration, stream.flush()).await {
+    match crate::utils::timeout::timeout_unless_ready(duration, stream.flush()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(err)) => Err(Error::SocketError(format!(
             "Error flushing socket: {err:?}"

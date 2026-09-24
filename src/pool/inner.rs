@@ -1645,7 +1645,8 @@ impl Pool {
         let start = tokio::time::Instant::now();
         let preparation = self.prepare_checkout(timeouts, start);
         let prepared = match timeouts.wait.filter(|wait| !wait.is_zero()) {
-            Some(wait) => tokio::time::timeout_at(start + wait, preparation)
+            // An idle backend is usually handed out at once.
+            Some(wait) => crate::utils::timeout::timeout_at_unless_ready(start + wait, preparation)
                 .await
                 .map_err(|_| PoolError::Timeout(TimeoutType::Wait))?,
             // Zero retains the existing non-blocking per-pool behavior and

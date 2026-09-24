@@ -5,6 +5,7 @@ pub mod dashmap;
 pub mod debug_messages;
 pub mod rate_limit;
 pub mod strings;
+pub mod timeout;
 
 /// Format chrono::Duration in Go-style: `4m30s`, `1h30m`, `2d 4h30m`.
 pub fn format_duration(duration: &chrono::Duration) -> String {
