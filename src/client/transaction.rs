@@ -1028,24 +1028,7 @@ where
         {
             self.stats.active_idle();
             self.respond_to_simple_discard(false).await?;
-
-            let elapsed_us = query_start_at.elapsed().as_micros() as u64;
-            self.stats.query();
-            self.stats.transaction();
-            pool.address.stats.query_count_add();
-            pool.address.stats.query_time_add_microseconds(elapsed_us);
-            pool.address.stats.xact_count_add();
-            pool.address.stats.xact_time_add(elapsed_us);
-            crate::web::metrics::observe_pool_query_microseconds(
-                &pool.address.username,
-                &pool.address.pool_name,
-                elapsed_us,
-            );
-            crate::web::metrics::observe_pool_transaction_microseconds(
-                &pool.address.username,
-                &pool.address.pool_name,
-                elapsed_us,
-            );
+            self.record_locally_answered_query(pool, query_start_at);
             pool.address.stats.discard_all_intercepted();
             self.stats.idle_read();
             return Ok(true);
@@ -1101,6 +1084,7 @@ where
                                 "[{}@{} #c{}] DEALLOCATE ALL: cleared {} entries from client cache; answering locally",
                                 self.username, self.pool_name, self.connection_id, count
                             );
+                            self.stats.active_idle();
                             let write_timeout =
                                 config_arc().general.proxy_copy_data_timeout.as_std();
                             write_all_flush_timeout(
@@ -1109,6 +1093,8 @@ where
                                 write_timeout,
                             )
                             .await?;
+                            self.record_locally_answered_query(pool, query_start_at);
+                            self.stats.idle_read();
                             return Ok(true);
                         }
                         info!(
@@ -1141,6 +1127,7 @@ where
                                      answering with synthetic ack (backend only knows DOORMAN_<n>)",
                                     self.username, self.pool_name, self.connection_id, name
                                 );
+                                self.stats.active_idle();
                                 let write_timeout =
                                     config_arc().general.proxy_copy_data_timeout.as_std();
                                 write_all_flush_timeout(
@@ -1150,6 +1137,8 @@ where
                                 )
                                 .await?;
                                 // Handled without touching a backend.
+                                self.record_locally_answered_query(pool, query_start_at);
+                                self.stats.idle_read();
                                 return Ok(true);
                             }
                             DeallocateForwardAction::Forward => {
@@ -1170,6 +1159,32 @@ where
         }
 
         Ok(false)
+    }
+
+    /// Counts a simple query the pooler answered itself as one query and one
+    /// transaction, as if PostgreSQL had run it.
+    fn record_locally_answered_query(
+        &self,
+        pool: &crate::pool::ConnectionPool,
+        query_start_at: quanta::Instant,
+    ) {
+        let elapsed_us = query_start_at.elapsed().as_micros() as u64;
+        self.stats.query();
+        self.stats.transaction();
+        pool.address.stats.query_count_add();
+        pool.address.stats.query_time_add_microseconds(elapsed_us);
+        pool.address.stats.xact_count_add();
+        pool.address.stats.xact_time_add(elapsed_us);
+        crate::web::metrics::observe_pool_query_microseconds(
+            &pool.address.username,
+            &pool.address.pool_name,
+            elapsed_us,
+        );
+        crate::web::metrics::observe_pool_transaction_microseconds(
+            &pool.address.username,
+            &pool.address.pool_name,
+            elapsed_us,
+        );
     }
 
     /// Returns true when the statement deallocates a pooler alias.
@@ -7023,6 +7038,40 @@ mod relay_response_client_write_failure_tests {
             !server.cleanup_state.needs_cleanup_prepare,
             "the error the guard provoked must not drop the shared statements at check-in"
         );
+    }
+
+    /// A DEALLOCATE the pooler answers itself counts as a query and a
+    /// transaction, like the DISCARD ALL it answers the same way.
+    #[tokio::test]
+    async fn locally_answered_deallocate_is_counted() {
+        use std::sync::atomic::Ordering;
+
+        for sql in ["DEALLOCATE ALL", "DEALLOCATE q"] {
+            let mut client = test_client_with_writer(RecordingWriter::default());
+            client.transaction_mode = true;
+            let mut frame = BytesMut::new();
+            frame.put_u8(b'P');
+            frame.put_i32(4 + 2 + 9 + 2);
+            frame.put_slice(b"q\0SELECT 1\0");
+            frame.put_i16(0);
+            let parse: crate::messages::Parse = (&frame).try_into().unwrap();
+            let _ = client.prepared.cache.put(
+                PreparedStatementKey::Named("q".to_string()),
+                crate::client::core::CachedStatement::new(Arc::new(parse), 1, None),
+            );
+            let pool = crate::pool::ConnectionPool::test_for_protocol();
+            let query = crate::messages::simple_query(sql);
+
+            let handled = client
+                .try_handle_without_server(&query, &pool, quanta::Instant::now())
+                .await
+                .unwrap();
+
+            assert!(handled, "{sql} is answered without a backend");
+            let total = &pool.address.stats.total;
+            assert_eq!(total.query_count.load(Ordering::Relaxed), 1, "{sql}");
+            assert_eq!(total.xact_count.load(Ordering::Relaxed), 1, "{sql}");
+        }
     }
 
     /// SQL-level PREPARE keeps the backend for the client only while one of
