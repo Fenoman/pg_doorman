@@ -314,32 +314,49 @@ pub(crate) fn enforce_extended_batch_buffer_cap(
 
 /// Cap retained extended-protocol batch metadata that is not necessarily
 /// represented in `self.buffer`. Cached Parse skips append metadata but no
-/// backend-bound bytes, so the wire-buffer cap alone cannot bound memory.
-/// Deliberately NOT tied to `EXTENDED_BATCH_BUFFER_CAP`: metadata grows only
-/// with the NUMBER of pipelined operations (tens of bytes each), never with
-/// payload size, so a large-payload allowance has no reason to loosen it.
+/// backend-bound bytes, and every Parse or Close keeps a namespace journal
+/// entry with its own copy of the client name (up to `MAX_PARSE_NAME_BYTES`)
+/// while the wire carries a short internal name, so the wire-buffer cap alone
+/// cannot bound memory. Deliberately NOT tied to `EXTENDED_BATCH_BUFFER_CAP`:
+/// metadata grows with the number of pipelined operations and the names they
+/// keep, never with query or parameter payload size.
 pub(crate) const EXTENDED_BATCH_METADATA_CAP: usize = 16 * 1024 * 1024;
 
 #[inline]
-fn extended_batch_metadata_bytes(batch_operations: usize, skipped_parses: usize) -> usize {
+fn extended_batch_metadata_bytes(
+    batch_operations: usize,
+    skipped_parses: usize,
+    journal_bytes: usize,
+) -> usize {
     let batch_bytes = batch_operations.saturating_mul(std::mem::size_of::<BatchOperation>());
     let skipped_bytes = skipped_parses.saturating_mul(
         std::mem::size_of::<SkippedParse>().saturating_add(PARSE_COMPLETE_MSG.len()),
     );
-    batch_bytes.saturating_add(skipped_bytes)
+    batch_bytes
+        .saturating_add(skipped_bytes)
+        .saturating_add(journal_bytes)
 }
 
 #[inline]
 pub(crate) fn enforce_extended_batch_metadata_cap(
     current_batch_operations: usize,
     current_skipped_parses: usize,
+    current_journal_bytes: usize,
     incoming_batch_operations: usize,
     incoming_skipped_parses: usize,
+    incoming_journal_bytes: usize,
     location: &'static str,
 ) -> Result<(), crate::app::errors::Error> {
-    let current = extended_batch_metadata_bytes(current_batch_operations, current_skipped_parses);
-    let incoming =
-        extended_batch_metadata_bytes(incoming_batch_operations, incoming_skipped_parses);
+    let current = extended_batch_metadata_bytes(
+        current_batch_operations,
+        current_skipped_parses,
+        current_journal_bytes,
+    );
+    let incoming = extended_batch_metadata_bytes(
+        incoming_batch_operations,
+        incoming_skipped_parses,
+        incoming_journal_bytes,
+    );
     if current.saturating_add(incoming) > EXTENDED_BATCH_METADATA_CAP {
         return Err(crate::app::errors::Error::ClientError(format!(
             "extended-protocol pending metadata would exceed {EXTENDED_BATCH_METADATA_CAP} bytes \
@@ -3633,18 +3650,27 @@ mod extended_batch_metadata_cap_tests {
 
     #[test]
     fn metadata_cap_rejects_skipped_parse_growth_before_synthetic_response_allocation() {
-        let per_skip = extended_batch_metadata_bytes(1, 1);
+        let per_skip = extended_batch_metadata_bytes(1, 1, 0);
         assert!(per_skip > 0);
         let max_skips = EXTENDED_BATCH_METADATA_CAP / per_skip;
 
         assert!(
-            enforce_extended_batch_metadata_cap(max_skips - 1, max_skips - 1, 1, 1, "cached Parse")
-                .is_ok(),
+            enforce_extended_batch_metadata_cap(
+                max_skips - 1,
+                max_skips - 1,
+                0,
+                1,
+                1,
+                0,
+                "cached Parse"
+            )
+            .is_ok(),
             "the last entry inside the metadata budget should be accepted"
         );
 
-        let err = enforce_extended_batch_metadata_cap(max_skips, max_skips, 1, 1, "cached Parse")
-            .expect_err("one more cached Parse must exceed the metadata budget");
+        let err =
+            enforce_extended_batch_metadata_cap(max_skips, max_skips, 0, 1, 1, 0, "cached Parse")
+                .expect_err("one more cached Parse must exceed the metadata budget");
         let msg = err.to_string();
         assert!(msg.contains("pending metadata"));
         assert!(msg.contains("cached Parse"));
@@ -3652,8 +3678,16 @@ mod extended_batch_metadata_cap_tests {
 
     #[test]
     fn metadata_cap_saturates_counting_overflows() {
-        let err = enforce_extended_batch_metadata_cap(usize::MAX, usize::MAX, 1, 1, "cached Parse")
-            .expect_err("saturating arithmetic must still reject absurd metadata counts");
+        let err = enforce_extended_batch_metadata_cap(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            1,
+            1,
+            1,
+            "cached Parse",
+        )
+        .expect_err("saturating arithmetic must still reject absurd metadata counts");
         assert!(err.to_string().contains("pending metadata"));
     }
 }

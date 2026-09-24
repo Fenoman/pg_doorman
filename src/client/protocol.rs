@@ -56,7 +56,7 @@ fn synthetic_miss_should_warn() -> bool {
 
 use super::core::{
     BatchOperation, CachedStatement, Client, PreparedNamespaceChange, PreparedStatementKey,
-    PutOutcome, SkippedParse,
+    PreparedStatementState, PutOutcome, SkippedParse,
 };
 use super::PREPARED_STATEMENT_COUNTER;
 
@@ -584,7 +584,16 @@ where
             }
             _ => {}
         }
-        self.prepared.namespace_changes.push_back(change);
+        crate::client::transaction::enforce_extended_batch_metadata_cap(
+            self.prepared.batch_operations.len(),
+            self.prepared.skipped_parses.len(),
+            self.prepared.namespace_journal_bytes,
+            0,
+            0,
+            PreparedStatementState::namespace_change_bytes(&change),
+            "Parse",
+        )?;
+        self.prepared.push_namespace_change(change);
 
         // Update prepared cache stats after modification
         self.update_prepared_cache_stats();
@@ -626,8 +635,10 @@ where
                 crate::client::transaction::enforce_extended_batch_metadata_cap(
                     self.prepared.batch_operations.len(),
                     self.prepared.skipped_parses.len(),
+                    self.prepared.namespace_journal_bytes,
                     1,
                     1,
+                    0,
                     "cached Parse",
                 )?;
                 self.prepared.skipped_parses.push(SkippedParse);
@@ -1092,17 +1103,25 @@ where
                 // stats for the full LRU lifetime).
                 self.update_prepared_cache_stats();
             }
-            self.prepared
-                .namespace_changes
-                .push_back(PreparedNamespaceChange {
-                    operation_index: self.prepared.batch_operations.len() - 1,
-                    key,
-                    previous,
-                    previous_anonymous_hash,
-                    evicted: None,
-                    close_on_success: None,
-                    is_parse: false,
-                });
+            let change = PreparedNamespaceChange {
+                operation_index: self.prepared.batch_operations.len() - 1,
+                key,
+                previous,
+                previous_anonymous_hash,
+                evicted: None,
+                close_on_success: None,
+                is_parse: false,
+            };
+            crate::client::transaction::enforce_extended_batch_metadata_cap(
+                self.prepared.batch_operations.len(),
+                self.prepared.skipped_parses.len(),
+                self.prepared.namespace_journal_bytes,
+                0,
+                0,
+                PreparedStatementState::namespace_change_bytes(&change),
+                "Close",
+            )?;
+            self.prepared.push_namespace_change(change);
         }
 
         Ok(())
@@ -1156,7 +1175,7 @@ where
                                 && change.is_parse
                                 && matches!(change.key, PreparedStatementKey::Anonymous(_))
                         });
-                while let Some(change) = self.prepared.namespace_changes.pop_back() {
+                while let Some(change) = self.prepared.pop_back_namespace_change() {
                     self.prepared.cache.pop(&change.key);
                     if let Some(previous) = change.previous {
                         let _ = self.prepared.cache.put(change.key, previous);
@@ -1199,7 +1218,7 @@ where
                         change.operation_index < self.prepared.namespace_response_index
                     })
                 {
-                    let change = self.prepared.namespace_changes.pop_front().unwrap();
+                    let change = self.prepared.pop_front_namespace_change().unwrap();
                     if let Some(name) = change.close_on_success {
                         server.queue_deferred_eviction_close(name);
                     }
@@ -2087,5 +2106,66 @@ mod anonymous_close_tests {
             Some(names[0].as_str())
         );
         assert_eq!(client.prepared.named_evictions, 0);
+    }
+
+    /// Retained bytes of one journal entry keyed by `name`: the entry itself
+    /// plus its own copy of the client-supplied name.
+    fn journal_entry_bytes(name: &str) -> usize {
+        std::mem::size_of::<PreparedNamespaceChange>() + name.len()
+    }
+
+    /// Without Sync, a re-Parse of the same long name is skipped each time,
+    /// but it still keeps a journal entry with its own copy of the name. The
+    /// journal must count against the extended-batch metadata cap.
+    #[tokio::test]
+    async fn repeated_long_named_parse_journal_stays_within_metadata_cap() {
+        let mut client = test_client();
+        let pool = ConnectionPool::test_for_protocol();
+        let (mut server, _peer) = Server::test_silent_socket();
+        server.prepared_statement_cache = Some(LruCache::with_hasher(
+            NonZeroUsize::new(16).unwrap(),
+            RandomState::new(),
+        ));
+        let name = "n".repeat(crate::messages::extended::MAX_PARSE_NAME_BYTES);
+        let cap = crate::client::transaction::EXTENDED_BATCH_METADATA_CAP;
+        for _ in 0..=cap / name.len() {
+            let result = client
+                .process_parse_immediate(make_parse(&name, "SELECT 1", &[]), &pool, &mut server)
+                .await;
+            if let Err(err) = result {
+                assert!(err.to_string().contains("pending metadata"), "{err}");
+                return;
+            }
+            let retained = client.prepared.namespace_changes.len() * journal_entry_bytes(&name);
+            assert!(
+                retained <= cap,
+                "{} Parses without Sync retain {retained} journal bytes over the {cap}-byte cap",
+                client.prepared.namespace_changes.len()
+            );
+        }
+        panic!("names alone exceed the cap, yet every Parse was accepted");
+    }
+
+    /// Close is renamed to a short unregistered alias on the wire, so the
+    /// buffer cap sees a few bytes while the journal keeps the client name.
+    #[test]
+    fn repeated_long_named_close_journal_stays_within_metadata_cap() {
+        let mut client = test_client();
+        let name = "c".repeat(crate::messages::extended::MAX_PARSE_NAME_BYTES);
+        let cap = crate::client::transaction::EXTENDED_BATCH_METADATA_CAP;
+        for _ in 0..=cap / name.len() {
+            let close: BytesMut = Close::new(&name).try_into().unwrap();
+            if let Err(err) = client.process_close_immediate(close) {
+                assert!(err.to_string().contains("pending metadata"), "{err}");
+                return;
+            }
+            let retained = client.prepared.namespace_changes.len() * journal_entry_bytes(&name);
+            assert!(
+                retained <= cap,
+                "{} Closes without Sync retain {retained} journal bytes over the {cap}-byte cap",
+                client.prepared.namespace_changes.len()
+            );
+        }
+        panic!("names alone exceed the cap, yet every Close was accepted");
     }
 }

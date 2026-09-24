@@ -797,6 +797,9 @@ pub struct PreparedStatementState {
     pub batch_operations: Vec<BatchOperation>,
 
     pub(crate) namespace_changes: std::collections::VecDeque<PreparedNamespaceChange>,
+    /// Retained bytes of `namespace_changes`, including the client names each
+    /// entry owns. Counted against the extended-batch metadata cap.
+    pub(crate) namespace_journal_bytes: usize,
     pub(crate) namespace_response_index: usize,
     /// ErrorResponse from Flush keeps this set until the actual Sync reply.
     pub(crate) ignore_until_sync: bool,
@@ -852,6 +855,7 @@ impl PreparedStatementState {
             skipped_parses: Vec::new(),
             batch_operations: Vec::new(),
             namespace_changes: std::collections::VecDeque::new(),
+            namespace_journal_bytes: 0,
             namespace_response_index: 0,
             ignore_until_sync: false,
             portal_set_cleanup_commands: AHashMap::new(),
@@ -875,8 +879,52 @@ impl PreparedStatementState {
         self.skipped_parses.clear();
         self.batch_operations.clear();
         self.namespace_changes.clear();
+        self.namespace_journal_bytes = 0;
         self.namespace_response_index = 0;
         self.processed_response_counts.clear();
+    }
+
+    /// Retained bytes of one journal entry: the entry itself and the client
+    /// names it owns, up to `MAX_PARSE_NAME_BYTES` each.
+    pub(crate) fn namespace_change_bytes(change: &PreparedNamespaceChange) -> usize {
+        fn owned_name_bytes(key: &PreparedStatementKey) -> usize {
+            match key {
+                PreparedStatementKey::Named(name) => name.len(),
+                PreparedStatementKey::Anonymous(_) => 0,
+            }
+        }
+        std::mem::size_of::<PreparedNamespaceChange>()
+            .saturating_add(owned_name_bytes(&change.key))
+            .saturating_add(
+                change
+                    .evicted
+                    .as_ref()
+                    .map_or(0, |(key, _)| owned_name_bytes(key)),
+            )
+            .saturating_add(change.close_on_success.as_ref().map_or(0, String::len))
+    }
+
+    pub(crate) fn push_namespace_change(&mut self, change: PreparedNamespaceChange) {
+        self.namespace_journal_bytes = self
+            .namespace_journal_bytes
+            .saturating_add(Self::namespace_change_bytes(&change));
+        self.namespace_changes.push_back(change);
+    }
+
+    pub(crate) fn pop_front_namespace_change(&mut self) -> Option<PreparedNamespaceChange> {
+        let change = self.namespace_changes.pop_front()?;
+        self.namespace_journal_bytes = self
+            .namespace_journal_bytes
+            .saturating_sub(Self::namespace_change_bytes(&change));
+        Some(change)
+    }
+
+    pub(crate) fn pop_back_namespace_change(&mut self) -> Option<PreparedNamespaceChange> {
+        let change = self.namespace_changes.pop_back()?;
+        self.namespace_journal_bytes = self
+            .namespace_journal_bytes
+            .saturating_sub(Self::namespace_change_bytes(&change));
+        Some(change)
     }
 
     #[inline(always)]
@@ -1108,6 +1156,7 @@ impl PreparedStatementState {
         let cleared = self.cache.len();
         self.cache.clear();
         self.namespace_changes.clear();
+        self.namespace_journal_bytes = 0;
         self.namespace_response_index = 0;
         self.ignore_until_sync = false;
         self.copy_from_extended = false;
