@@ -756,22 +756,22 @@ impl PoolInner {
     fn return_object(&self, mut inner: ObjectInner) {
         let mut slots = self.slots.lock();
 
-        let retire_pool_slot = slots.size > slots.max_size;
+        // Only a resize() shrink retires a healthy returning backend: it
+        // pre-marks permits_to_retire for the checkouts it could not take
+        // back. A pre_replace_one overshoot leaves it 0; the aging backend
+        // retires itself on its lifetime check, and closing whichever backend
+        // returns first would leave the pool at max_size - 1 once it expires.
+        let retire_pool_slot = slots.size > slots.max_size && slots.permits_to_retire > 0;
         if retire_pool_slot || inner.claim_capacity_retirement() {
             slots.size = slots.size.saturating_sub(1);
-            // retire the returning permit
-            // only when resize() pre-marked one. A pre_replace_one overshoot
-            // leaves permits_to_retire == 0, so the permit is restored below
-            // instead of leaked.
-            let retire_permit = retire_pool_slot && slots.permits_to_retire > 0;
-            if retire_permit {
+            if retire_pool_slot {
                 slots.permits_to_retire -= 1;
             }
             let waker_to_close = slots.waiters.pop_front();
             drop(slots);
             drop(waker_to_close);
             drop(inner);
-            if !retire_permit {
+            if !retire_pool_slot {
                 self.semaphore.add_permits(1);
             }
             self.notify_return_observers();
@@ -5250,11 +5250,9 @@ mod tests {
 
         // pre_replace_one drives slots.size
         // above max_size WITHOUT removing a semaphore permit (it is not a
-        // resize). A return during that overshoot window hits the
-        // `size > max_size` retire branch; because permits_to_retire stays 0,
-        // the returning client's permit must be RESTORED, not retired -
-        // otherwise every such return permanently leaks a permit and the pool
-        // drifts into self-inflicted "too many clients".
+        // resize). A healthy backend returning during that overshoot window
+        // goes back to idle and restores its permit: only the aging backend
+        // that triggered the replacement retires, on its lifetime check.
         let max_size = 2;
         let pool = empty_test_pool_with_max_size(max_size);
 
@@ -5280,20 +5278,79 @@ mod tests {
         // The checked-out client returns during the overshoot window.
         let inner = pool
             .inner
-            .new_object_inner(Server::test_zombie_marked_bad(), None);
+            .new_object_inner(Server::test_dead_socket(), None);
         pool.inner.return_object(inner);
 
-        // The extra connection was retired (size back to max_size) AND the
-        // permit was restored - no leak.
         assert_eq!(
             pool.status().size,
-            max_size,
-            "the pre-replacement overshoot connection must be retired on return"
+            max_size + 1,
+            "a healthy return during pre-replacement overshoot must not be closed"
         );
         assert_eq!(
             pool.semaphore().available_permits(),
             max_size,
             "a return during pre-replacement overshoot must restore the permit, not leak it"
+        );
+    }
+
+    /// One pre-replacement must cost one backend. Closing whichever backend
+    /// returns first during the overshoot dropped a young backend, kept the
+    /// aging one, and left the pool at max_size - 1 once it expired.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_replacement_retires_only_the_aging_backend() {
+        use crate::server::Server;
+
+        let max_size = 2;
+        let pool = empty_test_pool_with_max_size(max_size);
+
+        // Two checked-out backends: X reached its lifetime, Y is young.
+        let mut x_server = Server::test_dead_socket();
+        x_server.test_set_process_id(111);
+        let mut x = pool.inner.new_object_inner(x_server, None);
+        x.metrics.lifetime_ms = 1;
+        let mut y_server = Server::test_dead_socket();
+        y_server.test_set_process_id(222);
+        let y = pool.inner.new_object_inner(y_server, None);
+        pool.semaphore().try_acquire_many(2).unwrap().forget();
+        pool.inner.slots.lock().size = max_size;
+
+        // pre_replace_one finished: the fresh F is idle, size = max_size + 1.
+        let mut f_server = Server::test_dead_socket();
+        f_server.test_set_process_id(333);
+        let f = pool.inner.new_object_inner(f_server, None);
+        {
+            let mut slots = pool.inner.slots.lock();
+            slots.size += 1;
+            push_idle(pool.inner.config.queue_mode, &mut slots.vec, f);
+        }
+
+        // The young backend returns first, then the aging one.
+        pool.inner.return_object(y);
+        pool.inner.return_object(x);
+
+        // Next checkouts run the real recycle path; X fails its lifetime.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let timeouts = Timeouts {
+            wait: Some(Duration::from_secs(1)),
+            create: Some(Duration::from_secs(1)),
+            recycle: Some(Duration::from_secs(1)),
+        };
+        let mut reused = Vec::new();
+        loop {
+            match pool.inner.try_recycle_one(&timeouts).await {
+                RecycleOutcome::Reused(inner) => reused.push(inner.obj.test_process_id()),
+                RecycleOutcome::Failed => continue,
+                RecycleOutcome::Empty => break,
+            }
+        }
+        reused.sort_unstable();
+
+        assert_eq!(reused, vec![222, 333], "the young backend must survive");
+        assert_eq!(
+            pool.status().size,
+            max_size,
+            "one pre-replacement must leave the pool at max_size"
         );
     }
 
