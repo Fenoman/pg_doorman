@@ -903,7 +903,7 @@ where
         let Some(portal_name) = execute_portal_name(message) else {
             return;
         };
-        if self.prepared.take_portal_statement_reset(portal_name) {
+        if self.prepared.portal_drops_statements(portal_name) {
             // PostgreSQL drops every statement when it runs this portal;
             // later cache hits of the batch must prepare anew.
             server.queue_statements_reset();
@@ -1822,6 +1822,32 @@ mod anonymous_close_tests {
 
         client.track_execute_cleanup_attribution(&mut server, &make_execute("later"));
         assert!(!server.has_prepared_statement("DOORMAN_warm"));
+    }
+
+    /// PostgreSQL skips the Execute of a reset portal that follows an error
+    /// in the batch; the portal lives on in the transaction (a savepoint
+    /// rollback keeps it) and runs when executed again later. Each Execute
+    /// of it counts as the reset, not only the first one assembled.
+    #[tokio::test]
+    async fn a_statements_reset_counts_again_when_its_skipped_portal_runs_later() {
+        let pool = ConnectionPool::test_for_protocol();
+        let (mut client, mut server, _peer) = client_with_warm_and_reset_statements();
+
+        client
+            .process_bind_immediate(make_bind("r", "reset"), &pool, &mut server)
+            .await
+            .unwrap();
+        client.track_execute_cleanup_attribution(&mut server, &make_execute("r"));
+        // The batch ended in an error before the reset ran.
+        server.clear_queued_statements_reset();
+        client.prepared.reset_batch();
+        assert!(server.has_prepared_statement("DOORMAN_warm"));
+
+        client.track_execute_cleanup_attribution(&mut server, &make_execute("r"));
+        assert!(
+            !server.has_prepared_statement("DOORMAN_warm"),
+            "the portal still drops every statement when it finally runs"
+        );
     }
 
     #[tokio::test]

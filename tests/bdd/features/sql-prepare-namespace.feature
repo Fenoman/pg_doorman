@@ -139,6 +139,30 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     And we send SimpleQuery "COMMIT" to both
     Then we should receive identical messages from both
 
+  Scenario: A DEALLOCATE ALL portal skipped after an error still resets when it runs after a savepoint rollback
+    When we send SimpleQuery "BEGIN" to both
+    And we send Parse "warm" with query "SELECT 1" to both
+    And we send Bind "" to "warm" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    And we send Parse "reset" with query "DEALLOCATE ALL" to both
+    And we send Bind "r" to "reset" with params "" to both
+    And we send Sync to both
+    And we send SimpleQuery "SAVEPOINT s" to both
+    And we send Parse "bad" with query "SELECT 1 / (random() * 0)::int" to both
+    And we send Bind "b" to "bad" with params "" to both
+    And we send Execute "b" to both
+    And we send Execute "r" to both
+    And we send Sync to both
+    And we send SimpleQuery "ROLLBACK TO s" to both
+    And we send Execute "r" to both
+    And we send Parse "next" with query "SELECT 1" to both
+    And we send Bind "" to "next" with params "" to both
+    And we send Execute "" to both
+    And we send Sync to both
+    And we send SimpleQuery "COMMIT" to both
+    Then we should receive identical messages from both
+
   Scenario: A Bind of an unknown statement keeps the backend's shared statements
     When we create session "one" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send Parse "q" with query "SELECT 1" to session "one"

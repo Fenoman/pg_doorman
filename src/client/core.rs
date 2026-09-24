@@ -1056,8 +1056,17 @@ impl PreparedStatementState {
         Ok(())
     }
 
-    /// Whether running `portal_name` drops every prepared statement. Such a
-    /// portal runs once, and a closed one not at all, so the mark goes.
+    /// Whether running `portal_name` drops every prepared statement. The
+    /// mark stays: an Execute PostgreSQL skipped after an error leaves the
+    /// portal to run later in the transaction, and one that ran cannot run
+    /// again.
+    #[inline]
+    pub(crate) fn portal_drops_statements(&self, portal_name: &str) -> bool {
+        !self.portal_statement_resets.is_empty()
+            && self.portal_statement_resets.contains(portal_name)
+    }
+
+    /// Forget the mark of a portal that is closed or bound anew.
     #[inline]
     pub(crate) fn take_portal_statement_reset(&mut self, portal_name: &str) -> bool {
         if self.portal_statement_resets.is_empty()
