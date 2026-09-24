@@ -53,8 +53,6 @@ fn sanitize_for_log(s: &str) -> String {
     logged
 }
 
-use tokio::time::timeout;
-
 use crate::errors::Error;
 use crate::errors::Error::MaxMessageSize;
 use crate::messages::socket::read_message_body_append;
@@ -104,23 +102,58 @@ const COMMAND_COMPLETE_BY_DEALLOCATE: &[u8; 11] = b"DEALLOCATE\0";
 /// CLOSE ALL; UNLISTEN *; ...`, so disarms every `needs_cleanup_*` flag.
 const COMMAND_COMPLETE_BY_DISCARD_ALL: &[u8; 12] = b"DISCARD ALL\0";
 
-/// Flushes messages within `duration`; timeout marks the server bad.
+/// Flushes messages, allowing at most `duration` without the backend
+/// accepting more bytes; a stall marks the server bad.
 pub(crate) async fn send_and_flush_timeout(
     server: &mut Server,
     messages: &[u8],
     duration: Duration,
 ) -> Result<(), Error> {
-    match timeout(duration, send_and_flush(server, messages)).await {
-        Ok(result) => result,
-        Err(err) => {
+    server.stats.data_sent(messages.len());
+    server.stats.wait_writing();
+
+    // Bytes already buffered go first; the messages then bypass the buffer,
+    // since a flush of the buffered writer hides how far it got.
+    let result = async {
+        use tokio::io::AsyncWriteExt;
+
+        match crate::utils::timeout::timeout_unless_ready(duration, server.stream.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                return Err(Error::SocketError(format!(
+                    "Error flushing socket: {err:?}"
+                )))
+            }
+            Err(_) => return Err(Error::ProxyTimeout),
+        }
+        write_all_flush_timeout(server.stream.get_mut(), messages, duration).await
+    }
+    .await;
+    server.stats.wait_idle();
+    match result {
+        Ok(()) => {
+            server.touch_activity();
+            Ok(())
+        }
+        Err(Error::ProxyTimeout) => {
             server.mark_bad("flush timeout");
             error!(
-                "[{}@{}] flush timeout pid={}: {err}",
+                "[{}@{}] flush timeout pid={}: no progress for {duration:?}",
                 server.address.username,
                 server.address.pool_name,
                 server.get_process_id(),
             );
             Err(Error::FlushTimeout)
+        }
+        Err(err) => {
+            error!(
+                "[{}@{}] server connection terminated pid={}: {err}",
+                server.address.username,
+                server.address.pool_name,
+                server.get_process_id(),
+            );
+            server.mark_bad("failed to flush data to server");
+            Err(err)
         }
     }
 }
@@ -1572,6 +1605,33 @@ mod tests {
         assert!(logged.len() < 2048, "{} bytes logged", logged.len());
         assert!(logged.ends_with(&format!("... ({} more bytes)", 2 * 1024 * 1024 - 1024)));
         assert_eq!(super::sanitize_for_log("line\nnext"), "line\\nnext");
+    }
+
+    /// COPY data may take longer to reach a backend than the limit in total;
+    /// the limit bounds a pause without progress, as the setting promises.
+    #[tokio::test]
+    async fn send_limit_bounds_a_pause_not_the_whole_transfer() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        let data = vec![b'd'; 4 * 1024 * 1024];
+        let reader = tokio::spawn(async move {
+            let mut chunk = vec![0_u8; 256 * 1024];
+            let mut total = 0;
+            while total < 4 * 1024 * 1024 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                total += peer.read(&mut chunk).await.unwrap();
+            }
+            total
+        });
+
+        let sent =
+            super::send_and_flush_timeout(&mut server, &data, Duration::from_millis(100)).await;
+
+        assert!(sent.is_ok(), "{sent:?}");
+        assert_eq!(reader.await.unwrap(), data.len());
+        assert!(!server.is_bad());
     }
 
     /// A missing `DOORMAN_missing_*` statement is one the pooler named on
