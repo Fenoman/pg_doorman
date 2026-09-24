@@ -1092,10 +1092,10 @@ where
             }
             _ => unreachable!("pending_large_message should only contain 'D', 'd', or 'V'"),
         };
-        if result.is_ok() {
-            // Clear deferred header only after successful handling.
-            // On error we must keep it, otherwise the next recv() call
-            // starts from the middle of a large frame and breaks protocol sync.
+        // Clear the deferred header once the frame was read whole: after
+        // success, and after a client gone mid-frame, whose rest was still
+        // read. A backend failure leaves it, and the backend is closed.
+        if matches!(result, Ok(_) | Err(Error::ClientGoneMidStream(_))) {
             server.pending_large_message = None;
         }
         return result;
@@ -2713,6 +2713,65 @@ mod tests {
         assert!(!server.is_bad(), "the backend is still in step");
         assert!(server.is_data_available());
         let drained = server.recv(tokio::io::sink(), None).await.unwrap();
+        assert_eq!(&drained[..], &rest[..]);
+        let _peer = writer.await.unwrap();
+    }
+
+    /// A large DataRow behind a RowDescription is streamed by the recv after
+    /// the one that returned the RowDescription. A client gone in the middle
+    /// of it still has the frame read whole, so the next recv starts at the
+    /// message after it instead of taking that for the rest of the row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_gone_mid_deferred_frame_leaves_the_backend_in_step() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.max_message_size = 1024;
+        let value = vec![b'x'; 200 * 1024];
+        let mut reply = BytesMut::new();
+        reply.put_u8(b'T');
+        reply.put_i32(4 + 2 + 2 + 18);
+        reply.put_i16(1);
+        reply.put_slice(b"v\0");
+        reply.put_slice(&[0; 18]);
+        reply.put_u8(b'D');
+        reply.put_i32(4 + 2 + 4 + value.len() as i32);
+        reply.put_i16(1);
+        reply.put_i32(value.len() as i32);
+        reply.put_slice(&value);
+        let mut rest = crate::messages::command_complete("SELECT 1");
+        rest.put(crate::messages::ready_for_query(false));
+        reply.put_slice(&rest);
+        let writer = tokio::spawn(async move {
+            peer.write_all(&reply).await.unwrap();
+            peer
+        });
+
+        let mut client = FailAfter {
+            limit: 10_000,
+            taken: 0,
+        };
+        let described = server.recv(&mut client, None).await.unwrap();
+        assert_eq!(described.first(), Some(&b'T'));
+        assert!(server.pending_large_message.is_some());
+        let result = server.recv(&mut client, None).await;
+        assert!(
+            matches!(result, Err(Error::ClientGoneMidStream(_))),
+            "{result:?}"
+        );
+        assert!(
+            server.pending_large_message.is_none(),
+            "the frame was read whole"
+        );
+        assert!(!server.is_bad());
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.recv(tokio::io::sink(), None),
+        )
+        .await
+        .expect("the rest of the reply is read")
+        .unwrap();
         assert_eq!(&drained[..], &rest[..]);
         let _peer = writer.await.unwrap();
     }
