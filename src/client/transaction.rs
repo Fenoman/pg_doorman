@@ -831,12 +831,23 @@ where
             }
         }
 
-        tokio::select! {
-            biased;
-            result = &mut read_fut => {
-                return result.map(NextClientMessage::Message);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut read_fut => {
+                    return result.map(NextClientMessage::Message);
+                }
+                _ = server.wait_server_data() => {}
             }
-            _ = server.wait_server_data() => {}
+            // The reply to the release query of the backend's last check-in
+            // is the pooler's own and nothing follows it: read it away and
+            // keep waiting for the client.
+            if !server.release_reply_pending() {
+                break;
+            }
+            if server.settle_release_reply_in_time().await.is_err() {
+                return Ok(NextClientMessage::ServerDead);
+            }
         }
 
         // Readiness also means ordinary protocol data: LISTEN notifications,
@@ -6258,6 +6269,77 @@ mod relay_response_client_write_failure_tests {
             );
             assert!(client.read_buf.is_empty());
         }
+    }
+
+    /// The reply to the release query of the backend's last check-in may
+    /// arrive while the client is between messages of its first batch. It is
+    /// the pooler's own reply: it is read away, and the wait for the client
+    /// goes on; no other backend message follows it.
+    #[tokio::test]
+    async fn a_release_reply_arriving_while_the_client_is_idle_is_read_away() {
+        let query = backend_frame(b'Q', b"SELECT 42\0");
+        let mut release_reply = Vec::new();
+        for (tag, row) in [
+            (&b"BEGIN\0"[..], false),
+            (b"SELECT 1\0", true),
+            (b"COMMIT\0", false),
+        ] {
+            release_reply.extend(backend_frame(b'2', b""));
+            if row {
+                release_reply.extend(backend_frame(b'D', b"\0\x02\0\0\0\0\0\0\0\0"));
+            }
+            release_reply.extend(backend_frame(b'C', tag));
+        }
+        release_reply.extend(backend_frame(b'I', b""));
+        release_reply.extend(backend_frame(b'Z', b"I"));
+
+        let (read, mut frontend) = tokio::io::duplex(256);
+        let mut client = test_client_with_reader_and_writer(read, tokio::io::sink());
+        let (mut server, mut backend) = Server::test_silent_socket();
+        server.release_reply_pending = true;
+        frontend.write_all(&query[..3]).await.unwrap();
+        backend.write_all(&release_reply).await.unwrap();
+
+        let message = {
+            let mut wait = std::pin::pin!(client.wait_for_next_message(&mut server, false));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), &mut wait)
+                    .await
+                    .is_err(),
+                "nothing but the release reply came from the backend"
+            );
+            frontend.write_all(&query[3..]).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), wait)
+                .await
+                .expect("the wait for the client goes on after the release reply")
+                .unwrap()
+        };
+        assert!(
+            matches!(message, NextClientMessage::Message(ref bytes) if bytes.as_ref() == query.as_slice())
+        );
+        assert!(!server.release_reply_pending());
+        assert!(!server.is_bad());
+    }
+
+    /// A release that failed while the client is idle leaves nothing to
+    /// wait for on that backend: it is given up like a backend that died.
+    #[tokio::test]
+    async fn a_release_failure_while_the_client_is_idle_gives_up_the_backend() {
+        let (read, _frontend) = tokio::io::duplex(256);
+        let mut client = test_client_with_reader_and_writer(read, tokio::io::sink());
+        let (mut server, mut backend) = Server::test_silent_socket();
+        server.release_reply_pending = true;
+        backend.write_all(&failed_release_reply()).await.unwrap();
+
+        let message = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.wait_for_next_message(&mut server, true),
+        )
+        .await
+        .expect("a failed release ends the wait")
+        .unwrap();
+        assert!(matches!(message, NextClientMessage::ServerDead));
+        assert!(server.is_bad());
     }
 
     #[tokio::test]

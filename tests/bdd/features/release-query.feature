@@ -183,6 +183,21 @@ Feature: Configurable release query
     And we send Sync to session "one"
     Then session "one" should receive CommandComplete "VACUUM"
 
+  @release-query-pipelined
+  Scenario: a release reply that arrives while the client is in the middle of its batch is read away
+    Given PostgreSQL database "example_db" has no pgv_free function
+    When we create session "pg" to postgres as "example_user_1" with password "" and database "example_db"
+    And we send SimpleQuery "CREATE FUNCTION public.pgv_free() RETURNS void LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.3); END $$" to session "pg" and store response
+    Then session "pg" should receive CommandComplete "CREATE FUNCTION"
+    When we create session "app" to pg_doorman as "example_user_1" with password "" and database "release_default"
+    And we send SimpleQuery "SELECT 1" to session "app"
+    And we send Parse "" with query "SELECT 42" to session "app"
+    And we sleep 600ms
+    And we send Bind "" to "" with params "" to session "app"
+    And we send Execute "" to session "app"
+    And we send Sync to session "app"
+    Then session "app" should receive DataRow with "42"
+
   @release-query-pipelined-failure
   Scenario: a query sent behind a failed default release_query is not executed and the client stays connected
     Given PostgreSQL database "example_db" has no pgv_free function
