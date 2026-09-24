@@ -56,3 +56,16 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     And we create session "other" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 1" to session "other" and store response
     Then session "other" should receive DataRow with "1"
+
+  Scenario: DEALLOCATE ALL answers like PostgreSQL and keeps the shared statements
+    When we send SimpleQuery "DEALLOCATE ALL" to both
+    Then we should receive identical messages from both
+    When we create session "one" to pg_doorman as "example_user_1" with password "" and database "example_db"
+    And we send Parse "q" with query "SELECT 1" to session "one"
+    And we send Bind "" to "q" with params "" to session "one"
+    And we send Execute "" to session "one"
+    And we send Sync to session "one"
+    And we send SimpleQuery "DEALLOCATE ALL" to session "one" and store response
+    Then session "one" should receive CommandComplete "DEALLOCATE ALL"
+    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "one" and store response
+    Then session "one" should receive DataRow with "1"

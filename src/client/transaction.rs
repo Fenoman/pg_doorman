@@ -388,6 +388,17 @@ pub(crate) const SIMPLE_DEALLOCATE_NAMED_ACK: [u8; 22] = [
     0, 5, b'I',
 ];
 
+/// Synthetic answer to `DEALLOCATE ALL` from a transaction-pool client that
+/// holds no backend (see `try_handle_without_server`).
+///
+/// Wire layout (26 bytes):
+///   CommandComplete: 'C' + i32(19) + "DEALLOCATE ALL\0"
+///   ReadyForQuery:   'Z' + i32(5)  + 'I' (idle)
+pub(crate) const SIMPLE_DEALLOCATE_ALL_ACK: [u8; 26] = [
+    b'C', 0, 0, 0, 19, b'D', b'E', b'A', b'L', b'L', b'O', b'C', b'A', b'T', b'E', b' ', b'A',
+    b'L', b'L', 0, b'Z', 0, 0, 0, 5, b'I',
+];
+
 /// outcome of the forward/synthesize decision for a SIMPLE-query
 /// `DEALLOCATE <name>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1079,6 +1090,27 @@ where
                     crate::client::util::DeallocateTarget::All => {
                         let count = self.prepared.discard_clear();
                         self.update_prepared_cache_stats();
+                        // A transaction-pool client without a backend owns no
+                        // SQL-level statements (PREPARE keeps the backend
+                        // until they are gone); its extended-protocol ones
+                        // live in the cache just cleared. The DOORMAN_N on a
+                        // backend are shared by every client, so forwarding
+                        // would only drop them for everyone.
+                        if self.transaction_mode {
+                            debug!(
+                                "[{}@{} #c{}] DEALLOCATE ALL: cleared {} entries from client cache; answering locally",
+                                self.username, self.pool_name, self.connection_id, count
+                            );
+                            let write_timeout =
+                                config_arc().general.proxy_copy_data_timeout.as_std();
+                            write_all_flush_timeout(
+                                &mut self.write,
+                                &SIMPLE_DEALLOCATE_ALL_ACK,
+                                write_timeout,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
                         info!(
                             "[{}@{} #c{}] DEALLOCATE ALL: cleared {} entries from client cache; forwarding to backend",
                             self.username, self.pool_name, self.connection_id, count
@@ -3996,23 +4028,25 @@ mod internal_round_trip_timeout_tests {
             fast_path_body.contains("config_arc().general.proxy_copy_data_timeout.as_std()"),
             "synthetic DEALLOCATE writes must use proxy_copy_data_timeout"
         );
-        let deallocate_write_idx = fast_path_body
-            .find("write_all_flush_timeout(")
-            .expect("synthetic DEALLOCATE ack must be deadline-bound");
-        let deallocate_write_call = &fast_path_body[deallocate_write_idx..];
-        let deallocate_write_call = &deallocate_write_call[..deallocate_write_call
-            .find(".await?")
-            .expect("synthetic DEALLOCATE bounded write should be awaited")];
-        assert!(
-            deallocate_write_call.contains("&SIMPLE_DEALLOCATE_NAMED_ACK")
-                && deallocate_write_call.contains("write_timeout"),
-            "synthetic DEALLOCATE ack must not wait forever on a slow client"
-        );
-        assert!(
-            !fast_path_body
-                .contains("write_all_flush(&mut self.write, &SIMPLE_DEALLOCATE_NAMED_ACK)"),
-            "synthetic DEALLOCATE ack must not use an unbounded client write"
-        );
+        for ack in ["&SIMPLE_DEALLOCATE_NAMED_ACK", "&SIMPLE_DEALLOCATE_ALL_ACK"] {
+            let ack_idx = fast_path_body.find(ack).expect(ack);
+            let deallocate_write_idx = fast_path_body[..ack_idx]
+                .rfind("write_all_flush_timeout(")
+                .expect("synthetic DEALLOCATE ack must be deadline-bound");
+            let deallocate_write_call = &fast_path_body[deallocate_write_idx..];
+            let deallocate_write_call = &deallocate_write_call[..deallocate_write_call
+                .find(".await?")
+                .expect("synthetic DEALLOCATE bounded write should be awaited")];
+            assert!(
+                deallocate_write_call.contains(ack)
+                    && deallocate_write_call.contains("write_timeout"),
+                "synthetic DEALLOCATE ack must not wait forever on a slow client"
+            );
+            assert!(
+                !fast_path_body.contains(&format!("write_all_flush(&mut self.write, {ack})")),
+                "synthetic DEALLOCATE ack must not use an unbounded client write"
+            );
+        }
 
         let simple_begin_start = impl_src
             .find("if is_standalone_begin(&message) && self.client_pending_begin.is_none()")
@@ -5084,6 +5118,13 @@ mod v4_h2_deallocate_tests {
     /// knows `DOORMAN_<n>` and would answer SQLSTATE 26000. For that case
     /// pg_doorman answers the client itself with this exact byte
     /// sequence: CommandComplete("DEALLOCATE") + ReadyForQuery(idle).
+    #[test]
+    fn simple_deallocate_all_ack_matches_the_protocol_encoders() {
+        let mut expected = crate::messages::command_complete("DEALLOCATE ALL");
+        expected.extend_from_slice(&crate::messages::ready_for_query(false));
+        assert_eq!(&SIMPLE_DEALLOCATE_ALL_ACK[..], &expected[..]);
+    }
+
     #[test]
     fn simple_deallocate_named_ack_is_well_formed() {
         let ack = SIMPLE_DEALLOCATE_NAMED_ACK;
