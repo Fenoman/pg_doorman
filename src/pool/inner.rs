@@ -1773,46 +1773,53 @@ impl Pool {
                 // while `slots.size > slots.max_size`. Log the gap so
                 // operators see resize-under-load drift.
                 let permits_to_remove = old_max_size - max_size;
-                let acquired = self
-                    .inner
-                    .semaphore
-                    .try_acquire_many(permits_to_remove as u32)
-                    .map(|p| {
-                        p.forget();
-                        permits_to_remove
-                    })
-                    .unwrap_or_else(|_| {
-                        // Try acquiring permits one at a time to take
-                        // however many ARE available right now.
-                        let mut took = 0;
-                        while took < permits_to_remove {
-                            match self.inner.semaphore.try_acquire() {
-                                Ok(p) => {
-                                    p.forget();
-                                    took += 1;
+                if self.inner.semaphore.is_closed() {
+                    // close(): a closed semaphore hands out nothing, so there
+                    // are no permits to take back, only the backends still
+                    // checked out, which retire as they return.
+                    slots.permits_to_retire = slots.size.saturating_sub(max_size);
+                } else {
+                    let acquired = self
+                        .inner
+                        .semaphore
+                        .try_acquire_many(permits_to_remove as u32)
+                        .map(|p| {
+                            p.forget();
+                            permits_to_remove
+                        })
+                        .unwrap_or_else(|_| {
+                            // Try acquiring permits one at a time to take
+                            // however many ARE available right now.
+                            let mut took = 0;
+                            while took < permits_to_remove {
+                                match self.inner.semaphore.try_acquire() {
+                                    Ok(p) => {
+                                        p.forget();
+                                        took += 1;
+                                    }
+                                    Err(_) => break,
                                 }
-                                Err(_) => break,
                             }
-                        }
-                        if took < permits_to_remove {
-                            warn!(
-                                "[{}@{}] resize shrink: could acquire only {}/{} semaphore permits - active checkouts hold the rest; semaphore will resync as clients return",
-                                self.inner.pool_name,
-                                self.inner.username,
-                                took,
-                                permits_to_remove,
-                            );
-                        }
-                        took
-                    });
-                // record the permits this
-                // shrink wanted to remove but could not forget now (held by
-                // active checkouts). The `size > max_size` retire branches
-                // consume this counter as those clients return, so they retire
-                // exactly the resize shortfall - while a pre_replace_one
-                // overshoot (which never sets it) restores permits instead of
-                // leaking them.
-                slots.permits_to_retire += permits_to_remove.saturating_sub(acquired);
+                            if took < permits_to_remove {
+                                warn!(
+                                    "[{}@{}] resize shrink: could acquire only {}/{} semaphore permits - active checkouts hold the rest; semaphore will resync as clients return",
+                                    self.inner.pool_name,
+                                    self.inner.username,
+                                    took,
+                                    permits_to_remove,
+                                );
+                            }
+                            took
+                        });
+                    // record the permits this
+                    // shrink wanted to remove but could not forget now (held by
+                    // active checkouts). The `size > max_size` retire branches
+                    // consume this counter as those clients return, so they retire
+                    // exactly the resize shortfall - while a pre_replace_one
+                    // overshoot (which never sets it) restores permits instead of
+                    // leaking them.
+                    slots.permits_to_retire += permits_to_remove.saturating_sub(acquired);
+                }
                 // Reallocate vec
                 let mut vec = VecDeque::with_capacity(max_size);
                 for obj in slots.vec.drain(..) {
@@ -5352,6 +5359,33 @@ mod tests {
             max_size,
             "one pre-replacement must leave the pool at max_size"
         );
+    }
+
+    /// Closing a pool must not read its closed semaphore as permits held by
+    /// active checkouts: only the backends still checked out retire on
+    /// return, and nothing is reported missing.
+    #[tokio::test]
+    async fn close_retires_only_checked_out_backends() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let checked_out = pool
+            .inner
+            .new_object_inner(Server::test_dead_socket(), None);
+        pool.semaphore().try_acquire_many(1).unwrap().forget();
+        pool.inner.slots.lock().size = 1;
+
+        pool.close();
+        assert_eq!(
+            pool.inner.slots.lock().permits_to_retire,
+            1,
+            "one backend is still checked out"
+        );
+
+        pool.inner.return_object(checked_out);
+        let slots = pool.inner.slots.lock();
+        assert_eq!(slots.size, 0);
+        assert_eq!(slots.permits_to_retire, 0);
     }
 
     #[test]
