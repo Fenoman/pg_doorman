@@ -1792,8 +1792,12 @@ where
             return Ok(());
         }
 
+        // PostgreSQL pauses reading COPY data while a trigger, a constraint
+        // check or a lock wait holds a row; allow the documented pause
+        // without progress instead of a short fixed limit.
+        let pause_limit = config_arc().general.proxy_copy_data_timeout.as_std();
         server
-            .send_and_flush_timeout(&self.buffer, Duration::from_secs(5))
+            .send_and_flush_timeout(&self.buffer, pause_limit)
             .await?;
 
         self.buffer.clear();
@@ -6127,6 +6131,39 @@ mod relay_response_client_write_failure_tests {
         for extended in [false, true] {
             copy_control_preserves_buffered_data(b'S', extended).await;
         }
+    }
+
+    /// PostgreSQL stops reading COPY data while a trigger or a lock wait
+    /// holds the row; the pooler must wait like a direct client does, up to
+    /// `proxy_copy_data_timeout` without progress, not abort the COPY.
+    #[tokio::test]
+    async fn copy_data_waits_for_a_backend_that_pauses_reading() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        let (mut server, mut peer) = Server::test_silent_socket();
+        server.in_copy_mode = true;
+        // Enough data to fill the socket and BufStream buffers.
+        let chunk = vec![b'x'; 4 * 1024 * 1024];
+        client.buffer.put(&chunk[..]);
+        let total = chunk.len();
+        let backend = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let mut received = vec![0_u8; total];
+            let read =
+                tokio::time::timeout(Duration::from_secs(8), peer.read_exact(&mut received)).await;
+            (read.is_ok(), peer)
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(12),
+            client.flush_copy_buffer_with_timeout(&mut server),
+        )
+        .await
+        .expect("COPY data send must finish once the backend reads again");
+        assert!(result.is_ok(), "COPY data send failed: {result:?}");
+        let (all_read, _peer) = backend.await.unwrap();
+        assert!(all_read, "the backend must receive all COPY data");
+        assert!(!server.is_bad());
+        assert!(client.buffer.is_empty());
     }
 
     async fn delayed_copy_completion_preserves_response(extended: bool) {
