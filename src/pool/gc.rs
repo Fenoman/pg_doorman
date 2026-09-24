@@ -14,6 +14,7 @@ use super::{ConnectionPool, PoolIdentifier, Status, AUTH_QUERY_STATE, DYNAMIC_PO
 /// This is a no-op when DYNAMIC_POOLS is empty (no passthrough auth_query).
 pub fn spawn_dynamic_pool_gc(interval: Duration) {
     tokio::spawn(async move {
+        let mut current_interval = interval;
         let mut ticker = tokio::time::interval(interval);
         // Skip - runtime stalls should not trigger a burst
         // of GC sweeps that all race against `from_config` reloads.
@@ -21,6 +22,18 @@ pub fn spawn_dynamic_pool_gc(interval: Duration) {
         loop {
             ticker.tick().await;
             gc_idle_dynamic_pools();
+            // Follow a RELOAD of retain_connections_time, like the retain
+            // loop; the next sweep comes a full new period later.
+            let configured = crate::config::get_config()
+                .general
+                .retain_connections_time
+                .as_std();
+            if configured != current_interval && !configured.is_zero() {
+                current_interval = configured;
+                ticker =
+                    tokio::time::interval_at(tokio::time::Instant::now() + configured, configured);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            }
         }
     });
 }

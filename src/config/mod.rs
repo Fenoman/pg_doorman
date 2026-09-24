@@ -1469,12 +1469,6 @@ pub(crate) fn restart_only_listener_fields_changed(
     {
         fields.push("general.query_interner_gc_interval_seconds");
     }
-    if old.general.retain_connections_time != new.general.retain_connections_time {
-        fields.push("general.retain_connections_time");
-    }
-    if old.general.retain_connections_max != new.general.retain_connections_max {
-        fields.push("general.retain_connections_max");
-    }
     if old.web.enabled != new.web.enabled {
         fields.push("web.enabled");
     }

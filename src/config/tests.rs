@@ -5083,21 +5083,14 @@ fn restart_only_listener_fields_changed_flags_each_bind_field() {
         vec!["general.query_interner_gc_interval_seconds"]
     );
 
+    // The retain loop and the dynamic-pool GC re-read both knobs on every
+    // tick, so RELOAD applies them without a restart.
     let mut changed = base.clone();
     changed.general.retain_connections_time = crate::config::duration::Duration::from_millis(
         base.general.retain_connections_time.as_millis() + 1,
     );
-    assert_eq!(
-        restart_only_listener_fields_changed(&base, &changed),
-        vec!["general.retain_connections_time"]
-    );
-
-    let mut changed = base.clone();
     changed.general.retain_connections_max += 1;
-    assert_eq!(
-        restart_only_listener_fields_changed(&base, &changed),
-        vec!["general.retain_connections_max"]
-    );
+    assert!(restart_only_listener_fields_changed(&base, &changed).is_empty());
 
     let mut changed = base.clone();
     changed.web.enabled = !base.web.enabled;
