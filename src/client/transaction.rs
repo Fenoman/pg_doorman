@@ -3288,7 +3288,7 @@ where
         // own reply, however long the query runs, watching the client.
         if server.release_reply_pending() {
             server
-                .settle_release_reply()
+                .settle_release_reply_in_time()
                 .await
                 .map_err(ServerWaitError::Server)?;
         }
@@ -7268,6 +7268,28 @@ mod relay_response_client_write_failure_tests {
 
         assert!(matches!(result, Err(Error::ReleaseQueryFailed(_))));
         assert!(client.write.bytes.is_empty());
+        assert!(server.is_bad());
+    }
+
+    /// A backend that took the release prefix and never answers does not
+    /// hold the next client's exchange forever: the release reply is waited
+    /// for no longer than a housekeeping query, then the backend is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_reply_that_never_comes_ends_the_exchange_in_time() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = true;
+        let (mut server, _peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+
+        let query = crate::messages::simple_query("SELECT 1");
+        let result = tokio::time::timeout(
+            crate::server::HOUSEKEEPING_TIMEOUT + Duration::from_secs(5),
+            client.handle_simple_query(&query, &mut server, quanta::Instant::now()),
+        )
+        .await
+        .expect("the release reply is waited for in bounded time");
+
+        assert!(result.is_err());
         assert!(server.is_bad());
     }
 

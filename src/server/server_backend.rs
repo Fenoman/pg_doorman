@@ -1961,12 +1961,6 @@ impl Server {
         self.release_reply_pending
     }
 
-    /// Read the reply to the release query of the last check-in; see
-    /// [`protocol_io::settle_release_reply`].
-    pub(crate) async fn settle_release_reply(&mut self) -> Result<(), Error> {
-        protocol_io::settle_release_reply(self).await
-    }
-
     /// Reads the reply to the last check-in's release query if it has
     /// already arrived whole, without waiting for any of it. A reply still
     /// on its way stays for the next exchange to read.
@@ -4021,7 +4015,7 @@ mod tests {
                 .unwrap();
             assert_eq!(&sent[..], expected, "after {reset:?}");
             peer.write_all(&ready).await.unwrap();
-            server.settle_release_reply().await.unwrap();
+            server.settle_release_reply_in_time().await.unwrap();
         }
     }
 
