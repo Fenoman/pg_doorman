@@ -67,7 +67,7 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     And we send Sync to session "one"
     And we send SimpleQuery "DEALLOCATE ALL" to session "one" and store response
     Then session "one" should receive CommandComplete "DEALLOCATE ALL"
-    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "one" and store response
+    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%' AND name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')" to session "one" and store response
     Then session "one" should receive DataRow with "1"
 
   Scenario: A DEALLOCATE ALL inside a pipeline keeps the statements prepared after it
@@ -107,5 +107,5 @@ Feature: Statements created with SQL PREPARE behave as on PostgreSQL
     And we send Execute "" to session "one"
     And we send Sync to session "one"
     Then session "one" should receive error containing "does not exist"
-    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "one" and store response
+    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%' AND name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')" to session "one" and store response
     Then session "one" should receive DataRow with "1"

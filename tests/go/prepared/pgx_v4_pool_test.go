@@ -56,7 +56,8 @@ func TestPgxV4Prepared(t *testing.T) {
 			atomic.AddUint32(&count, 1)
 			if atomic.LoadUint32(&count)%1000 == 0 {
 				var preparedCount, backendPid, memory int
-				if err := tx.QueryRow(ctx, "select count(*), pg_backend_pid() from pg_prepared_statements").Scan(
+				if err := tx.QueryRow(ctx, "select count(*), pg_backend_pid() from pg_prepared_statements"+
+					" WHERE name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')").Scan(
 					&preparedCount, &backendPid); err != nil {
 					assert.NoError(t, err)
 				}

@@ -49,11 +49,11 @@ Feature: Repeated Parse does not multiply statements on backends
     And we send SimpleQuery "BEGIN" to session "b3"
     And we create session "b4" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "BEGIN" to session "b4"
-    Then we send SimpleQuery "SELECT CASE WHEN count(*) <= 2 THEN 'ok' ELSE 'backend holds ' || count(*) || ' DOORMAN statements' END FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "b1" and store response
+    Then we send SimpleQuery "SELECT CASE WHEN count(*) <= 2 THEN 'ok' ELSE 'backend holds ' || count(*) || ' DOORMAN statements' END FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%' AND name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')" to session "b1" and store response
     And session "b1" should receive DataRow with "ok"
-    And we send SimpleQuery "SELECT CASE WHEN count(*) <= 2 THEN 'ok' ELSE 'backend holds ' || count(*) || ' DOORMAN statements' END FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "b2" and store response
+    And we send SimpleQuery "SELECT CASE WHEN count(*) <= 2 THEN 'ok' ELSE 'backend holds ' || count(*) || ' DOORMAN statements' END FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%' AND name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')" to session "b2" and store response
     And session "b2" should receive DataRow with "ok"
-    And we send SimpleQuery "SELECT CASE WHEN count(*) <= 2 THEN 'ok' ELSE 'backend holds ' || count(*) || ' DOORMAN statements' END FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "b3" and store response
+    And we send SimpleQuery "SELECT CASE WHEN count(*) <= 2 THEN 'ok' ELSE 'backend holds ' || count(*) || ' DOORMAN statements' END FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%' AND name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')" to session "b3" and store response
     And session "b3" should receive DataRow with "ok"
-    And we send SimpleQuery "SELECT CASE WHEN count(*) <= 2 THEN 'ok' ELSE 'backend holds ' || count(*) || ' DOORMAN statements' END FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "b4" and store response
+    And we send SimpleQuery "SELECT CASE WHEN count(*) <= 2 THEN 'ok' ELSE 'backend holds ' || count(*) || ' DOORMAN statements' END FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%' AND name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')" to session "b4" and store response
     And session "b4" should receive DataRow with "ok"

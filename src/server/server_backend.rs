@@ -254,8 +254,37 @@ pub(crate) struct ResolvedReleaseQuery {
     /// Messages sent at check-in without waiting for the reply, for the
     /// release queries the pooler itself chose; see [`release_prefix`].
     /// `None` for an operator's query, which keeps its round trip.
-    prefix: Option<Bytes>,
+    prefix: Option<ReleasePrefix>,
 }
+
+/// The pooler's release query as sent at check-in without waiting for the
+/// reply; see [`release_prefix`].
+#[derive(Clone, Debug)]
+pub(crate) struct ReleasePrefix {
+    /// Prepares the named statements, then runs them.
+    first: Bytes,
+    /// Runs the statements already prepared on the backend.
+    prepared: Bytes,
+}
+
+impl ReleasePrefix {
+    #[inline]
+    pub(crate) fn first(&self) -> &[u8] {
+        &self.first
+    }
+
+    #[inline]
+    pub(crate) fn prepared(&self) -> &[u8] {
+        &self.prepared
+    }
+}
+
+/// Names of the release statements the pooler prepares on each backend.
+const RELEASE_STATEMENT_NAMES: [&str; 3] = [
+    "DOORMAN_release_begin",
+    "DOORMAN_release",
+    "DOORMAN_release_commit",
+];
 
 impl ResolvedReleaseQuery {
     #[inline]
@@ -269,8 +298,8 @@ impl ResolvedReleaseQuery {
     }
 
     #[inline]
-    pub(crate) fn prefix(&self) -> Option<&[u8]> {
-        self.prefix.as_deref()
+    pub(crate) fn prefix(&self) -> Option<&ReleasePrefix> {
+        self.prefix.as_ref()
     }
 }
 
@@ -308,15 +337,37 @@ fn release_reply_arrived(received: &[u8]) -> bool {
     false
 }
 
-/// Wire form of statements whose reply is read only before the next exchange
-/// on the backend: BEGIN, the statements and COMMIT as unnamed Parse, Bind
-/// and Execute, then an empty Query. PostgreSQL answers at once, and the
-/// committed block leaves the backend idle, as after a simple Query; without
-/// the explicit block PostgreSQL 18 keeps the implicit transaction open across
-/// the empty Query. If a statement fails, PostgreSQL skips every message up
-/// to the next Sync, the empty Query and the next client's messages
-/// included, so nothing runs in a session the release did not clean.
-fn release_prefix<'a>(statements: impl IntoIterator<Item = &'a str>) -> Bytes {
+/// Wire form of the pooler's release query, whose reply is read only before
+/// the next exchange on the backend: BEGIN, the query and COMMIT as named
+/// statements run by Bind and Execute, then an empty Query. They are prepared
+/// once per backend, as parse and plan cost PostgreSQL more than running
+/// them. PostgreSQL answers at once, and the committed block leaves the
+/// backend idle, as after a simple Query; without the explicit block
+/// PostgreSQL 18 keeps the implicit transaction open across the empty Query.
+/// If a statement fails, PostgreSQL skips every message up to the next Sync,
+/// the empty Query and the next client's messages included, so nothing runs
+/// in a session the release did not clean.
+fn release_prefix(sql: &str) -> ReleasePrefix {
+    let statements = ["BEGIN", sql, "COMMIT"];
+    let mut prepared = BytesMut::new();
+    for name in RELEASE_STATEMENT_NAMES {
+        prepared.put(bind_execute(name));
+    }
+    prepared.put(simple_query(";"));
+    let mut first = BytesMut::new();
+    for (name, statement) in RELEASE_STATEMENT_NAMES.into_iter().zip(statements) {
+        first.put(named_parse(name, statement));
+    }
+    first.put_slice(&prepared);
+    ReleasePrefix {
+        first: first.freeze(),
+        prepared: prepared.freeze(),
+    }
+}
+
+/// The same form built for one check-in with unnamed statements: BEGIN, the
+/// statements and COMMIT, then an empty Query.
+fn unnamed_release_prefix<'a>(statements: impl IntoIterator<Item = &'a str>) -> Bytes {
     let mut prefix = extended_statement("BEGIN");
     for statement in statements {
         prefix.put(extended_statement(statement));
@@ -326,9 +377,45 @@ fn release_prefix<'a>(statements: impl IntoIterator<Item = &'a str>) -> Bytes {
     prefix.freeze()
 }
 
+fn trim_statement(sql: &str) -> &str {
+    sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace())
+}
+
+/// A Parse of `sql` as the named statement `name`, with no parameter types.
+fn named_parse(name: &str, sql: &str) -> BytesMut {
+    let statement = trim_statement(sql);
+    let mut message = BytesMut::with_capacity(name.len() + statement.len() + 9);
+    message.put_u8(b'P');
+    message.put_i32(4 + name.len() as i32 + 1 + statement.len() as i32 + 1 + 2);
+    message.put_slice(name.as_bytes());
+    message.put_u8(0);
+    message.put_slice(statement.as_bytes());
+    message.put_u8(0);
+    message.put_i16(0);
+    message
+}
+
+/// Bind of the named statement `name` to the unnamed portal, then Execute.
+fn bind_execute(name: &str) -> BytesMut {
+    let mut messages = BytesMut::with_capacity(name.len() + 23);
+    messages.put_u8(b'B');
+    messages.put_i32(4 + 1 + name.len() as i32 + 1 + 2 + 2 + 2);
+    messages.put_u8(0);
+    messages.put_slice(name.as_bytes());
+    messages.put_u8(0);
+    messages.put_i16(0);
+    messages.put_i16(0);
+    messages.put_i16(0);
+    messages.put_u8(b'E');
+    messages.put_i32(4 + 1 + 4);
+    messages.put_u8(0);
+    messages.put_i32(0);
+    messages
+}
+
 /// One statement as unnamed Parse, Bind and Execute, without Sync.
 fn extended_statement(sql: &str) -> BytesMut {
-    let statement = sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    let statement = trim_statement(sql);
     let mut messages = BytesMut::with_capacity(statement.len() + 34);
     messages.put_u8(b'P');
     messages.put_i32(4 + 1 + statement.len() as i32 + 1 + 2);
@@ -387,7 +474,7 @@ pub(crate) fn resolve_pooler_release_query(sql: &str) -> ResolvedReleaseQuery {
     ResolvedReleaseQuery {
         sql: Arc::from(sql),
         frame: release_query_frame(sql),
-        prefix: Some(release_prefix([sql])),
+        prefix: Some(release_prefix(sql)),
     }
 }
 
@@ -729,6 +816,12 @@ pub struct Server {
     /// That release failed: PostgreSQL aborted the transaction block it
     /// opened, which the client never did. The backend is marked bad.
     pub(crate) release_failed: bool,
+
+    /// The pooler's release statements are prepared on this backend under
+    /// `RELEASE_STATEMENT_NAMES`. Cleared by anything that drops prepared
+    /// statements: DEALLOCATE ALL or DISCARD ALL, the client's or the
+    /// pooler's.
+    pub(crate) release_statements_prepared: bool,
 
     /// Whether the DISCARD ALL synthetic-response fast path is allowed for
     /// this backend. Mirrors `Pool.intercept_discard_all`. Installed by
@@ -1786,13 +1879,16 @@ impl Server {
         let session_state_was_dirty =
             self.cleanup_state.needs_cleanup() && self.cleanup_connections;
         let needs_cleanup_prepare = self.cleanup_state.needs_cleanup_prepare;
-        let messages = release_prefix(
+        let messages = unnamed_release_prefix(
             stmts
                 .iter()
                 .map(String::as_str)
                 .chain(std::iter::once(release_sql)),
         );
         self.send_release_prefix(&messages).await?;
+        if stmts.iter().any(|stmt| stmt == "DEALLOCATE ALL") {
+            self.release_statements_prepared = false;
+        }
 
         if needs_cleanup_prepare && session_state_was_dirty {
             self.registering_prepared_statement.clear();
@@ -2143,7 +2239,16 @@ impl Server {
             self.in_copy_mode = false;
             return match release_query.as_ref() {
                 Some(release_query) => match release_query.prefix() {
-                    Some(prefix) => self.send_release_prefix(prefix).await,
+                    Some(prefix) => {
+                        let messages = if self.release_statements_prepared {
+                            prefix.prepared()
+                        } else {
+                            prefix.first()
+                        };
+                        self.send_release_prefix(messages).await?;
+                        self.release_statements_prepared = true;
+                        Ok(())
+                    }
                     None => self.send_release_query_only(release_query).await,
                 },
                 None => {
@@ -3187,6 +3292,7 @@ impl Server {
                         release_cleanup_pending: false,
                         release_reply_pending: false,
                         release_failed: false,
+                        release_statements_prepared: false,
                         intercept_discard_all: true,
                         abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
                         internal_round_trip_in_flight: false,
@@ -3528,6 +3634,7 @@ impl Server {
             release_cleanup_pending: false,
             release_reply_pending: false,
             release_failed: false,
+            release_statements_prepared: false,
             intercept_discard_all: true,
             abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
         };
@@ -3583,28 +3690,57 @@ mod tests {
         );
     }
 
-    /// The default goes out as unnamed Parse, Bind and Execute of the
-    /// statement without its trailing semicolon, then an empty Query.
-    #[test]
-    fn default_release_query_is_encoded_as_the_skip_until_sync_prefix() {
-        let resolved = resolve_release_query(None).expect("default release query");
-        let mut expected = Vec::new();
-        for statement in [
-            &b"BEGIN"[..],
-            b"SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free()",
-            b"COMMIT",
+    /// Bind and Execute of the pooler's named release statements, then an
+    /// empty Query: what every check-in after the first sends.
+    fn release_run() -> Vec<u8> {
+        let mut run = Vec::new();
+        for name in [
+            "DOORMAN_release_begin",
+            "DOORMAN_release",
+            "DOORMAN_release_commit",
         ] {
-            expected.push(b'P');
-            expected.extend_from_slice(&(4 + 1 + statement.len() as i32 + 1 + 2).to_be_bytes());
-            expected.push(0);
-            expected.extend_from_slice(statement);
-            expected.extend_from_slice(&[0, 0, 0]);
-            expected.extend_from_slice(&[b'B', 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0]);
-            expected.extend_from_slice(&[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0]);
+            run.push(b'B');
+            run.extend_from_slice(&(4 + 1 + name.len() as i32 + 1 + 2 + 2 + 2).to_be_bytes());
+            run.push(0);
+            run.extend_from_slice(name.as_bytes());
+            run.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+            run.extend_from_slice(&[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0]);
         }
-        expected.extend_from_slice(&crate::messages::simple_query(";"));
+        run.extend_from_slice(&crate::messages::simple_query(";"));
+        run
+    }
 
-        assert_eq!(resolved.prefix(), Some(&expected[..]));
+    /// The first check-in on a backend prepares BEGIN, the release and
+    /// COMMIT under the pooler's names; later ones only bind and execute
+    /// them, skipping the parse and plan PostgreSQL would redo each time.
+    #[test]
+    fn default_release_query_is_prepared_once_and_then_only_executed() {
+        let resolved = resolve_release_query(None).expect("default release query");
+        let prefix = resolved
+            .prefix()
+            .expect("the default is sent without waiting");
+        let mut first = Vec::new();
+        for (name, statement) in [
+            ("DOORMAN_release_begin", "BEGIN"),
+            (
+                "DOORMAN_release",
+                "SELECT pg_catalog.pg_advisory_unlock_all(), public.pgv_free()",
+            ),
+            ("DOORMAN_release_commit", "COMMIT"),
+        ] {
+            first.push(b'P');
+            first.extend_from_slice(
+                &(4 + name.len() as i32 + 1 + statement.len() as i32 + 1 + 2).to_be_bytes(),
+            );
+            first.extend_from_slice(name.as_bytes());
+            first.push(0);
+            first.extend_from_slice(statement.as_bytes());
+            first.extend_from_slice(&[0, 0, 0]);
+        }
+        first.extend_from_slice(&release_run());
+
+        assert_eq!(prefix.first(), &first[..]);
+        assert_eq!(prefix.prepared(), &release_run()[..]);
     }
 
     /// A backend already marked bad is closed on return, which ends its
@@ -3649,6 +3785,7 @@ mod tests {
         server.cleanup_state.needs_cleanup_prepare = true;
         server.set_release_query(None);
         server.arm_release_cleanup();
+        server.release_statements_prepared = true;
 
         tokio::time::timeout(Duration::from_secs(1), server.finalize_checkin())
             .await
@@ -3673,6 +3810,10 @@ mod tests {
         assert!(!server.cleanup_state.needs_cleanup());
         assert!(server.release_reply_pending);
         assert!(!server.release_cleanup_pending);
+        assert!(
+            !server.release_statements_prepared,
+            "DEALLOCATE ALL drops the release statements too"
+        );
     }
 
     /// A backend returned inside a transaction (its client went away) keeps
@@ -3727,6 +3868,7 @@ mod tests {
             .unwrap()
             .prefix()
             .unwrap()
+            .first()
             .to_vec();
         let mut sent = vec![0_u8; expected.len()];
         peer.read_exact(&mut sent).await.unwrap();
@@ -3734,6 +3876,47 @@ mod tests {
         assert!(!server.release_cleanup_pending);
         assert!(server.release_reply_pending);
         assert!(!server.is_bad());
+    }
+
+    /// Once prepared, the release statements are only executed, until a
+    /// DEALLOCATE ALL or DISCARD ALL drops them and they are prepared again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_statements_are_prepared_again_after_a_reset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = super::Server::test_silent_socket();
+        server.set_release_query(None);
+        let prefix = resolve_release_query(None)
+            .unwrap()
+            .prefix()
+            .unwrap()
+            .clone();
+        let ready = crate::messages::ready_for_query(false);
+        for (reset, expected) in [
+            (None, prefix.first()),
+            (None, prefix.prepared()),
+            (Some("DEALLOCATE ALL"), prefix.first()),
+            (Some("DISCARD ALL"), prefix.first()),
+        ] {
+            if let Some(tag) = reset {
+                peer.write_all(&crate::messages::command_complete(tag))
+                    .await
+                    .unwrap();
+                peer.write_all(&ready).await.unwrap();
+                server.recv(tokio::io::sink(), None).await.unwrap();
+            }
+            server.arm_release_cleanup();
+            server.finalize_checkin().await.expect("check-in");
+            let mut sent = vec![0_u8; expected.len()];
+            tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut sent))
+                .await
+                .unwrap_or_else(|_| panic!("the check-in after {reset:?} sent a shorter form"))
+                .unwrap();
+            assert_eq!(&sent[..], expected, "after {reset:?}");
+            peer.write_all(&ready).await.unwrap();
+            server.settle_release_reply().await.unwrap();
+        }
     }
 
     #[cfg(unix)]

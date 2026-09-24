@@ -54,7 +54,7 @@ Feature: An ordinary SQL error keeps the backend's prepared statements
     And we send Sync to session "one"
     And we send SimpleQuery "SELECT 1/0" to session "one" expecting error
     Then session "one" should receive error containing "division by zero"
-    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%'" to session "one" and store response
+    When we send SimpleQuery "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'DOORMAN%' AND name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')" to session "one" and store response
     Then session "one" should receive DataRow with "1"
 
   Scenario: With cleanup disabled a statement error keeps the backend

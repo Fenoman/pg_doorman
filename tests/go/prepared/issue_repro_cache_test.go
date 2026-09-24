@@ -26,7 +26,9 @@ func TestIssueReproPreparedCache(t *testing.T) {
 
 	// Проверяем количество подготовленных операторов в бэкенде
 	var count int
-	err = conn.QueryRow(ctx, "SELECT count(*) FROM pg_prepared_statements").Scan(&count)
+	// The pooler's own release statements are not the client's.
+	err = conn.QueryRow(ctx, "SELECT count(*) FROM pg_prepared_statements"+
+		" WHERE name NOT IN ('DOORMAN_release_begin', 'DOORMAN_release', 'DOORMAN_release_commit')").Scan(&count)
 	assert.NoError(t, err)
 
 	// Должно быть ровно 10, так как prepared_statements_cache_size = 10

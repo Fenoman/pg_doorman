@@ -734,6 +734,7 @@ fn classify_command_complete_with_attribution(
 /// the same pipeline and creates its statement after the reset, so those
 /// registrations and their cache entries stay.
 fn drop_prepared_statement_cache_on_reset(server: &mut Server, reason: &'static str) {
+    server.release_statements_prepared = false;
     let Some(cache_size) = server
         .prepared_statement_cache
         .as_ref()
