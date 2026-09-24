@@ -1042,7 +1042,8 @@ where
     /// PostgreSQL acknowledges a Close for an absent name, so a fresh unused
     /// alias preserves response order without touching any physical statement.
     /// Client names can coincide with another statement's DOORMAN_* alias.
-    /// Portal Close and uncached statement Close retain their original names.
+    /// Portal Close and a Close of a name the pooler does not manage, such as
+    /// a statement created with SQL PREPARE, retain their original names.
     #[inline]
     pub(crate) fn process_close_immediate(&mut self, message: BytesMut) -> Result<(), Error> {
         if self.prepared.ignore_until_sync {
@@ -1055,7 +1056,15 @@ where
             "Close",
         )?;
         let close: Close = (&message).try_into()?;
-        let message = if self.prepared.enabled && close.is_prepared_statement() {
+        let pooler_managed = close.is_prepared_statement()
+            && (close.anonymous()
+                || close.name.starts_with("DOORMAN_")
+                || self
+                    .prepared
+                    .cache
+                    .get(&PreparedStatementKey::Named(close.name.clone()))
+                    .is_some());
+        let message = if self.prepared.enabled && pooler_managed {
             let rewritten = Close::rename(message, &Self::unregistered_prepared_statement_name())?;
             crate::client::transaction::enforce_extended_batch_buffer_cap(
                 self.buffer.len(),
@@ -1923,6 +1932,18 @@ mod anonymous_close_tests {
             );
             assert!(client.prepared.cache.get(&keep).is_some());
         }
+    }
+
+    /// A statement created with SQL PREPARE is unknown to the pooler cache,
+    /// and its protocol Close must reach PostgreSQL under its own name:
+    /// otherwise the statement stays and the next PREPARE of that name fails.
+    #[test]
+    fn close_of_sql_prepared_statement_keeps_its_wire_name() {
+        let mut client = test_client();
+        assert!(client.prepared.enabled);
+        let close: BytesMut = Close::new("sql_prepared").try_into().unwrap();
+        client.process_close_immediate(close.clone()).unwrap();
+        assert_eq!(&client.buffer[..], &close[..]);
     }
 
     #[test]
