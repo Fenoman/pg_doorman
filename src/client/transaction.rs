@@ -4587,14 +4587,15 @@ mod client_response_write_timeout_tests {
             "post-release fast-response flush must use proxy_copy_data_timeout"
         );
         assert!(
-            flush_body.contains("write_all_flush_timeout(")
-                && flush_body.contains("buffered_response")
-                && flush_body.contains("write_timeout"),
+            flush_body.contains(
+                "write_all_flush_timeout(client_write, buffered_response, write_timeout)"
+            ),
             "post-release fast-response flush must not wait forever on a slow client"
         );
         assert!(
-            !flush_body
-                .contains("write_all_flush(&mut self.write, &self.client_last_messages_in_tx"),
+            !flush_body.contains("write_all_flush(client_write")
+                && !flush_body
+                    .contains("write_all_flush(&mut self.write, &self.client_last_messages_in_tx"),
             "post-release fast-response flush must not use an unbounded client write"
         );
     }
