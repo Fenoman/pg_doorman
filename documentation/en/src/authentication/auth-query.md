@@ -43,6 +43,14 @@ When a client connects as `alice`:
 3. Performs MD5 or SCRAM passthrough authentication (see [Passthrough](passthrough.md)).
 4. Opens a backend connection authenticated as `alice` with the same hash.
 
+Each such user gets its own pool, and a database accepts at most 1024 of
+them. The 1025th distinct user is refused with SQLSTATE 58000 ("Unable to
+create authenticated dynamic pool"), a WARN line `dynamic pool limit reached`
+and an auth failure in the metrics. The pool of a user that disconnected
+is garbage-collected once it has no backend connections left, unless
+`min_pool_size > 0`; `RELOAD` starts the count over. For more users per
+database use dedicated mode.
+
 ## Dedicated mode
 
 ```yaml
