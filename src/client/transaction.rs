@@ -7653,6 +7653,35 @@ mod relay_response_client_write_failure_tests {
         }
     }
 
+    /// A query the pooler answers itself is also observed in the pool query
+    /// and transaction latency histograms, like one PostgreSQL ran.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn locally_answered_query_is_observed_in_pool_latency_histograms() {
+        let mut client = test_client_with_writer(RecordingWriter::default());
+        client.transaction_mode = true;
+        let mut pool = crate::pool::ConnectionPool::test_for_protocol();
+        pool.address.username = "local_answer_user".to_string();
+        pool.address.pool_name = "local_answer_pool".to_string();
+        let labels = ["local_answer_user", "local_answer_pool"];
+        let queries =
+            crate::web::metrics::SHOW_POOLS_QUERY_DURATION_SECONDS.with_label_values(&labels);
+        let transactions =
+            crate::web::metrics::SHOW_POOLS_TRANSACTION_DURATION_SECONDS.with_label_values(&labels);
+        let before = (queries.get_sample_count(), transactions.get_sample_count());
+
+        let query = crate::messages::simple_query("DEALLOCATE ALL");
+        let started = quanta::Instant::now() - Duration::from_millis(5);
+        let handled = client
+            .try_handle_without_server(&query, &pool, started)
+            .await
+            .unwrap();
+
+        assert!(handled);
+        assert_eq!(queries.get_sample_count(), before.0 + 1);
+        assert_eq!(transactions.get_sample_count(), before.1 + 1);
+    }
+
     /// SQL-level PREPARE keeps the backend for the client only while one of
     /// its statements exists there: a failed PREPARE creates none. Its
     /// ordinary error also leaves the statements other clients share alone.
