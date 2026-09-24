@@ -75,6 +75,18 @@ Feature: Client session reset batch suppresses doorman-side cleanup
       username = "example_user_1"
       password = ""
       pool_size = 1
+
+      [pools.reset_abandoned]
+      server_host = "127.0.0.1"
+      server_port = ${PG_PORT}
+      server_database = "example_db"
+      pool_mode = "session"
+      release_query = ""
+
+      [[pools.reset_abandoned.users]]
+      username = "example_user_1"
+      password = ""
+      pool_size = 1
       """
 
   @client-session-reset-cleanup-pgx-batch
@@ -270,3 +282,15 @@ Feature: Client session reset batch suppresses doorman-side cleanup
     When we create session "extended_clean" to pg_doorman as "example_user_1" with password "" and database "reset_rollback"
     And we send SimpleQuery "SELECT current_setting('search_path') = 'pg_catalog'" to session "extended_clean" and store response
     Then session "extended_clean" should receive DataRow with "f"
+
+  @client-session-reset-cleanup-abandoned-reset-rollback
+  Scenario: a RESET ALL rolled back in a query its client abandoned leaves the cleanup armed
+    When we create session "abandoning" to pg_doorman as "example_user_1" with password "" and database "reset_abandoned"
+    And we send SimpleQuery "SET work_mem = '77MB'" to session "abandoning"
+    And we send SimpleQuery "BEGIN; RESET ALL; SELECT pg_sleep(0.3); ROLLBACK" to session "abandoning" without waiting
+    And we sleep 100ms
+    And we abort TCP connection for session "abandoning"
+    And we sleep 600ms
+    And we create session "next" to pg_doorman as "example_user_1" with password "" and database "reset_abandoned"
+    And we send SimpleQuery "SELECT current_setting('work_mem') = '77MB'" to session "next" and store response
+    Then session "next" should receive DataRow with "f"
