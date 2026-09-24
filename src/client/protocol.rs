@@ -729,11 +729,13 @@ where
         // Never forward a cache-miss client name verbatim: it could coincide
         // with another logical statement's cached DOORMAN_* backend alias.
         // A fresh unregistered name makes PostgreSQL produce the error in
-        // batch order and enter its normal skip-until-Sync state.
+        // batch order and enter its normal skip-until-Sync state. The suffix
+        // is random: a client that could predict the name could create it
+        // with SQL PREPARE, and a Bind aimed here would execute that.
         Arc::from(format!(
-            "{}{}",
+            "{}{:016x}",
             crate::client::util::UNREGISTERED_STATEMENT_PREFIX,
-            PREPARED_STATEMENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+            rand::random::<u64>()
         ))
     }
 
@@ -2298,5 +2300,30 @@ mod anonymous_close_tests {
             );
         }
         panic!("names alone exceed the cap, yet every Close was accepted");
+    }
+
+    /// A Bind of an unknown statement is aimed at an unregistered name. A
+    /// client that could predict the name could create it with SQL PREPARE
+    /// and have that Bind execute its statement instead of failing.
+    #[test]
+    fn unregistered_statement_names_cannot_be_predicted() {
+        let random_suffix = |name: Arc<str>| {
+            let hex = name
+                .strip_prefix(crate::client::util::UNREGISTERED_STATEMENT_PREFIX)
+                .unwrap_or_else(|| panic!("{name} lacks the unregistered prefix"));
+            assert!(
+                hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{name} does not end with 16 hex digits"
+            );
+            u64::from_str_radix(hex, 16).unwrap()
+        };
+        let first = random_suffix(Client::<Empty, Sink>::unregistered_prepared_statement_name());
+        let second = random_suffix(Client::<Empty, Sink>::unregistered_prepared_statement_name());
+        // A counter in any base puts the next name right after the previous
+        // one. Two random values are this close with probability 2^-31.
+        assert!(
+            first.abs_diff(second) > u64::from(u32::MAX),
+            "{first:016x} and {second:016x} are too close to be random"
+        );
     }
 }
