@@ -31,6 +31,15 @@ What does **not** work in transaction mode:
 - Cursors held outside transactions (`WITH HOLD`). Use session mode.
 - `SET LOCAL` works as expected — it is transaction-scoped.
 
+### A client that disconnects during a query
+
+If a client disconnects while PostgreSQL still runs its query, PgDoorman keeps the backend for it until the query ends. A query that finishes within a second is read to the end, and the backend goes through the usual check-in cleanup back to the pool. A longer query is canceled with a CancelRequest, and the backend is closed once PostgreSQL answers, or 10 seconds after the cancel. The pool slot stays occupied all that time, so the backend that takes it never runs next to the abandoned query.
+
+Two cases are not covered:
+
+- A DataRow, CopyData or function call result larger than `message_size_to_be_stream` is streamed to the client in parts. If the client disconnects in the middle, the backend is closed at once and its slot is freed. PostgreSQL notices the closed connection only on its next write, so the rest of the query can run next to the backend that takes the slot.
+- Once PostgreSQL has sent part of the response, for example a NOTICE, PgDoorman notices the disconnect only with the next message. Until then the backend stays with the gone client, and the query is not canceled.
+
 ## Session mode
 
 ```yaml
