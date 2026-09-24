@@ -804,8 +804,12 @@ impl PoolInner {
     /// an idle backend still holds its database permit and cannot wake them.
     fn requeue_handoff(&self, mut inner: ObjectInner) {
         let mut slots = self.slots.lock();
-        if inner.claim_capacity_retirement() {
+        let pool_closed = self.semaphore.is_closed();
+        if pool_closed || inner.claim_capacity_retirement() {
             slots.size = slots.size.saturating_sub(1);
+            if pool_closed {
+                slots.permits_to_retire = slots.permits_to_retire.saturating_sub(1);
+            }
             drop(slots);
             drop(inner);
             self.notify_return_observers();
@@ -1007,10 +1011,13 @@ impl<'p> EvictGuard<'p> {
         let mut retired = Vec::new();
         if !survivors.is_empty() || evicted > 0 {
             let mut guard = self.pool.slots.lock();
+            // A pool closed while the scan held its backends publishes none
+            // of them: nothing but the last pool reference would close them.
+            let pool_closed = self.pool.semaphore.is_closed();
             for mut obj in survivors {
                 // RELOAD cannot see backends temporarily owned by this scan.
                 // Check the shared shrink budget before making them reusable.
-                if obj.claim_capacity_retirement() {
+                if pool_closed || obj.claim_capacity_retirement() {
                     retired.push(obj);
                     continue;
                 }
@@ -1023,6 +1030,13 @@ impl<'p> EvictGuard<'p> {
             }
             if evicted > 0 || !retired.is_empty() {
                 guard.size = guard.size.saturating_sub(evicted + retired.len());
+            }
+            if pool_closed {
+                // close() counted the scan's backends among those that
+                // retire as they come back.
+                guard.permits_to_retire = guard
+                    .permits_to_retire
+                    .saturating_sub(evicted + retired.len());
             }
         }
         drop(retired); // Close outside slots; budget stays held until ObjectInner drops.
@@ -5384,6 +5398,51 @@ mod tests {
 
         pool.inner.return_object(checked_out);
         let slots = pool.inner.slots.lock();
+        assert_eq!(slots.size, 0);
+        assert_eq!(slots.permits_to_retire, 0);
+    }
+
+    /// A health scan owns the idle backends it checks. When the pool closes
+    /// meanwhile, a survivor must not return to its idle queue, where only
+    /// the last reference to the pool would ever close it.
+    #[tokio::test]
+    async fn health_scan_survivor_of_a_closed_pool_is_closed() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let survivor = pool
+            .inner
+            .new_object_inner(Server::test_dead_socket(), None);
+        pool.semaphore().try_acquire_many(1).unwrap().forget();
+        pool.inner.slots.lock().size = 1;
+        let scan = EvictGuard::new(&pool.inner, 1);
+
+        pool.close();
+        scan.commit(QueueMode::Fifo, vec![survivor], 0);
+
+        let slots = pool.inner.slots.lock();
+        assert!(slots.vec.is_empty(), "a closed pool keeps no idle backend");
+        assert_eq!(slots.size, 0);
+        assert_eq!(slots.permits_to_retire, 0);
+    }
+
+    /// A backend whose handoff receiver went away is requeued; if the pool
+    /// closed in between, it is closed instead.
+    #[tokio::test]
+    async fn cancelled_handoff_into_a_closed_pool_closes_the_backend() {
+        use crate::server::Server;
+
+        let pool = empty_test_pool_with_max_size(4);
+        let delivered = pool
+            .inner
+            .new_object_inner(Server::test_dead_socket(), None);
+        pool.inner.slots.lock().size = 1;
+
+        pool.close();
+        pool.inner.requeue_handoff(delivered);
+
+        let slots = pool.inner.slots.lock();
+        assert!(slots.vec.is_empty(), "a closed pool keeps no idle backend");
         assert_eq!(slots.size, 0);
         assert_eq!(slots.permits_to_retire, 0);
     }
