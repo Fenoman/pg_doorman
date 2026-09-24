@@ -3893,6 +3893,24 @@ mod tests {
         );
     }
 
+    /// Without pg_variables the default release only unlocks advisory locks.
+    /// Once the extension is installed the query must fail, so the backend is
+    /// closed and its replacement probes again, instead of leaving session
+    /// variables set from then on to the next client.
+    #[test]
+    fn release_without_pg_variables_fails_once_the_extension_is_installed() {
+        let sql = super::RELEASE_WITHOUT_PG_VARIABLES;
+        assert!(sql.starts_with("SELECT pg_catalog.pg_advisory_unlock_all(), "));
+        assert!(
+            sql.contains(
+                "CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_extension \
+                 WHERE extname = 'pg_variables') \
+                 THEN pg_catalog.current_setting('pg_doorman.pg_variables_installed_reconnect') END"
+            ),
+            "{sql}"
+        );
+    }
+
     /// An unwaited check-in is observed once, when its reply tells how it
     /// went, under the path it took.
     #[cfg(unix)]
