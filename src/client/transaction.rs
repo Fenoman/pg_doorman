@@ -26,7 +26,7 @@ use crate::errors::Error;
 use crate::messages::{
     ends_with_idle_ready_for_query, error_response_timeout, has_error_response,
     insert_close_complete_after_last_close_complete, read_message_reuse,
-    read_message_reuse_cancel_safe, simple_query, write_all_flush_timeout, Parse, PgErrorMsg,
+    read_message_reuse_cancel_safe, simple_query, write_all_flush_timeout, PgErrorMsg,
 };
 use crate::pool::{canceled_pids_consume, CancelMarker};
 use crate::server::{
@@ -585,16 +585,26 @@ fn is_plain_begin_sql(query: &str) -> bool {
         .eq_ignore_ascii_case("begin")
 }
 
+/// Every first Parse of a transaction passes here, so the frame is read in
+/// place instead of decoded: an unnamed statement, a query starting with
+/// `b`, and no parameter types after it.
 fn is_extended_begin_parse(message: &BytesMut) -> bool {
-    if message.first() != Some(&b'P') {
+    if message.first() != Some(&b'P') || message.get(5) != Some(&0) {
         return false;
     }
-    match Parse::try_from(message) {
-        Ok(parse) => {
-            parse.name.is_empty() && parse.num_params() == 0 && is_plain_begin_sql(parse.query())
-        }
-        Err(_) => false,
+    let query = &message[6..];
+    let starts_with_b = query
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'b'));
+    if !starts_with_b {
+        return false;
     }
+    let Some(query_end) = query.iter().position(|&byte| byte == 0) else {
+        return false;
+    };
+    query[query_end + 1..] == [0, 0]
+        && std::str::from_utf8(&query[..query_end]).is_ok_and(is_plain_begin_sql)
 }
 
 fn is_empty_unnamed_bind(message: &BytesMut) -> bool {
@@ -3431,6 +3441,50 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod extended_begin_detection_tests {
+    use super::*;
+    use bytes::BufMut;
+
+    fn parse_frame(name: &str, query: &str, param_types: &[i32]) -> BytesMut {
+        let mut frame = BytesMut::new();
+        frame.put_u8(b'P');
+        frame.put_i32((4 + name.len() + 1 + query.len() + 1 + 2 + 4 * param_types.len()) as i32);
+        frame.put_slice(name.as_bytes());
+        frame.put_u8(0);
+        frame.put_slice(query.as_bytes());
+        frame.put_u8(0);
+        frame.put_i16(param_types.len() as i16);
+        for oid in param_types {
+            frame.put_i32(*oid);
+        }
+        frame
+    }
+
+    /// Only an unnamed, parameterless Parse of a bare BEGIN is deferred.
+    #[test]
+    fn extended_begin_parse_is_recognised_from_the_raw_frame() {
+        for (name, query, params, expected) in [
+            ("", "BEGIN", &[][..], true),
+            ("", "  begin ; ", &[][..], true),
+            ("", "Begin;", &[][..], true),
+            ("s1", "BEGIN", &[][..], false),
+            ("", "BEGIN", &[23][..], false),
+            ("", "BEGIN ISOLATION LEVEL SERIALIZABLE", &[][..], false),
+            ("", "BEGINNING", &[][..], false),
+            ("", "SELECT 1", &[][..], false),
+            ("", "", &[][..], false),
+        ] {
+            assert_eq!(
+                is_extended_begin_parse(&parse_frame(name, query, params)),
+                expected,
+                "{name:?} {query:?} {params:?}"
+            );
+        }
+        assert!(!is_extended_begin_parse(&simple_query("BEGIN")));
     }
 }
 
