@@ -71,8 +71,10 @@ pub(crate) struct OverviewDto {
     /// pool counts because clients do not always belong to a pool yet (e.g.
     /// during startup negotiation).
     pub current_clients: i64,
-    /// Number of clients currently inside an open PG transaction holding
-    /// a backend connection. Mirrors `CLIENTS_IN_TRANSACTIONS`.
+    /// Number of clients currently in a transaction: from the checkout of a
+    /// backend until the client has been sent the response. A backend can go
+    /// back to the pool before that, so this can exceed the number of
+    /// backends in use. Mirrors `CLIENTS_IN_TRANSACTIONS`.
     pub clients_in_transactions: i64,
     /// Set during `SIGTERM`/admin SHUTDOWN. Operator-visible "the pooler is
     /// draining, do not deploy now" indicator.

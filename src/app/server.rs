@@ -86,7 +86,10 @@ pub static SHUTDOWN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// startup also follows this readiness rule.
 pub static READY: AtomicBool = AtomicBool::new(false);
 
-/// Global counter for clients currently in transactions (holding server connections)
+/// Global counter for clients currently in a transaction: from the checkout
+/// of a backend until the client has been sent the response. The backend goes
+/// back to the pool once its check-in is done, possibly before that, so the
+/// counter can exceed the number of backends in use.
 pub static CLIENTS_IN_TRANSACTIONS: AtomicI64 = AtomicI64::new(0);
 
 /// Global flag: migration to new process is active. Clients should self-migrate at idle points.
