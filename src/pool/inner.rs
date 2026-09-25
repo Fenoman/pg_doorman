@@ -1867,8 +1867,10 @@ impl Pool {
 
     /// Wraps `inner` for the checkout that holds `permit`, unless the pool
     /// was paused while the checkout waited: a paused pool hands out nothing.
-    /// The backend then goes back to the idle slots as it came, owing no
-    /// release and keeping its idle age, and the permit goes back with it.
+    /// The backend then takes the usual way back of `PoolInner::return_object`
+    /// (the idle slots, a waiting checkout, or retirement on a shrink) with
+    /// its permit. It owes no new release, keeps a release its last client
+    /// left, and keeps its idle age.
     fn hand_out(&self, inner: ObjectInner, permit: SemaphorePermit<'_>) -> Option<Object> {
         if self.inner.server_pool.is_paused() {
             permit.forget();
