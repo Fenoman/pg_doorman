@@ -57,6 +57,23 @@ Both the old and the new process must use identical `tls_certificate` and `tls_p
 
 For deb/rpm packaging see `debian/` and `pkg/` in the repository.
 
+### Profile-guided optimization
+
+Release builds use profile-guided optimization (PGO): the compiler inlines and lays out code by a profile recorded while pgbench ran through pg_doorman. The hot path of pg_doorman is bound by instruction-cache misses, and PGO packs hot code densely. On a 16-core x86_64 host (pgbench select-only at 8 to 128 clients, pool of 8, 4 worker threads) a PGO build gives 2-3% more TPS and 3-5% less CPU per transaction.
+
+The profile is committed as `pgo/pg_doorman.profdata.gz`. `make build`, the Ubuntu PPA packages and the deb and rpm packages of GitHub releases use it when the file exists. The Docker build passes it too, but `cargo auditable` there changes the symbol names of pg_doorman's own code, so in the image only the dependencies get PGO. `make build PGO=0` and plain `cargo build --release` build without it.
+
+To record a new profile, run on x86_64 Linux with PostgreSQL and pgbench installed:
+
+```bash
+rustup component add llvm-tools   # once, inside the repository
+make pgo-profile                  # PG_BIN=/usr/lib/postgresql/17/bin make pgo-profile when initdb is not in PATH
+```
+
+The script builds an instrumented pg_doorman, runs pgbench through it against a throwaway PostgreSQL cluster and rewrites `pgo/pg_doorman.profdata.gz`, which then goes into a commit.
+
+The compiler finds profile entries by symbol name, and symbol names change with the package version, the rustc version and the platform. Record the profile after the version bump of a release, before tagging it, and after large changes of the hot path. A stale or missing profile is safe: functions without a matching entry are compiled as without PGO, and the build succeeds either way.
+
 ## Distribution packages
 
 Pre-built deb and rpm packages are published from the same release tags. Use these when you cannot or do not want to build from source.
