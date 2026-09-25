@@ -47,6 +47,7 @@ pub use connections::{
     CANCEL_CONNECTION_COUNTER, PLAIN_CONNECTION_COUNTER, TLS_CONNECTION_COUNTER,
     TOTAL_CONNECTION_COUNTER,
 };
+pub(crate) use server::PoolLatencyCache;
 pub use server::ServerStats;
 #[cfg(target_os = "linux")]
 pub use socket::{

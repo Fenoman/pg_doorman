@@ -706,6 +706,9 @@ pub struct Server {
     /// Statistics collector for this server connection (bytes sent/received, queries executed, etc.).
     pub stats: Arc<ServerStats>,
 
+    /// The latency histograms of this backend's pool; see `PoolLatencyCache`.
+    pool_latency: crate::stats::PoolLatencyCache,
+
     /// Application name of the client currently using this server connection.
     /// Updated when the connection is checked out from the pool.
     application_name: String,
@@ -1239,6 +1242,30 @@ impl Server {
         }
 
         Ok(())
+    }
+
+    /// Records a query this backend ran in its stats and in the latency
+    /// histogram of its pool.
+    #[inline(always)]
+    pub(crate) fn record_query(&mut self, microseconds: u64, application_name: &str) {
+        self.stats
+            .query(microseconds, application_name, &mut self.pool_latency);
+    }
+
+    /// Records how long the client waited for this backend in its stats and
+    /// in the latency histogram of its pool.
+    #[inline(always)]
+    pub(crate) fn record_checkout(&mut self, microseconds: u64, application_name: &str) {
+        self.stats
+            .checkout_time(microseconds, application_name, &mut self.pool_latency);
+    }
+
+    /// Records the transaction this backend finished in its stats and in the
+    /// latency histogram of its pool, and marks it idle.
+    #[inline(always)]
+    pub(crate) fn record_transaction_end(&mut self, microseconds: u64) {
+        self.stats
+            .add_xact_time_and_idle(microseconds, &mut self.pool_latency);
     }
 
     /// Returns the PostgreSQL backend process ID for this connection.
@@ -3469,6 +3496,7 @@ impl Server {
                         client_server_map,
                         connected_at: chrono::offset::Utc::now().naive_utc(),
                         stats,
+                        pool_latency: Default::default(),
                         application_name,
                         last_activity: SystemTime::now(),
                         last_activity_quanta: quanta::Instant::now(),
@@ -3847,6 +3875,7 @@ impl Server {
             client_server_map: Arc::new(DashMap::new()),
             connected_at: chrono::Utc::now().naive_utc(),
             stats: Arc::new(ServerStats::default()),
+            pool_latency: Default::default(),
             application_name: String::new(),
             last_activity: SystemTime::now(),
             last_activity_quanta: quanta::Instant::now(),
@@ -4507,6 +4536,33 @@ mod tests {
             peer.write_all(&ready).await.unwrap();
             server.settle_release_reply_in_time().await.unwrap();
         }
+    }
+
+    /// A backend records its queries, checkout waits and transactions in the
+    /// latency histograms of its pool, each in the histogram of its kind.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_backend_records_its_latencies_in_the_histograms_of_its_pool() {
+        let (user, pool) = ("backend_latency_user", "backend_latency_pool");
+        let (mut server, _peer) = super::Server::test_silent_socket();
+        server.stats = std::sync::Arc::new(crate::stats::ServerStats::new(
+            crate::config::Address {
+                username: user.to_string(),
+                pool_name: pool.to_string(),
+                ..Default::default()
+            },
+            crate::utils::clock::now(),
+        ));
+
+        server.record_query(1_500, "app");
+        server.record_checkout(700, "app");
+        server.record_transaction_end(3_000);
+
+        assert_eq!(
+            crate::web::metrics::exported_pool_latency(user, pool),
+            [Some((1, 0.0015)), Some((1, 0.003)), Some((1, 0.0007))]
+        );
     }
 
     /// A check-in with nothing to clean and no release query, the one every

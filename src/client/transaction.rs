@@ -751,7 +751,7 @@ where
     T: tokio::io::AsyncWrite + std::marker::Unpin,
 {
     #[inline(always)]
-    fn complete_transaction_if_needed(&mut self, server: &Server, check_async: bool) -> bool {
+    fn complete_transaction_if_needed(&mut self, server: &mut Server, check_async: bool) -> bool {
         if server.in_transaction() {
             if self.session_xact_start.is_none() {
                 self.session_xact_start = Some(crate::utils::clock::now());
@@ -776,9 +776,7 @@ where
 
             if !self.transaction_mode {
                 if let Some(start) = self.session_xact_start.take() {
-                    server
-                        .stats
-                        .add_xact_time_and_idle(start.elapsed().as_micros() as u64);
+                    server.record_transaction_end(start.elapsed().as_micros() as u64);
                 }
             }
 
@@ -1619,7 +1617,7 @@ where
         }
 
         self.stats.query();
-        server.stats.query(
+        server.record_query(
             query_start_at.elapsed().as_micros() as u64,
             self.server_parameters.get_application_name(),
         );
@@ -1648,7 +1646,7 @@ where
 
         self.execute_server_roundtrip(Some(message), server).await?;
         self.stats.query();
-        server.stats.query(
+        server.record_query(
             query_start_at.elapsed().as_micros() as u64,
             self.server_parameters.get_application_name(),
         );
@@ -1867,9 +1865,7 @@ where
         if let Some((hash, anon)) = self.prepared.last_bound_for_top.take() {
             crate::server::record_query_duration_us(hash, anon, micros);
         }
-        server
-            .stats
-            .query(micros, self.server_parameters.get_application_name());
+        server.record_query(micros, self.server_parameters.get_application_name());
 
         self.buffer.clear();
         if code != 'H' && !server.in_transaction() {
@@ -2554,9 +2550,7 @@ where
                 let server = conn.deref_mut();
                 server.stats.active(self.stats.application_name());
                 let checkout_us = connecting_at.elapsed().as_micros() as u64;
-                server
-                    .stats
-                    .checkout_time(checkout_us, self.stats.application_name());
+                server.record_checkout(checkout_us, self.stats.application_name());
                 // Update client-side wait tracking so SHOW POOLS maxwait
                 // reflects real checkout peaks, not the zero from init.
                 self.stats
@@ -3283,9 +3277,7 @@ where
                 let (flush_res, finalize_res) = tokio::join!(flush_response, finalize_backend);
 
                 if self.transaction_mode {
-                    server
-                        .stats
-                        .add_xact_time_and_idle(server_active_at.elapsed().as_micros() as u64);
+                    server.record_transaction_end(server_active_at.elapsed().as_micros() as u64);
                 }
 
                 if let Err(err) = finalize_res {
@@ -8076,7 +8068,7 @@ mod flush_transaction_counter_tests {
         server.set_async_mode(true);
 
         assert!(
-            !client.complete_transaction_if_needed(&server, true),
+            !client.complete_transaction_if_needed(&mut server, true),
             "a mid-batch Flush must not release the backend"
         );
         assert_eq!(
@@ -8091,7 +8083,7 @@ mod flush_transaction_counter_tests {
         );
 
         // asyncpg pipelines several Flushes per statement.
-        assert!(!client.complete_transaction_if_needed(&server, true));
+        assert!(!client.complete_transaction_if_needed(&mut server, true));
         assert_eq!(
             client.stats.transaction_count.load(Ordering::Relaxed),
             0,
@@ -8102,7 +8094,7 @@ mod flush_transaction_counter_tests {
         // transaction, and in transaction mode the backend goes back to the pool.
         server.set_async_mode(false);
         assert!(
-            client.complete_transaction_if_needed(&server, true),
+            client.complete_transaction_if_needed(&mut server, true),
             "the Sync that ends the batch must still release the backend"
         );
         assert_eq!(
@@ -8125,7 +8117,7 @@ mod flush_transaction_counter_tests {
 
         // ReadyForQuery('T'): the client opened an explicit transaction.
         server.in_transaction = true;
-        assert!(!client.complete_transaction_if_needed(&server, false));
+        assert!(!client.complete_transaction_if_needed(&mut server, false));
         assert_eq!(
             client.stats.transaction_count.load(Ordering::Relaxed),
             0,
@@ -8135,7 +8127,7 @@ mod flush_transaction_counter_tests {
         // ReadyForQuery('I'): COMMIT (or an autocommit statement) finished it.
         server.in_transaction = false;
         assert!(
-            client.complete_transaction_if_needed(&server, false),
+            client.complete_transaction_if_needed(&mut server, false),
             "the simple-query path must still release the backend in transaction mode"
         );
         assert_eq!(
@@ -8163,7 +8155,7 @@ mod flush_transaction_counter_tests {
         // Mid-batch Flush: the transaction is not over, so the session
         // xact timer must stay armed instead of reporting a partial duration.
         server.set_async_mode(true);
-        assert!(!client.complete_transaction_if_needed(&server, true));
+        assert!(!client.complete_transaction_if_needed(&mut server, true));
         assert!(
             client.session_xact_start.is_some(),
             "a mid-batch Flush must not close the session xact timer"
@@ -8174,7 +8166,7 @@ mod flush_transaction_counter_tests {
         // xact timer is closed (session mode keeps the backend).
         server.set_async_mode(false);
         assert!(
-            !client.complete_transaction_if_needed(&server, true),
+            !client.complete_transaction_if_needed(&mut server, true),
             "session mode never releases the backend at transaction end"
         );
         assert_eq!(client.stats.transaction_count.load(Ordering::Relaxed), 1);
@@ -8219,7 +8211,7 @@ mod sql_prepare_pin_release_tests {
         server.cleanup_state.sql_prepared_statements = 0;
 
         assert!(
-            client.complete_transaction_if_needed(&server, false),
+            client.complete_transaction_if_needed(&mut server, false),
             "with no SQL-level prepared statements left the backend must go back \
              to the pool, even though this client never sent a simple query"
         );
@@ -8239,7 +8231,7 @@ mod sql_prepare_pin_release_tests {
         server.cleanup_state.sql_prepared_statements = 1;
 
         assert!(
-            !client.complete_transaction_if_needed(&server, false),
+            !client.complete_transaction_if_needed(&mut server, false),
             "a backend still carrying SQL-level prepared statements must stay \
              pinned to its client"
         );
@@ -8258,7 +8250,7 @@ mod sql_prepare_pin_release_tests {
         server.cleanup_state.sql_prepared_statements = 0;
 
         assert!(
-            !client.complete_transaction_if_needed(&server, false),
+            !client.complete_transaction_if_needed(&mut server, false),
             "session mode never hands the backend back mid-session"
         );
     }

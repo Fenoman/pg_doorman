@@ -2271,12 +2271,13 @@ mod tests {
             },
             crate::utils::clock::now(),
         );
-        stats.query(100, "app");
+        let latency = &mut crate::stats::PoolLatencyCache::default();
+        stats.query(100, "app", latency);
 
         super::sweep_pool_latency_series_with_hook(&std::collections::HashSet::new(), || {
-            stats.query(200, "app")
+            stats.query(200, "app", latency)
         });
-        stats.query(2_000, "app");
+        stats.query(2_000, "app", latency);
 
         assert_eq!(
             super::exported_pool_latency(user, pool)[0],

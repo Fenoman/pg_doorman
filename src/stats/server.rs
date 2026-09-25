@@ -2,7 +2,7 @@ use super::AddressStats;
 use super::{get_reporter, Reporter};
 use crate::config::Address;
 use crate::utils::clock;
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 use iota::iota;
 use log::debug;
 use std::sync::atomic::*;
@@ -101,11 +101,6 @@ pub struct ServerStats {
     /// Nanoseconds elapsed from `connect_time` at the moment this server
     /// last entered ACTIVE. `NEVER_ACTIVE` means not activated yet.
     active_since_nanos_from_connect: AtomicU64,
-
-    /// The pool latency histograms, resolved on the first observation and
-    /// again after the sweep of gone pools moves the latency epoch past the
-    /// one they carry.
-    pool_latency: ArcSwapOption<crate::web::metrics::PoolLatencyHistograms>,
 }
 
 /// Sentinel for `active_since_nanos_from_connect` meaning "not activated yet".
@@ -179,7 +174,6 @@ impl Default for ServerStats {
             prepared_cache_size: AtomicU64::new(0),
             use_tls: AtomicBool::new(false),
             active_since_nanos_from_connect: AtomicU64::new(NEVER_ACTIVE),
-            pool_latency: ArcSwapOption::empty(),
         }
     }
 }
@@ -197,54 +191,40 @@ fn next_server_id() -> i32 {
     NEXT_SERVER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-impl ServerStats {
-    /// Runs `observe` on the latency histograms of this backend's pool. The
-    /// cached handles serve while the latency epoch equals the one they
-    /// carry: no lock, no label lookup and no allocation. Otherwise the
-    /// handles are resolved again.
+/// The latency histograms of a backend's pool, kept by the backend itself:
+/// only the task that holds the backend observes into them, so they need no
+/// synchronization. Resolved on the first observation and again once the
+/// sweep of gone pools moves the latency epoch past the one they carry.
+#[derive(Debug, Default)]
+pub(crate) struct PoolLatencyCache(Option<crate::web::metrics::PoolLatencyHistograms>);
+
+impl PoolLatencyCache {
+    /// The histograms of the pool of `address`, resolved again when a sweep
+    /// may have removed their series.
     #[inline(always)]
-    fn observe_pool_latency(
-        &self,
-        observe: impl FnOnce(&crate::web::metrics::PoolLatencyHistograms),
-    ) {
+    fn histograms(&mut self, address: &Address) -> &crate::web::metrics::PoolLatencyHistograms {
         let epoch = crate::web::metrics::pool_latency_epoch();
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|histograms| histograms.epoch() != epoch)
         {
-            let cached = self.pool_latency.load();
-            if let Some(histograms) = cached.as_ref() {
-                if histograms.epoch() == epoch {
-                    observe(histograms);
-                    return;
-                }
-            }
+            self.resolve(address);
         }
-        observe(&self.resolve_pool_latency());
+        self.0.as_ref().expect("the histograms were just resolved")
     }
 
-    /// Resolves the latency histograms and caches them for the next
-    /// observations.
     #[cold]
     #[inline(never)]
-    fn resolve_pool_latency(&self) -> Arc<crate::web::metrics::PoolLatencyHistograms> {
-        let histograms = Arc::new(crate::web::metrics::PoolLatencyHistograms::resolve(
-            &self.address.username,
-            &self.address.pool_name,
+    fn resolve(&mut self, address: &Address) {
+        self.0 = Some(crate::web::metrics::PoolLatencyHistograms::resolve(
+            &address.username,
+            &address.pool_name,
         ));
-        self.pool_latency.store(Some(Arc::clone(&histograms)));
-        histograms
     }
+}
 
-    /// Observes a finished transaction in the pool latency histogram. A zero
-    /// duration comes from backend creation or client drop, not from a
-    /// transaction, and returns before the histograms resolve: it creates no
-    /// series, like [`crate::web::metrics::observe_pool_transaction_microseconds`].
-    #[inline(always)]
-    fn observe_pool_transaction(&self, microseconds: u64) {
-        if microseconds == 0 {
-            return;
-        }
-        self.observe_pool_latency(|histograms| histograms.observe_transaction(microseconds));
-    }
-
+impl ServerStats {
     #[inline(always)]
     fn pack(state: u8, wait: u8) -> u8 {
         (state << 4) | (wait & 0x0F)
@@ -419,20 +399,26 @@ impl ServerStats {
             .as_nanos() as u64
     }
 
-    /// Server is idle and available for the next client.
+    /// Server is idle and available for the next client. Its callers report
+    /// no transaction, so the pool latency histogram is left alone.
     #[inline(always)]
     pub fn idle(&self, microseconds: u64) {
         self.address.stats.xact_time_add(microseconds);
-        self.observe_pool_transaction(microseconds);
         self.set_state(SERVER_STATE_IDLE);
     }
 
-    /// Records transaction time and sets the server state to IDLE.
+    /// Records transaction time and sets the server state to IDLE. A zero
+    /// duration comes from backend creation or client drop, not from a
+    /// transaction, and creates no latency series.
     #[inline(always)]
-    pub fn add_xact_time_and_idle(&self, microseconds: u64) {
+    pub(crate) fn add_xact_time_and_idle(&self, microseconds: u64, latency: &mut PoolLatencyCache) {
         self.set_state(SERVER_STATE_IDLE);
         self.address.stats.xact_time_add(microseconds);
-        self.observe_pool_transaction(microseconds);
+        if microseconds != 0 {
+            latency
+                .histograms(&self.address)
+                .observe_transaction(microseconds);
+        }
     }
 
     //
@@ -581,11 +567,16 @@ impl ServerStats {
     /// * `microseconds` - Checkout time in microseconds
     /// * `application_name` - Name of the application using this server connection
     #[inline(always)]
-    pub fn checkout_time(&self, microseconds: u64, application_name: &str) {
+    pub(crate) fn checkout_time(
+        &self,
+        microseconds: u64,
+        application_name: &str,
+        latency: &mut PoolLatencyCache,
+    ) {
         // Pass through `&str` so the hot path does not allocate.
         self.set_application_str(application_name);
         self.address.stats.wait_time_add(microseconds);
-        self.observe_pool_latency(|histograms| histograms.observe_wait(microseconds));
+        latency.histograms(&self.address).observe_wait(microseconds);
     }
 
     /// Records a query execution and updates related statistics.
@@ -595,13 +586,20 @@ impl ServerStats {
     /// * `microseconds` - Query execution time in microseconds
     /// * `application_name` - Name of the application executing the query
     #[inline(always)]
-    pub fn query(&self, microseconds: u64, application_name: &str) {
+    pub(crate) fn query(
+        &self,
+        microseconds: u64,
+        application_name: &str,
+        latency: &mut PoolLatencyCache,
+    ) {
         // Avoid copying application_name on every query.
         self.set_application_str(application_name);
         self.address.stats.query_count_add();
         self.address.stats.query_time_add_microseconds(microseconds);
         self.query_count.fetch_add(1, Ordering::Relaxed);
-        self.observe_pool_latency(|histograms| histograms.observe_query(microseconds));
+        latency
+            .histograms(&self.address)
+            .observe_query(microseconds);
     }
 
     /// Records a transaction execution and updates related statistics.
@@ -776,14 +774,15 @@ mod tests {
     fn pool_latency_observations_go_to_the_series_of_the_pool() {
         let (user, pool) = ("latency_series_user", "latency_series_pool");
         let stats = latency_stats(user, pool);
+        let latency = &mut PoolLatencyCache::default();
 
-        stats.query(1_500, "app");
-        stats.query(0, "app");
-        stats.checkout_time(700, "app");
-        stats.checkout_time(0, "app");
-        stats.idle(2_000);
-        stats.add_xact_time_and_idle(0);
-        stats.add_xact_time_and_idle(3_000);
+        stats.query(1_500, "app", latency);
+        stats.query(0, "app", latency);
+        stats.checkout_time(700, "app", latency);
+        stats.checkout_time(0, "app", latency);
+        stats.add_xact_time_and_idle(2_000, latency);
+        stats.add_xact_time_and_idle(0, latency);
+        stats.add_xact_time_and_idle(3_000, latency);
 
         assert_eq!(
             crate::web::metrics::exported_pool_latency(user, pool),
@@ -801,9 +800,10 @@ mod tests {
     fn pool_latency_observations_after_the_sweep_are_exported() {
         let (user, pool) = ("swept_series_user", "swept_series_pool");
         let stats = latency_stats(user, pool);
-        stats.checkout_time(100, "app");
-        stats.query(200, "app");
-        stats.idle(300);
+        let latency = &mut PoolLatencyCache::default();
+        stats.checkout_time(100, "app", latency);
+        stats.query(200, "app", latency);
+        stats.add_xact_time_and_idle(300, latency);
 
         crate::web::metrics::sweep_pool_latency_series(&std::collections::HashSet::new());
         assert_eq!(
@@ -812,9 +812,9 @@ mod tests {
             "the sweep removes the series of a pool missing from the key set"
         );
 
-        stats.checkout_time(1_000, "app");
-        stats.query(2_000, "app");
-        stats.idle(3_000);
+        stats.checkout_time(1_000, "app", latency);
+        stats.query(2_000, "app", latency);
+        stats.add_xact_time_and_idle(3_000, latency);
 
         assert_eq!(
             crate::web::metrics::exported_pool_latency(user, pool),
@@ -831,12 +831,13 @@ mod tests {
     fn pool_latency_of_an_old_backend_goes_to_the_recreated_series() {
         let (user, pool) = ("recreated_series_user", "recreated_series_pool");
         let old = latency_stats(user, pool);
-        old.query(100, "app");
+        let old_latency = &mut PoolLatencyCache::default();
+        old.query(100, "app", old_latency);
 
         crate::web::metrics::sweep_pool_latency_series(&std::collections::HashSet::new());
         let new = latency_stats(user, pool);
-        new.query(1_000, "app");
-        old.query(2_000, "app");
+        new.query(1_000, "app", &mut PoolLatencyCache::default());
+        old.query(2_000, "app", old_latency);
 
         assert_eq!(
             crate::web::metrics::exported_pool_latency(user, pool)[0],
@@ -854,7 +855,7 @@ mod tests {
         let stats = latency_stats(user, pool);
 
         stats.idle(0);
-        stats.add_xact_time_and_idle(0);
+        stats.add_xact_time_and_idle(0, &mut PoolLatencyCache::default());
 
         assert_eq!(
             crate::web::metrics::exported_pool_latency(user, pool),
@@ -1055,7 +1056,7 @@ mod tests {
 
         // Test add_xact_time_and_idle
         stats.set_state(SERVER_STATE_ACTIVE); // Reset state
-        stats.add_xact_time_and_idle(200);
+        stats.add_xact_time_and_idle(200, &mut PoolLatencyCache::default());
         assert_eq!(stats.state(), SERVER_STATE_IDLE);
         // Check that xact_time_add was called with 200
         assert_eq!(
@@ -1207,7 +1208,7 @@ mod tests {
         let stats = create_test_server_stats();
 
         // Test checkout_time
-        stats.checkout_time(100, "TestApp");
+        stats.checkout_time(100, "TestApp", &mut PoolLatencyCache::default());
         assert_eq!(stats.application_name(), "TestApp");
         assert_eq!(
             stats.address.stats.total.wait_time.load(Ordering::Relaxed),
@@ -1215,7 +1216,7 @@ mod tests {
         );
 
         // Test query
-        stats.query(200, "QueryApp");
+        stats.query(200, "QueryApp", &mut PoolLatencyCache::default());
         assert_eq!(stats.application_name(), "QueryApp");
         assert_eq!(stats.query_count.load(Ordering::Relaxed), 1);
         assert_eq!(
