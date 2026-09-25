@@ -2152,6 +2152,145 @@ mod tests {
         assert!(server.is_bad());
     }
 
+    /// Reads the release reply, failing instead of waiting for bytes the
+    /// test never sends.
+    async fn read_release_reply_in_time(server: &mut crate::server::Server) -> Result<(), Error> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::read_release_reply(server),
+        )
+        .await
+        .expect("the release reply is read from the bytes sent")
+    }
+
+    /// The bytes in the read buffer, without waiting for more.
+    fn buffered(server: &mut crate::server::Server) -> Vec<u8> {
+        use futures::FutureExt;
+        use tokio::io::AsyncBufReadExt;
+
+        match server.stream.fill_buf().now_or_never() {
+            Some(bytes) => bytes.unwrap().to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    /// A reply that arrives in parts is read message by message up to where
+    /// the buffered part ends. The rest, which comes with the client's reply,
+    /// is settled in one pass up to the CommandComplete still owed, and the
+    /// client's reply stays whole.
+    #[tokio::test]
+    async fn a_release_reply_arriving_in_parts_is_settled_up_to_the_clients_reply() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        server.release_reply_commands = crate::server::server_backend::COALESCED_RELEASE_COMMANDS;
+        let release = coalesced_release_ok_reply();
+        // ParseComplete, BindComplete and CommandComplete of COMMIT.
+        let commit_len = 5 + 5 + crate::messages::command_complete("COMMIT").len();
+        let (head, commit) = release.split_at(release.len() - commit_len);
+        peer.write_all(head).await.unwrap();
+        server.stream.fill_buf().await.unwrap();
+        let mut own = crate::messages::command_complete("SELECT 1");
+        own.put(crate::messages::ready_for_query(false));
+        let mut rest = BytesMut::from(commit);
+        rest.put_slice(&own);
+        peer.write_all(&rest).await.unwrap();
+        let received = server
+            .stats
+            .bytes_received
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        read_release_reply_in_time(&mut server).await.unwrap();
+
+        assert!(!server.release_reply_pending);
+        assert_eq!(server.release_reply_commands, 0);
+        assert_eq!(buffered(&mut server), &own[..]);
+        assert_eq!(
+            server
+                .stats
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            received + release.len() as u64
+        );
+        assert!(!server.is_bad());
+    }
+
+    /// A message the one pass does not settle hands the reply to the reader
+    /// up to that message. The pass that then settles the rest counts only
+    /// the CommandCompletes still owed, so the reply ends at its own last
+    /// one, and the client's reply behind it stays whole.
+    #[tokio::test]
+    async fn a_release_reply_left_to_the_reader_ends_at_its_last_command_complete() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        server.release_reply_commands = crate::server::server_backend::COALESCED_RELEASE_COMMANDS;
+        let release = coalesced_release_ok_reply();
+        // ParseComplete, BindComplete and CommandComplete of BEGIN.
+        let begin_len = 5 + 5 + crate::messages::command_complete("BEGIN").len();
+        let mut bytes = BytesMut::from(&release[..begin_len]);
+        bytes.put(crate::messages::server_parameter_message("TimeZone", "UTC"));
+        bytes.put_slice(&release[begin_len..]);
+        let mut own = crate::messages::command_complete("SELECT 1");
+        own.put(crate::messages::ready_for_query(false));
+        bytes.put_slice(&own);
+        peer.write_all(&bytes).await.unwrap();
+        server.stream.fill_buf().await.unwrap();
+
+        read_release_reply_in_time(&mut server).await.unwrap();
+
+        assert!(!server.release_reply_pending);
+        assert_eq!(server.release_reply_commands, 0);
+        assert_eq!(buffered(&mut server), &own[..]);
+        assert_eq!(
+            server
+                .server_parameters_as_hashmap()
+                .get("TimeZone")
+                .map(String::as_str),
+            Some("UTC")
+        );
+        assert!(!server.is_bad());
+    }
+
+    /// A reply settled in one pass ends as every read of it does: the
+    /// RESET ALL it confirms drops the parameters PostgreSQL resets without
+    /// reporting them, and the session reset is no longer pending.
+    #[tokio::test]
+    async fn a_release_reply_settled_in_one_pass_completes_its_reset_all() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        server.release_reply_resets_session = true;
+        server.release_reply_resets_all = true;
+        server
+            .server_parameters
+            .set_param("search_path", "app", true);
+        assert!(server
+            .server_parameters_as_hashmap()
+            .contains_key("search_path"));
+        let mut reply = BytesMut::new();
+        for tag in ["BEGIN", "RESET", "SELECT 1", "COMMIT"] {
+            reply.put(crate::messages::parse_complete());
+            reply.put_slice(&[b'2', 0, 0, 0, 4]);
+            reply.put(crate::messages::command_complete(tag));
+        }
+        reply.put_slice(&[b'I', 0, 0, 0, 4]);
+        reply.put(crate::messages::ready_for_query(false));
+        peer.write_all(&reply).await.unwrap();
+        server.stream.fill_buf().await.unwrap();
+
+        read_release_reply_in_time(&mut server).await.unwrap();
+
+        assert!(!server.release_reply_resets_session);
+        assert!(!server.release_reply_resets_all);
+        assert!(!server
+            .server_parameters_as_hashmap()
+            .contains_key("search_path"));
+    }
+
     /// The release reply precedes the reply to the exchange sent after it
     /// and is read away; the caller gets only its own reply.
     #[tokio::test]
