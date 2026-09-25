@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+#[cfg(unix)]
+use futures::task::AtomicWaker;
 use log::{debug, error, info, warn};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpSocket;
@@ -120,9 +122,67 @@ pub fn migration_deadline() -> Option<tokio::time::Instant> {
     MIGRATION_DEADLINE.get().copied()
 }
 
-/// Wakes idle client tasks after the new process is ready to receive migrated fds.
+/// Idle client sessions to wake once the new process is ready to receive
+/// migrated fds.
 #[cfg(unix)]
-pub static MIGRATION_NOTIFY: std::sync::LazyLock<Notify> = std::sync::LazyLock::new(Notify::new);
+pub static MIGRATION_WAITERS: std::sync::LazyLock<MigrationWaiters> =
+    std::sync::LazyLock::new(MigrationWaiters::default);
+
+/// Every client session registers here once, for its whole life, with a
+/// waker of its own. An idle read of the session then only refreshes that
+/// waker and checks `migration_in_progress()`: it takes no lock that the
+/// sessions of all worker threads share.
+#[cfg(unix)]
+#[derive(Default)]
+pub struct MigrationWaiters {
+    next_key: std::sync::atomic::AtomicU64,
+    sessions: parking_lot::Mutex<std::collections::HashMap<u64, Arc<AtomicWaker>>>,
+}
+
+#[cfg(unix)]
+impl MigrationWaiters {
+    /// Registers a session until the returned registration is dropped.
+    pub fn register(&'static self) -> MigrationWaiter {
+        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let waker = Arc::new(AtomicWaker::new());
+        self.sessions.lock().insert(key, Arc::clone(&waker));
+        MigrationWaiter {
+            waiters: self,
+            key,
+            waker,
+        }
+    }
+
+    /// Wakes every registered session.
+    pub fn wake_all(&self) {
+        for waker in self.sessions.lock().values() {
+            waker.wake();
+        }
+    }
+}
+
+/// The registration of one client session in `MIGRATION_WAITERS`.
+#[cfg(unix)]
+pub struct MigrationWaiter {
+    waiters: &'static MigrationWaiters,
+    key: u64,
+    waker: Arc<AtomicWaker>,
+}
+
+#[cfg(unix)]
+impl MigrationWaiter {
+    /// The waker that the session keeps registered while it is idle.
+    pub fn waker(&self) -> &AtomicWaker {
+        &self.waker
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MigrationWaiter {
+    fn drop(&mut self) {
+        self.waiters.sessions.lock().remove(&self.key);
+    }
+}
 
 const MIGRATION_FRESH_ACCEPT_GRACE: Duration = Duration::from_millis(250);
 
@@ -2760,7 +2820,7 @@ async fn binary_upgrade_and_shutdown(
 
                         SHUTDOWN_IN_PROGRESS.store(true, Ordering::SeqCst);
                         if notify_migration_waiters {
-                            MIGRATION_NOTIFY.notify_waiters();
+                            MIGRATION_WAITERS.wake_all();
                         }
 
                         info!("Foreground binary upgrade complete, listener released");
@@ -3923,6 +3983,27 @@ mod inherited_listener_tests {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
+mod migration_waiters_tests {
+    use super::MIGRATION_WAITERS;
+
+    /// A session stays registered for migration wakes while it holds its
+    /// registration, and no longer.
+    #[test]
+    fn a_session_is_registered_until_it_drops_its_registration() {
+        let waiter = MIGRATION_WAITERS.register();
+        let key = waiter.key;
+        assert!(MIGRATION_WAITERS.sessions.lock().contains_key(&key));
+
+        drop(waiter);
+        assert!(
+            !MIGRATION_WAITERS.sessions.lock().contains_key(&key),
+            "an ended session stayed registered"
+        );
+    }
+}
+
+#[cfg(test)]
 mod migration_capacity_tests {
     use super::{MIGRATION_CHANNEL_CAPACITY_MAX, MIGRATION_QUEUED_PAYLOAD_HEAP_BUDGET_BYTES};
     use crate::client::migration::MAX_MIGRATION_PAYLOAD_BYTES;
@@ -4143,7 +4224,7 @@ mod binary_upgrade_spawn_tests {
             .find("publish_migration_in_progress(true)")
             .expect("foreground migration path must publish migration before notifying clients");
         let foreground_notify_idx = foreground_block
-            .find("MIGRATION_NOTIFY.notify_waiters()")
+            .find("MIGRATION_WAITERS.wake_all()")
             .expect("foreground migration path must notify idle clients");
         assert!(
             foreground_ready_idx < foreground_shutdown_idx,
@@ -4701,7 +4782,7 @@ mod binary_upgrade_spawn_tests {
             .find("MIGRATION_TX.set(tx)")
             .expect("migration sender channel publication not found");
         let notify_idx = body
-            .find("MIGRATION_NOTIFY.notify_waiters()")
+            .find("MIGRATION_WAITERS.wake_all()")
             .expect("migration waiters notification not found");
 
         assert!(

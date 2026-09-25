@@ -10,11 +10,11 @@ use std::time::Duration;
 use crate::utils::clock::now;
 
 use crate::admin::handle_admin;
-#[cfg(unix)]
-use crate::app::server::MIGRATION_NOTIFY;
 use crate::app::server::{
     migration_in_progress, CLIENTS_IN_TRANSACTIONS, MIGRATION_TX, SHUTDOWN_IN_PROGRESS,
 };
+#[cfg(unix)]
+use crate::app::server::{MigrationWaiter, MIGRATION_WAITERS};
 use crate::client::batch_handling::PARSE_COMPLETE_MSG;
 use crate::client::core::{BatchOperation, Client, PreparedStatementKey, SkippedParse};
 use crate::client::util::{
@@ -223,22 +223,26 @@ enum IdleClientRead {
     MigrationRequested,
 }
 
+/// Reads the next message of an idle client, or learns that the client should
+/// migrate. With `migration_waker` a migration published while the client is
+/// idle between messages wakes the read, which then reports it; a message the
+/// client has begun sending is read to its end first. Without it the client
+/// only reads.
 #[cfg(unix)]
 async fn read_idle_message_or_migration_notice<S>(
     read: &mut tokio::io::BufReader<S>,
     read_buf: &mut BytesMut,
     max_memory_usage: u64,
-    admin: bool,
-    migration_wake_enabled: bool,
+    migration_waker: Option<&futures::task::AtomicWaker>,
 ) -> Result<IdleClientRead, Error>
 where
     S: tokio::io::AsyncRead + std::marker::Unpin,
 {
-    if admin || !migration_wake_enabled {
+    let Some(migration_waker) = migration_waker else {
         return read_message_reuse_cancel_safe(read, read_buf, max_memory_usage)
             .await
             .map(IdleClientRead::Message);
-    }
+    };
 
     loop {
         enum ReadRace {
@@ -246,47 +250,38 @@ where
             MigrationNotice,
         }
 
-        // Every idle client shares the migration notice, and registering
-        // takes its lock. A client whose next message is already here does
-        // not need it.
-        if !migration_in_progress() {
-            let read_next = read_message_reuse_cancel_safe(read, read_buf, max_memory_usage);
-            tokio::pin!(read_next);
-            if let std::task::Poll::Ready(result) = futures::poll!(read_next.as_mut()) {
-                return result.map(IdleClientRead::Message);
-            }
-        }
-
-        let race = {
-            let migration_notice = MIGRATION_NOTIFY.notified();
-            tokio::pin!(migration_notice);
-            migration_notice.as_mut().enable();
-
-            if migration_in_progress() && read_buf.is_empty() && read.buffer().is_empty() {
+        // A migration already published takes the client only between
+        // messages; with part of a message buffered the read goes on.
+        let watch_migration = if migration_in_progress() {
+            if read_buf.is_empty() && read.buffer().is_empty() {
                 return Ok(IdleClientRead::MigrationRequested);
             }
+            false
+        } else {
+            true
+        };
 
-            let read_next = read_message_reuse_cancel_safe(read, read_buf, max_memory_usage);
-            tokio::pin!(read_next);
-
-            tokio::select! {
-                biased;
-                result = &mut read_next => {
-                    ReadRace::Message(result)
-                }
-                _ = &mut migration_notice => {
-                    ReadRace::MigrationNotice
+        let read_next = read_message_reuse_cancel_safe(read, read_buf, max_memory_usage);
+        tokio::pin!(read_next);
+        let race = poll_fn(|cx| {
+            if let Poll::Ready(result) = read_next.as_mut().poll(cx) {
+                return Poll::Ready(ReadRace::Message(result));
+            }
+            if watch_migration {
+                // The waker goes in before the check: a migration published
+                // after the check wakes this task and is seen on that poll.
+                migration_waker.register(cx.waker());
+                if migration_in_progress() {
+                    return Poll::Ready(ReadRace::MigrationNotice);
                 }
             }
-        };
+            Poll::Pending
+        })
+        .await;
 
         match race {
             ReadRace::Message(result) => return result.map(IdleClientRead::Message),
-            ReadRace::MigrationNotice => {
-                if migration_in_progress() && read_buf.is_empty() && read.buffer().is_empty() {
-                    return Ok(IdleClientRead::MigrationRequested);
-                }
-            }
+            ReadRace::MigrationNotice => continue,
         }
     }
 }
@@ -2185,6 +2180,8 @@ where
         let mut pre_server_replay = VecDeque::new();
         #[cfg(unix)]
         let mut migration_wake_allowed = true;
+        #[cfg(unix)]
+        let migration_waiter = (!self.admin).then(|| MIGRATION_WAITERS.register());
         loop {
             self.stats.idle_read();
 
@@ -2333,8 +2330,10 @@ where
                         &mut self.read,
                         &mut self.read_buf,
                         self.max_memory_usage,
-                        self.admin,
-                        migration_wake_enabled,
+                        migration_waiter
+                            .as_ref()
+                            .filter(|_| migration_wake_enabled)
+                            .map(MigrationWaiter::waker),
                     )
                     .await
                     {
@@ -3680,41 +3679,88 @@ mod migration_idle_read_tests {
     use crate::app::server::publish_migration_in_progress;
     use tokio::io::{AsyncWriteExt, BufReader};
 
+    /// A client idle between messages when a migration is published learns
+    /// about it through the waker of its session, without sending anything.
     #[tokio::test]
     #[serial_test::serial(migration_globals)]
     async fn idle_read_wakes_on_migration_notice_without_client_bytes() {
-        publish_migration_in_progress(true);
+        publish_migration_in_progress(false);
 
         let (client, _peer) = tokio::io::duplex(64);
         let mut read = BufReader::new(client);
         let mut read_buf = BytesMut::new();
+        let waiter = MIGRATION_WAITERS.register();
         let mut task = tokio::spawn(async move {
-            read_idle_message_or_migration_notice(&mut read, &mut read_buf, u64::MAX, false, true)
-                .await
+            read_idle_message_or_migration_notice(
+                &mut read,
+                &mut read_buf,
+                u64::MAX,
+                Some(waiter.waker()),
+            )
+            .await
         });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "the idle read finished before the migration"
+        );
 
-        let mut result = None;
-        for _ in 0..50 {
-            MIGRATION_NOTIFY.notify_waiters();
-            match tokio::time::timeout(Duration::from_millis(20), &mut task).await {
-                Ok(joined) => {
-                    result = Some(joined.expect("idle read task panicked"));
-                    break;
-                }
-                Err(_) => continue,
-            }
-        }
-
+        publish_migration_in_progress(true);
+        MIGRATION_WAITERS.wake_all();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
         publish_migration_in_progress(false);
 
         match result
             .expect("idle read did not wake on migration notice")
+            .expect("idle read task panicked")
             .unwrap()
         {
             IdleClientRead::MigrationRequested => {}
             IdleClientRead::Message(message) => {
                 panic!("expected migration request, got client message {message:?}")
             }
+        }
+    }
+
+    /// A migration published while the client is in the middle of sending a
+    /// message waits for the rest of it: the read returns the whole message.
+    #[tokio::test]
+    #[serial_test::serial(migration_globals)]
+    async fn idle_read_finishes_a_message_begun_before_the_migration() {
+        publish_migration_in_progress(false);
+
+        let message = simple_query("SELECT 1");
+        let (client, mut peer) = tokio::io::duplex(64);
+        peer.write_all(&message[..5]).await.unwrap();
+        let mut read = BufReader::new(client);
+        let mut read_buf = BytesMut::new();
+        let waiter = MIGRATION_WAITERS.register();
+        let idle_read = read_idle_message_or_migration_notice(
+            &mut read,
+            &mut read_buf,
+            u64::MAX,
+            Some(waiter.waker()),
+        );
+        tokio::pin!(idle_read);
+        assert!(futures::poll!(idle_read.as_mut()).is_pending());
+
+        publish_migration_in_progress(true);
+        MIGRATION_WAITERS.wake_all();
+        assert!(
+            futures::poll!(idle_read.as_mut()).is_pending(),
+            "a client in the middle of a message migrated"
+        );
+        peer.write_all(&message[5..]).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), idle_read).await;
+        publish_migration_in_progress(false);
+
+        match result.expect("the rest of the message did not complete the read") {
+            Ok(IdleClientRead::Message(received)) => assert_eq!(&received[..], &message[..]),
+            Ok(IdleClientRead::MigrationRequested) => {
+                panic!("a client in the middle of a message migrated")
+            }
+            Err(err) => panic!("idle read failed: {err:?}"),
         }
     }
 
@@ -3726,9 +3772,15 @@ mod migration_idle_read_tests {
         let (client, _peer) = tokio::io::duplex(64);
         let mut read = BufReader::new(client);
         let mut read_buf = BytesMut::new();
+        let waiter = MIGRATION_WAITERS.register();
         let result = tokio::time::timeout(
             Duration::from_millis(50),
-            read_idle_message_or_migration_notice(&mut read, &mut read_buf, u64::MAX, false, true),
+            read_idle_message_or_migration_notice(
+                &mut read,
+                &mut read_buf,
+                u64::MAX,
+                Some(waiter.waker()),
+            ),
         )
         .await;
 
@@ -3760,7 +3812,7 @@ mod migration_idle_read_tests {
         let mut read_buf = BytesMut::new();
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            read_idle_message_or_migration_notice(&mut read, &mut read_buf, u64::MAX, false, false),
+            read_idle_message_or_migration_notice(&mut read, &mut read_buf, u64::MAX, None),
         )
         .await;
 
@@ -3778,9 +3830,9 @@ mod migration_idle_read_tests {
         }
     }
 
-    /// While no migration is in progress, the idle read polls the client once
-    /// before it registers on `MIGRATION_NOTIFY`. A message the client has
-    /// already sent comes back from that poll.
+    /// The idle read polls the client before it registers the waker of its
+    /// session. A message the client has already sent comes back from that
+    /// poll.
     #[tokio::test]
     #[serial_test::serial(migration_globals)]
     async fn idle_read_fast_path_returns_message_already_sent() {
@@ -3792,8 +3844,13 @@ mod migration_idle_read_tests {
 
         let mut read = BufReader::new(client);
         let mut read_buf = BytesMut::new();
-        let idle_read =
-            read_idle_message_or_migration_notice(&mut read, &mut read_buf, u64::MAX, false, true);
+        let waiter = MIGRATION_WAITERS.register();
+        let idle_read = read_idle_message_or_migration_notice(
+            &mut read,
+            &mut read_buf,
+            u64::MAX,
+            Some(waiter.waker()),
+        );
         tokio::pin!(idle_read);
 
         match futures::poll!(idle_read.as_mut()) {
@@ -3825,12 +3882,12 @@ mod migration_idle_read_tests {
 
             let mut read = BufReader::new(client);
             let mut read_buf = BytesMut::new();
+            let waiter = MIGRATION_WAITERS.register();
             let idle_read = read_idle_message_or_migration_notice(
                 &mut read,
                 &mut read_buf,
                 u64::MAX,
-                false,
-                true,
+                Some(waiter.waker()),
             );
             tokio::pin!(idle_read);
             assert!(
@@ -3888,7 +3945,7 @@ mod migration_idle_read_tests {
         let call_pos = impl_src
             .find("read_idle_message_or_migration_notice(")
             .expect("idle read helper call should exist");
-        let call_window = &impl_src[call_pos..call_pos + 260.min(impl_src.len() - call_pos)];
+        let call_window = &impl_src[call_pos..call_pos + 400.min(impl_src.len() - call_pos)];
         assert!(
             call_window.contains("migration_wake_enabled"),
             "idle read helper must receive the migration wake guard"
