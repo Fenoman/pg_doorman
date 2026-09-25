@@ -7,7 +7,7 @@
 [![Docs](https://img.shields.io/badge/docs-ozontech.github.io%2Fpg__doorman-blue)](https://ozontech.github.io/pg_doorman/)
 [![Telegram](https://img.shields.io/badge/telegram-%40pg__doorman-blue?logo=telegram)](https://t.me/pg_doorman)
 
-A multithreaded PostgreSQL connection pooler in Rust (MSRV 1.87). Alternative to PgBouncer, Odyssey, and PgCat. In production at Ozon for over three years across Go (pgx), .NET (Npgsql), Python (asyncpg, SQLAlchemy), and Node.js workloads.
+A multithreaded PostgreSQL connection pooler in Rust (MSRV 1.88). Alternative to PgBouncer, Odyssey, and PgCat. In production at Ozon for over three years across Go (pgx), .NET (Npgsql), Python (asyncpg, SQLAlchemy), and Node.js workloads.
 
 > ## 📖 Full documentation: **[ozontech.github.io/pg_doorman](https://ozontech.github.io/pg_doorman/)**
 >

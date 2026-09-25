@@ -7,7 +7,7 @@ PgDoorman runs on Linux and macOS. The recommended path for production is to bui
 - Linux (recommended) or macOS
 - PostgreSQL 10 or newer (any supported version)
 - Memory budget proportional to pool size (a few MB per pool plus prepared statement cache)
-- Rust 1.87 or newer if building from source
+- Rust 1.88 or newer if building from source
 
 ## Build from source (recommended)
 
