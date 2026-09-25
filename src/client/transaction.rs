@@ -5934,23 +5934,31 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         let src = full.split("#[cfg(test)]").next().unwrap_or(full);
         let lines: Vec<&str> = src.lines().collect();
 
-        let idx = lines
+        let sites: Vec<usize> = lines
             .iter()
-            .position(|l| l.contains("canceled_pids_consume(conn.get_process_id())"))
-            .expect("checkout-loop cancel-quarantine consume not found");
-        let window: String = lines[idx..(idx + 8).min(lines.len())].join("\n");
+            .enumerate()
+            .filter(|(_, l)| l.contains("canceled_pids_consume(conn.get_process_id())"))
+            .map(|(idx, _)| idx)
+            .collect();
         assert!(
-            window.contains("CancelMarker::Fresh"),
-            "the checkout must branch on a FRESH cancel marker"
+            sites.len() >= 2,
+            "the client checkout loop and the pooler_check_query probe both consume the marker"
         );
-        assert!(
-            window.contains("mark_bad"),
-            "a FRESH-quarantined pid at checkout must mark_bad the backend, not reuse it"
-        );
-        assert!(
-            window.contains("continue"),
-            "a FRESH-quarantined pid at checkout must `continue` to another backend"
-        );
+        for idx in sites {
+            let window: String = lines[idx..(idx + 8).min(lines.len())].join("\n");
+            assert!(
+                window.contains("CancelMarker::Fresh"),
+                "the checkout must branch on a FRESH cancel marker"
+            );
+            assert!(
+                window.contains("mark_bad"),
+                "a FRESH-quarantined pid at checkout must mark_bad the backend, not reuse it"
+            );
+            assert!(
+                window.contains("continue"),
+                "a FRESH-quarantined pid at checkout must `continue` to another backend"
+            );
+        }
     }
 
     /// cancel-quarantine regression lock
