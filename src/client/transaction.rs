@@ -4940,9 +4940,7 @@ mod client_response_write_timeout_tests {
             .find("async fn check_in_beside_response<W>(")
             .expect("post-release fast-response flush should exist");
         let flush_body = &impl_src[flush_start..];
-        let flush_end = flush_body
-            .find("\n}\n")
-            .expect("the helper should end");
+        let flush_end = flush_body.find("\n}\n").expect("the helper should end");
         let flush_body = &flush_body[..flush_end];
 
         assert!(
@@ -6307,12 +6305,18 @@ mod relay_response_client_write_failure_tests {
         )
         .await;
 
-        assert!(delivered.is_err(), "the failed client write was not reported");
+        assert!(
+            delivered.is_err(),
+            "the failed client write was not reported"
+        );
         let next = tokio::time::timeout(Duration::from_secs(5), pool.database.get())
             .await
             .expect("the backend stayed out of the pool")
             .expect("the next checkout failed");
-        assert!(!next.is_bad(), "the failed client write spoiled the backend");
+        assert!(
+            !next.is_bad(),
+            "the failed client write spoiled the backend"
+        );
     }
 
     /// A first batch the pooler answers itself, a cached Parse and Flush,
