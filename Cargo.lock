@@ -2110,6 +2110,7 @@ dependencies = [
  "log",
  "lru",
  "md-5 0.10.6",
+ "memchr",
  "native-tls",
  "nix 0.30.1",
  "num_cpus",

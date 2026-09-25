@@ -373,7 +373,7 @@ fn extract_cleanup_commands(
 /// The statement of a text that holds only one: a text without ';', or one
 /// whose single ';' is followed by nothing but whitespace.
 fn single_statement(bytes: &[u8]) -> Option<&[u8]> {
-    match bytes.iter().position(|&byte| byte == b';') {
+    match memchr::memchr(b';', bytes) {
         None => Some(bytes),
         Some(end) if bytes[end + 1..].iter().all(u8::is_ascii_whitespace) => Some(&bytes[..end]),
         Some(_) => None,
