@@ -77,6 +77,14 @@ jobs:
           apt-get update && apt-get install git cmake wget build-essential pkg-config libssl-dev clang g++ perl patch -y --option=Dpkg::Options::=--force-confdef &&
           wget -q https://static.rust-lang.org/dist/rust-1.87.0-x86_64-unknown-linux-gnu.tar.gz -O /tmp/rust.tar.gz &&
           cd /tmp && tar xf rust.tar.gz && ./rust-*-x86_64-unknown-linux-gnu/install.sh
+      - name: Use the committed PGO profile
+        # Without pgo/pg_doorman.profdata.gz the script prints nothing and
+        # the build runs without PGO.
+        run: |
+          PGO_RUSTFLAGS="$(bash scripts/pgo-rustflags.sh)"
+          if [ -n "$PGO_RUSTFLAGS" ]; then
+            echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }$PGO_RUSTFLAGS" >> "$GITHUB_ENV"
+          fi
       - name: Build binaries in release mode
         run: JEMALLOC_SYS_WITH_MALLOC_CONF="dirty_decay_ms:30000,muzzy_decay_ms:30000,background_thread:true,metadata_thp:auto" cargo build --release
       - name: Prepare output dir
@@ -121,6 +129,14 @@ jobs:
           yum install -y @"Development Tools" openssl-devel wget perl patch &&
           wget -q https://static.rust-lang.org/dist/rust-1.87.0-x86_64-unknown-linux-gnu.tar.gz -O /tmp/rust.tar.gz &&
           cd /tmp && tar xf rust.tar.gz && ./rust-*-x86_64-unknown-linux-gnu/install.sh
+      - name: Use the committed PGO profile
+        # Without pgo/pg_doorman.profdata.gz the script prints nothing and
+        # the build runs without PGO.
+        run: |
+          PGO_RUSTFLAGS="$(bash scripts/pgo-rustflags.sh)"
+          if [ -n "$PGO_RUSTFLAGS" ]; then
+            echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }$PGO_RUSTFLAGS" >> "$GITHUB_ENV"
+          fi
       - name: Build binaries in release mode
         run: JEMALLOC_SYS_WITH_MALLOC_CONF="dirty_decay_ms:30000,muzzy_decay_ms:30000,background_thread:true,metadata_thp:auto" cargo build --release
       - name: Prepare output dir
