@@ -128,6 +128,73 @@ where
     checkout_or_client_disconnect(read, get).await
 }
 
+/// What the check-in of a backend after its transaction needs.
+struct CheckIn<'a> {
+    shutdown_in_progress: bool,
+    transaction_mode: bool,
+    server_active_at: quanta::Instant,
+    username: &'a str,
+    pool_name: &'a str,
+    connection_id: u64,
+}
+
+/// Checks in the backend of a finished transaction and delivers the response
+/// buffered for its client. The two use different sockets and run together,
+/// which keeps the check-in, a release query included, out of the latency the
+/// client sees. The check-in owns the checkout and returns the backend to the
+/// pool as soon as it is done, while the client may still be taking the
+/// response. Returns the result of the delivery.
+async fn check_in_beside_response<W>(
+    mut conn: crate::pool::Object,
+    client_write: &mut W,
+    buffered_response: &[u8],
+    check_in: CheckIn<'_>,
+) -> Result<(), Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let write_timeout = crate::config::proxy_copy_data_timeout();
+    let flush_response = async {
+        if buffered_response.is_empty() {
+            Ok(())
+        } else {
+            write_all_flush_timeout(client_write, buffered_response, write_timeout).await
+        }
+    };
+    let finalize_backend = async move {
+        let server = conn.deref_mut();
+        let finalize_res = if check_in.shutdown_in_progress {
+            server.mark_bad("graceful shutdown - releasing server connection");
+            Ok(())
+        } else if !server.is_async() {
+            server.finalize_checkin().await
+        } else {
+            Ok(())
+        };
+
+        if check_in.transaction_mode {
+            server.record_transaction_end(check_in.server_active_at.elapsed().as_micros() as u64);
+        }
+
+        if let Err(err) = finalize_res {
+            if !server.is_bad() {
+                server.mark_bad(&format!("check-in cleanup failed: {err}"));
+            }
+            warn!(
+                "[{}@{} #c{}] check-in cleanup failed for backend pid={}: {err}",
+                check_in.username,
+                check_in.pool_name,
+                check_in.connection_id,
+                server.get_process_id(),
+            );
+        }
+        server.stats.wait_idle();
+        drop(conn);
+    };
+    let (flush_res, ()) = tokio::join!(flush_response, finalize_backend);
+    flush_res
+}
+
 fn append_pooler_check_query_response(response: &mut BytesMut, bytes: &[u8]) -> Result<(), String> {
     let next_len = response
         .len()
@@ -3249,55 +3316,20 @@ where
                 if has_buffered_response {
                     self.stats.idle_write();
                 }
-                let write_timeout = crate::config::proxy_copy_data_timeout();
-                let buffered_response = &self.client_last_messages_in_tx;
-                let client_write = &mut self.write;
-                let transaction_mode = self.transaction_mode;
-                let (username, pool_name, connection_id) =
-                    (&self.username, &self.pool_name, self.connection_id);
-
-                // Client delivery and backend cleanup are independent after
-                // ReadyForQuery and use different sockets. Running them together
-                // keeps release-query latency out of the client-visible result,
-                // and the check-in returns the backend to the pool as soon as it
-                // is done, while the client may still be reading the response.
-                let flush_response = async {
-                    if has_buffered_response {
-                        write_all_flush_timeout(client_write, buffered_response, write_timeout)
-                            .await
-                    } else {
-                        Ok(())
-                    }
-                };
-                let finalize_backend = async move {
-                    let server = conn.deref_mut();
-                    let finalize_res = if shutdown_in_progress {
-                        server.mark_bad("graceful shutdown - releasing server connection");
-                        Ok(())
-                    } else if !server.is_async() {
-                        server.finalize_checkin().await
-                    } else {
-                        Ok(())
-                    };
-
-                    if transaction_mode {
-                        server
-                            .record_transaction_end(server_active_at.elapsed().as_micros() as u64);
-                    }
-
-                    if let Err(err) = finalize_res {
-                        if !server.is_bad() {
-                            server.mark_bad(&format!("check-in cleanup failed: {err}"));
-                        }
-                        warn!(
-                            "[{username}@{pool_name} #c{connection_id}] check-in cleanup failed for backend pid={}: {err}",
-                            server.get_process_id(),
-                        );
-                    }
-                    server.stats.wait_idle();
-                    drop(conn);
-                };
-                let (flush_res, ()) = tokio::join!(flush_response, finalize_backend);
+                let flush_res = check_in_beside_response(
+                    conn,
+                    &mut self.write,
+                    &self.client_last_messages_in_tx,
+                    CheckIn {
+                        shutdown_in_progress,
+                        transaction_mode: self.transaction_mode,
+                        server_active_at,
+                        username: &self.username,
+                        pool_name: &self.pool_name,
+                        connection_id: self.connection_id,
+                    },
+                )
+                .await;
 
                 match flush_res {
                     Ok(()) => {
@@ -4881,27 +4913,6 @@ mod client_response_write_timeout_tests {
         );
     }
 
-    /// After ReadyForQuery the backend goes back to the pool as soon as its
-    /// check-in is done, while the response may still be on its way to the
-    /// client: the check-in owns the checkout and drops it, and the client
-    /// write runs beside it.
-    #[test]
-    fn a_backend_returns_before_the_client_has_the_response() {
-        let src = include_str!("transaction.rs");
-        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
-        let start = impl_src
-            .find("let finalize_backend = async move {")
-            .expect("the check-in future must own the checkout");
-        let finalize = &impl_src[start..];
-        let end = finalize
-            .find("tokio::join!(flush_response, finalize_backend)")
-            .expect("the check-in runs beside the client write");
-        assert!(
-            finalize[..end].contains("drop(conn);"),
-            "the check-in future returns the backend itself"
-        );
-    }
-
     #[test]
     fn fast_release_post_release_flush_is_timeout_bound() {
         let src = include_str!("transaction.rs");
@@ -4911,13 +4922,27 @@ mod client_response_write_timeout_tests {
                 .expect("at least one test module should follow the impl");
             &src[..tests_start]
         };
-        let flush_start = impl_src
+        let caller_start = impl_src
             .find("let has_buffered_response = !self.client_last_messages_in_tx.is_empty()")
+            .expect("post-release fast-response flush should exist");
+        let caller = &impl_src[caller_start..];
+        let caller_end = caller
+            .find("// TransactionGuard dropped at end of block above")
+            .expect("transaction guard comment should follow fast-response flush");
+        let caller = &caller[..caller_end];
+        assert!(
+            caller.contains("check_in_beside_response(")
+                && !caller.contains("write_all_flush(&mut self.write"),
+            "the session delivers the buffered response through the bounded helper"
+        );
+
+        let flush_start = impl_src
+            .find("async fn check_in_beside_response<W>(")
             .expect("post-release fast-response flush should exist");
         let flush_body = &impl_src[flush_start..];
         let flush_end = flush_body
-            .find("// TransactionGuard dropped at end of block above")
-            .expect("transaction guard comment should follow fast-response flush");
+            .find("\n}\n")
+            .expect("the helper should end");
         let flush_body = &flush_body[..flush_end];
 
         assert!(
@@ -4931,9 +4956,7 @@ mod client_response_write_timeout_tests {
             "post-release fast-response flush must not wait forever on a slow client"
         );
         assert!(
-            !flush_body.contains("write_all_flush(client_write")
-                && !flush_body
-                    .contains("write_all_flush(&mut self.write, &self.client_last_messages_in_tx"),
+            !flush_body.contains("write_all_flush(client_write"),
             "post-release fast-response flush must not use an unbounded client write"
         );
     }
@@ -6223,6 +6246,73 @@ mod relay_response_client_write_failure_tests {
         ) -> Poll<Result<(), std::io::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    fn check_in_for_tests() -> CheckIn<'static> {
+        CheckIn {
+            shutdown_in_progress: false,
+            transaction_mode: true,
+            server_active_at: now(),
+            username: "user",
+            pool_name: "db",
+            connection_id: 1,
+        }
+    }
+
+    /// After ReadyForQuery the check-in returns the backend to the pool while
+    /// the response is still on its way to a client that does not read: the
+    /// next checkout gets that backend. The previous client going away in the
+    /// middle of its write does not touch the backend of its new owner.
+    #[tokio::test]
+    async fn a_backend_goes_back_to_the_pool_while_its_client_does_not_read() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let (mut conn, _peer) = pool.database.test_checked_out_backend().await;
+        conn.test_set_process_id(4242);
+        let mut client_write = StalledWriter;
+        let mut delivery = Box::pin(check_in_beside_response(
+            conn,
+            &mut client_write,
+            COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE,
+            check_in_for_tests(),
+        ));
+
+        let next = tokio::select! {
+            biased;
+            _ = &mut delivery => panic!("a client that does not read took the response"),
+            next = tokio::time::timeout(Duration::from_secs(5), pool.database.get()) => next,
+        };
+        let next = next
+            .expect("the backend stayed out of the pool while its client was not reading")
+            .expect("the next checkout failed");
+        assert_eq!(next.test_process_id(), 4242);
+
+        drop(delivery);
+        assert!(!next.is_bad(), "the previous client spoiled the backend");
+    }
+
+    /// A client write that fails after ReadyForQuery reports the failure and
+    /// leaves the backend healthy in the pool: after ReadyForQuery it is
+    /// clean, whatever happens to the client.
+    #[tokio::test]
+    async fn a_failed_delivery_leaves_the_backend_healthy_in_the_pool() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let (conn, _peer) = pool.database.test_checked_out_backend().await;
+        let mut client_write = BrokenPipeWriter;
+
+        let delivered = check_in_beside_response(
+            conn,
+            &mut client_write,
+            COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE,
+            check_in_for_tests(),
+        )
+        .await;
+
+        assert!(delivered.is_err(), "the failed client write was not reported");
+        let next = tokio::time::timeout(Duration::from_secs(5), pool.database.get())
+            .await
+            .expect("the backend stayed out of the pool")
+            .expect("the next checkout failed");
+        assert!(!next.is_bad(), "the failed client write spoiled the backend");
     }
 
     /// A first batch the pooler answers itself, a cached Parse and Flush,
