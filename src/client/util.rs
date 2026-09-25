@@ -1392,11 +1392,12 @@ pub(crate) fn extract_deallocate_target(bytes: &[u8]) -> Option<DeallocateTarget
     Some(DeallocateTarget::Named(name))
 }
 
+/// The first byte, upper-cased, of a statement text past its leading
+/// whitespace and comments. `None` for a text with nothing else or with an
+/// unterminated leading comment. DISCARD ALL and DEALLOCATE are found only
+/// in a text whose first byte is a D, so any other query skips their
+/// parsers.
 #[inline]
-/// The first letter, upper-cased, of the first keyword of a statement text,
-/// past leading whitespace and comments. `None` for a text without one or
-/// with an unterminated comment. DISCARD ALL and DEALLOCATE are found only
-/// in a text that starts with a D, so any other query skips their parsers.
 pub(crate) fn leading_keyword_initial(bytes: &[u8]) -> Option<u8> {
     let mut idx = 0;
     if !skip_whitespace_and_comments(bytes, &mut idx) {
@@ -1405,6 +1406,7 @@ pub(crate) fn leading_keyword_initial(bytes: &[u8]) -> Option<u8> {
     bytes.get(idx).map(u8::to_ascii_uppercase)
 }
 
+#[inline]
 pub(crate) fn simple_query_starts_with_prepare(bytes: &[u8]) -> bool {
     let mut idx = 0;
     if !skip_whitespace_and_comments(bytes, &mut idx) {
