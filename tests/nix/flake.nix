@@ -79,7 +79,7 @@
           };
 
           # Rust toolchain from rust-overlay
-          rustToolchain = pkgs.rust-bin.stable."1.87.0".default.override {
+          rustToolchain = pkgs.rust-bin.stable."1.88.0".default.override {
             extensions = [
               "rust-src"
               "rust-analyzer"

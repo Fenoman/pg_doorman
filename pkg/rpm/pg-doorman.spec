@@ -1,5 +1,5 @@
 %global debug_package %{nil}
-%global rust_version 1.87.0
+%global rust_version 1.88.0
 
 Name:           pg-doorman
 Version:        3.0.0
