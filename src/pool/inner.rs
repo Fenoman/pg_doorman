@@ -1025,7 +1025,7 @@ enum CoordinatorJitResult<'a> {
 // Boxing it here would add an allocation to every successful warm checkout.
 #[allow(clippy::large_enum_variant)]
 enum CheckoutPreparation<'a> {
-    Recycled(Object),
+    Recycled(Option<Object>),
     Create {
         permit: SemaphorePermit<'a>,
         coordinator_permit: Option<pool_coordinator::CoordinatorPermit>,
@@ -1809,25 +1809,23 @@ impl Pool {
         mut spun: Option<SemaphorePermit<'_>>,
     ) -> Result<Object, PoolError> {
         loop {
-            let object = self.checkout_once(timeouts, start, spun.take()).await?;
-            // A pool paused while the checkout waited hands out nothing: the
-            // backend goes back to the idle slots, and the checkout waits for
-            // the resume under the same deadline.
-            if !self.inner.server_pool.is_paused() {
+            // A pass the pool was paused through hands out nothing; the next
+            // one waits for the resume under the same deadline.
+            if let Some(object) = self.checkout_once(timeouts, start, spun.take()).await? {
                 return Ok(object);
             }
-            drop(object);
         }
     }
 
     /// One pass of [`Self::finish_checkout`]: a backend for the permit the
-    /// spin found, or else for one taken from the semaphore queue.
+    /// spin found, or else for one taken from the semaphore queue. `None`
+    /// when the pool was paused meanwhile, see [`Self::hand_out`].
     async fn checkout_once(
         &self,
         timeouts: &Timeouts,
         start: tokio::time::Instant,
         spun: Option<SemaphorePermit<'_>>,
-    ) -> Result<Object, PoolError> {
+    ) -> Result<Option<Object>, PoolError> {
         let preparation = std::pin::pin!(self.prepare_checkout(timeouts, start, spun));
         let prepared = match timeouts.wait.filter(|wait| !wait.is_zero()) {
             // An idle backend is usually handed out at once.
@@ -1864,7 +1862,20 @@ impl Pool {
                 );
                 e
             })?;
-        Ok(self.wrap_checkout(obj_inner, permit))
+        Ok(self.hand_out(obj_inner, permit))
+    }
+
+    /// Wraps `inner` for the checkout that holds `permit`, unless the pool
+    /// was paused while the checkout waited: a paused pool hands out nothing.
+    /// The backend then goes back to the idle slots as it came, owing no
+    /// release and keeping its idle age, and the permit goes back with it.
+    fn hand_out(&self, inner: ObjectInner, permit: SemaphorePermit<'_>) -> Option<Object> {
+        if self.inner.server_pool.is_paused() {
+            permit.forget();
+            self.inner.return_object(inner);
+            return None;
+        }
+        Some(self.wrap_checkout(inner, permit))
     }
 
     /// [`Self::try_anticipate`] built in its own frame and kept on the heap:
@@ -1934,23 +1945,21 @@ impl Pool {
             // `maybe_trigger_pre_replacement`. Once ownership is assigned,
             // any subsequent panic flows through `Object::drop` and
             // `return_object`, preserving slot-size invariants.
-            let obj = self.wrap_checkout(*inner, permit);
-            self.maybe_trigger_pre_replacement(&obj.inner.as_ref().unwrap().metrics);
+            let obj = self.hand_out(*inner, permit);
+            if let Some(obj) = obj.as_ref() {
+                self.maybe_trigger_pre_replacement(&obj.inner.as_ref().unwrap().metrics);
+            }
             return Ok(CheckoutPreparation::Recycled(obj));
         }
 
         if let Some(inner) = self.try_anticipate_boxed(timeouts, start).await {
-            return Ok(CheckoutPreparation::Recycled(
-                self.wrap_checkout(inner, permit),
-            ));
+            return Ok(CheckoutPreparation::Recycled(self.hand_out(inner, permit)));
         }
 
         loop {
             match self.inner.try_recycle_one(timeouts).await {
                 RecycleOutcome::Reused(inner) => {
-                    return Ok(CheckoutPreparation::Recycled(
-                        self.wrap_checkout(*inner, permit),
-                    ));
+                    return Ok(CheckoutPreparation::Recycled(self.hand_out(*inner, permit)));
                 }
                 RecycleOutcome::Failed => continue,
                 RecycleOutcome::Empty => break,
@@ -1961,9 +1970,7 @@ impl Pool {
         let _create_gate = match self.acquire_burst_gate_boxed(timeouts, non_blocking).await {
             BurstGateOutcome::Acquired(guard) => guard,
             BurstGateOutcome::Recycled(inner) => {
-                return Ok(CheckoutPreparation::Recycled(
-                    self.wrap_checkout(*inner, permit),
-                ));
+                return Ok(CheckoutPreparation::Recycled(self.hand_out(*inner, permit)));
             }
             BurstGateOutcome::Timeout => {
                 let slots = self.inner.slots.lock();
@@ -1987,9 +1994,7 @@ impl Pool {
                 gate: g,
             } => (cp, g),
             CoordinatorJitResult::Recycled(inner) => {
-                return Ok(CheckoutPreparation::Recycled(
-                    self.wrap_checkout(*inner, permit),
-                ));
+                return Ok(CheckoutPreparation::Recycled(self.hand_out(*inner, permit)));
             }
         };
 
@@ -7015,6 +7020,92 @@ mod checkout_spin_tests {
         assert_eq!(semaphore.available_permits(), 1);
         pool.database.resume();
         assert!(checkout.await.is_ok());
+    }
+
+    /// An idle backend of `pool` and its process id; `release` gives it the
+    /// default release query. It owes no cleanup, and its idle age is the
+    /// moment returned with it.
+    fn add_idle_backend(
+        pool: &crate::pool::ConnectionPool,
+        release: bool,
+    ) -> (i32, quanta::Instant, tokio::net::UnixStream) {
+        let (mut server, peer) = crate::server::Server::test_silent_socket();
+        if release {
+            server.set_release_query(None);
+        }
+        let process_id = server.get_process_id();
+        let mut idle = pool.database.inner.new_object_inner(server, None);
+        let returned_at = crate::utils::clock::now();
+        idle.metrics.recycled = Some(returned_at);
+        let mut slots = pool.database.inner.slots.lock();
+        slots.vec.push_back(idle);
+        slots.size += 1;
+        (process_id, returned_at, peer)
+    }
+
+    /// A checkout queued behind every permit of `pool`, polled past its
+    /// spin, and the permit that frees one.
+    async fn queue_a_checkout(
+        pool: &crate::pool::ConnectionPool,
+    ) -> (
+        std::pin::Pin<
+            Box<impl std::future::Future<Output = Result<super::Object, super::PoolError>> + '_>,
+        >,
+        tokio::sync::SemaphorePermit<'_>,
+        tokio::sync::SemaphorePermit<'_>,
+    ) {
+        let semaphore = &pool.database.inner.semaphore;
+        let all = semaphore.available_permits() as u32;
+        let first = semaphore.acquire().await.unwrap();
+        let rest = semaphore.acquire_many(all - 1).await.unwrap();
+        let mut checkout = Box::pin(pool.database.timeout_get(&QUEUED_TIMEOUTS));
+        for _ in 0..2 * super::MAX_FAST_RETRY {
+            assert!(futures::poll!(checkout.as_mut()).is_pending());
+        }
+        (checkout, first, rest)
+    }
+
+    const QUEUED_TIMEOUTS: super::Timeouts = super::Timeouts {
+        wait: Some(std::time::Duration::from_secs(5)),
+        create: None,
+        recycle: None,
+    };
+
+    /// A backend a paused pool holds back from a queued checkout stays in
+    /// the pool: with a release query it owes nothing yet, so it is not
+    /// closed, and the checkout gets it after the resume.
+    #[tokio::test]
+    async fn a_paused_pool_keeps_the_backend_it_holds_back() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let (process_id, _, _peer) = add_idle_backend(&pool, true);
+        let (mut checkout, first, _rest) = queue_a_checkout(&pool).await;
+
+        pool.database.pause();
+        drop(first);
+
+        assert!(futures::poll!(checkout.as_mut()).is_pending());
+        assert_eq!(pool.database.inner.slots.lock().size, 1);
+        assert_eq!(pool.database.status().available, 1);
+        pool.database.resume();
+        let object = checkout.await.unwrap();
+        assert_eq!(object.get_process_id(), process_id);
+    }
+
+    /// A backend a paused pool holds back keeps the idle age it had: no
+    /// client used it, so its idle timeout runs on.
+    #[tokio::test]
+    async fn a_backend_a_paused_pool_holds_back_keeps_its_idle_age() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let (_, returned_at, _peer) = add_idle_backend(&pool, false);
+        let (mut checkout, first, _rest) = queue_a_checkout(&pool).await;
+
+        pool.database.pause();
+        drop(first);
+
+        assert!(futures::poll!(checkout.as_mut()).is_pending());
+        let slots = pool.database.inner.slots.lock();
+        let idle = slots.vec.front().expect("the backend is idle again");
+        assert_eq!(idle.metrics.recycled, Some(returned_at));
     }
 
     /// The turns are not a time bound: a checkout whose deadline passes
