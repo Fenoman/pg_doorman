@@ -30,18 +30,22 @@
 #   - llvm-profdata from the llvm-tools component of the active toolchain:
 #       rustup component add llvm-tools --toolchain <rustc version>
 #   - initdb, pg_ctl, createdb and pgbench in PG_BIN or PATH
-#   - an unprivileged user, since initdb refuses to run as root
+#   - as root, runuser and an unprivileged PG_OS_USER: the PostgreSQL server
+#     refuses to run as root, so initdb and pg_ctl run as that user
 #
 # Environment:
 #   PG_BIN         directory with the PostgreSQL binaries, searched before PATH
 #   PGO_DURATION   seconds per pgbench run (default: 8)
 #   LLVM_PROFDATA  llvm-profdata to use instead of the one from llvm-tools
+#   PG_OS_USER     user that runs initdb and pg_ctl when the script runs as
+#                  root (default: postgres)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT="$ROOT/pgo/pg_doorman.profdata.gz"
 DURATION="${PGO_DURATION:-8}"
+PG_OS_USER="${PG_OS_USER:-postgres}"
 
 target_dir="${CARGO_TARGET_DIR:-$ROOT/target}"
 case "$target_dir" in
@@ -102,12 +106,22 @@ stop_doorman() {
     return "$status"
 }
 
+# The PostgreSQL server refuses to run as root; a root run starts it as
+# PG_OS_USER.
+as_pg() {
+    if [ "$(id -u)" -eq 0 ]; then
+        runuser -u "$PG_OS_USER" -- "$@"
+    else
+        "$@"
+    fi
+}
+
 cleanup() {
     local status=$?
     set +e
     stop_doorman
     if [ -n "$PGDATA_DIR" ] && [ -f "$PGDATA_DIR/postmaster.pid" ]; then
-        pg_ctl -D "$PGDATA_DIR" -m immediate -w stop >/dev/null 2>&1
+        as_pg pg_ctl -D "$PGDATA_DIR" -m immediate -w stop >/dev/null 2>&1
     fi
     if [ "$status" -ne 0 ] && [ -n "$WORK" ]; then
         show_tail "$WORK/pg_doorman.log"
@@ -154,8 +168,13 @@ size_mb() {
 preflight() {
     local tool version_text profdata_llvm
 
-    [ "$(id -u)" -ne 0 ] ||
-        die "initdb refuses to run as root, run this script as an unprivileged user"
+    if [ "$(id -u)" -eq 0 ]; then
+        command -v runuser >/dev/null 2>&1 ||
+            die "running as root needs runuser to start PostgreSQL as PG_OS_USER"
+        id -u "$PG_OS_USER" >/dev/null 2>&1 ||
+            die "PG_OS_USER=$PG_OS_USER does not exist; PostgreSQL refuses to run as root"
+        [ "$(id -u "$PG_OS_USER")" -ne 0 ] || die "PG_OS_USER must not be root"
+    fi
 
     case "$DURATION" in
         '' | *[!0-9]*) die "PGO_DURATION must be a number of seconds, got '$DURATION'" ;;
@@ -233,12 +252,15 @@ start_postgres() {
     [ "${#base}" -le 60 ] || base=/tmp
     WORK="$(mktemp -d "$base/pg_doorman-pgo.XXXXXX")"
     mkdir "$WORK/profraw"
+    if [ "$(id -u)" -eq 0 ]; then
+        chown "$PG_OS_USER" "$WORK"
+    fi
     PGDATA_DIR="$WORK/pgdata"
     PG_PORT="$(free_port)"
 
     pg_version="$(pg_ctl --version)"
     log "Starting PostgreSQL ${pg_version#pg_ctl (PostgreSQL) } in $WORK"
-    initdb -D "$PGDATA_DIR" -U postgres -A trust -E UTF8 --no-locale --no-sync \
+    as_pg initdb -D "$PGDATA_DIR" -U postgres -A trust -E UTF8 --no-locale --no-sync \
         >"$WORK/initdb.log" 2>&1 || {
         cat "$WORK/initdb.log" >&2
         die "initdb failed"
@@ -253,7 +275,7 @@ fsync = off
 synchronous_commit = off
 full_page_writes = off
 EOF
-    pg_ctl -D "$PGDATA_DIR" -l "$WORK/postgres.log" -w -t 60 start >/dev/null ||
+    as_pg pg_ctl -D "$PGDATA_DIR" -l "$WORK/postgres.log" -w -t 60 start >/dev/null ||
         die "PostgreSQL did not start"
 
     log "Initializing pgbench tables, scale 10"
