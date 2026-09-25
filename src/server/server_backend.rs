@@ -3781,19 +3781,41 @@ impl Server {
         s
     }
 
+    /// Test-only `Server` over a loopback TCP connection, with the peer end
+    /// handed back to the caller. Unlike a Unix socket pair, TCP lets the
+    /// peer reset the connection: the next read then fails with
+    /// `ConnectionReset`, and every read after it reports EOF.
+    pub(crate) async fn test_tcp_socket() -> (Self, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener must bind in tests");
+        let address = listener.local_addr().expect("listener address");
+        let (connected, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        let stream = connected.expect("loopback connect must succeed in tests");
+        let (peer, _) = accepted.expect("loopback accept must succeed in tests");
+        (
+            Self::test_over_stream(StreamInner::TCPPlain { stream }, false),
+            peer,
+        )
+    }
+
     #[cfg(unix)]
     fn test_zombie_inner_with_peer(bad: bool) -> (Self, tokio::net::UnixStream) {
+        let (a, b) =
+            tokio::net::UnixStream::pair().expect("UnixStream::pair must succeed in tests");
+        (
+            Self::test_over_stream(StreamInner::UnixSocket { stream: a }, bad),
+            b,
+        )
+    }
+
+    fn test_over_stream(stream: StreamInner, bad: bool) -> Self {
         use dashmap::DashMap;
-        use tokio::net::UnixStream;
 
-        let (a, b) = UnixStream::pair().expect("UnixStream::pair must succeed in tests");
-        let stream = BufStream::with_capacity(
-            BUF_STREAM_CAPACITY,
-            BUF_STREAM_CAPACITY,
-            StreamInner::UnixSocket { stream: a },
-        );
+        let stream = BufStream::with_capacity(BUF_STREAM_CAPACITY, BUF_STREAM_CAPACITY, stream);
 
-        let server = Server {
+        Server {
             address: Address::default(),
             stream: std::mem::ManuallyDrop::new(stream),
             buffer: BytesMut::new(),
@@ -3856,8 +3878,7 @@ impl Server {
             prepared_after_statements_reset: HashSet::new(),
             intercept_discard_all: true,
             abandoned_query_timeouts: AbandonedQueryTimeouts::DEFAULT,
-        };
-        (server, b)
+        }
     }
 }
 

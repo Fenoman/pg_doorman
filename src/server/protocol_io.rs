@@ -1070,6 +1070,8 @@ enum BufferedReleaseReply {
     /// Part of the reply, or a message this pass does not settle (an error,
     /// a parameter change), left untouched.
     Other,
+    /// The read failed, with the error the message reader reports for it.
+    ReadFailed(Error),
 }
 
 /// Settles a release reply that already sits whole in the read buffer, in
@@ -1085,7 +1087,9 @@ fn settle_buffered_release_reply(server: &mut Server) -> BufferedReleaseReply {
     let buffered = match server.stream.fill_buf().now_or_never() {
         Some(Ok(buffered)) if !buffered.is_empty() => buffered,
         None => return BufferedReleaseReply::Empty,
-        Some(_) => return BufferedReleaseReply::Other,
+        // EOF, which the message reader reports.
+        Some(Ok(_)) => return BufferedReleaseReply::Other,
+        Some(Err(err)) => return BufferedReleaseReply::ReadFailed(message_code_read_error(err)),
     };
     let mut end = 0;
     loop {
@@ -1126,18 +1130,38 @@ fn settle_buffered_release_reply(server: &mut Server) -> BufferedReleaseReply {
     BufferedReleaseReply::Settled
 }
 
+/// The error [`read_message_header`] reports when the read of a message
+/// code fails.
+fn message_code_read_error(err: std::io::Error) -> Error {
+    Error::SocketError(format!(
+        "Error reading message code from socket - Error {err:?}"
+    ))
+}
+
+/// Ends a read of the release reply that failed with `err`: the backend is
+/// marked bad, and the read returns `err`.
+fn release_reply_read_failed(server: &mut Server, err: Error) -> Error {
+    server.release_reply_pending = false;
+    server.mark_bad(&format!("failed to read the release_query reply: {err}"));
+    err
+}
+
 async fn read_release_reply(server: &mut Server) -> Result<(), Error> {
     use tokio::io::AsyncBufReadExt;
 
     while server.release_reply_pending {
         match settle_buffered_release_reply(server) {
             BufferedReleaseReply::Settled => break,
-            // Wait for the first bytes, then settle the reply in one pass;
-            // a failed read is left to the reader below.
-            BufferedReleaseReply::Empty => {
-                if server.stream.fill_buf().await.is_ok() {
-                    continue;
+            // Wait for the first bytes, then settle the reply in one pass.
+            BufferedReleaseReply::Empty => match server.stream.fill_buf().await {
+                Ok(_) => continue,
+                Err(err) => {
+                    let err = message_code_read_error(err);
+                    return Err(release_reply_read_failed(server, err));
                 }
+            },
+            BufferedReleaseReply::ReadFailed(err) => {
+                return Err(release_reply_read_failed(server, err))
             }
             BufferedReleaseReply::Other => {}
         }
@@ -1150,11 +1174,7 @@ async fn read_release_reply(server: &mut Server) -> Result<(), Error> {
         };
         let mut message = match read.await {
             Ok(message) => message,
-            Err(err) => {
-                server.release_reply_pending = false;
-                server.mark_bad(&format!("failed to read the release_query reply: {err}"));
-                return Err(err);
-            }
+            Err(err) => return Err(release_reply_read_failed(server, err)),
         };
         server.stats.data_received(message.len());
         let code = message.get_u8();
@@ -2077,6 +2097,59 @@ mod tests {
         assert!(!server.release_reply_pending);
         assert!(!server.is_bad());
         drop(writer.await.unwrap());
+    }
+
+    /// Resets the connection from the peer's end: the backend's next read
+    /// fails with `ConnectionReset`, and the reads after it report EOF.
+    fn reset_by_peer(peer: tokio::net::TcpStream) {
+        socket2::SockRef::from(&peer)
+            .set_linger(Some(std::time::Duration::ZERO))
+            .unwrap();
+        drop(peer);
+    }
+
+    /// What the message reader reports when the read of a message code
+    /// fails with `ConnectionReset`.
+    fn connection_reset_read_error() -> Error {
+        Error::SocketError(format!(
+            "Error reading message code from socket - Error {:?}",
+            std::io::Error::from_raw_os_error(libc::ECONNRESET)
+        ))
+    }
+
+    /// A failed read of the release reply fails it with that read's error,
+    /// not with the EOF the connection reports after a reset.
+    #[tokio::test]
+    async fn a_failed_read_of_the_release_reply_reports_its_own_error() {
+        let (mut server, peer) = crate::server::Server::test_tcp_socket().await;
+        server.release_reply_pending = true;
+        reset_by_peer(peer);
+        server.stream.get_ref().readable().await.unwrap();
+
+        let result = super::read_release_reply(&mut server).await;
+
+        assert_eq!(result, Err(connection_reset_read_error()));
+        assert!(!server.release_reply_pending);
+        assert!(server.is_bad());
+    }
+
+    /// The same holds for a read that fails while the reader waits for the
+    /// first bytes of the reply.
+    #[tokio::test]
+    async fn a_read_of_the_release_reply_failing_while_it_waits_reports_its_own_error() {
+        let (mut server, peer) = crate::server::Server::test_tcp_socket().await;
+        server.release_reply_pending = true;
+
+        let result = {
+            let mut read = std::pin::pin!(super::read_release_reply(&mut server));
+            assert!(futures::poll!(read.as_mut()).is_pending());
+            reset_by_peer(peer);
+            read.await
+        };
+
+        assert_eq!(result, Err(connection_reset_read_error()));
+        assert!(!server.release_reply_pending);
+        assert!(server.is_bad());
     }
 
     /// The release reply precedes the reply to the exchange sent after it
