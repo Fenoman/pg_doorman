@@ -461,9 +461,11 @@ mod tests {
 
     // KEYS is process-wide and other tests load their keys into it
     // concurrently, so this test checks only its own key files and leaves
-    // the rest of the registry alone.
+    // the rest of the registry alone. Publishing replaces the published
+    // filename set just like a config reload, so the test shares the default
+    // serial key with the config tests that parse or reload a config.
     #[tokio::test]
-    #[serial_test::serial(jwt_keys)]
+    #[serial_test::serial]
     async fn publish_jwt_pub_keys_prunes_removed_reload_keys() {
         let (_old_private, old_public) = generate_temp_rsa_keys();
         let (_new_private, new_public) = generate_temp_rsa_keys();
