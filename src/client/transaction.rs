@@ -3252,10 +3252,15 @@ where
                 let write_timeout = crate::config::proxy_copy_data_timeout();
                 let buffered_response = &self.client_last_messages_in_tx;
                 let client_write = &mut self.write;
+                let transaction_mode = self.transaction_mode;
+                let (username, pool_name, connection_id) =
+                    (&self.username, &self.pool_name, self.connection_id);
 
                 // Client delivery and backend cleanup are independent after
                 // ReadyForQuery and use different sockets. Running them together
-                // keeps release-query latency out of the client-visible result.
+                // keeps release-query latency out of the client-visible result,
+                // and the check-in returns the backend to the pool as soon as it
+                // is done, while the client may still be reading the response.
                 let flush_response = async {
                     if has_buffered_response {
                         write_all_flush_timeout(client_write, buffered_response, write_timeout)
@@ -3264,35 +3269,35 @@ where
                         Ok(())
                     }
                 };
-                let finalize_backend = async {
-                    if shutdown_in_progress {
+                let finalize_backend = async move {
+                    let server = conn.deref_mut();
+                    let finalize_res = if shutdown_in_progress {
                         server.mark_bad("graceful shutdown - releasing server connection");
                         Ok(())
                     } else if !server.is_async() {
                         server.finalize_checkin().await
                     } else {
                         Ok(())
+                    };
+
+                    if transaction_mode {
+                        server
+                            .record_transaction_end(server_active_at.elapsed().as_micros() as u64);
                     }
+
+                    if let Err(err) = finalize_res {
+                        if !server.is_bad() {
+                            server.mark_bad(&format!("check-in cleanup failed: {err}"));
+                        }
+                        warn!(
+                            "[{username}@{pool_name} #c{connection_id}] check-in cleanup failed for backend pid={}: {err}",
+                            server.get_process_id(),
+                        );
+                    }
+                    server.stats.wait_idle();
+                    drop(conn);
                 };
-                let (flush_res, finalize_res) = tokio::join!(flush_response, finalize_backend);
-
-                if self.transaction_mode {
-                    server.record_transaction_end(server_active_at.elapsed().as_micros() as u64);
-                }
-
-                if let Err(err) = finalize_res {
-                    if !server.is_bad() {
-                        server.mark_bad(&format!("check-in cleanup failed: {err}"));
-                    }
-                    warn!(
-                        "[{}@{} #c{}] check-in cleanup failed for backend pid={}: {err}",
-                        self.username,
-                        self.pool_name,
-                        self.connection_id,
-                        server.get_process_id(),
-                    );
-                }
-                server.stats.wait_idle();
+                let (flush_res, ()) = tokio::join!(flush_response, finalize_backend);
 
                 match flush_res {
                     Ok(()) => {
@@ -4873,6 +4878,27 @@ mod client_response_write_timeout_tests {
         assert!(
             !relay_body.contains("write_all_flush(&mut self.write, &response"),
             "client response relay must not use an unbounded client write while holding a backend"
+        );
+    }
+
+    /// After ReadyForQuery the backend goes back to the pool as soon as its
+    /// check-in is done, while the response may still be on its way to the
+    /// client: the check-in owns the checkout and drops it, and the client
+    /// write runs beside it.
+    #[test]
+    fn a_backend_returns_before_the_client_has_the_response() {
+        let src = include_str!("transaction.rs");
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let start = impl_src
+            .find("let finalize_backend = async move {")
+            .expect("the check-in future must own the checkout");
+        let finalize = &impl_src[start..];
+        let end = finalize
+            .find("tokio::join!(flush_response, finalize_backend)")
+            .expect("the check-in runs beside the client write");
+        assert!(
+            finalize[..end].contains("drop(conn);"),
+            "the check-in future returns the backend itself"
         );
     }
 
