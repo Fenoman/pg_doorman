@@ -1529,24 +1529,25 @@ impl Pool {
     /// queueing on the semaphore and without a timer. Under load a backend
     /// comes back every few microseconds, and a queued waiter would first
     /// have to be woken up. `None` when no permit came before the turns ran
-    /// out or `deadline` passed, or at once when the pool is paused: a paused
-    /// pool hands out nothing.
+    /// out or `deadline` passed, or once the pool is paused: a paused pool
+    /// hands out nothing.
     pub(crate) async fn spin_for_permit(
         &self,
         deadline: Option<tokio::time::Instant>,
     ) -> Option<SemaphorePermit<'_>> {
-        if self.inner.server_pool.is_paused() {
-            return None;
-        }
         for turn in 0..MAX_FAST_RETRY {
-            if let Ok(permit) = self.inner.semaphore.try_acquire() {
-                return Some(permit);
-            }
-            // The turns bound the count of tries, not the time they take:
-            // past its deadline a checkout stops spinning and times out.
-            if turn > 0 && deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            // A paused pool hands out nothing, and the turns bound the count
+            // of tries, not the time they take: once the pool is paused or
+            // past its deadline, the checkout stops spinning and waits for
+            // the resume or times out.
+            if self.inner.server_pool.is_paused()
+                || (turn > 0
+                    && deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline))
             {
                 return None;
+            }
+            if let Ok(permit) = self.inner.semaphore.try_acquire() {
+                return Some(permit);
             }
             for _ in 0..4 {
                 std::hint::spin_loop();
@@ -6900,6 +6901,31 @@ mod checkout_spin_tests {
         pool.database.pause();
         let spun = pool.database.spin_for_permit(None).now_or_never();
         assert!(matches!(spun, Some(None)));
+    }
+
+    /// A pool paused while a checkout spins hands it nothing: a permit
+    /// freed after the pause waits for the resume.
+    #[tokio::test]
+    async fn the_spin_stops_once_the_pool_is_paused() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let all = pool.database.inner.semaphore.available_permits() as u32;
+        let taken = pool
+            .database
+            .inner
+            .semaphore
+            .acquire_many(all)
+            .await
+            .unwrap();
+        let database = &pool.database;
+        let pause_and_release = async move {
+            tokio::task::yield_now().await;
+            database.pause();
+            drop(taken);
+        };
+
+        let (spun, ()) = tokio::join!(pool.database.spin_for_permit(None), pause_and_release);
+
+        assert!(spun.is_none());
     }
 
     /// The turns are not a time bound: a checkout whose deadline passes
