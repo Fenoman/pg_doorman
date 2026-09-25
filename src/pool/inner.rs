@@ -1806,6 +1806,26 @@ impl Pool {
         &self,
         timeouts: &Timeouts,
         start: tokio::time::Instant,
+        mut spun: Option<SemaphorePermit<'_>>,
+    ) -> Result<Object, PoolError> {
+        loop {
+            let object = self.checkout_once(timeouts, start, spun.take()).await?;
+            // A pool paused while the checkout waited hands out nothing: the
+            // backend goes back to the idle slots, and the checkout waits for
+            // the resume under the same deadline.
+            if !self.inner.server_pool.is_paused() {
+                return Ok(object);
+            }
+            drop(object);
+        }
+    }
+
+    /// One pass of [`Self::finish_checkout`]: a backend for the permit the
+    /// spin found, or else for one taken from the semaphore queue.
+    async fn checkout_once(
+        &self,
+        timeouts: &Timeouts,
+        start: tokio::time::Instant,
         spun: Option<SemaphorePermit<'_>>,
     ) -> Result<Object, PoolError> {
         let preparation = std::pin::pin!(self.prepare_checkout(timeouts, start, spun));
@@ -6961,6 +6981,38 @@ mod checkout_spin_tests {
         let (spun, ()) = tokio::join!(pool.database.spin_for_permit(None), pause_and_release);
 
         assert!(spun.permit.is_none());
+    }
+
+    /// A checkout already queued for a permit when the pool is paused gets
+    /// nothing until the resume: the permit a returned backend frees goes
+    /// back to the semaphore.
+    #[tokio::test]
+    async fn a_queued_checkout_gets_nothing_while_the_pool_is_paused() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let semaphore = &pool.database.inner.semaphore;
+        let all = semaphore.available_permits() as u32;
+        let (held, _backend) = pool.database.test_checked_out_backend().await;
+        let _rest = semaphore.acquire_many(all - 1).await.unwrap();
+        let timeouts = super::Timeouts {
+            wait: Some(std::time::Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let mut checkout = Box::pin(pool.database.timeout_get(&timeouts));
+        // Past its spin the checkout waits in the semaphore queue.
+        for _ in 0..2 * super::MAX_FAST_RETRY {
+            assert!(futures::poll!(checkout.as_mut()).is_pending());
+        }
+
+        pool.database.pause();
+        drop(held);
+
+        assert!(
+            futures::poll!(checkout.as_mut()).is_pending(),
+            "a paused pool hands out no backend"
+        );
+        assert_eq!(semaphore.available_permits(), 1);
+        pool.database.resume();
+        assert!(checkout.await.is_ok());
     }
 
     /// The turns are not a time bound: a checkout whose deadline passes
