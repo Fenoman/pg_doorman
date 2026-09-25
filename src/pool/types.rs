@@ -94,8 +94,9 @@ impl Timeouts {
         Self::default()
     }
 
-    /// The deadline of a checkout begun at `start`: none without a positive
-    /// wait timeout, which keeps a zero wait non-blocking.
+    /// The deadline of a checkout begun at `start`, none without a positive
+    /// wait timeout. A checkout with a zero wait still spins, then fails
+    /// without queueing when no permit is free.
     pub(crate) fn checkout_deadline(
         &self,
         start: tokio::time::Instant,

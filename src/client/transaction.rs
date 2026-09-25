@@ -104,8 +104,9 @@ where
 /// spin is taken before the checkout arms its deadline and before the
 /// client is watched: both matter only for a real wait. A checkout that
 /// yielded in the spin looks at the client before it goes on, and the rest
-/// of the checkout runs under the disconnect watcher, so the query of a
-/// client that closed meanwhile never reaches a backend.
+/// of the checkout runs under the disconnect watcher: a client that closed
+/// meanwhile gets no backend, unless bytes it sent before closing are still
+/// buffered ahead of the end of its stream.
 async fn checkout_for_client<R>(
     read: &mut tokio::io::BufReader<R>,
     database: &crate::pool::Pool,
