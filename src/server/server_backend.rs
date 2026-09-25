@@ -165,8 +165,14 @@ impl AbandonedQueryTimeouts {
     };
 }
 
-/// Values of the `path` label of `CHECKIN_CLEANUP_SECONDS`.
-const CHECKIN_CLEANUP_PATHS: [&str; 4] = ["release_only", "combined", "cleanup_only", "empty"];
+/// Values of the `path` label of `CHECKIN_CLEANUP_SECONDS` a successful
+/// check-in is observed under.
+const CHECKIN_CLEANUP_PATHS: [&str; 3] = ["release_only", "combined", "cleanup_only"];
+
+/// The `path` of a check-in with nothing to clean and no release query, the
+/// one every transaction of a pool with `release_query = ""` makes. It is
+/// observed only when it fails.
+const EMPTY_CHECKIN_PATH: &str = "empty";
 
 /// Historical iServ default for the per-checkin release query. Releases
 /// session-scoped state that PostgreSQL does not clear between transactions:
@@ -812,10 +818,10 @@ pub struct Server {
     release_query: Option<ResolvedReleaseQuery>,
 
     /// Pre-bound observers for successful check-ins, one per
-    /// `CHECKIN_CLEANUP_PATHS` entry. Every transaction records one of them;
-    /// binding once per backend avoids a four-label MetricVec lookup each
-    /// time, while failed check-ins stay dynamic.
-    ok_cleanup_metrics: Option<Box<[prometheus::Histogram; 4]>>,
+    /// `CHECKIN_CLEANUP_PATHS` entry. Binding once per backend avoids a
+    /// four-label MetricVec lookup on each observed check-in, while failed
+    /// check-ins stay dynamic.
+    ok_cleanup_metrics: Option<Box<[prometheus::Histogram; 3]>>,
 
     /// True while the current checkout still owes a successful
     /// `release_query` round trip. Armed by [`Server::arm_release_cleanup`]
@@ -2320,7 +2326,7 @@ impl Server {
             (true, true) => "combined",
             (true, false) => "release_only",
             (false, true) => "cleanup_only",
-            (false, false) => "empty",
+            (false, false) => EMPTY_CHECKIN_PATH,
         }
     }
 
@@ -2393,7 +2399,7 @@ impl Server {
         if result.is_ok() && (self.release_reply_pending || self.deferred_release) {
             // Sent without waiting: observed once its reply is read.
             self.release_reply_metric = Some((path, seconds));
-        } else {
+        } else if result.is_err() || path != EMPTY_CHECKIN_PATH {
             self.record_checkin_cleanup_metric(
                 path,
                 Self::checkin_cleanup_metric_result(&result),
@@ -4501,6 +4507,36 @@ mod tests {
             peer.write_all(&ready).await.unwrap();
             server.settle_release_reply_in_time().await.unwrap();
         }
+    }
+
+    /// A check-in with nothing to clean and no release query, the one every
+    /// transaction of a pool with `release_query = ""` makes, is not
+    /// observed. A failed one still is.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_empty_checkin_is_observed_only_when_it_fails() {
+        let observed = |result: &str| {
+            crate::web::metrics::CHECKIN_CLEANUP_SECONDS
+                .with_label_values(&["empty_checkin_user", "empty_checkin_db", "empty", result])
+                .get_sample_count()
+        };
+        let before = (observed("ok"), observed("protocol_error"));
+        let (mut server, _peer) = super::Server::test_silent_socket();
+        server.address.username = "empty_checkin_user".to_string();
+        server.address.database = "empty_checkin_db".to_string();
+        server.set_release_query(Some(""));
+
+        server.finalize_checkin().await.expect("check-in");
+        assert_eq!(
+            observed("ok"),
+            before.0,
+            "an empty check-in is not observed"
+        );
+
+        server.in_copy_mode = true;
+        assert!(server.finalize_checkin().await.is_err());
+        assert_eq!(observed("protocol_error"), before.1 + 1);
     }
 
     #[cfg(unix)]

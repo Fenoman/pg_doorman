@@ -893,7 +893,10 @@ pub(crate) static SYNC_PARAMS_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 /// Duration and outcome of the backend check-in exchange after a client
 /// transaction has reached ReadyForQuery. Both labels have a fixed vocabulary:
 /// `path` is empty/release_only/cleanup_only/combined and `result` is
-/// ok/sql_error/transport_error/protocol_error/error. The duration is that of
+/// ok/sql_error/transport_error/protocol_error/error. An empty check-in, with
+/// nothing to clean and no release query, is observed only when it fails:
+/// every transaction of a pool with `release_query = ""` makes one. The
+/// duration is that of
 /// the check-in itself. A default `release_query` goes out without waiting for
 /// its reply, so it counts the send; a release left for the next client's
 /// first write counts only the check-in's own work, and its send goes with
