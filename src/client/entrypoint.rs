@@ -49,6 +49,107 @@ pub struct ClientSessionInfo {
     pub connection_id: u64,
 }
 
+type BoxedEntryFuture<O> = std::pin::Pin<Box<dyn std::future::Future<Output = O> + Send>>;
+
+type TlsClient = crate::client::core::Client<
+    tokio::io::ReadHalf<tokio_native_tls::TlsStream<TcpStream>>,
+    tokio::io::WriteHalf<tokio_native_tls::TlsStream<TcpStream>>,
+>;
+
+/// The authenticated session of a client, built in its own frame and kept on
+/// the heap. The entrypoints poll it on every wakeup: inline, it would give
+/// each of their poll functions a stack frame of its size.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn drive_authenticated_client<S, T>(
+    read: S,
+    write: T,
+    transport: ClientTransport,
+    bytes: bytes::BytesMut,
+    client_server_map: ClientServerMap,
+    admin_only: bool,
+    connection_id: u64,
+    #[cfg(unix)] raw_fd: Option<std::os::unix::io::RawFd>,
+    #[cfg(all(unix, feature = "tls-migration"))] ssl_ptr: Option<crate::client::core::SslRawPtr>,
+    log_client_connections: bool,
+    log_label: &'static str,
+) -> BoxedEntryFuture<Result<Option<ClientSessionInfo>, Error>>
+where
+    S: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+    T: tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    Box::pin(drive_authenticated_client_session(
+        read,
+        write,
+        transport,
+        bytes,
+        client_server_map,
+        admin_only,
+        connection_id,
+        #[cfg(unix)]
+        raw_fd,
+        #[cfg(all(unix, feature = "tls-migration"))]
+        ssl_ptr,
+        log_client_connections,
+        log_label,
+    ))
+}
+
+/// [`startup_with_auth_timeout`] built in its own frame and kept on the heap,
+/// for the same reason as [`drive_authenticated_client`].
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn startup_with_auth_timeout_boxed<S, T>(
+    read: S,
+    write: T,
+    transport: ClientTransport,
+    bytes: bytes::BytesMut,
+    client_server_map: ClientServerMap,
+    admin_only: bool,
+    connection_id: u64,
+    #[cfg(unix)] raw_fd: Option<std::os::unix::io::RawFd>,
+    #[cfg(all(unix, feature = "tls-migration"))] ssl_ptr: Option<crate::client::core::SslRawPtr>,
+    timeout_duration: std::time::Duration,
+) -> BoxedEntryFuture<Result<crate::client::core::Client<S, T>, Error>>
+where
+    S: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+    T: tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    Box::pin(startup_with_auth_timeout(
+        read,
+        write,
+        transport,
+        bytes,
+        client_server_map,
+        admin_only,
+        connection_id,
+        #[cfg(unix)]
+        raw_fd,
+        #[cfg(all(unix, feature = "tls-migration"))]
+        ssl_ptr,
+        timeout_duration,
+    ))
+}
+
+/// [`startup_tls`] built in its own frame and kept on the heap, for the same
+/// reason as [`drive_authenticated_client`].
+#[inline(never)]
+fn startup_tls_boxed(
+    stream: TcpStream,
+    client_server_map: ClientServerMap,
+    admin_only: bool,
+    tls_acceptor: tokio_native_tls::TlsAcceptor,
+    connection_id: u64,
+) -> BoxedEntryFuture<Result<TlsClient, Error>> {
+    Box::pin(startup_tls(
+        stream,
+        client_server_map,
+        admin_only,
+        tls_acceptor,
+        connection_id,
+    ))
+}
+
 /// Drive the authenticated-client lifecycle for any transport.
 ///
 /// Three places (plain TCP startup, TCP plain-continue after rejected TLS,
@@ -58,7 +159,7 @@ pub struct ClientSessionInfo {
 /// the three call sites down to a single generic hop and removes ~90
 /// lines of copy-paste.
 #[allow(clippy::too_many_arguments)]
-async fn drive_authenticated_client<S, T>(
+async fn drive_authenticated_client_session<S, T>(
     read: S,
     write: T,
     transport: ClientTransport,
@@ -72,11 +173,11 @@ async fn drive_authenticated_client<S, T>(
     log_label: &'static str,
 ) -> Result<Option<ClientSessionInfo>, Error>
 where
-    S: tokio::io::AsyncRead + Unpin + Send + 'static,
-    T: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+    T: tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
     let peer = transport.peer_display();
-    match startup_with_auth_timeout(
+    match startup_with_auth_timeout_boxed(
         read,
         write,
         transport,
@@ -293,7 +394,7 @@ pub async fn client_entrypoint(
                 }
 
                 // Negotiate TLS.
-                match startup_tls(
+                match startup_tls_boxed(
                     stream,
                     client_server_map,
                     admin_only,
@@ -576,6 +677,36 @@ mod tests {
 
     fn empty_client_server_map() -> ClientServerMap {
         Arc::new(DashMap::new())
+    }
+
+    /// The entrypoints poll the authenticated session on every wakeup. Kept
+    /// inline, its future would give each of their poll functions a stack
+    /// frame of its size, probed page by page on every poll.
+    #[test]
+    fn the_authenticated_session_future_is_a_heap_pointer() {
+        let session = drive_authenticated_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            ClientTransport::Tcp {
+                peer: "127.0.0.1:5432".parse().unwrap(),
+                ssl: false,
+            },
+            bytes::BytesMut::new(),
+            empty_client_server_map(),
+            false,
+            1,
+            #[cfg(unix)]
+            None,
+            #[cfg(all(unix, feature = "tls-migration"))]
+            None,
+            false,
+            "plain",
+        );
+        let size = std::mem::size_of_val(&session);
+        assert!(
+            size <= 2 * std::mem::size_of::<usize>(),
+            "the session future is {size} bytes inline"
+        );
     }
 
     async fn idle_tcp_pair() -> (TcpStream, TcpStream) {

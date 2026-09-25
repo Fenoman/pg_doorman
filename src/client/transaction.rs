@@ -2032,7 +2032,22 @@ where
         }
     }
 
-    pub async fn handle(&mut self) -> Result<(), Error> {
+    /// Runs the client session from a heap allocation. The entrypoints poll
+    /// the session on every wakeup: kept inline, its large future would give
+    /// each of their poll functions a stack frame of its size, which is
+    /// probed page by page on every poll.
+    #[inline(never)]
+    pub fn handle(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>>
+    where
+        S: Send + Sync,
+        T: Send + Sync,
+    {
+        Box::pin(self.handle_session())
+    }
+
+    async fn handle_session(&mut self) -> Result<(), Error> {
         // The client wants to cancel a query it has issued earlier.
         if self.cancel_mode {
             return self.handle_cancel_mode().await;
@@ -4525,7 +4540,7 @@ mod internal_round_trip_timeout_tests {
         );
 
         let client_loop_start = impl_src
-            .find("pub async fn handle(")
+            .find("async fn handle_session(")
             .expect("client handle loop not found");
         let client_loop = &impl_src[client_loop_start..];
         let client_loop_end = client_loop
@@ -5526,7 +5541,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
         );
 
         let handle_start = impl_src
-            .find("pub async fn handle(&mut self)")
+            .find("async fn handle_session(&mut self)")
             .expect("client handle loop not found");
         let handle = &impl_src[handle_start..];
         let intercept_call = handle
@@ -8181,6 +8196,25 @@ mod cancel_counter_attribution_tests {
             body.contains("get_pool("),
             "the cancel path must look the pool up by (database, user) taken \
              from the cancel target"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_future_size_tests {
+    use super::relay_response_client_write_failure_tests::test_client_with_broken_pipe_writer;
+
+    /// The entrypoints poll the session on every wakeup. Kept inline, the
+    /// session future would give each of their poll functions a stack frame
+    /// of its size, which is probed page by page on every poll.
+    #[test]
+    fn the_client_session_future_is_a_heap_pointer() {
+        let mut client = test_client_with_broken_pipe_writer();
+        let session = client.handle();
+        let size = std::mem::size_of_val(&session);
+        assert!(
+            size <= 2 * std::mem::size_of::<usize>(),
+            "the session future is {size} bytes inline"
         );
     }
 }
