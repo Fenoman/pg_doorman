@@ -19,7 +19,8 @@ use crate::client::batch_handling::PARSE_COMPLETE_MSG;
 use crate::client::core::{BatchOperation, Client, PreparedStatementKey, SkippedParse};
 use crate::client::util::{
     contains_discard_all, extract_deallocate_target, extract_set_and_reset_cleanup_commands,
-    is_standalone_begin, simple_query_body, simple_query_starts_with_prepare, QUERY_DEALLOCATE,
+    is_standalone_begin, leading_keyword_initial, simple_query_body,
+    simple_query_starts_with_prepare, QUERY_DEALLOCATE,
 };
 use crate::errors::Error;
 use crate::messages::{
@@ -1107,9 +1108,12 @@ where
             return Ok(true);
         }
 
+        // DISCARD ALL and DEALLOCATE both lead with a D.
+        let starts_with_d = leading_keyword_initial(simple_query_body(message)) == Some(b'D');
         if self.transaction_mode
             && !self.sql_prepare_session_pinned
             && pool.settings.intercept_discard_all
+            && starts_with_d
             && contains_discard_all(simple_query_body(message))
         {
             self.stats.active_idle();
@@ -1129,7 +1133,7 @@ where
         // SQL keyword itself. Do not apply a separate total-frame heuristic
         // here; the SimpleQuery reader already enforces the protocol memory
         // cap, and the strict SQL parser below rejects non-DEALLOCATE bodies.
-        if message.len() > QUERY_DEALLOCATE.len() + 6 {
+        if starts_with_d && message.len() > QUERY_DEALLOCATE.len() + 6 {
             let query_bytes = simple_query_body(message);
 
             // tokenizing parser (skips leading whitespace,
@@ -1273,7 +1277,9 @@ where
 
     /// Returns true when the statement deallocates a pooler alias.
     fn track_forwarded_simple_deallocate_cache_state(&mut self, message: &BytesMut) -> bool {
-        if message.len() <= QUERY_DEALLOCATE.len() + 6 {
+        if message.len() <= QUERY_DEALLOCATE.len() + 6
+            || leading_keyword_initial(simple_query_body(message)) != Some(b'D')
+        {
             return false;
         }
 

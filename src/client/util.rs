@@ -1393,6 +1393,18 @@ pub(crate) fn extract_deallocate_target(bytes: &[u8]) -> Option<DeallocateTarget
 }
 
 #[inline]
+/// The first letter, upper-cased, of the first keyword of a statement text,
+/// past leading whitespace and comments. `None` for a text without one or
+/// with an unterminated comment. DISCARD ALL and DEALLOCATE are found only
+/// in a text that starts with a D, so any other query skips their parsers.
+pub(crate) fn leading_keyword_initial(bytes: &[u8]) -> Option<u8> {
+    let mut idx = 0;
+    if !skip_whitespace_and_comments(bytes, &mut idx) {
+        return None;
+    }
+    bytes.get(idx).map(u8::to_ascii_uppercase)
+}
+
 pub(crate) fn simple_query_starts_with_prepare(bytes: &[u8]) -> bool {
     let mut idx = 0;
     if !skip_whitespace_and_comments(bytes, &mut idx) {
@@ -1450,6 +1462,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// DISCARD ALL and DEALLOCATE are found only in a text whose first
+    /// keyword starts with a D, so gating their parsers on it changes
+    /// nothing.
+    #[test]
+    fn keyword_parsers_match_only_their_leading_initial() {
+        for text in [
+            "SELECT 1",
+            "  select 1;",
+            "/* c */ DISCARD ALL",
+            "-- c\n discard all;",
+            "DISCARD ALL",
+            "DISCARDS ALL",
+            "DEALLOCATE ALL",
+            "deallocate prepare x",
+            "/* x */DEALLOCATE \"a b\"",
+            "PREPARE p AS SELECT 1",
+            "prepare\tp as select 1",
+            "PREPARED",
+            "/* unterminated DISCARD ALL",
+            "",
+            ";",
+            " \n\t",
+            "d",
+            "p",
+            "SET x = 1",
+            "RESET ALL",
+            "(SELECT 1)",
+        ] {
+            let bytes = text.as_bytes();
+            let initial = leading_keyword_initial(bytes);
+            if initial != Some(b'D') {
+                assert!(!contains_discard_all(bytes), "{text:?}");
+                assert!(extract_deallocate_target(bytes).is_none(), "{text:?}");
+            }
+        }
+        assert_eq!(leading_keyword_initial(b"-- c\n discard all;"), Some(b'D'));
+        assert_eq!(leading_keyword_initial(b"/* unterminated"), None);
     }
 
     #[test]
