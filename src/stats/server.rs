@@ -2,7 +2,7 @@ use super::AddressStats;
 use super::{get_reporter, Reporter};
 use crate::config::Address;
 use crate::utils::clock;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use iota::iota;
 use log::debug;
 use std::sync::atomic::*;
@@ -102,8 +102,10 @@ pub struct ServerStats {
     /// last entered ACTIVE. `NEVER_ACTIVE` means not activated yet.
     active_since_nanos_from_connect: AtomicU64,
 
-    /// The pool latency histograms, resolved on the first observation.
-    pool_latency: std::sync::OnceLock<crate::web::metrics::PoolLatencyHistograms>,
+    /// The pool latency histograms, resolved on the first observation and
+    /// again after the sweep of gone pools moves the latency epoch past the
+    /// one they carry.
+    pool_latency: ArcSwapOption<crate::web::metrics::PoolLatencyHistograms>,
 }
 
 /// Sentinel for `active_since_nanos_from_connect` meaning "not activated yet".
@@ -177,7 +179,7 @@ impl Default for ServerStats {
             prepared_cache_size: AtomicU64::new(0),
             use_tls: AtomicBool::new(false),
             active_since_nanos_from_connect: AtomicU64::new(NEVER_ACTIVE),
-            pool_latency: std::sync::OnceLock::new(),
+            pool_latency: ArcSwapOption::empty(),
         }
     }
 }
@@ -196,14 +198,39 @@ fn next_server_id() -> i32 {
 }
 
 impl ServerStats {
+    /// Runs `observe` on the latency histograms of this backend's pool. The
+    /// cached handles serve while the latency epoch equals the one they
+    /// carry: no lock, no label lookup and no allocation. Otherwise the
+    /// handles are resolved again.
     #[inline(always)]
-    fn pool_latency(&self) -> &crate::web::metrics::PoolLatencyHistograms {
-        self.pool_latency.get_or_init(|| {
-            crate::web::metrics::PoolLatencyHistograms::resolve(
-                &self.address.username,
-                &self.address.pool_name,
-            )
-        })
+    fn observe_pool_latency(
+        &self,
+        observe: impl FnOnce(&crate::web::metrics::PoolLatencyHistograms),
+    ) {
+        let epoch = crate::web::metrics::pool_latency_epoch();
+        {
+            let cached = self.pool_latency.load();
+            if let Some(histograms) = cached.as_ref() {
+                if histograms.epoch() == epoch {
+                    observe(histograms);
+                    return;
+                }
+            }
+        }
+        observe(&self.resolve_pool_latency());
+    }
+
+    /// Resolves the latency histograms and caches them for the next
+    /// observations.
+    #[cold]
+    #[inline(never)]
+    fn resolve_pool_latency(&self) -> Arc<crate::web::metrics::PoolLatencyHistograms> {
+        let histograms = Arc::new(crate::web::metrics::PoolLatencyHistograms::resolve(
+            &self.address.username,
+            &self.address.pool_name,
+        ));
+        self.pool_latency.store(Some(Arc::clone(&histograms)));
+        histograms
     }
 
     #[inline(always)]
@@ -384,7 +411,7 @@ impl ServerStats {
     #[inline(always)]
     pub fn idle(&self, microseconds: u64) {
         self.address.stats.xact_time_add(microseconds);
-        self.pool_latency().observe_transaction(microseconds);
+        self.observe_pool_latency(|histograms| histograms.observe_transaction(microseconds));
         self.set_state(SERVER_STATE_IDLE);
     }
 
@@ -393,7 +420,7 @@ impl ServerStats {
     pub fn add_xact_time_and_idle(&self, microseconds: u64) {
         self.set_state(SERVER_STATE_IDLE);
         self.address.stats.xact_time_add(microseconds);
-        self.pool_latency().observe_transaction(microseconds);
+        self.observe_pool_latency(|histograms| histograms.observe_transaction(microseconds));
     }
 
     //
@@ -546,7 +573,7 @@ impl ServerStats {
         // Pass through `&str` so the hot path does not allocate.
         self.set_application_str(application_name);
         self.address.stats.wait_time_add(microseconds);
-        self.pool_latency().observe_wait(microseconds);
+        self.observe_pool_latency(|histograms| histograms.observe_wait(microseconds));
     }
 
     /// Records a query execution and updates related statistics.
@@ -562,7 +589,7 @@ impl ServerStats {
         self.address.stats.query_count_add();
         self.address.stats.query_time_add_microseconds(microseconds);
         self.query_count.fetch_add(1, Ordering::Relaxed);
-        self.pool_latency().observe_query(microseconds);
+        self.observe_pool_latency(|histograms| histograms.observe_query(microseconds));
     }
 
     /// Records a transaction execution and updates related statistics.
@@ -752,6 +779,68 @@ mod tests {
         assert_eq!(transaction.get_sample_count(), before.1 + 2);
         assert_eq!(wait.get_sample_count(), before.2 + 1);
         assert!(crate::web::metrics::pool_latency_keys_tracked(user, pool));
+    }
+
+    /// Stats of a backend whose pool is `(user, pool)`.
+    fn latency_stats(user: &str, pool: &str) -> ServerStats {
+        let address = crate::config::Address {
+            username: user.to_string(),
+            pool_name: pool.to_string(),
+            ..Default::default()
+        };
+        ServerStats::new(address, clock::now())
+    }
+
+    /// Once the sweep removes the series of a gone pool, a backend that is
+    /// still alive writes its next observations to series the registry
+    /// exports again.
+    #[test]
+    #[serial]
+    fn pool_latency_observations_after_the_sweep_are_exported() {
+        let (user, pool) = ("swept_series_user", "swept_series_pool");
+        let stats = latency_stats(user, pool);
+        stats.checkout_time(100, "app");
+        stats.query(200, "app");
+        stats.idle(300);
+
+        crate::web::metrics::sweep_pool_latency_series(&std::collections::HashSet::new());
+        assert_eq!(
+            crate::web::metrics::exported_pool_latency(user, pool),
+            [None, None, None],
+            "the sweep removes the series of a pool missing from the key set"
+        );
+
+        stats.checkout_time(1_000, "app");
+        stats.query(2_000, "app");
+        stats.idle(3_000);
+
+        assert_eq!(
+            crate::web::metrics::exported_pool_latency(user, pool),
+            [Some((1, 0.002)), Some((1, 0.003)), Some((1, 0.001))],
+            "observations after the sweep land in exported series"
+        );
+    }
+
+    /// A pool that is gone and back under the same labels while an old
+    /// backend of it is alive exports the observations of the old backend
+    /// together with those of a new one.
+    #[test]
+    #[serial]
+    fn pool_latency_of_an_old_backend_goes_to_the_recreated_series() {
+        let (user, pool) = ("recreated_series_user", "recreated_series_pool");
+        let old = latency_stats(user, pool);
+        old.query(100, "app");
+
+        crate::web::metrics::sweep_pool_latency_series(&std::collections::HashSet::new());
+        let new = latency_stats(user, pool);
+        new.query(1_000, "app");
+        old.query(2_000, "app");
+
+        assert_eq!(
+            crate::web::metrics::exported_pool_latency(user, pool)[0],
+            Some((2, 0.003)),
+            "both backends observe into the one exported query series"
+        );
     }
 
     #[test]

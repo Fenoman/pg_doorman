@@ -3,7 +3,7 @@
 #[cfg(target_os = "linux")]
 use log::error;
 use once_cell::sync::Lazy;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::pool::{PoolIdentifier, AUTH_QUERY_STATE, COORDINATORS, DYNAMIC_POOLS};
@@ -732,6 +732,12 @@ pub(crate) static CLIENT_PREPARED_EVICTIONS_KEYS: Lazy<LabelKeyTracker> =
     Lazy::new(LabelKeyTracker::new);
 pub(crate) static STREAMING_KEYS: Lazy<LabelKeyTracker> = Lazy::new(LabelKeyTracker::new);
 pub(crate) static POOL_LATENCY_KEYS: Lazy<LabelKeyTracker> = Lazy::new(LabelKeyTracker::new);
+/// Moves forward each time the sweep removes the latency series of a gone
+/// pool. A backend keeps its latency histograms together with the value read
+/// before resolving them and resolves them again once the value moves: the
+/// registry no longer exports a removed series, even after the same labels
+/// get a new one.
+static POOL_LATENCY_EPOCH: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POOL_ONLY_FALLBACK_TLS_KEYS: Lazy<PoolLabelTracker> =
     Lazy::new(PoolLabelTracker::new);
 pub(crate) static FALLBACK_HOST_KEYS: Lazy<FallbackHostLabelTracker> =
@@ -1717,15 +1723,40 @@ pub fn observe_pool_transaction_microseconds(user: &str, pool: &str, microsecond
 }
 
 /// Removes the query, transaction and wait series of every label pair in the
-/// latency tracker that `current_pool_keys` lacks. Every `/metrics` scrape
-/// runs it with the pools that exist at that moment.
+/// latency tracker that `current_pool_keys` lacks, then moves
+/// [`POOL_LATENCY_EPOCH`] forward so backends holding handles of removed
+/// series resolve them again. Every `/metrics` scrape runs it with the pools
+/// that exist at that moment.
 pub(crate) fn sweep_pool_latency_series(current_pool_keys: &std::collections::HashSet<PoolKey>) {
-    for (user, pool) in POOL_LATENCY_KEYS.drain_stale(current_pool_keys) {
+    sweep_pool_latency_series_with_hook(current_pool_keys, || {});
+}
+
+/// Runs `before_epoch` between removing the series and moving the epoch.
+fn sweep_pool_latency_series_with_hook<F: FnOnce()>(
+    current_pool_keys: &std::collections::HashSet<PoolKey>,
+    before_epoch: F,
+) {
+    let stale = POOL_LATENCY_KEYS.drain_stale(current_pool_keys);
+    if stale.is_empty() {
+        return;
+    }
+    for (user, pool) in &stale {
         let labels = [user.as_str(), pool.as_str()];
         let _ = super::SHOW_POOLS_QUERY_DURATION_SECONDS.remove_label_values(&labels);
         let _ = super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS.remove_label_values(&labels);
         let _ = super::SHOW_POOLS_WAIT_DURATION_SECONDS.remove_label_values(&labels);
     }
+    // The epoch moves only after the removal: a backend that sees the new
+    // value and resolves again gets fresh series, not ones about to go.
+    before_epoch();
+    POOL_LATENCY_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// The current value of [`POOL_LATENCY_EPOCH`]. Acquire pairs with the
+/// sweep, so a caller that sees a new value also sees the removal before it.
+#[inline(always)]
+pub(crate) fn pool_latency_epoch() -> u64 {
+    POOL_LATENCY_EPOCH.load(Ordering::Acquire)
 }
 
 /// Whether the label tracker holds `(user, pool)`, so its latency series go
@@ -1770,12 +1801,14 @@ pub(crate) fn exported_pool_latency(user: &str, pool: &str) -> [Option<(u64, f64
     })
 }
 
-/// The query, transaction and wait histograms of one pool, resolved once for
-/// a backend connection. Every transaction observes into them, and resolving
-/// the label values each time costs a hash and a lookup under a read lock in
-/// the histogram vector and another in the label tracker.
+/// The query, transaction and wait histograms of one pool, resolved for a
+/// backend connection and kept while the epoch they were resolved at is
+/// current. Every transaction observes into them, and resolving the label
+/// values each time costs a hash and a lookup under a read lock in the
+/// histogram vector and another in the label tracker.
 #[derive(Debug)]
 pub(crate) struct PoolLatencyHistograms {
+    epoch: u64,
     query: prometheus::Histogram,
     transaction: prometheus::Histogram,
     wait: prometheus::Histogram,
@@ -1792,6 +1825,9 @@ impl PoolLatencyHistograms {
     /// pair.
     fn resolve_with_hook<F: FnOnce()>(user: &str, pool: &str, before_record: F) -> Self {
         let histograms = Self {
+            // Read before the series: a sweep that removes them while they
+            // resolve leaves this value behind the current one.
+            epoch: pool_latency_epoch(),
             query: super::SHOW_POOLS_QUERY_DURATION_SECONDS.with_label_values(&[user, pool]),
             transaction: super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
                 .with_label_values(&[user, pool]),
@@ -1803,6 +1839,14 @@ impl PoolLatencyHistograms {
         before_record();
         POOL_LATENCY_KEYS.record(user, pool);
         histograms
+    }
+
+    /// The value of [`pool_latency_epoch`] read before resolving. Once the
+    /// current value moves past it, a sweep may have removed the series
+    /// behind these handles.
+    #[inline(always)]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// See [`observe_pool_query_microseconds`].
@@ -2174,6 +2218,59 @@ mod tests {
             super::exported_pool_latency(user, pool),
             [None, None, None],
             "the sweep after the pool is gone removes its series"
+        );
+    }
+
+    /// Handles resolved while a sweep removes their series carry an epoch
+    /// behind the current one, so the backend resolves them again.
+    #[test]
+    #[serial]
+    fn latency_handles_resolved_during_a_sweep_are_stale() {
+        let (user, pool) = ("stale_resolve_user", "stale_resolve_pool");
+        let no_pools = std::collections::HashSet::new();
+        let _tracked = super::PoolLatencyHistograms::resolve(user, pool);
+
+        let histograms = super::PoolLatencyHistograms::resolve_with_hook(user, pool, || {
+            super::sweep_pool_latency_series(&no_pools)
+        });
+
+        assert_eq!(
+            super::exported_pool_latency(user, pool),
+            [None, None, None],
+            "the sweep during resolve removes the series behind the handles"
+        );
+        assert_ne!(
+            histograms.epoch(),
+            super::pool_latency_epoch(),
+            "handles of removed series must not look current"
+        );
+    }
+
+    /// A backend observing between the removal of its series and the move of
+    /// the epoch still observes into exported series once the sweep is over.
+    #[test]
+    #[serial]
+    fn observation_during_a_sweep_does_not_keep_removed_series() {
+        let (user, pool) = ("sweep_race_user", "sweep_race_pool");
+        let stats = crate::stats::ServerStats::new(
+            crate::config::Address {
+                username: user.to_string(),
+                pool_name: pool.to_string(),
+                ..Default::default()
+            },
+            crate::utils::clock::now(),
+        );
+        stats.query(100, "app");
+
+        super::sweep_pool_latency_series_with_hook(&std::collections::HashSet::new(), || {
+            stats.query(200, "app")
+        });
+        stats.query(2_000, "app");
+
+        assert_eq!(
+            super::exported_pool_latency(user, pool)[0],
+            Some((1, 0.002)),
+            "the observation after the sweep lands in an exported series"
         );
     }
 

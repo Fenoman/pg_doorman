@@ -21,8 +21,9 @@ mod tests;
 // Re-exports
 pub(crate) use handler::write_metrics_response;
 #[cfg(test)]
-pub(crate) use metrics::pool_latency_keys_tracked;
-pub(crate) use metrics::PoolLatencyHistograms;
+pub(crate) use metrics::{
+    exported_pool_latency, pool_latency_keys_tracked, sweep_pool_latency_series,
+};
 pub use metrics::{
     forget_fallback_host_label, inc_sync_params_applied, inc_sync_params_piggyback_rejection,
     inc_sync_params_plan, inc_sync_params_skipped, observe_anonymous_eviction,
@@ -34,6 +35,7 @@ pub use metrics::{
     record_migration_receiver_failure, record_pool_only_fallback_tls_label, record_synthetic_miss,
     refresh_static_info_metrics,
 };
+pub(crate) use metrics::{pool_latency_epoch, PoolLatencyHistograms};
 
 // Define the metrics we want to expose
 pub(crate) static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
