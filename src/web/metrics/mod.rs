@@ -25,10 +25,11 @@ pub(crate) use metrics::{
     exported_pool_latency, pool_latency_keys_tracked, sweep_pool_latency_series,
 };
 pub use metrics::{
-    forget_fallback_host_label, inc_sync_params_applied, inc_sync_params_piggyback_rejection,
-    inc_sync_params_plan, inc_sync_params_skipped, observe_anonymous_eviction,
-    observe_backend_create_phase, observe_backend_startup_parameter_error, observe_checkin_cleanup,
-    observe_named_eviction, observe_pool_query_microseconds, observe_pool_transaction_microseconds,
+    forget_fallback_host_label, inc_sync_params_applied, inc_sync_params_empty,
+    inc_sync_params_piggyback_rejection, inc_sync_params_plan, inc_sync_params_skipped,
+    observe_anonymous_eviction, observe_backend_create_phase,
+    observe_backend_startup_parameter_error, observe_checkin_cleanup, observe_named_eviction,
+    observe_pool_query_microseconds, observe_pool_transaction_microseconds,
     observe_pool_wait_microseconds, observe_startup_parameters_dropped, observe_streaming_bytes,
     observe_streaming_event, observe_sync_params_rtt_seconds, record_fallback_host_label,
     record_interner_gc, record_listener_rejection, record_migration_client_dropped,

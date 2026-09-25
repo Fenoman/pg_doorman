@@ -1667,6 +1667,20 @@ pub fn inc_sync_params_applied() {
     SYNC_PARAMS_APPLIED.inc();
 }
 
+/// The plan series of a checkout whose parameters already match, resolved
+/// once: nearly every checkout bumps it, and the lookup by labels takes the
+/// read lock every worker thread shares.
+static SYNC_PARAMS_PLAN_EMPTY: Lazy<prometheus::IntCounter> =
+    Lazy::new(|| SYNC_PARAMS_PLAN_TOTAL.with_label_values(&["empty", "none"]));
+
+/// Record a checkout whose parameters already match the backend: the empty
+/// plan and the skipped sync.
+#[inline]
+pub fn inc_sync_params_empty() {
+    SYNC_PARAMS_PLAN_EMPTY.inc();
+    SYNC_PARAMS_SKIPPED.inc();
+}
+
 /// Record which checkout sync plan was selected and how it was executed.
 #[inline]
 pub fn inc_sync_params_plan(plan: &'static str, path: &'static str) {

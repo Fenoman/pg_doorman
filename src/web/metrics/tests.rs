@@ -172,6 +172,28 @@ fn test_streaming_counters_register_and_increment() {
     );
 }
 
+/// A checkout whose parameters already match counts the empty plan and the
+/// skipped sync.
+#[test]
+#[serial]
+fn an_empty_sync_plan_counts_the_plan_and_the_skip() {
+    use crate::web::metrics::{inc_sync_params_empty, SYNC_PARAMS_PLAN_TOTAL, SYNC_PARAMS_SKIPPED};
+
+    let plan = || {
+        SYNC_PARAMS_PLAN_TOTAL
+            .with_label_values(&["empty", "none"])
+            .get()
+    };
+    let before = (plan(), SYNC_PARAMS_SKIPPED.get());
+
+    inc_sync_params_empty();
+
+    assert_eq!(
+        (plan(), SYNC_PARAMS_SKIPPED.get()),
+        (before.0 + 1, before.1 + 1)
+    );
+}
+
 #[test]
 #[serial]
 fn sync_params_plan_metric_registers_plan_and_path_labels() {

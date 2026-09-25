@@ -2645,10 +2645,7 @@ where
                         }
                     };
                     match sync_plan {
-                        SyncPlan::Empty => {
-                            crate::web::metrics::inc_sync_params_plan("empty", "none");
-                            crate::web::metrics::inc_sync_params_skipped();
-                        }
+                        SyncPlan::Empty => crate::web::metrics::inc_sync_params_empty(),
                         SyncPlan::AppNameOnly(sql) => {
                             // Single consumer per checkout; take()n on the
                             // first client message (success AND error paths).
@@ -5622,8 +5619,11 @@ mod app_name_set_discard_all_clears_pending_set_tests {
             false
         }
 
+        assert!(
+            src.contains("SyncPlan::Empty => crate::web::metrics::inc_sync_params_empty()"),
+            "a checkout with matching parameters must count the empty plan"
+        );
         for (plan, path) in [
-            ("empty", "none"),
             ("complex", "standalone"),
             ("app_name_only", "simple_query_piggyback"),
             ("app_name_only", "deferred_begin_preflush"),
