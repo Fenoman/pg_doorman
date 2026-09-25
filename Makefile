@@ -34,6 +34,11 @@ generate:
 flamegraph: ## Generate CPU flamegraph (perf + pgbench load)
 	./scripts/flamegraph.sh
 
+# Records pgo/pg_doorman.profdata.gz. Run it on x86_64 Linux with PostgreSQL
+# and pgbench installed (PG_BIN=<dir> when initdb is not in PATH).
+pgo-profile: ## Record the PGO profile for release builds (pgbench load)
+	./scripts/pgo-profile.sh
+
 # Build the public Dockerfile as pg_doorman:demo. Same tag the
 # dashboard-validation CI workflow uses. Run this once before
 # `make docker-smoke` on a fresh machine, or pass a different

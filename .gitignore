@@ -51,6 +51,11 @@ documentation/ru/mermaid.min.js
 # Flamegraph profiling artifacts
 flamegraph-output/
 
+# PGO raw profiles and unpacked profile data. The committed profile is
+# pgo/pg_doorman.profdata.gz.
+*.profraw
+*.profdata
+
 # Claude memory compiler (personal knowledge base)
 .claude-memory-compiler/
 
