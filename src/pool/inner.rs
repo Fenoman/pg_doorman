@@ -6908,13 +6908,15 @@ mod checkout_future_size_tests {
     /// Every transaction creates and moves a checkout future. It keeps the
     /// rare paths (anticipation, burst gate, coordinator, a new connection,
     /// the liveness probe of a long-idle backend) on the heap and stays
-    /// small on the usual one, which takes an idle backend at once.
+    /// small on the usual one, which takes an idle backend at once. The
+    /// bound sits under the size with any one of those paths inline: 1344
+    /// bytes and more in a test build, against 1096 without.
     #[test]
     fn a_checkout_future_stays_small() {
         let pool = crate::pool::ConnectionPool::test_for_protocol();
         let checkout = pool.database.get();
         let size = std::mem::size_of_val(&checkout);
-        assert!(size <= 4096, "the checkout future is {size} bytes");
+        assert!(size <= 1280, "the checkout future is {size} bytes");
     }
 
     /// A pool slot moves between the idle queue and a checkout on every
