@@ -606,7 +606,12 @@ mod tests {
         assert!(missing_expiration_claims.validate().is_err());
     }
 
+    // TALOS_KEYS is process-wide, and every config parse or successful reload
+    // replaces it whole. Tests that load a key into it therefore share the
+    // default serial key with the config tests, so no other test changes the
+    // map while they run. That also lets this test clear it and count entries.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_load_talos_pub_key() {
         let (_private_file, public_file) = generate_temp_rsa_keys();
         let public_path = public_file.path().to_str().unwrap().to_string();
@@ -641,6 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_generate_and_validate() {
         let (private_file, public_file) = generate_temp_rsa_keys();
         let private_path = private_file.path().to_str().unwrap().to_string();
@@ -695,6 +701,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn talos_token_without_requested_database_is_rejected() {
         let (private_file, public_file) = generate_temp_rsa_keys();
         let private_path = private_file.path().to_str().unwrap().to_string();
@@ -745,6 +752,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn talos_token_with_unconfigured_resource_prefix_is_rejected() {
         let (private_file, public_file) = generate_temp_rsa_keys();
         let private_path = private_file.path().to_str().unwrap().to_string();
