@@ -1721,6 +1721,62 @@ pub fn observe_pool_transaction_microseconds(user: &str, pool: &str, microsecond
     POOL_LATENCY_KEYS.record(user, pool);
 }
 
+/// Whether the label tracker holds `(user, pool)`, so its latency series go
+/// once the pool is gone.
+#[cfg(test)]
+pub(crate) fn pool_latency_keys_tracked(user: &str, pool: &str) -> bool {
+    POOL_LATENCY_KEYS
+        .inner
+        .contains_key(&POOL_LATENCY_KEYS.hash_pair(user, pool))
+}
+
+/// The query, transaction and wait histograms of one pool, resolved once for
+/// a backend connection. Every transaction observes into them, and resolving
+/// the label values each time costs a hash and a lookup under a read lock in
+/// the histogram vector and another in the label tracker.
+#[derive(Debug)]
+pub(crate) struct PoolLatencyHistograms {
+    query: prometheus::Histogram,
+    transaction: prometheus::Histogram,
+    wait: prometheus::Histogram,
+}
+
+impl PoolLatencyHistograms {
+    /// Resolves the histograms of `(user, pool)` and registers the pair with
+    /// the label tracker, which drops its series once the pool is gone.
+    pub(crate) fn resolve(user: &str, pool: &str) -> Self {
+        POOL_LATENCY_KEYS.record(user, pool);
+        Self {
+            query: super::SHOW_POOLS_QUERY_DURATION_SECONDS.with_label_values(&[user, pool]),
+            transaction: super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
+                .with_label_values(&[user, pool]),
+            wait: super::SHOW_POOLS_WAIT_DURATION_SECONDS.with_label_values(&[user, pool]),
+        }
+    }
+
+    /// See [`observe_pool_query_microseconds`].
+    #[inline]
+    pub(crate) fn observe_query(&self, microseconds: u64) {
+        self.query.observe(microseconds as f64 / 1_000_000.0);
+    }
+
+    /// See [`observe_pool_transaction_microseconds`], which drops zero inputs
+    /// the same way.
+    #[inline]
+    pub(crate) fn observe_transaction(&self, microseconds: u64) {
+        if microseconds == 0 {
+            return;
+        }
+        self.transaction.observe(microseconds as f64 / 1_000_000.0);
+    }
+
+    /// See [`observe_pool_wait_microseconds`].
+    #[inline]
+    pub(crate) fn observe_wait(&self, microseconds: u64) {
+        self.wait.observe(microseconds as f64 / 1_000_000.0);
+    }
+}
+
 /// Observes one client checkout wait in the per-pool wait histogram.
 /// Same unit-conversion contract as `observe_pool_query_microseconds`.
 #[inline]

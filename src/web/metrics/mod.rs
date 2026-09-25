@@ -20,6 +20,9 @@ mod tests;
 
 // Re-exports
 pub(crate) use handler::write_metrics_response;
+#[cfg(test)]
+pub(crate) use metrics::pool_latency_keys_tracked;
+pub(crate) use metrics::PoolLatencyHistograms;
 pub use metrics::{
     forget_fallback_host_label, inc_sync_params_applied, inc_sync_params_piggyback_rejection,
     inc_sync_params_plan, inc_sync_params_skipped, observe_anonymous_eviction,

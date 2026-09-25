@@ -101,6 +101,9 @@ pub struct ServerStats {
     /// Nanoseconds elapsed from `connect_time` at the moment this server
     /// last entered ACTIVE. `NEVER_ACTIVE` means not activated yet.
     active_since_nanos_from_connect: AtomicU64,
+
+    /// The pool latency histograms, resolved on the first observation.
+    pool_latency: std::sync::OnceLock<crate::web::metrics::PoolLatencyHistograms>,
 }
 
 /// Sentinel for `active_since_nanos_from_connect` meaning "not activated yet".
@@ -174,6 +177,7 @@ impl Default for ServerStats {
             prepared_cache_size: AtomicU64::new(0),
             use_tls: AtomicBool::new(false),
             active_since_nanos_from_connect: AtomicU64::new(NEVER_ACTIVE),
+            pool_latency: std::sync::OnceLock::new(),
         }
     }
 }
@@ -192,6 +196,16 @@ fn next_server_id() -> i32 {
 }
 
 impl ServerStats {
+    #[inline(always)]
+    fn pool_latency(&self) -> &crate::web::metrics::PoolLatencyHistograms {
+        self.pool_latency.get_or_init(|| {
+            crate::web::metrics::PoolLatencyHistograms::resolve(
+                &self.address.username,
+                &self.address.pool_name,
+            )
+        })
+    }
+
     #[inline(always)]
     fn pack(state: u8, wait: u8) -> u8 {
         (state << 4) | (wait & 0x0F)
@@ -370,11 +384,7 @@ impl ServerStats {
     #[inline(always)]
     pub fn idle(&self, microseconds: u64) {
         self.address.stats.xact_time_add(microseconds);
-        crate::web::metrics::observe_pool_transaction_microseconds(
-            &self.address.username,
-            &self.address.pool_name,
-            microseconds,
-        );
+        self.pool_latency().observe_transaction(microseconds);
         self.set_state(SERVER_STATE_IDLE);
     }
 
@@ -383,11 +393,7 @@ impl ServerStats {
     pub fn add_xact_time_and_idle(&self, microseconds: u64) {
         self.set_state(SERVER_STATE_IDLE);
         self.address.stats.xact_time_add(microseconds);
-        crate::web::metrics::observe_pool_transaction_microseconds(
-            &self.address.username,
-            &self.address.pool_name,
-            microseconds,
-        );
+        self.pool_latency().observe_transaction(microseconds);
     }
 
     //
@@ -540,11 +546,7 @@ impl ServerStats {
         // Pass through `&str` so the hot path does not allocate.
         self.set_application_str(application_name);
         self.address.stats.wait_time_add(microseconds);
-        crate::web::metrics::observe_pool_wait_microseconds(
-            &self.address.username,
-            &self.address.pool_name,
-            microseconds,
-        );
+        self.pool_latency().observe_wait(microseconds);
     }
 
     /// Records a query execution and updates related statistics.
@@ -560,11 +562,7 @@ impl ServerStats {
         self.address.stats.query_count_add();
         self.address.stats.query_time_add_microseconds(microseconds);
         self.query_count.fetch_add(1, Ordering::Relaxed);
-        crate::web::metrics::observe_pool_query_microseconds(
-            &self.address.username,
-            &self.address.pool_name,
-            microseconds,
-        );
+        self.pool_latency().observe_query(microseconds);
     }
 
     /// Records a transaction execution and updates related statistics.
@@ -718,6 +716,41 @@ impl ServerStats {
 mod tests {
     use super::*;
     use crate::stats::get_server_stats;
+
+    /// Observations of a backend go to the latency series of its pool, the
+    /// label pair registered with the tracker, zero transactions dropped.
+    #[test]
+    fn pool_latency_observations_go_to_the_series_of_the_pool() {
+        let (user, pool) = ("latency_series_user", "latency_series_pool");
+        let address = crate::config::Address {
+            username: user.to_string(),
+            pool_name: pool.to_string(),
+            ..Default::default()
+        };
+        let stats = ServerStats::new(address, clock::now());
+        let query =
+            crate::web::metrics::SHOW_POOLS_QUERY_DURATION_SECONDS.with_label_values(&[user, pool]);
+        let transaction = crate::web::metrics::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
+            .with_label_values(&[user, pool]);
+        let wait =
+            crate::web::metrics::SHOW_POOLS_WAIT_DURATION_SECONDS.with_label_values(&[user, pool]);
+        let before = (
+            query.get_sample_count(),
+            transaction.get_sample_count(),
+            wait.get_sample_count(),
+        );
+
+        stats.query(1_500, "app");
+        stats.checkout_time(700, "app");
+        stats.idle(2_000);
+        stats.add_xact_time_and_idle(0);
+        stats.add_xact_time_and_idle(3_000);
+
+        assert_eq!(query.get_sample_count(), before.0 + 1);
+        assert_eq!(transaction.get_sample_count(), before.1 + 2);
+        assert_eq!(wait.get_sample_count(), before.2 + 1);
+        assert!(crate::web::metrics::pool_latency_keys_tracked(user, pool));
+    }
 
     #[test]
     fn test_server_stats_default() {
