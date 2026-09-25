@@ -1065,10 +1065,10 @@ struct EvictGuard<'p> {
 /// `slots.size == max_size` with zero real backends.
 ///
 /// Behaviour:
-/// - On `Drop` without `disarm()`: decrement `slots.size` by 1,
-///   `add_permits(1)` to the semaphore (the caller's permit is
-///   restored), then drop the wrapped `ObjectInner` off-lock -
-///   `Server::drop` closes the TCP fd via RAII.
+/// - On `Drop` without `disarm()`: decrement `slots.size` by 1, then
+///   drop the wrapped `ObjectInner` off-lock - `Server::drop` closes
+///   the TCP fd via RAII. The semaphore is left alone: the caller's
+///   permit goes back to it when the caller drops it.
 /// - On `disarm()`: returns the `ObjectInner` for the success
 ///   path; bookkeeping is the caller's responsibility (typically
 ///   `wrap_checkout` which `permit.forget()`s).
