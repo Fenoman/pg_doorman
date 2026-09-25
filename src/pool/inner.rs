@@ -32,6 +32,8 @@ const MAX_FAST_RETRY: i32 = 10;
 /// progress without busy-spinning.
 const BURST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
 
+type BoxedPoolFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 /// Internal object wrapper with metrics.
 /// The `coordinator_permit` is held for the entire lifetime of the connection:
 /// - Acquired when a NEW connection is created (timeout_get / replenish)
@@ -39,8 +41,6 @@ const BURST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
 /// - Dropped when the connection is destroyed → frees coordinator semaphore slot
 /// - Tracked even with max_db_connections = 0 so RELOAD can enable the limit
 ///   without forgetting existing backends; `None` is used by isolated tests
-type BoxedPoolFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
-
 #[derive(Debug)]
 struct ObjectInner {
     obj: Box<Server>,
@@ -3059,8 +3059,6 @@ pub(crate) struct Spin<'a> {
     pub(crate) yielded: bool,
 }
 
-/// RAII guard for a burst gate slot. Decrements `inflight_creates`
-/// and wakes one burst-gate waiter on drop.
 /// Counts a checkout as under way; see [`Pool::begin_checkout`].
 pub(crate) struct CheckoutGuard<'a> {
     users: &'a AtomicUsize,
@@ -3072,6 +3070,8 @@ impl Drop for CheckoutGuard<'_> {
     }
 }
 
+/// RAII guard for a burst gate slot. Decrements `inflight_creates`
+/// and wakes one burst-gate waiter on drop.
 struct BurstGateGuard<'a> {
     inflight_creates: &'a AtomicUsize,
     create_done: &'a Notify,
