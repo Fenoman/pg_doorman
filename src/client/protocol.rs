@@ -55,7 +55,7 @@ fn synthetic_miss_should_warn() -> bool {
 
 use super::core::{
     BatchOperation, CachedStatement, Client, PreparedNamespaceChange, PreparedStatementKey,
-    PreparedStatementState, PutOutcome, SkippedParse,
+    PreparedStatementKeyRef, PreparedStatementState, PutOutcome, SkippedParse,
 };
 use super::PREPARED_STATEMENT_COUNTER;
 
@@ -157,8 +157,13 @@ where
     ) -> Result<(), Error> {
         match self.prepared.cache.get(&key).cloned() {
             Some(cached) => {
-                self.ensure_prepared_statement_is_on_server_cached(&cached, key, pool, server)
-                    .await
+                self.ensure_prepared_statement_is_on_server_cached(
+                    &cached,
+                    (&key).into(),
+                    pool,
+                    server,
+                )
+                .await
             }
             None => Err(Error::ClientError(format!(
                 "prepared statement `{key:?}` not found"
@@ -172,7 +177,7 @@ where
     pub(crate) async fn ensure_prepared_statement_is_on_server_cached(
         &mut self,
         cached: &CachedStatement,
-        key: PreparedStatementKey,
+        key: PreparedStatementKeyRef<'_>,
         pool: &ConnectionPool,
         server: &mut Server,
     ) -> Result<(), Error> {
@@ -182,9 +187,11 @@ where
                 self.username,
                 self.pool_name,
                 self.connection_id,
-                match &key {
-                    PreparedStatementKey::Named(name) => format!("name=`{name}`"),
-                    PreparedStatementKey::Anonymous(hash) => format!("hash={hash:#x} (unnamed)"),
+                match key {
+                    PreparedStatementKeyRef::Named(name) => format!("name=`{name}`"),
+                    PreparedStatementKeyRef::Anonymous(hash) => {
+                        format!("hash={hash:#x} (unnamed)")
+                    }
                 },
                 truncate_query_for_log(cached.parse.query()),
             );
@@ -702,16 +709,18 @@ where
     }
 
     /// Look up the logical namespace without emitting an out-of-order error.
-    fn get_prepared_statement_lookup_key(
+    /// The key borrows the name, so a Bind or Describe allocates nothing to
+    /// find its statement.
+    fn get_prepared_statement_lookup_key<'a>(
         &self,
-        client_given_name: &str,
-    ) -> Option<PreparedStatementKey> {
+        client_given_name: &'a str,
+    ) -> Option<PreparedStatementKeyRef<'a>> {
         if client_given_name.is_empty() {
             self.prepared
                 .last_anonymous_hash
-                .map(PreparedStatementKey::Anonymous)
+                .map(PreparedStatementKeyRef::Anonymous)
         } else {
-            Some(PreparedStatementKey::Named(client_given_name.to_string()))
+            Some(PreparedStatementKeyRef::Named(client_given_name))
         }
     }
 
@@ -801,7 +810,6 @@ where
         let client_portal_name = Bind::get_portal_str(&message)?;
         let lookup_key = self.get_prepared_statement_lookup_key(client_given_name);
         let cached = lookup_key
-            .as_ref()
             .and_then(|key| self.prepared.cache.get(key))
             .cloned();
         match cached {
@@ -997,7 +1005,6 @@ where
         let client_given_name = describe.statement_name.clone();
         let lookup_key = self.get_prepared_statement_lookup_key(&client_given_name);
         let cached = lookup_key
-            .as_ref()
             .and_then(|key| self.prepared.cache.get(key))
             .cloned();
         match cached {
@@ -2345,7 +2352,7 @@ mod anonymous_close_tests {
                 .get_prepared_statement_lookup_key(client_name)
                 .unwrap();
             assert_eq!(
-                client.prepared.cache.get(&key).unwrap().server_name(),
+                client.prepared.cache.get(key).unwrap().server_name(),
                 backend_name
             );
             assert!(

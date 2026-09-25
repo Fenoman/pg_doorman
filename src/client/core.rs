@@ -246,15 +246,18 @@ impl PreparedStatementCache {
         }
     }
 
-    /// Returns a reference to the value corresponding to the key.
-    /// Updates LRU order for Anonymous + Limited.
+    /// Returns a reference to the value corresponding to the key, owned or
+    /// borrowed. Updates LRU order for Anonymous + Limited.
     #[inline]
-    pub fn get(&mut self, key: &PreparedStatementKey) -> Option<&CachedStatement> {
-        match key {
-            PreparedStatementKey::Named(s) => self.named.get(s),
-            PreparedStatementKey::Anonymous(h) => match &mut self.anonymous {
-                AnonymousCache::Unlimited(m) => m.get(h),
-                AnonymousCache::Limited(l) => l.get(h),
+    pub fn get<'k>(
+        &mut self,
+        key: impl Into<PreparedStatementKeyRef<'k>>,
+    ) -> Option<&CachedStatement> {
+        match key.into() {
+            PreparedStatementKeyRef::Named(s) => self.named.get(s),
+            PreparedStatementKeyRef::Anonymous(h) => match &mut self.anonymous {
+                AnonymousCache::Unlimited(m) => m.get(&h),
+                AnonymousCache::Limited(l) => l.get(&h),
             },
         }
     }
