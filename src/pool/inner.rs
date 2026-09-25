@@ -39,6 +39,8 @@ const BURST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
 /// - Dropped when the connection is destroyed → frees coordinator semaphore slot
 /// - Tracked even with max_db_connections = 0 so RELOAD can enable the limit
 ///   without forgetting existing backends; `None` is used by isolated tests
+type BoxedPoolFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 #[derive(Debug)]
 struct ObjectInner {
     obj: Server,
@@ -651,6 +653,17 @@ impl PoolInner {
     /// Create a new backend connection via `server_pool.create()`, respecting
     /// the caller's `create` timeout. On success, increments `slots.size` and
     /// returns the `ObjectInner` ready for wrapping into an `Object`.
+    /// [`Self::create_connection`] kept off the checkout future; see
+    /// [`Pool::try_anticipate_boxed`].
+    #[inline(never)]
+    fn create_connection_boxed<'a>(
+        &'a self,
+        timeouts: &'a Timeouts,
+        coordinator_permit: Option<pool_coordinator::CoordinatorPermit>,
+    ) -> BoxedPoolFuture<'a, Result<ObjectInner, PoolError>> {
+        Box::pin(self.create_connection(timeouts, coordinator_permit))
+    }
+
     async fn create_connection(
         &self,
         timeouts: &Timeouts,
@@ -744,19 +757,15 @@ impl PoolInner {
             // borrow checker; `as_mut` returned one mutable reference,
             // so destructure from it.
             let ObjectInner { obj, metrics, .. } = inner_ref;
+            let recycle = std::pin::pin!(self.server_pool.recycle(obj, metrics, skip_lifetime));
             match timeouts.recycle {
                 Some(duration) => {
-                    match tokio::time::timeout(
-                        duration,
-                        self.server_pool.recycle(obj, metrics, skip_lifetime),
-                    )
-                    .await
-                    {
+                    match crate::utils::timeout::timeout_unless_ready(duration, recycle).await {
                         Ok(r) => r,
                         Err(_) => Err(RecycleError::StaticMessage("Recycle timeout")),
                     }
                 }
-                None => self.server_pool.recycle(obj, metrics, skip_lifetime).await,
+                None => recycle.await,
             }
         };
 
@@ -1753,7 +1762,7 @@ impl Pool {
         }
 
         let start = tokio::time::Instant::now();
-        let preparation = self.prepare_checkout(timeouts, start);
+        let preparation = std::pin::pin!(self.prepare_checkout(timeouts, start));
         let prepared = match timeouts.wait.filter(|wait| !wait.is_zero()) {
             // An idle backend is usually handed out at once.
             Some(wait) => crate::utils::timeout::timeout_at_unless_ready(start + wait, preparation)
@@ -1775,7 +1784,7 @@ impl Pool {
 
         let obj_inner = self
             .inner
-            .create_connection(timeouts, coordinator_permit)
+            .create_connection_boxed(timeouts, coordinator_permit)
             .await
             .map_err(|e| {
                 let slots = self.inner.slots.lock();
@@ -1790,6 +1799,46 @@ impl Pool {
                 e
             })?;
         Ok(self.wrap_checkout(obj_inner, permit))
+    }
+
+    /// [`Self::try_anticipate`] built in its own frame and kept on the heap:
+    /// the checkout future stays small on its usual path, which takes an
+    /// idle backend at once.
+    #[inline(never)]
+    fn try_anticipate_boxed<'a>(
+        &'a self,
+        timeouts: &'a Timeouts,
+        start: tokio::time::Instant,
+    ) -> BoxedPoolFuture<'a, Option<ObjectInner>> {
+        Box::pin(self.try_anticipate(timeouts, start))
+    }
+
+    /// [`Self::acquire_burst_gate`] kept off the checkout future; see
+    /// [`Self::try_anticipate_boxed`].
+    #[inline(never)]
+    fn acquire_burst_gate_boxed<'a, 't>(
+        &'a self,
+        timeouts: &'t Timeouts,
+        non_blocking: bool,
+    ) -> BoxedPoolFuture<'t, BurstGateOutcome<'a>>
+    where
+        'a: 't,
+    {
+        Box::pin(self.acquire_burst_gate(timeouts, non_blocking))
+    }
+
+    /// [`Self::acquire_coordinator_jit`] kept off the checkout future; see
+    /// [`Self::try_anticipate_boxed`].
+    #[inline(never)]
+    fn acquire_coordinator_jit_boxed<'a, 't>(
+        &'a self,
+        timeouts: &'t Timeouts,
+        gate: BurstGateGuard<'a>,
+    ) -> BoxedPoolFuture<'t, Result<CoordinatorJitResult<'a>, PoolError>>
+    where
+        'a: 't,
+    {
+        Box::pin(self.acquire_coordinator_jit(timeouts, gate))
     }
 
     async fn prepare_checkout(
@@ -1818,7 +1867,7 @@ impl Pool {
             return Ok(CheckoutPreparation::Recycled(obj));
         }
 
-        if let Some(inner) = self.try_anticipate(timeouts, start).await {
+        if let Some(inner) = self.try_anticipate_boxed(timeouts, start).await {
             return Ok(CheckoutPreparation::Recycled(
                 self.wrap_checkout(inner, permit),
             ));
@@ -1837,7 +1886,7 @@ impl Pool {
         }
 
         let non_blocking = timeouts.wait.is_some_and(|t| t.as_nanos() == 0);
-        let _create_gate = match self.acquire_burst_gate(timeouts, non_blocking).await {
+        let _create_gate = match self.acquire_burst_gate_boxed(timeouts, non_blocking).await {
             BurstGateOutcome::Acquired(guard) => guard,
             BurstGateOutcome::Recycled(inner) => {
                 return Ok(CheckoutPreparation::Recycled(
@@ -1857,18 +1906,20 @@ impl Pool {
             }
         };
 
-        let (coordinator_permit, _gate) =
-            match self.acquire_coordinator_jit(timeouts, _create_gate).await? {
-                CoordinatorJitResult::Create {
-                    permit: cp,
-                    gate: g,
-                } => (cp, g),
-                CoordinatorJitResult::Recycled(inner) => {
-                    return Ok(CheckoutPreparation::Recycled(
-                        self.wrap_checkout(*inner, permit),
-                    ));
-                }
-            };
+        let (coordinator_permit, _gate) = match self
+            .acquire_coordinator_jit_boxed(timeouts, _create_gate)
+            .await?
+        {
+            CoordinatorJitResult::Create {
+                permit: cp,
+                gate: g,
+            } => (cp, g),
+            CoordinatorJitResult::Recycled(inner) => {
+                return Ok(CheckoutPreparation::Recycled(
+                    self.wrap_checkout(*inner, permit),
+                ));
+            }
+        };
 
         Ok(CheckoutPreparation::Create {
             permit,
@@ -6745,5 +6796,20 @@ mod tests {
              concurrent acquire would see more permits than the pool has \
              live slots.",
         );
+    }
+}
+
+#[cfg(test)]
+mod checkout_future_size_tests {
+    /// Every transaction creates and moves a checkout future. It keeps the
+    /// rare paths (anticipation, burst gate, coordinator, a new connection,
+    /// the liveness probe of a long-idle backend) on the heap and stays
+    /// small on the usual one, which takes an idle backend at once.
+    #[test]
+    fn a_checkout_future_stays_small() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let checkout = pool.database.get();
+        let size = std::mem::size_of_val(&checkout);
+        assert!(size <= 6144, "the checkout future is {size} bytes");
     }
 }

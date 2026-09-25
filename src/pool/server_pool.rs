@@ -1482,7 +1482,7 @@ impl ServerPool {
         // Probe long-idle connections before reuse.
         if let Some(idle_time_ms) = inline_alive_check_needed(metrics, self.idle_check_timeout_ms) {
             debug!("Connection {conn} idle for {idle_time_ms}ms, checking alive...");
-            if conn.check_alive(self.connect_timeout).await.is_err() {
+            if check_alive_boxed(conn, self.connect_timeout).await.is_err() {
                 conn.close_reason = Some(format!(
                     "failed alive check after {} idle",
                     format_duration_ms(idle_time_ms),
@@ -1494,6 +1494,17 @@ impl ServerPool {
 
         Ok(())
     }
+}
+
+/// [`Server::check_alive`] built in its own frame and kept on the heap: only a
+/// long-idle backend needs it, and the recycle future of every checkout stays
+/// small.
+#[inline(never)]
+fn check_alive_boxed(
+    conn: &mut Server,
+    timeout: std::time::Duration,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>> {
+    Box::pin(conn.check_alive(timeout))
 }
 
 /// Compact "host:port(role)" list for fallback wave logs.

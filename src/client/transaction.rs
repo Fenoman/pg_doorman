@@ -2345,12 +2345,8 @@ where
                 let connecting_at = now();
                 self.stats.waiting();
                 let mut conn = loop {
-                    let checkout = match checkout_or_client_disconnect(
-                        &mut self.read,
-                        current_pool.database.get(),
-                    )
-                    .await
-                    {
+                    let get = std::pin::pin!(current_pool.database.get());
+                    let checkout = match checkout_or_client_disconnect(&mut self.read, get).await {
                         Ok(checkout) => checkout,
                         Err(err) => return self.process_error(err).await,
                     };
