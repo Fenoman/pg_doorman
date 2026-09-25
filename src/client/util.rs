@@ -351,22 +351,47 @@ fn extract_cleanup_commands(
     SmallVec<[SetCleanupCommand; 2]>,
     SmallVec<[ResetCleanupCommand; 2]>,
 ) {
-    let mut set_commands = SmallVec::new();
-    let mut reset_commands = SmallVec::new();
-
     // Statements are separated by ';', so a text without one is a single
-    // statement, and only its start can make it a SET or RESET. A Parse
-    // holds one statement anyway; scanning its whole text costs about
+    // statement, and only its start can make it a SET or RESET. So is a text
+    // whose only ';' ends it, the way drivers commonly send one statement. A
+    // Parse holds one statement anyway; scanning a whole text costs about
     // 1-2 ns per byte.
-    if !bytes.contains(&b';') {
+    if let Some(statement) = single_statement(bytes) {
+        let mut set_commands = SmallVec::new();
+        let mut reset_commands = SmallVec::new();
         if include_set {
-            set_commands.extend(parse_set_cleanup_command(bytes));
+            set_commands.extend(parse_set_cleanup_command(statement));
         }
         if include_reset {
-            reset_commands.extend(parse_reset_cleanup_command(bytes));
+            reset_commands.extend(parse_reset_cleanup_command(statement));
         }
         return (set_commands, reset_commands);
     }
+    scan_cleanup_commands(bytes, include_set, include_reset)
+}
+
+/// The statement of a text that holds only one: a text without ';', or one
+/// whose single ';' is followed by nothing but whitespace.
+fn single_statement(bytes: &[u8]) -> Option<&[u8]> {
+    match bytes.iter().position(|&byte| byte == b';') {
+        None => Some(bytes),
+        Some(end) if bytes[end + 1..].iter().all(u8::is_ascii_whitespace) => Some(&bytes[..end]),
+        Some(_) => None,
+    }
+}
+
+/// The SET and RESET cleanup statements of a text, found by a quote- and
+/// comment-aware scan of all of it.
+fn scan_cleanup_commands(
+    bytes: &[u8],
+    include_set: bool,
+    include_reset: bool,
+) -> (
+    SmallVec<[SetCleanupCommand; 2]>,
+    SmallVec<[ResetCleanupCommand; 2]>,
+) {
+    let mut set_commands = SmallVec::new();
+    let mut reset_commands = SmallVec::new();
 
     let scan_set = include_set && contains_ascii_ci(bytes, b"set");
     let scan_reset = include_reset && contains_ascii_ci(bytes, b"reset");
@@ -1394,9 +1419,9 @@ mod tests {
         DeallocateTarget::Named(name.to_string())
     }
 
-    /// A text without ';' skips the scan of the whole text. The same
-    /// statement with a trailing ';' goes through the full scanner and must
-    /// be classified the same way.
+    /// A text holding one statement, with or without a closing ';', skips
+    /// the scan of the whole text and must be classified the way the full
+    /// scanner classifies it.
     #[test]
     fn single_statement_fast_path_matches_the_full_scan() {
         for statement in [
@@ -1415,8 +1440,15 @@ mod tests {
             "",
         ] {
             let fast = extract_set_and_reset_cleanup_commands(statement.as_bytes());
-            let full = extract_set_and_reset_cleanup_commands(format!("{statement};").as_bytes());
-            assert_eq!(fast, full, "{statement:?}");
+            for text in [format!("{statement};"), format!("{statement} ;\n")] {
+                let full = scan_cleanup_commands(text.as_bytes(), true, true);
+                assert_eq!(fast, full, "{text:?}");
+                assert_eq!(
+                    extract_set_and_reset_cleanup_commands(text.as_bytes()),
+                    full,
+                    "{text:?}"
+                );
+            }
         }
     }
 
