@@ -6394,22 +6394,43 @@ mod cancel_target_attribution_tests {
         );
     }
 
-    /// Every checkout of a backend registers it for cancel requests. The
-    /// registrations share one cancel target of the backend instead of
-    /// copying its host, pool and user names on every checkout.
+    /// Every checkout of a backend registers it for cancel requests, and the
+    /// release after the transaction removes the registration. The next
+    /// checkout registers the same cancel target of the backend instead of
+    /// copying its host, pool and user names again. The target goes away
+    /// with the backend.
     #[tokio::test]
     async fn checkouts_of_a_backend_share_one_cancel_target() {
-        fn target_of(target: &CancelTarget) -> *const CancelTarget {
-            target
-        }
         let (mut server, _peer) = Server::test_silent_socket();
 
         server.claim(1, 11);
-        server.claim(2, 22);
+        let first = Arc::downgrade(
+            server
+                .client_server_map
+                .get(&(1, 11))
+                .expect("first claim")
+                .value(),
+        );
+        server.client_server_map.remove(&(1, 11));
 
-        let map = &server.client_server_map;
-        let first = target_of(map.get(&(1, 11)).expect("first claim").value());
-        let second = target_of(map.get(&(2, 22)).expect("second claim").value());
-        assert_eq!(first, second, "each checkout built its own cancel target");
+        server.claim(2, 22);
+        let second = Arc::downgrade(
+            server
+                .client_server_map
+                .get(&(2, 22))
+                .expect("second claim")
+                .value(),
+        );
+        assert!(
+            std::sync::Weak::ptr_eq(&first, &second),
+            "the second checkout built its own cancel target"
+        );
+
+        server.client_server_map.remove(&(2, 22));
+        drop(server);
+        assert!(
+            first.upgrade().is_none(),
+            "the cancel target outlived its backend"
+        );
     }
 }
