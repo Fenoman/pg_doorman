@@ -427,12 +427,7 @@ fn update_pool_metrics() {
             let _ = super::STREAMING_BYTES_TOTAL.remove_label_values(&[user, db, kind]);
         }
     }
-    for stale in POOL_LATENCY_KEYS.drain_stale(&current_pool_keys) {
-        let _ = super::SHOW_POOLS_QUERY_DURATION_SECONDS.remove_label_values(&[&stale.0, &stale.1]);
-        let _ = super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
-            .remove_label_values(&[&stale.0, &stale.1]);
-        let _ = super::SHOW_POOLS_WAIT_DURATION_SECONDS.remove_label_values(&[&stale.0, &stale.1]);
-    }
+    sweep_pool_latency_series(&current_pool_keys);
 
     for pool in POOL_ONLY_FALLBACK_TLS_KEYS.drain_stale(&current_pool_labels) {
         let pool = pool.as_str();
@@ -1721,6 +1716,18 @@ pub fn observe_pool_transaction_microseconds(user: &str, pool: &str, microsecond
     POOL_LATENCY_KEYS.record(user, pool);
 }
 
+/// Removes the query, transaction and wait series of every label pair in the
+/// latency tracker that `current_pool_keys` lacks. Every `/metrics` scrape
+/// runs it with the pools that exist at that moment.
+pub(crate) fn sweep_pool_latency_series(current_pool_keys: &std::collections::HashSet<PoolKey>) {
+    for (user, pool) in POOL_LATENCY_KEYS.drain_stale(current_pool_keys) {
+        let labels = [user.as_str(), pool.as_str()];
+        let _ = super::SHOW_POOLS_QUERY_DURATION_SECONDS.remove_label_values(&labels);
+        let _ = super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS.remove_label_values(&labels);
+        let _ = super::SHOW_POOLS_WAIT_DURATION_SECONDS.remove_label_values(&labels);
+    }
+}
+
 /// Whether the label tracker holds `(user, pool)`, so its latency series go
 /// once the pool is gone.
 #[cfg(test)]
@@ -1728,6 +1735,39 @@ pub(crate) fn pool_latency_keys_tracked(user: &str, pool: &str) -> bool {
     POOL_LATENCY_KEYS
         .inner
         .contains_key(&POOL_LATENCY_KEYS.hash_pair(user, pool))
+}
+
+/// The exported `(sample count, sample sum)` of the query, transaction and
+/// wait series of `(user, pool)`, in that order. `None` stands for a series
+/// the registry does not export.
+#[cfg(test)]
+pub(crate) fn exported_pool_latency(user: &str, pool: &str) -> [Option<(u64, f64)>; 3] {
+    let families = super::REGISTRY.gather();
+    [
+        "pg_doorman_pools_query_duration_seconds",
+        "pg_doorman_pools_transaction_duration_seconds",
+        "pg_doorman_pools_wait_duration_seconds",
+    ]
+    .map(|name| {
+        families
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(|family| family.get_metric())
+            .find(|metric| {
+                let label = |key: &str| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .find(|pair| pair.name() == key)
+                        .map(|pair| pair.value())
+                };
+                label("user") == Some(user) && label("database") == Some(pool)
+            })
+            .map(|metric| {
+                let histogram = metric.get_histogram();
+                (histogram.sample_count(), histogram.sample_sum())
+            })
+    })
 }
 
 /// The query, transaction and wait histograms of one pool, resolved once for
@@ -1745,13 +1785,24 @@ impl PoolLatencyHistograms {
     /// Resolves the histograms of `(user, pool)` and registers the pair with
     /// the label tracker, which drops its series once the pool is gone.
     pub(crate) fn resolve(user: &str, pool: &str) -> Self {
-        POOL_LATENCY_KEYS.record(user, pool);
-        Self {
+        Self::resolve_with_hook(user, pool, || {})
+    }
+
+    /// Runs `before_record` between creating the series and recording the
+    /// pair.
+    fn resolve_with_hook<F: FnOnce()>(user: &str, pool: &str, before_record: F) -> Self {
+        let histograms = Self {
             query: super::SHOW_POOLS_QUERY_DURATION_SECONDS.with_label_values(&[user, pool]),
             transaction: super::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
                 .with_label_values(&[user, pool]),
             wait: super::SHOW_POOLS_WAIT_DURATION_SECONDS.with_label_values(&[user, pool]),
-        }
+        };
+        // Recording the pair last keeps every series of the pair tracked: a
+        // sweep before the record leaves the series to the record, a sweep
+        // after it drains the pair and removes the series.
+        before_record();
+        POOL_LATENCY_KEYS.record(user, pool);
+        histograms
     }
 
     /// See [`observe_pool_query_microseconds`].
@@ -2093,6 +2144,37 @@ mod tests {
         let before = child.get_sample_count();
         super::observe_pool_wait_microseconds(user, database, 0);
         assert_eq!(child.get_sample_count(), before + 1);
+    }
+
+    /// A sweep that runs while a backend resolves its latency histograms
+    /// leaves the pair tracked, so a later sweep removes the series once
+    /// their pool is gone.
+    #[test]
+    #[serial]
+    fn latency_series_resolved_during_a_sweep_go_with_their_pool() {
+        let (user, pool) = ("resolve_sweep_user", "resolve_sweep_pool");
+        let no_pools = std::collections::HashSet::new();
+
+        let _histograms = super::PoolLatencyHistograms::resolve_with_hook(user, pool, || {
+            super::sweep_pool_latency_series(&no_pools)
+        });
+
+        assert!(
+            super::pool_latency_keys_tracked(user, pool),
+            "the pair is tracked after a sweep during resolve"
+        );
+        assert!(
+            super::exported_pool_latency(user, pool)
+                .iter()
+                .all(Option::is_some),
+            "resolve creates the three series"
+        );
+        super::sweep_pool_latency_series(&no_pools);
+        assert_eq!(
+            super::exported_pool_latency(user, pool),
+            [None, None, None],
+            "the sweep after the pool is gone removes its series"
+        );
     }
 
     #[test]
