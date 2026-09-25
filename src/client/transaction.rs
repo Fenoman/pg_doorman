@@ -3738,6 +3738,25 @@ mod migration_idle_read_tests {
         }
     }
 
+    /// Client read half that fails the test when polled more often than a
+    /// read of a few messages needs: a read that spins polls it without end.
+    struct PollLimit<R> {
+        inner: R,
+        polls_left: usize,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PollLimit<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            assert!(self.polls_left > 0, "the idle read spins on the client");
+            self.polls_left -= 1;
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
     /// A migration published while the client is in the middle of sending a
     /// message waits for the rest of it: the read returns the whole message.
     #[tokio::test]
@@ -3748,7 +3767,10 @@ mod migration_idle_read_tests {
         let message = simple_query("SELECT 1");
         let (client, mut peer) = tokio::io::duplex(64);
         peer.write_all(&message[..5]).await.unwrap();
-        let mut read = BufReader::new(client);
+        let mut read = BufReader::new(PollLimit {
+            inner: client,
+            polls_left: 100,
+        });
         let mut read_buf = BytesMut::new();
         let waiter = MIGRATION_WAITERS.register();
         let idle_read = read_idle_message_or_migration_notice(
