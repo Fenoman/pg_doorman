@@ -13,7 +13,18 @@ vendor-licenses.txt:
 	cargo license --json > ./vendor-licenses.json
 	python ./pkg/make_vendor_license.py ./vendor-licenses.json ./vendor-licenses.txt
 
+# Release builds use the committed PGO profile, pgo/pg_doorman.profdata.gz,
+# when it exists. `make build PGO=0` builds without it.
+PGO ?= 1
+
 build:
+	@pgo_flags="$$(PGO='$(PGO)' ./scripts/pgo-rustflags.sh)" || exit 1; \
+	if [ -n "$$pgo_flags" ]; then \
+		RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }$$pgo_flags"; \
+		export RUSTFLAGS; \
+		echo "RUSTFLAGS=$$RUSTFLAGS"; \
+	fi; \
+	echo "cargo build --release"; \
 	cargo build --release
 
 install: build

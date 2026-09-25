@@ -27,7 +27,14 @@ override_dh_auto_build:
 		echo '[source.vendored-sources]' >> .cargo/config.toml && \
 		echo 'directory = "vendor"' >> .cargo/config.toml; \
 	fi
-	# Build with local Rust
+	# Build with local Rust. scripts/pgo-rustflags.sh adds the committed PGO
+	# profile to RUSTFLAGS when pgo/pg_doorman.profdata.gz is present.
+	pgo_flags="$$(bash scripts/pgo-rustflags.sh)" || exit 1; \
+	if [ -n "$$pgo_flags" ]; then \
+		RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }$$pgo_flags"; \
+		export RUSTFLAGS; \
+	fi; \
+	echo "RUSTFLAGS=$${RUSTFLAGS:-}"; \
 	$(RUST_INSTALL_DIR)/bin/cargo build --release
 
 override_dh_auto_install:

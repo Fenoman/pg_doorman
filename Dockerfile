@@ -24,7 +24,18 @@ RUN cargo install cargo-auditable --version 0.7.5 --locked
 
 COPY . /app
 WORKDIR /app
-RUN cargo auditable build --locked --release --bin pg_doorman --bin patroni_proxy
+# scripts/pgo-rustflags.sh adds the committed PGO profile to RUSTFLAGS when
+# pgo/pg_doorman.profdata.gz is present. `--build-arg PGO=0` builds without it.
+# cargo auditable runs rustc through RUSTC_WORKSPACE_WRAPPER, and cargo mixes
+# the wrapper path into the symbol names of the pg_doorman crates, so only the
+# dependencies find their records in a profile recorded by plain cargo.
+ARG PGO=1
+RUN pgo_flags="$(PGO="$PGO" bash scripts/pgo-rustflags.sh)" && \
+    if [ -n "$pgo_flags" ]; then \
+        export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$pgo_flags"; \
+    fi && \
+    echo "RUSTFLAGS=${RUSTFLAGS:-}" && \
+    cargo auditable build --locked --release --bin pg_doorman --bin patroni_proxy
 
 # The runtime stage is distroless and has no shell, so everything that used to
 # be an in-image `RUN` has to be materialised here and copied in as files.

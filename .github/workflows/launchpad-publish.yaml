@@ -214,8 +214,10 @@ jobs:
             # Rust tarball is included for offline installation (Launchpad has no network access).
             # `frontend/dist` carries the pre-built SPA bundled into the binary
             # via include_dir!() — without it cargo build fails on Launchpad.
+            # debian/rules runs scripts/pgo-rustflags.sh, which applies the
+            # PGO profile from `pgo` when the repository has one.
             RUST_TARBALL="rust-${{ env.RUST_VERSION }}-x86_64-unknown-linux-gnu.tar.gz"
-            FILES_TO_COPY="Cargo.toml Cargo.lock src patches benches debian vendor.tar.gz rust-toolchain.toml frontend/dist $RUST_TARBALL"
+            FILES_TO_COPY="Cargo.toml Cargo.lock src patches benches debian vendor.tar.gz rust-toolchain.toml frontend/dist pgo scripts/pgo-rustflags.sh $RUST_TARBALL"
 
             # Debug: show what we're going to copy
             echo "Files/directories to copy:"
