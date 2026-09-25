@@ -757,42 +757,6 @@ mod tests {
     use crate::stats::get_server_stats;
     use serial_test::serial;
 
-    /// Observations of a backend go to the latency series of its pool, the
-    /// label pair registered with the tracker, zero transactions dropped.
-    #[test]
-    #[serial]
-    fn pool_latency_observations_go_to_the_series_of_the_pool() {
-        let (user, pool) = ("latency_series_user", "latency_series_pool");
-        let address = crate::config::Address {
-            username: user.to_string(),
-            pool_name: pool.to_string(),
-            ..Default::default()
-        };
-        let stats = ServerStats::new(address, clock::now());
-        let query =
-            crate::web::metrics::SHOW_POOLS_QUERY_DURATION_SECONDS.with_label_values(&[user, pool]);
-        let transaction = crate::web::metrics::SHOW_POOLS_TRANSACTION_DURATION_SECONDS
-            .with_label_values(&[user, pool]);
-        let wait =
-            crate::web::metrics::SHOW_POOLS_WAIT_DURATION_SECONDS.with_label_values(&[user, pool]);
-        let before = (
-            query.get_sample_count(),
-            transaction.get_sample_count(),
-            wait.get_sample_count(),
-        );
-
-        stats.query(1_500, "app");
-        stats.checkout_time(700, "app");
-        stats.idle(2_000);
-        stats.add_xact_time_and_idle(0);
-        stats.add_xact_time_and_idle(3_000);
-
-        assert_eq!(query.get_sample_count(), before.0 + 1);
-        assert_eq!(transaction.get_sample_count(), before.1 + 2);
-        assert_eq!(wait.get_sample_count(), before.2 + 1);
-        assert!(crate::web::metrics::pool_latency_keys_tracked(user, pool));
-    }
-
     /// Stats of a backend whose pool is `(user, pool)`.
     fn latency_stats(user: &str, pool: &str) -> ServerStats {
         let address = crate::config::Address {
@@ -801,6 +765,32 @@ mod tests {
             ..Default::default()
         };
         ServerStats::new(address, clock::now())
+    }
+
+    /// Observations of a backend go to the latency series of its pool in
+    /// seconds, each to the histogram of its kind. Zero queries and zero
+    /// checkout waits count, zero transactions do not. The label pair is
+    /// registered with the tracker.
+    #[test]
+    #[serial]
+    fn pool_latency_observations_go_to_the_series_of_the_pool() {
+        let (user, pool) = ("latency_series_user", "latency_series_pool");
+        let stats = latency_stats(user, pool);
+
+        stats.query(1_500, "app");
+        stats.query(0, "app");
+        stats.checkout_time(700, "app");
+        stats.checkout_time(0, "app");
+        stats.idle(2_000);
+        stats.add_xact_time_and_idle(0);
+        stats.add_xact_time_and_idle(3_000);
+
+        assert_eq!(
+            crate::web::metrics::exported_pool_latency(user, pool),
+            [Some((2, 0.0015)), Some((2, 0.005)), Some((2, 0.0007))],
+            "(count, sum in seconds) of the query, transaction and wait series"
+        );
+        assert!(crate::web::metrics::pool_latency_keys_tracked(user, pool));
     }
 
     /// Once the sweep removes the series of a gone pool, a backend that is
