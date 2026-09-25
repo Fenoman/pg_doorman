@@ -13,12 +13,18 @@
 # else target/ of the repository) as pg_doorman-<checksum>.profdata. The
 # checksum ties the name to the profile contents: another profile changes
 # RUSTFLAGS and cargo rebuilds with it, while builds with the same profile
-# reuse the unpacked file and stay incremental. Needs only bash, cksum and
-# gunzip.
+# reuse the unpacked file and stay incremental. Needs only bash, cksum,
+# gunzip and uname.
 #
 # A stale profile is safe: functions that changed since it was recorded
 # get no profile data and are compiled as without PGO, and
 # -no-pgo-warn-mismatch keeps LLVM from warning about each of them.
+#
+# On x86_64 Linux, where the profile is recorded, the build also splits
+# machine functions: the blocks the profile found cold leave their
+# functions for a section of cold code, and the hot code takes fewer
+# instruction cache lines. The splitting needs the profile data and ELF
+# output.
 
 set -euo pipefail
 
@@ -59,5 +65,10 @@ if [ ! -s "$unpacked" ]; then
     mv -f "$unpacked.tmp.$$" "$unpacked"
 fi
 
+flags="-Cprofile-use=$unpacked -Cllvm-args=-no-pgo-warn-mismatch"
+if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
+    flags="$flags -Cllvm-args=-enable-split-machine-functions"
+fi
+
 echo "pgo-rustflags: building with pgo/pg_doorman.profdata.gz" >&2
-printf '%s\n' "-Cprofile-use=$unpacked -Cllvm-args=-no-pgo-warn-mismatch"
+printf '%s\n' "$flags"
