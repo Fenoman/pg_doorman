@@ -2045,6 +2045,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pool_transaction_observe_drops_zero_microseconds() {
         // idle(0) and add_xact_time_and_idle(0) fire on backend
         // creation and on `Drop for Client`; recording those zeros
@@ -2063,6 +2064,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pool_query_observe_records_zero_microseconds() {
         // query_time_add_microseconds records zero-elapsed
         // queries (sub-microsecond ones) — keep parity here so the
@@ -2078,6 +2080,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pool_wait_observe_records_zero_microseconds() {
         // Zero-length checkouts are the healthy-pool baseline; keep
         // recording them so histogram_quantile reflects "checkout was

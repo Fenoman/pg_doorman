@@ -716,10 +716,12 @@ impl ServerStats {
 mod tests {
     use super::*;
     use crate::stats::get_server_stats;
+    use serial_test::serial;
 
     /// Observations of a backend go to the latency series of its pool, the
     /// label pair registered with the tracker, zero transactions dropped.
     #[test]
+    #[serial]
     fn pool_latency_observations_go_to_the_series_of_the_pool() {
         let (user, pool) = ("latency_series_user", "latency_series_pool");
         let address = crate::config::Address {
