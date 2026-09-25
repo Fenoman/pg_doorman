@@ -81,6 +81,51 @@ where
     }
 }
 
+/// Whether a frontend closed its socket while its checkout spun, which the
+/// disconnect watcher does not cover: one poll of the read side that leaves
+/// pipelined bytes buffered.
+fn client_gone_now<R>(read: &mut tokio::io::BufReader<R>) -> Result<(), Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use futures::FutureExt;
+    match read.fill_buf().now_or_never() {
+        Some(Ok([])) => Err(Error::SocketError(
+            "client disconnected while waiting for a backend".to_string(),
+        )),
+        Some(Err(err)) => Err(Error::SocketError(format!(
+            "Error reading from client while waiting for a backend: {err:?}"
+        ))),
+        Some(Ok(_)) | None => Ok(()),
+    }
+}
+
+/// Checks out a backend for a client. A backend freed within the pool's
+/// spin is taken before the checkout arms its deadline and before the
+/// client is watched: both matter only for a real wait. A checkout that
+/// yielded in the spin looks at the client before it goes on, and the rest
+/// of the checkout runs under the disconnect watcher, so the query of a
+/// client that closed meanwhile never reaches a backend.
+async fn checkout_for_client<R>(
+    read: &mut tokio::io::BufReader<R>,
+    database: &crate::pool::Pool,
+) -> Result<Result<crate::pool::Object, crate::pool::PoolError>, Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let _checkout = database.begin_checkout();
+    let start = tokio::time::Instant::now();
+    let timeouts = database.timeouts();
+    let spun = database
+        .spin_for_permit(timeouts.checkout_deadline(start))
+        .await;
+    if spun.yielded {
+        client_gone_now(read)?;
+    }
+    let get = std::pin::pin!(database.finish_checkout(&timeouts, start, spun.permit));
+    checkout_or_client_disconnect(read, get).await
+}
+
 fn append_pooler_check_query_response(response: &mut BytesMut, bytes: &[u8]) -> Result<(), String> {
     let next_len = response
         .len()
@@ -2345,20 +2390,8 @@ where
                 let connecting_at = now();
                 self.stats.waiting();
                 let mut conn = loop {
-                    let database = &current_pool.database;
-                    let checkout = {
-                        let _checkout = database.begin_checkout();
-                        let start = tokio::time::Instant::now();
-                        // A backend freed within the pool's spin is taken
-                        // before the checkout arms its deadline and before the
-                        // client is watched: both matter only for a real wait.
-                        let timeouts = database.timeouts();
-                        let spun = database
-                            .spin_for_permit(timeouts.checkout_deadline(start))
-                            .await;
-                        let get = std::pin::pin!(database.finish_checkout(&timeouts, start, spun));
-                        checkout_or_client_disconnect(&mut self.read, get).await
-                    };
+                    let checkout =
+                        checkout_for_client(&mut self.read, &current_pool.database).await;
                     let checkout = match checkout {
                         Ok(checkout) => checkout,
                         Err(err) => return self.process_error(err).await,
@@ -5557,7 +5590,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
             .find(".try_handle_without_server(&message, current_pool, query_start_at)")
             .expect("no-server fast-path call not found");
         let checkout = handle
-            .find(".spin_for_permit(")
+            .find("checkout_for_client(&mut self.read")
             .expect("backend checkout not found");
         assert!(
             intercept_call < checkout,
@@ -6257,6 +6290,70 @@ mod relay_response_client_write_failure_tests {
         deliver.send(42).unwrap();
         peer.shutdown().await.unwrap();
         assert!(matches!(checkout.await, Err(Error::SocketError(_))));
+    }
+
+    /// A client that closes its socket while its checkout spins gets no
+    /// backend: the one that frees up within the spin goes back idle, and
+    /// the client's query never reaches it.
+    #[tokio::test]
+    async fn a_client_gone_during_the_spin_gets_no_backend() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let all = pool.database.semaphore().available_permits();
+        let (held, _backend) = pool.database.test_checked_out_backend().await;
+        let rest = pool
+            .database
+            .semaphore()
+            .acquire_many(all as u32 - 1)
+            .await
+            .unwrap();
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let mut read = BufReader::new(socket);
+        let close_and_return = async move {
+            tokio::task::yield_now().await;
+            peer.shutdown().await.unwrap();
+            drop(held);
+        };
+
+        let (checkout, ()) = tokio::join!(
+            checkout_for_client(&mut read, &pool.database),
+            close_and_return
+        );
+
+        match checkout {
+            Err(Error::SocketError(msg)) => assert!(msg.contains("client disconnected"), "{msg}"),
+            Err(err) => panic!("unexpected error: {err}"),
+            Ok(Ok(_)) => panic!("the client that closed got a backend"),
+            Ok(Err(err)) => panic!("the checkout failed: {err:?}"),
+        }
+        drop(rest);
+        assert_eq!(pool.database.status().available, 1);
+        assert_eq!(pool.database.semaphore().available_permits(), all);
+    }
+
+    /// The same checkout with the client still there takes the backend that
+    /// frees up within the spin.
+    #[tokio::test]
+    async fn a_client_waiting_in_the_spin_gets_the_freed_backend() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let all = pool.database.semaphore().available_permits();
+        let (held, _backend) = pool.database.test_checked_out_backend().await;
+        let _rest = pool
+            .database
+            .semaphore()
+            .acquire_many(all as u32 - 1)
+            .await
+            .unwrap();
+        let (socket, _peer) = tokio::io::duplex(64);
+        let mut read = BufReader::new(socket);
+        let give_back = async move {
+            tokio::task::yield_now().await;
+            drop(held);
+        };
+
+        let (checkout, ()) =
+            tokio::join!(checkout_for_client(&mut read, &pool.database), give_back);
+
+        assert!(matches!(checkout, Ok(Ok(_))));
     }
 
     #[tokio::test]

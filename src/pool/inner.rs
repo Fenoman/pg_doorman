@@ -1531,30 +1531,37 @@ impl Pool {
     /// have to be woken up. `None` when no permit came before the turns ran
     /// out or `deadline` passed, or once the pool is paused: a paused pool
     /// hands out nothing.
-    pub(crate) async fn spin_for_permit(
-        &self,
-        deadline: Option<tokio::time::Instant>,
-    ) -> Option<SemaphorePermit<'_>> {
+    pub(crate) async fn spin_for_permit(&self, deadline: Option<tokio::time::Instant>) -> Spin<'_> {
         for turn in 0..MAX_FAST_RETRY {
+            let yielded = turn > 0;
             // A paused pool hands out nothing, and the turns bound the count
             // of tries, not the time they take: once the pool is paused or
             // past its deadline, the checkout stops spinning and waits for
             // the resume or times out.
             if self.inner.server_pool.is_paused()
-                || (turn > 0
+                || (yielded
                     && deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline))
             {
-                return None;
+                return Spin {
+                    permit: None,
+                    yielded,
+                };
             }
             if let Ok(permit) = self.inner.semaphore.try_acquire() {
-                return Some(permit);
+                return Spin {
+                    permit: Some(permit),
+                    yielded,
+                };
             }
             for _ in 0..4 {
                 std::hint::spin_loop();
             }
             tokio::task::yield_now().await;
         }
-        None
+        Spin {
+            permit: None,
+            yielded: true,
+        }
     }
 
     /// Acquire a semaphore permit, queueing when none is free; the spin of
@@ -1778,7 +1785,7 @@ impl Pool {
         let spun = self
             .spin_for_permit(timeouts.checkout_deadline(start))
             .await;
-        self.finish_checkout(timeouts, start, spun).await
+        self.finish_checkout(timeouts, start, spun.permit).await
     }
 
     /// Counts a checkout as under way until the guard drops. A release a
@@ -2758,6 +2765,18 @@ impl Pool {
         &self.inner.semaphore
     }
 
+    /// A healthy backend checked out with a permit, and the peer end of its
+    /// socket. Dropping the object returns the backend to the idle slots.
+    #[cfg(test)]
+    pub(crate) async fn test_checked_out_backend(&self) -> (Object, tokio::net::UnixStream) {
+        let (server, peer) = Server::test_silent_socket();
+        let mut inner = self.inner.new_object_inner(server, None);
+        inner.metrics.recycled = Some(clock::now());
+        self.inner.slots.lock().size += 1;
+        let permit = self.inner.semaphore.acquire().await.unwrap();
+        (self.wrap_checkout(inner, permit), peer)
+    }
+
     /// Pauses the pool — blocks new connection acquisition.
     pub fn pause(&self) {
         self.inner.server_pool.pause();
@@ -3029,6 +3048,15 @@ fn try_take_burst_slot(counter: &AtomicUsize, max: usize) -> bool {
     }
     counter.fetch_sub(1, Ordering::Release);
     false
+}
+
+/// What the spin of [`Pool::spin_for_permit`] got.
+pub(crate) struct Spin<'a> {
+    /// A permit that was free or freed up within the turns.
+    pub(crate) permit: Option<SemaphorePermit<'a>>,
+    /// Whether the checkout yielded while spinning: a checkout that waited
+    /// looks at its client before it takes a backend.
+    pub(crate) yielded: bool,
 }
 
 /// RAII guard for a burst gate slot. Decrements `inflight_creates`
@@ -6888,8 +6916,9 @@ mod checkout_spin_tests {
     async fn the_spin_takes_a_free_permit() {
         let pool = crate::pool::ConnectionPool::test_for_protocol();
         let free = pool.database.inner.semaphore.available_permits();
-        let permit = pool.database.spin_for_permit(None).await;
-        assert!(permit.is_some());
+        let spun = pool.database.spin_for_permit(None).await;
+        assert!(spun.permit.is_some());
+        assert!(!spun.yielded);
         assert_eq!(pool.database.inner.semaphore.available_permits(), free - 1);
     }
 
@@ -6900,7 +6929,13 @@ mod checkout_spin_tests {
         let pool = crate::pool::ConnectionPool::test_for_protocol();
         pool.database.pause();
         let spun = pool.database.spin_for_permit(None).now_or_never();
-        assert!(matches!(spun, Some(None)));
+        assert!(matches!(
+            spun,
+            Some(super::Spin {
+                permit: None,
+                yielded: false
+            })
+        ));
     }
 
     /// A pool paused while a checkout spins hands it nothing: a permit
@@ -6925,7 +6960,7 @@ mod checkout_spin_tests {
 
         let (spun, ()) = tokio::join!(pool.database.spin_for_permit(None), pause_and_release);
 
-        assert!(spun.is_none());
+        assert!(spun.permit.is_none());
     }
 
     /// The turns are not a time bound: a checkout whose deadline passes
@@ -6954,7 +6989,7 @@ mod checkout_spin_tests {
 
         let (spun, ()) = tokio::join!(pool.database.spin_for_permit(Some(deadline)), late_release);
 
-        assert!(spun.is_none());
+        assert!(spun.permit.is_none());
     }
 
     /// With every permit taken the spin gives up after its turns and leaves
@@ -6970,6 +7005,8 @@ mod checkout_spin_tests {
             .acquire_many(all)
             .await
             .unwrap();
-        assert!(pool.database.spin_for_permit(None).await.is_none());
+        let spun = pool.database.spin_for_permit(None).await;
+        assert!(spun.permit.is_none());
+        assert!(spun.yielded);
     }
 }
