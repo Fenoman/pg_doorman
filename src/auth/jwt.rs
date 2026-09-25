@@ -459,6 +459,9 @@ mod tests {
         );
     }
 
+    // KEYS is process-wide and other tests load their keys into it
+    // concurrently, so this test checks only its own key files and leaves
+    // the rest of the registry alone.
     #[tokio::test]
     #[serial_test::serial(jwt_keys)]
     async fn publish_jwt_pub_keys_prunes_removed_reload_keys() {
@@ -466,15 +469,6 @@ mod tests {
         let (_new_private, new_public) = generate_temp_rsa_keys();
         let old_path = old_public.path().to_str().unwrap().to_string();
         let new_path = new_public.path().to_str().unwrap().to_string();
-
-        {
-            let mut keys = KEYS.write().await;
-            keys.clear();
-        }
-        {
-            let mut published = PUBLISHED_JWT_KEY_FILENAMES.write().await;
-            published.clear();
-        }
 
         publish_jwt_pub_keys(vec![old_path.clone(), new_path.clone()])
             .await
