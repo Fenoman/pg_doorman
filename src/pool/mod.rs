@@ -105,8 +105,71 @@ static PREVIOUS_GENERAL_STARTUP_HASH: AtomicU64 = AtomicU64::new(0);
 /// recycled by PG to a healthy NEW backend -> reuse it, the recycled-pid quarantine fix). Lock-free
 /// sharded; same structure as the former `DashMap`, now carrying a timestamp
 /// instead of unit.
-pub static CANCELED_PIDS: Lazy<Arc<dashmap::DashMap<ProcessId, Instant>>> =
-    Lazy::new(|| Arc::new(dashmap::DashMap::new()));
+pub static CANCELED_PIDS: Lazy<CanceledPids> = Lazy::new(CanceledPids::default);
+
+/// The quarantine markers and how many there are. Every checkout looks up
+/// the marker of its backend, and markers are rare: while there is none,
+/// the count lets the lookup skip the map and the lock of its shard. The
+/// count goes up before a marker goes in and down after one comes out, so
+/// it never falls below the number of markers, and zero means none.
+#[derive(Debug, Default)]
+pub struct CanceledPids {
+    markers: DashMap<ProcessId, Instant>,
+    count: std::sync::atomic::AtomicUsize,
+}
+
+impl CanceledPids {
+    /// Sets the marker of `pid`, returning the time of the one it replaces.
+    pub fn insert(&self, pid: ProcessId, at: Instant) -> Option<Instant> {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        let replaced = self.markers.insert(pid, at);
+        if replaced.is_some() {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+        }
+        replaced
+    }
+
+    /// Takes the marker of `pid`.
+    #[inline]
+    pub fn remove(&self, pid: &ProcessId) -> Option<(ProcessId, Instant)> {
+        if self.count.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
+        let removed = self.markers.remove(pid);
+        if removed.is_some() {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+        }
+        removed
+    }
+
+    /// Whether `pid` has a marker.
+    pub fn contains_key(&self, pid: &ProcessId) -> bool {
+        self.count.load(Ordering::SeqCst) != 0 && self.markers.contains_key(pid)
+    }
+
+    /// The number of markers, summed over the shards without a common lock.
+    pub fn len(&self) -> usize {
+        self.markers.len()
+    }
+
+    /// Whether there is no marker.
+    pub fn is_empty(&self) -> bool {
+        self.count.load(Ordering::SeqCst) == 0
+    }
+
+    /// Removes every marker.
+    pub fn clear(&self) {
+        self.markers.retain(|_, _| {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+            false
+        });
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
 
 /// hard cap on `CANCELED_PIDS` to bound the
 /// worst-case memory footprint. Three real paths leak stale entries
@@ -3724,6 +3787,31 @@ mod tests {
         let mut current = (**DYNAMIC_POOLS.load()).clone();
         current.remove(&id);
         DYNAMIC_POOLS.store(Arc::new(current));
+    }
+
+    /// The marker count never falls below the number of markers and is
+    /// back at zero once they are gone: a checkout skips the map exactly
+    /// while it is empty.
+    #[test]
+    fn the_marker_count_follows_the_markers() {
+        let markers = CanceledPids::default();
+        assert_eq!(markers.count(), 0);
+        assert!(markers.remove(&7).is_none());
+
+        markers.insert(7, Instant::now());
+        markers.insert(7, Instant::now());
+        markers.insert(8, Instant::now());
+        assert_eq!(markers.count(), 2);
+        assert!(markers.remove(&9).is_none());
+        assert_eq!(markers.count(), 2);
+        assert!(markers.remove(&7).is_some());
+        assert_eq!(markers.count(), 1);
+        assert!(markers.contains_key(&8));
+
+        markers.clear();
+        assert_eq!(markers.count(), 0);
+        assert!(!markers.contains_key(&8));
+        assert_eq!(markers.len(), 0);
     }
 
     /// `canceled_pids_insert` must stop inserting once
