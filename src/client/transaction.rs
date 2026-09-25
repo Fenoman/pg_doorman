@@ -812,6 +812,59 @@ where
     S: tokio::io::AsyncRead + std::marker::Unpin,
     T: tokio::io::AsyncWrite + std::marker::Unpin,
 {
+    /// Ends a transaction that reached ReadyForQuery: detaches the client
+    /// from its backend, then checks the backend in beside the delivery of
+    /// the response buffered for the client, see `check_in_beside_response`.
+    async fn finish_transaction(
+        &mut self,
+        conn: crate::pool::Object,
+        server_active_at: quanta::Instant,
+        shutdown_in_progress: bool,
+    ) -> Result<(), Error> {
+        // From here on cancellation must not target this backend, the next
+        // exchange on it is internal check-in cleanup, and a client that goes
+        // away no longer speaks for it: the backend can reach its next owner
+        // while this client still takes the response.
+        self.connected_to_server = false;
+        self.release();
+
+        let has_buffered_response = !self.client_last_messages_in_tx.is_empty();
+        if has_buffered_response {
+            self.stats.idle_write();
+        }
+        let flush_res = check_in_beside_response(
+            conn,
+            &mut self.write,
+            &self.client_last_messages_in_tx,
+            CheckIn {
+                shutdown_in_progress,
+                transaction_mode: self.transaction_mode,
+                server_active_at,
+                username: &self.username,
+                pool_name: &self.pool_name,
+                connection_id: self.connection_id,
+            },
+        )
+        .await;
+
+        match flush_res {
+            Ok(()) => {
+                if has_buffered_response {
+                    self.client_last_messages_in_tx.clear();
+                }
+                Ok(())
+            }
+            Err(err) => {
+                warn!(
+                    "[{}@{} #c{}] buffered transaction response flush to client failed: {err}",
+                    self.username, self.pool_name, self.connection_id
+                );
+                self.stats.disconnect();
+                Err(err)
+            }
+        }
+    }
+
     #[inline(always)]
     fn complete_transaction_if_needed(&mut self, server: &mut Server, check_async: bool) -> bool {
         if server.in_transaction() {
@@ -3304,47 +3357,9 @@ where
                         TransactionAction::Break => break,
                     }
                 }
-                // Once the client query reached ReadyForQuery, cancellation must
-                // no longer target this backend: the next exchange is internal
-                // check-in cleanup.
                 let shutdown_in_progress = SHUTDOWN_IN_PROGRESS.load(Ordering::Relaxed);
-                self.connected_to_server = false;
-                self.release();
-
-                let has_buffered_response = !self.client_last_messages_in_tx.is_empty();
-                if has_buffered_response {
-                    self.stats.idle_write();
-                }
-                let flush_res = check_in_beside_response(
-                    conn,
-                    &mut self.write,
-                    &self.client_last_messages_in_tx,
-                    CheckIn {
-                        shutdown_in_progress,
-                        transaction_mode: self.transaction_mode,
-                        server_active_at,
-                        username: &self.username,
-                        pool_name: &self.pool_name,
-                        connection_id: self.connection_id,
-                    },
-                )
-                .await;
-
-                match flush_res {
-                    Ok(()) => {
-                        if has_buffered_response {
-                            self.client_last_messages_in_tx.clear();
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            "[{}@{} #c{}] buffered transaction response flush to client failed: {err}",
-                            self.username, self.pool_name, self.connection_id
-                        );
-                        self.stats.disconnect();
-                        return Err(err);
-                    }
-                }
+                self.finish_transaction(conn, server_active_at, shutdown_in_progress)
+                    .await?;
 
                 shutdown_in_progress
             }; // release server.
@@ -4980,12 +4995,12 @@ mod client_response_write_timeout_tests {
             &src[..tests_start]
         };
         let caller_start = impl_src
-            .find("let has_buffered_response = !self.client_last_messages_in_tx.is_empty()")
+            .find("async fn finish_transaction(")
             .expect("post-release fast-response flush should exist");
         let caller = &impl_src[caller_start..];
         let caller_end = caller
-            .find("// TransactionGuard dropped at end of block above")
-            .expect("transaction guard comment should follow fast-response flush");
+            .find("\n    }\n")
+            .expect("the transaction end should end");
         let caller = &caller[..caller_end];
         assert!(
             caller.contains("check_in_beside_response(")
@@ -6343,6 +6358,42 @@ mod relay_response_client_write_failure_tests {
 
         drop(delivery);
         assert!(!next.is_bad(), "the previous client spoiled the backend");
+    }
+
+    /// A client whose transaction reached ReadyForQuery no longer speaks for
+    /// its backend. Once the backend has gone to its next owner, the previous
+    /// client going away in the middle of its response leaves the state of
+    /// the backend to that owner.
+    #[tokio::test]
+    async fn a_client_that_goes_away_leaves_its_reissued_backend_alone() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let (conn, _peer) = pool.database.test_checked_out_backend().await;
+        let backend_stats = conn.stats.clone();
+        let mut client = test_client_with_writer(StalledWriter);
+        client.connected_to_server = true;
+        client.last_server_stats = Some(backend_stats.clone());
+        client
+            .client_last_messages_in_tx
+            .extend_from_slice(COMMAND_COMPLETE_SELECT_1_READY_FOR_QUERY_IDLE);
+
+        let mut finishing = Box::pin(client.finish_transaction(conn, now(), false));
+        let next = tokio::select! {
+            biased;
+            _ = &mut finishing => panic!("a client that does not read took the response"),
+            next = tokio::time::timeout(Duration::from_secs(5), pool.database.get()) => next,
+        };
+        let next = next
+            .expect("the backend stayed out of the pool while its client was not reading")
+            .expect("the next checkout failed");
+        next.stats.active("next owner");
+
+        drop(finishing);
+        drop(client);
+        assert_eq!(
+            backend_stats.state_str(),
+            "active",
+            "the previous client changed the state of the reissued backend"
+        );
     }
 
     /// A client write that fails after ReadyForQuery reports the failure and
