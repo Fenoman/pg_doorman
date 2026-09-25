@@ -305,7 +305,7 @@ struct PoolInner {
 const DEFERRED_RELEASE_GRACE: Duration = Duration::from_millis(5);
 
 enum RecycleOutcome {
-    Reused(Box<ObjectInner>),
+    Reused(ObjectInner),
     Failed,
     Empty,
 }
@@ -771,7 +771,7 @@ impl PoolInner {
 
         match recycle_result {
             Ok(()) if !guard.as_mut().claim_capacity_retirement() => {
-                RecycleOutcome::Reused(Box::new(guard.disarm()))
+                RecycleOutcome::Reused(guard.disarm())
             }
             _ => {
                 // Guard's Drop decrements `slots.size` and closes the
@@ -1001,7 +1001,7 @@ enum BurstGateOutcome<'a> {
     /// Slot acquired — caller proceeds to create a connection.
     Acquired(BurstGateGuard<'a>),
     /// A recycled connection was obtained while waiting for a slot.
-    Recycled(Box<ObjectInner>),
+    Recycled(ObjectInner),
     /// Non-blocking caller and gate is full — no connection available.
     Timeout,
 }
@@ -1016,7 +1016,7 @@ enum CoordinatorJitResult<'a> {
         gate: BurstGateGuard<'a>,
     },
     /// A recycled connection was found during the slow-path wait.
-    Recycled(Box<ObjectInner>),
+    Recycled(ObjectInner),
 }
 
 /// Result of the bounded wait phases. Backend creation starts after this
@@ -1332,7 +1332,7 @@ impl Pool {
                 result = handoff_rx.rx_mut() => {
                     if let Ok(inner) = result {
                         if let Ok(inner) = self.recycle_handoff(inner, timeouts).await {
-                            return BurstGateOutcome::Recycled(Box::new(inner));
+                            return BurstGateOutcome::Recycled(inner);
                         }
                     }
                 }
@@ -1419,7 +1419,7 @@ impl Pool {
                 result = handoff_rx.rx_mut() => {
                     if let Ok(inner) = result {
                         if let Ok(inner) = self.recycle_handoff(inner, timeouts).await {
-                            return Ok(CoordinatorJitResult::Recycled(Box::new(inner)));
+                            return Ok(CoordinatorJitResult::Recycled(inner));
                         }
                     }
                 }
@@ -1429,7 +1429,7 @@ impl Pool {
                     // the receiver makes any later checkin use the idle queue.
                     if let Ok(inner) = handoff_rx.close_and_drain() {
                         if let Ok(inner) = self.recycle_handoff(inner, timeouts).await {
-                            return Ok(CoordinatorJitResult::Recycled(Box::new(inner)));
+                            return Ok(CoordinatorJitResult::Recycled(inner));
                         }
                     }
                     prune_closed_handoff_waiters(&mut self.inner.slots.lock());
@@ -1621,7 +1621,7 @@ impl Pool {
         let fast_retries = self.inner.config.scaling.fast_retries;
         for _ in 0..fast_retries {
             if let RecycleOutcome::Reused(inner) = self.inner.try_recycle_one(timeouts).await {
-                return Some(*inner);
+                return Some(inner);
             }
             for _ in 0..4 {
                 std::hint::spin_loop();
@@ -1947,7 +1947,7 @@ impl Pool {
             // `maybe_trigger_pre_replacement`. Once ownership is assigned,
             // any subsequent panic flows through `Object::drop` and
             // `return_object`, preserving slot-size invariants.
-            let obj = self.hand_out(*inner, permit);
+            let obj = self.hand_out(inner, permit);
             if let Some(obj) = obj.as_ref() {
                 self.maybe_trigger_pre_replacement(&obj.inner.as_ref().unwrap().metrics);
             }
@@ -1961,7 +1961,7 @@ impl Pool {
         loop {
             match self.inner.try_recycle_one(timeouts).await {
                 RecycleOutcome::Reused(inner) => {
-                    return Ok(CheckoutPreparation::Recycled(self.hand_out(*inner, permit)));
+                    return Ok(CheckoutPreparation::Recycled(self.hand_out(inner, permit)));
                 }
                 RecycleOutcome::Failed => continue,
                 RecycleOutcome::Empty => break,
@@ -1972,7 +1972,7 @@ impl Pool {
         let _create_gate = match self.acquire_burst_gate_boxed(timeouts, non_blocking).await {
             BurstGateOutcome::Acquired(guard) => guard,
             BurstGateOutcome::Recycled(inner) => {
-                return Ok(CheckoutPreparation::Recycled(self.hand_out(*inner, permit)));
+                return Ok(CheckoutPreparation::Recycled(self.hand_out(inner, permit)));
             }
             BurstGateOutcome::Timeout => {
                 let slots = self.inner.slots.lock();
@@ -1996,7 +1996,7 @@ impl Pool {
                 gate: g,
             } => (cp, g),
             CoordinatorJitResult::Recycled(inner) => {
-                return Ok(CheckoutPreparation::Recycled(self.hand_out(*inner, permit)));
+                return Ok(CheckoutPreparation::Recycled(self.hand_out(inner, permit)));
             }
         };
 
