@@ -72,7 +72,7 @@ pub struct CancelTarget {
     pub username: String,
 }
 
-pub type ClientServerMap = Arc<DashMap<(ProcessId, SecretKey), CancelTarget>>;
+pub type ClientServerMap = Arc<DashMap<(ProcessId, SecretKey), Arc<CancelTarget>>>;
 pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 
 /// The connection pool, globally available.

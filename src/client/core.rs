@@ -1723,7 +1723,7 @@ mod cache_split_tests {
         );
         client_server_map.insert(
             (client.connection_id as i32, client.secret_key),
-            CancelTarget {
+            Arc::new(CancelTarget {
                 process_id: 123,
                 secret_key: 456,
                 host: "127.0.0.1".to_string(),
@@ -1732,7 +1732,7 @@ mod cache_split_tests {
                 connected_with_tls: false,
                 pool_name: client.pool_name.clone(),
                 username: client.username.clone(),
-            },
+            }),
         );
 
         client.release_after_inner_handler_error();
@@ -1768,7 +1768,7 @@ mod cache_split_tests {
         // exact key the cancel-mode client now carries.
         client_server_map.insert(
             (client.connection_id as i32, client.secret_key),
-            CancelTarget {
+            Arc::new(CancelTarget {
                 process_id: 123,
                 secret_key: 456,
                 host: "127.0.0.1".to_string(),
@@ -1777,7 +1777,7 @@ mod cache_split_tests {
                 connected_with_tls: false,
                 pool_name: client.pool_name.clone(),
                 username: client.username.clone(),
-            },
+            }),
         );
         let key = (client.connection_id as i32, client.secret_key);
 

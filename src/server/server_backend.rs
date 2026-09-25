@@ -700,6 +700,11 @@ pub struct Server {
     /// Allows canceling queries by mapping client process IDs to server process IDs.
     client_server_map: ClientServerMap,
 
+    /// Where a cancel request for this backend goes, made at its first
+    /// checkout and shared by the registrations of every later one. Nothing
+    /// in it changes for the life of the connection.
+    cancel_target: Option<Arc<CancelTarget>>,
+
     /// Timestamp when this connection was established to the server.
     connected_at: chrono::naive::NaiveDateTime,
 
@@ -2851,9 +2856,8 @@ impl Server {
 
     /// Claim this server as mine for the purposes of query cancellation.
     pub fn claim(&mut self, process_id: i32, secret_key: i32) {
-        self.client_server_map.insert(
-            (process_id, secret_key),
-            CancelTarget {
+        let target = self.cancel_target.get_or_insert_with(|| {
+            Arc::new(CancelTarget {
                 process_id: self.process_id,
                 secret_key: self.secret_key,
                 host: self.address.host.clone(),
@@ -2862,8 +2866,10 @@ impl Server {
                 connected_with_tls: self.connected_with_tls,
                 pool_name: self.address.pool_name.clone(),
                 username: self.address.username.clone(),
-            },
-        );
+            })
+        });
+        self.client_server_map
+            .insert((process_id, secret_key), Arc::clone(target));
     }
 
     /// queue a server prepared-statement name for backend
@@ -3494,6 +3500,7 @@ impl Server {
                         pending_cleanup_disarms: PendingCleanupDisarms::default(),
                         response_cycle_had_error: false,
                         client_server_map,
+                        cancel_target: None,
                         connected_at: chrono::offset::Utc::now().naive_utc(),
                         stats,
                         pool_latency: Default::default(),
@@ -3873,6 +3880,7 @@ impl Server {
             pending_cleanup_disarms: PendingCleanupDisarms::default(),
             response_cycle_had_error: false,
             client_server_map: Arc::new(DashMap::new()),
+            cancel_target: None,
             connected_at: chrono::Utc::now().naive_utc(),
             stats: Arc::new(ServerStats::default()),
             pool_latency: Default::default(),
@@ -6384,5 +6392,24 @@ mod cancel_target_attribution_tests {
             "the cancel target must identify the pool that owns the backend, \
              otherwise the per-pool cancel counter cannot be attributed to it"
         );
+    }
+
+    /// Every checkout of a backend registers it for cancel requests. The
+    /// registrations share one cancel target of the backend instead of
+    /// copying its host, pool and user names on every checkout.
+    #[tokio::test]
+    async fn checkouts_of_a_backend_share_one_cancel_target() {
+        fn target_of(target: &CancelTarget) -> *const CancelTarget {
+            target
+        }
+        let (mut server, _peer) = Server::test_silent_socket();
+
+        server.claim(1, 11);
+        server.claim(2, 22);
+
+        let map = &server.client_server_map;
+        let first = target_of(map.get(&(1, 11)).expect("first claim").value());
+        let second = target_of(map.get(&(2, 22)).expect("second claim").value());
+        assert_eq!(first, second, "each checkout built its own cancel target");
     }
 }
