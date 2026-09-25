@@ -2345,8 +2345,19 @@ where
                 let connecting_at = now();
                 self.stats.waiting();
                 let mut conn = loop {
-                    let get = std::pin::pin!(current_pool.database.get());
-                    let checkout = match checkout_or_client_disconnect(&mut self.read, get).await {
+                    let database = &current_pool.database;
+                    let checkout = {
+                        let _checkout = database.begin_checkout();
+                        let start = tokio::time::Instant::now();
+                        // A backend freed within the pool's spin is taken
+                        // before the checkout arms its deadline and before the
+                        // client is watched: both matter only for a real wait.
+                        let spun = database.spin_for_permit().await;
+                        let timeouts = database.timeouts();
+                        let get = std::pin::pin!(database.finish_checkout(&timeouts, start, spun));
+                        checkout_or_client_disconnect(&mut self.read, get).await
+                    };
+                    let checkout = match checkout {
                         Ok(checkout) => checkout,
                         Err(err) => return self.process_error(err).await,
                     };
@@ -5544,7 +5555,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
             .find(".try_handle_without_server(&message, current_pool, query_start_at)")
             .expect("no-server fast-path call not found");
         let checkout = handle
-            .find("current_pool.database.get()")
+            .find("database.spin_for_permit()")
             .expect("backend checkout not found");
         assert!(
             intercept_call < checkout,

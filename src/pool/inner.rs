@@ -1525,48 +1525,54 @@ impl Pool {
         }
     }
 
-    /// Acquire a semaphore permit: fast spin path, then blocking fallback.
+    /// A permit that frees up within a few scheduler turns, taken without
+    /// queueing on the semaphore and without a timer. Under load a backend
+    /// comes back every few microseconds, and a queued waiter would first
+    /// have to be woken up. `None` when no permit came, or at once when the
+    /// pool is paused: a paused pool hands out nothing.
+    pub(crate) async fn spin_for_permit(&self) -> Option<SemaphorePermit<'_>> {
+        if self.inner.server_pool.is_paused() {
+            return None;
+        }
+        for _ in 0..MAX_FAST_RETRY {
+            if let Ok(permit) = self.inner.semaphore.try_acquire() {
+                return Some(permit);
+            }
+            for _ in 0..4 {
+                std::hint::spin_loop();
+            }
+            tokio::task::yield_now().await;
+        }
+        None
+    }
+
+    /// Acquire a semaphore permit, queueing when none is free; the spin of
+    /// [`Self::spin_for_permit`] comes before it.
     async fn acquire_semaphore(
         &self,
         timeouts: &Timeouts,
     ) -> Result<SemaphorePermit<'_>, PoolError> {
-        let mut try_fast = 0;
-        loop {
-            if try_fast < MAX_FAST_RETRY {
-                if let Ok(p) = self.inner.semaphore.try_acquire() {
-                    return Ok(p);
+        let non_blocking = timeouts.wait.is_some_and(|t| t.as_nanos() == 0);
+        if non_blocking {
+            return self.inner.semaphore.try_acquire().map_err(|e| match e {
+                TryAcquireError::Closed => PoolError::Closed,
+                TryAcquireError::NoPermits => PoolError::Timeout(TimeoutType::Wait),
+            });
+        }
+        match timeouts.wait {
+            Some(duration) => {
+                match tokio::time::timeout(duration, self.inner.semaphore.acquire()).await {
+                    Ok(Ok(p)) => Ok(p),
+                    Ok(Err(_)) => Err(PoolError::Closed),
+                    Err(_) => Err(PoolError::Timeout(TimeoutType::Wait)),
                 }
-                try_fast += 1;
-                for _ in 0..4 {
-                    std::hint::spin_loop();
-                }
-                tokio::task::yield_now().await;
-                continue;
             }
-
-            let non_blocking = timeouts.wait.is_some_and(|t| t.as_nanos() == 0);
-            return if non_blocking {
-                self.inner.semaphore.try_acquire().map_err(|e| match e {
-                    TryAcquireError::Closed => PoolError::Closed,
-                    TryAcquireError::NoPermits => PoolError::Timeout(TimeoutType::Wait),
-                })
-            } else {
-                match timeouts.wait {
-                    Some(duration) => {
-                        match tokio::time::timeout(duration, self.inner.semaphore.acquire()).await {
-                            Ok(Ok(p)) => Ok(p),
-                            Ok(Err(_)) => Err(PoolError::Closed),
-                            Err(_) => Err(PoolError::Timeout(TimeoutType::Wait)),
-                        }
-                    }
-                    None => self
-                        .inner
-                        .semaphore
-                        .acquire()
-                        .await
-                        .map_err(|_| PoolError::Closed),
-                }
-            };
+            None => self
+                .inner
+                .semaphore
+                .acquire()
+                .await
+                .map_err(|_| PoolError::Closed),
         }
     }
 
@@ -1756,13 +1762,33 @@ impl Pool {
 
     /// Retrieves an Object from this Pool using a different timeout than the configured one.
     pub async fn timeout_get(&self, timeouts: &Timeouts) -> Result<Object, PoolError> {
-        self.inner.users.fetch_add(1, Ordering::Relaxed);
-        scopeguard::defer! {
-            self.inner.users.fetch_sub(1, Ordering::Relaxed);
-        }
-
+        let _checkout = self.begin_checkout();
         let start = tokio::time::Instant::now();
-        let preparation = std::pin::pin!(self.prepare_checkout(timeouts, start));
+        let spun = self.spin_for_permit().await;
+        self.finish_checkout(timeouts, start, spun).await
+    }
+
+    /// Counts a checkout as under way until the guard drops. A release a
+    /// check-in leaves meanwhile waits for the first write of the client
+    /// that takes the backend; see `PoolInner::checkout_imminent`.
+    pub(crate) fn begin_checkout(&self) -> CheckoutGuard<'_> {
+        self.inner.users.fetch_add(1, Ordering::Relaxed);
+        CheckoutGuard {
+            users: &self.inner.users,
+        }
+    }
+
+    /// The rest of a checkout begun with [`Self::begin_checkout`] at `start`,
+    /// given the permit [`Self::spin_for_permit`] found, if any. The deadline
+    /// timer starts here, so a checkout that found a backend in the spin
+    /// runs without one.
+    pub(crate) async fn finish_checkout(
+        &self,
+        timeouts: &Timeouts,
+        start: tokio::time::Instant,
+        spun: Option<SemaphorePermit<'_>>,
+    ) -> Result<Object, PoolError> {
+        let preparation = std::pin::pin!(self.prepare_checkout(timeouts, start, spun));
         let prepared = match timeouts.wait.filter(|wait| !wait.is_zero()) {
             // An idle backend is usually handed out at once.
             Some(wait) => crate::utils::timeout::timeout_at_unless_ready(start + wait, preparation)
@@ -1841,21 +1867,27 @@ impl Pool {
         Box::pin(self.acquire_coordinator_jit(timeouts, gate))
     }
 
-    async fn prepare_checkout(
-        &self,
+    async fn prepare_checkout<'a>(
+        &'a self,
         timeouts: &Timeouts,
         start: tokio::time::Instant,
-    ) -> Result<CheckoutPreparation<'_>, PoolError> {
-        self.wait_if_paused(timeouts).await?;
-        let permit = self.acquire_semaphore(timeouts).await.inspect_err(|_e| {
-            let slots = self.inner.slots.lock();
-            warn!(
-                "[{}@{}] checkout timeout at phase=semaphore elapsed={}ms size={} max={} waiters={} semaphore_avail={}",
-                self.inner.pool_name, self.inner.username,
-                start.elapsed().as_millis(), slots.size, slots.max_size,
-                slots.waiters.len(), self.inner.semaphore.available_permits(),
-            );
-        })?;
+        spun: Option<SemaphorePermit<'a>>,
+    ) -> Result<CheckoutPreparation<'a>, PoolError> {
+        let permit = match spun {
+            Some(permit) => permit,
+            None => {
+                self.wait_if_paused(timeouts).await?;
+                self.acquire_semaphore(timeouts).await.inspect_err(|_e| {
+                    let slots = self.inner.slots.lock();
+                    warn!(
+                        "[{}@{}] checkout timeout at phase=semaphore elapsed={}ms size={} max={} waiters={} semaphore_avail={}",
+                        self.inner.pool_name, self.inner.username,
+                        start.elapsed().as_millis(), slots.size, slots.max_size,
+                        slots.waiters.len(), self.inner.semaphore.available_permits(),
+                    );
+                })?
+            }
+        };
 
         if let RecycleOutcome::Reused(inner) = self.inner.try_recycle_one(timeouts).await {
             // Wrap first so Object's RAII Drop covers any panic in
@@ -2988,6 +3020,17 @@ fn try_take_burst_slot(counter: &AtomicUsize, max: usize) -> bool {
 
 /// RAII guard for a burst gate slot. Decrements `inflight_creates`
 /// and wakes one burst-gate waiter on drop.
+/// Counts a checkout as under way; see [`Pool::begin_checkout`].
+pub(crate) struct CheckoutGuard<'a> {
+    users: &'a AtomicUsize,
+}
+
+impl Drop for CheckoutGuard<'_> {
+    fn drop(&mut self) {
+        self.users.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 struct BurstGateGuard<'a> {
     inflight_creates: &'a AtomicUsize,
     create_done: &'a Notify,
@@ -6820,5 +6863,46 @@ mod checkout_future_size_tests {
     fn a_pool_slot_holds_its_backend_on_the_heap() {
         let size = std::mem::size_of::<super::ObjectInner>();
         assert!(size <= 256, "a pool slot is {size} bytes");
+    }
+}
+
+#[cfg(test)]
+mod checkout_spin_tests {
+    use futures::FutureExt;
+
+    /// A permit that is free is taken at once, without queueing.
+    #[tokio::test]
+    async fn the_spin_takes_a_free_permit() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let free = pool.database.inner.semaphore.available_permits();
+        let permit = pool.database.spin_for_permit().await;
+        assert!(permit.is_some());
+        assert_eq!(pool.database.inner.semaphore.available_permits(), free - 1);
+    }
+
+    /// A paused pool hands out nothing: the spin gives up without a turn,
+    /// and the checkout waits for the resume instead.
+    #[test]
+    fn the_spin_of_a_paused_pool_takes_nothing() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        pool.database.pause();
+        let spun = pool.database.spin_for_permit().now_or_never();
+        assert!(matches!(spun, Some(None)));
+    }
+
+    /// With every permit taken the spin gives up after its turns and leaves
+    /// the wait to the semaphore queue.
+    #[tokio::test]
+    async fn the_spin_gives_up_when_no_permit_frees() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let all = pool.database.inner.semaphore.available_permits() as u32;
+        let _taken = pool
+            .database
+            .inner
+            .semaphore
+            .acquire_many(all)
+            .await
+            .unwrap();
+        assert!(pool.database.spin_for_permit().await.is_none());
     }
 }
