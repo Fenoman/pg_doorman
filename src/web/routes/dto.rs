@@ -72,9 +72,11 @@ pub(crate) struct OverviewDto {
     /// during startup negotiation).
     pub current_clients: i64,
     /// Number of clients currently in a transaction: from the checkout of a
-    /// backend until the client has been sent the response. A backend can go
-    /// back to the pool before that, so this can exceed the number of
-    /// backends in use. Mirrors `CLIENTS_IN_TRANSACTIONS`.
+    /// backend until both its check-in and the delivery of the response are
+    /// done, in session mode for as long as the client holds the backend. A
+    /// backend can go back to the pool before the delivery is done, so this
+    /// can exceed the number of backends in use. Mirrors
+    /// `CLIENTS_IN_TRANSACTIONS`.
     pub clients_in_transactions: i64,
     /// Set during `SIGTERM`/admin SHUTDOWN. Operator-visible "the pooler is
     /// draining, do not deploy now" indicator.
