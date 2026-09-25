@@ -110,8 +110,9 @@ pub static CANCELED_PIDS: Lazy<CanceledPids> = Lazy::new(CanceledPids::default);
 /// The quarantine markers and how many there are. Every checkout looks up
 /// the marker of its backend, and markers are rare: while there is none,
 /// the count lets the lookup skip the map and the lock of its shard. The
-/// count goes up before a marker goes in and down after one comes out, so
-/// it never falls below the number of markers, and zero means none.
+/// count goes up before a marker goes in and down once one is out, or, in
+/// `clear`, under the lock of the shard that drops it. So it never falls
+/// below the number of markers a lookup can see, and zero means none.
 #[derive(Debug, Default)]
 pub struct CanceledPids {
     markers: DashMap<ProcessId, Instant>,

@@ -170,7 +170,7 @@ impl AbandonedQueryTimeouts {
 const CHECKIN_CLEANUP_PATHS: [&str; 3] = ["release_only", "combined", "cleanup_only"];
 
 /// The `path` of a check-in with nothing to clean and no release query, the
-/// one every transaction of a pool with `release_query = ""` makes. It is
+/// one a clean backend makes in a pool with `release_query = ""`. It is
 /// observed only when it fails.
 const EMPTY_CHECKIN_PATH: &str = "empty";
 
@@ -4565,9 +4565,9 @@ mod tests {
         );
     }
 
-    /// A check-in with nothing to clean and no release query, the one every
-    /// transaction of a pool with `release_query = ""` makes, is not
-    /// observed. A failed one still is.
+    /// A check-in with nothing to clean and no release query, the one a clean
+    /// backend makes in a pool with `release_query = ""`, is not observed. A
+    /// failed one still is.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
