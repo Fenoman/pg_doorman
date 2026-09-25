@@ -6992,6 +6992,32 @@ mod checkout_spin_tests {
         assert!(spun.permit.is_none());
     }
 
+    /// A checkout counts as under way from its start, spin included, until
+    /// it ends, also when it times out: a check-in reads the count to hold
+    /// its release back for the checkout.
+    #[tokio::test]
+    async fn a_checkout_counts_as_under_way_until_it_ends() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let inner = &pool.database.inner;
+        let all = inner.semaphore.available_permits() as u32;
+        let _taken = inner.semaphore.acquire_many(all).await.unwrap();
+        let timeouts = super::Timeouts {
+            wait: Some(std::time::Duration::from_millis(5)),
+            ..Default::default()
+        };
+        let checkout = pool.database.timeout_get(&timeouts);
+        let during = async {
+            tokio::task::yield_now().await;
+            inner.checkout_imminent()
+        };
+
+        let (result, imminent_during) = tokio::join!(checkout, during);
+
+        assert!(imminent_during);
+        assert!(result.is_err());
+        assert!(!inner.checkout_imminent());
+    }
+
     /// With every permit taken the spin gives up after its turns and leaves
     /// the wait to the semaphore queue.
     #[tokio::test]
