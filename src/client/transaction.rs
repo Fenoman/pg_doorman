@@ -2352,8 +2352,10 @@ where
                         // A backend freed within the pool's spin is taken
                         // before the checkout arms its deadline and before the
                         // client is watched: both matter only for a real wait.
-                        let spun = database.spin_for_permit().await;
                         let timeouts = database.timeouts();
+                        let spun = database
+                            .spin_for_permit(timeouts.checkout_deadline(start))
+                            .await;
                         let get = std::pin::pin!(database.finish_checkout(&timeouts, start, spun));
                         checkout_or_client_disconnect(&mut self.read, get).await
                     };
@@ -5555,7 +5557,7 @@ mod app_name_set_discard_all_clears_pending_set_tests {
             .find(".try_handle_without_server(&message, current_pool, query_start_at)")
             .expect("no-server fast-path call not found");
         let checkout = handle
-            .find("database.spin_for_permit()")
+            .find(".spin_for_permit(")
             .expect("backend checkout not found");
         assert!(
             intercept_call < checkout,

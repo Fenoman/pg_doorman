@@ -1528,15 +1528,25 @@ impl Pool {
     /// A permit that frees up within a few scheduler turns, taken without
     /// queueing on the semaphore and without a timer. Under load a backend
     /// comes back every few microseconds, and a queued waiter would first
-    /// have to be woken up. `None` when no permit came, or at once when the
-    /// pool is paused: a paused pool hands out nothing.
-    pub(crate) async fn spin_for_permit(&self) -> Option<SemaphorePermit<'_>> {
+    /// have to be woken up. `None` when no permit came before the turns ran
+    /// out or `deadline` passed, or at once when the pool is paused: a paused
+    /// pool hands out nothing.
+    pub(crate) async fn spin_for_permit(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<SemaphorePermit<'_>> {
         if self.inner.server_pool.is_paused() {
             return None;
         }
-        for _ in 0..MAX_FAST_RETRY {
+        for turn in 0..MAX_FAST_RETRY {
             if let Ok(permit) = self.inner.semaphore.try_acquire() {
                 return Some(permit);
+            }
+            // The turns bound the count of tries, not the time they take:
+            // past its deadline a checkout stops spinning and times out.
+            if turn > 0 && deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return None;
             }
             for _ in 0..4 {
                 std::hint::spin_loop();
@@ -1764,7 +1774,9 @@ impl Pool {
     pub async fn timeout_get(&self, timeouts: &Timeouts) -> Result<Object, PoolError> {
         let _checkout = self.begin_checkout();
         let start = tokio::time::Instant::now();
-        let spun = self.spin_for_permit().await;
+        let spun = self
+            .spin_for_permit(timeouts.checkout_deadline(start))
+            .await;
         self.finish_checkout(timeouts, start, spun).await
     }
 
@@ -6875,7 +6887,7 @@ mod checkout_spin_tests {
     async fn the_spin_takes_a_free_permit() {
         let pool = crate::pool::ConnectionPool::test_for_protocol();
         let free = pool.database.inner.semaphore.available_permits();
-        let permit = pool.database.spin_for_permit().await;
+        let permit = pool.database.spin_for_permit(None).await;
         assert!(permit.is_some());
         assert_eq!(pool.database.inner.semaphore.available_permits(), free - 1);
     }
@@ -6886,8 +6898,37 @@ mod checkout_spin_tests {
     fn the_spin_of_a_paused_pool_takes_nothing() {
         let pool = crate::pool::ConnectionPool::test_for_protocol();
         pool.database.pause();
-        let spun = pool.database.spin_for_permit().now_or_never();
+        let spun = pool.database.spin_for_permit(None).now_or_never();
         assert!(matches!(spun, Some(None)));
+    }
+
+    /// The turns are not a time bound: a checkout whose deadline passes
+    /// while every permit is taken stops spinning, so a permit freed later
+    /// is not handed to it past its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_spin_stops_once_the_deadline_passes() {
+        let pool = crate::pool::ConnectionPool::test_for_protocol();
+        let all = pool.database.inner.semaphore.available_permits() as u32;
+        let taken = pool
+            .database
+            .inner
+            .semaphore
+            .acquire_many(all)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+        let late_release = async move {
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(20)).await;
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            drop(taken);
+        };
+
+        let (spun, ()) = tokio::join!(pool.database.spin_for_permit(Some(deadline)), late_release);
+
+        assert!(spun.is_none());
     }
 
     /// With every permit taken the spin gives up after its turns and leaves
@@ -6903,6 +6944,6 @@ mod checkout_spin_tests {
             .acquire_many(all)
             .await
             .unwrap();
-        assert!(pool.database.spin_for_permit().await.is_none());
+        assert!(pool.database.spin_for_permit(None).await.is_none());
     }
 }

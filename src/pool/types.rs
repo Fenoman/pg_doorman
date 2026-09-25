@@ -93,6 +93,17 @@ impl Timeouts {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// The deadline of a checkout begun at `start`: none without a positive
+    /// wait timeout, which keeps a zero wait non-blocking.
+    pub(crate) fn checkout_deadline(
+        &self,
+        start: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        self.wait
+            .filter(|wait| !wait.is_zero())
+            .map(|wait| start + wait)
+    }
 }
 
 /// Mode for dequeuing objects from a pool.
