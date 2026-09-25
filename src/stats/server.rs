@@ -233,6 +233,18 @@ impl ServerStats {
         histograms
     }
 
+    /// Observes a finished transaction in the pool latency histogram. A zero
+    /// duration comes from backend creation or client drop, not from a
+    /// transaction, and returns before the histograms resolve: it creates no
+    /// series, like [`crate::web::metrics::observe_pool_transaction_microseconds`].
+    #[inline(always)]
+    fn observe_pool_transaction(&self, microseconds: u64) {
+        if microseconds == 0 {
+            return;
+        }
+        self.observe_pool_latency(|histograms| histograms.observe_transaction(microseconds));
+    }
+
     #[inline(always)]
     fn pack(state: u8, wait: u8) -> u8 {
         (state << 4) | (wait & 0x0F)
@@ -411,7 +423,7 @@ impl ServerStats {
     #[inline(always)]
     pub fn idle(&self, microseconds: u64) {
         self.address.stats.xact_time_add(microseconds);
-        self.observe_pool_latency(|histograms| histograms.observe_transaction(microseconds));
+        self.observe_pool_transaction(microseconds);
         self.set_state(SERVER_STATE_IDLE);
     }
 
@@ -420,7 +432,7 @@ impl ServerStats {
     pub fn add_xact_time_and_idle(&self, microseconds: u64) {
         self.set_state(SERVER_STATE_IDLE);
         self.address.stats.xact_time_add(microseconds);
-        self.observe_pool_latency(|histograms| histograms.observe_transaction(microseconds));
+        self.observe_pool_transaction(microseconds);
     }
 
     //
@@ -840,6 +852,28 @@ mod tests {
             crate::web::metrics::exported_pool_latency(user, pool)[0],
             Some((2, 0.003)),
             "both backends observe into the one exported query series"
+        );
+    }
+
+    /// A zero transaction, which backend creation and client drop report,
+    /// creates no latency series and leaves the tracker alone.
+    #[test]
+    #[serial]
+    fn zero_transaction_creates_no_latency_series() {
+        let (user, pool) = ("zero_xact_series_user", "zero_xact_series_pool");
+        let stats = latency_stats(user, pool);
+
+        stats.idle(0);
+        stats.add_xact_time_and_idle(0);
+
+        assert_eq!(
+            crate::web::metrics::exported_pool_latency(user, pool),
+            [None, None, None],
+            "a zero transaction exports no series"
+        );
+        assert!(
+            !crate::web::metrics::pool_latency_keys_tracked(user, pool),
+            "a zero transaction records no pair"
         );
     }
 

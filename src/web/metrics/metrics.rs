@@ -1855,13 +1855,10 @@ impl PoolLatencyHistograms {
         self.query.observe(microseconds as f64 / 1_000_000.0);
     }
 
-    /// See [`observe_pool_transaction_microseconds`], which drops zero inputs
-    /// the same way.
+    /// See [`observe_pool_transaction_microseconds`]. The caller skips zero
+    /// durations before resolving the histograms, so they create no series.
     #[inline]
     pub(crate) fn observe_transaction(&self, microseconds: u64) {
-        if microseconds == 0 {
-            return;
-        }
         self.transaction.observe(microseconds as f64 / 1_000_000.0);
     }
 
