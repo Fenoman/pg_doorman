@@ -43,7 +43,7 @@ type BoxedPoolFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output =
 
 #[derive(Debug)]
 struct ObjectInner {
-    obj: Server,
+    obj: Box<Server>,
     metrics: Metrics,
     /// Held for RAII — dropped when connection is destroyed, freeing coordinator slot.
     #[allow(dead_code)]
@@ -498,7 +498,7 @@ impl PoolInner {
             .override_lifetime_ms
             .unwrap_or(self.server_pool.lifetime_ms());
         ObjectInner {
-            obj,
+            obj: Box::new(obj),
             metrics: Metrics::new(
                 lifetime_ms,
                 self.server_pool.idle_timeout_ms(),
@@ -4193,7 +4193,7 @@ mod tests {
                 permit.forget();
                 slots.size += 1;
                 checked_out.push(ObjectInner {
-                    obj: Server::test_zombie_marked_bad(),
+                    obj: Box::new(Server::test_zombie_marked_bad()),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -4204,7 +4204,7 @@ mod tests {
                 pool.inner.config.queue_mode,
                 &mut slots.vec,
                 ObjectInner {
-                    obj: Server::test_zombie_marked_bad(),
+                    obj: Box::new(Server::test_zombie_marked_bad()),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 },
@@ -5200,14 +5200,14 @@ mod tests {
                 permit.forget();
                 slots.size += 1;
                 active.push(ObjectInner {
-                    obj: Server::test_zombie_marked_bad(),
+                    obj: Box::new(Server::test_zombie_marked_bad()),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
             }
             slots.size += 1;
             slots.vec.push_back(ObjectInner {
-                obj: Server::test_zombie_marked_bad(),
+                obj: Box::new(Server::test_zombie_marked_bad()),
                 metrics: Metrics::default(),
                 coordinator_permit: None,
             });
@@ -5256,7 +5256,7 @@ mod tests {
                 permit.forget();
                 slots.size += 1;
                 active.push(ObjectInner {
-                    obj: Server::test_zombie_marked_bad(),
+                    obj: Box::new(Server::test_zombie_marked_bad()),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -5312,7 +5312,7 @@ mod tests {
                 permit.forget();
                 slots.size += 1;
                 active.push(ObjectInner {
-                    obj: Server::test_zombie_marked_bad(),
+                    obj: Box::new(Server::test_zombie_marked_bad()),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -5324,7 +5324,7 @@ mod tests {
 
         let bad_object = Object {
             inner: Some(ObjectInner {
-                obj: Server::test_zombie_marked_bad(),
+                obj: Box::new(Server::test_zombie_marked_bad()),
                 metrics: Metrics::default(),
                 coordinator_permit: None,
             }),
@@ -5367,7 +5367,7 @@ mod tests {
 
         let object = Object {
             inner: Some(ObjectInner {
-                obj: server,
+                obj: Box::new(server),
                 metrics: Metrics::default(),
                 coordinator_permit: None,
             }),
@@ -5985,7 +5985,7 @@ mod tests {
                                                          // `last_activity` is `SystemTime::now()` from the
                                                          // constructor - well inside the 30 s threshold.
                 guard.vec.push_back(ObjectInner {
-                    obj: server,
+                    obj: Box::new(server),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -6026,7 +6026,7 @@ mod tests {
             for _ in 0..ZOMBIES {
                 let server = Server::test_dead_socket();
                 guard.vec.push_back(ObjectInner {
-                    obj: server,
+                    obj: Box::new(server),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -6073,7 +6073,7 @@ mod tests {
                 server.last_activity =
                     std::time::SystemTime::now() - std::time::Duration::from_secs(3);
                 guard.vec.push_back(ObjectInner {
-                    obj: server,
+                    obj: Box::new(server),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -6130,7 +6130,7 @@ mod tests {
         {
             let mut guard = pool.inner.slots.lock();
             guard.vec.push_back(ObjectInner {
-                obj: server,
+                obj: Box::new(server),
                 metrics: Metrics {
                     recycled: Some(checked_in_at),
                     ..Metrics::default()
@@ -6306,7 +6306,7 @@ mod tests {
             let mut guard = pool.inner.slots.lock();
             for _ in 0..ZOMBIES {
                 guard.vec.push_back(ObjectInner {
-                    obj: Server::test_zombie_marked_bad(),
+                    obj: Box::new(Server::test_zombie_marked_bad()),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -6442,7 +6442,7 @@ mod tests {
                     std::time::SystemTime::now() - std::time::Duration::from_secs(60);
                 peers.push(peer);
                 guard.vec.push_back(ObjectInner {
-                    obj: server,
+                    obj: Box::new(server),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -6542,7 +6542,7 @@ mod tests {
                 let mut obj = Server::test_zombie_marked_bad();
                 obj.test_set_process_id(pid);
                 guard.vec.push_back(ObjectInner {
-                    obj,
+                    obj: Box::new(obj),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -6687,7 +6687,7 @@ mod tests {
                 server.last_activity =
                     std::time::SystemTime::now() - std::time::Duration::from_secs(60);
                 guard.vec.push_back(ObjectInner {
-                    obj: server,
+                    obj: Box::new(server),
                     metrics: Metrics::default(),
                     coordinator_permit: None,
                 });
@@ -6810,6 +6810,15 @@ mod checkout_future_size_tests {
         let pool = crate::pool::ConnectionPool::test_for_protocol();
         let checkout = pool.database.get();
         let size = std::mem::size_of_val(&checkout);
-        assert!(size <= 6144, "the checkout future is {size} bytes");
+        assert!(size <= 4096, "the checkout future is {size} bytes");
+    }
+
+    /// A pool slot moves between the idle queue and a checkout on every
+    /// transaction. It keeps the backend connection on the heap, so the
+    /// moves copy a pointer, not the whole connection state.
+    #[test]
+    fn a_pool_slot_holds_its_backend_on_the_heap() {
+        let size = std::mem::size_of::<super::ObjectInner>();
+        assert!(size <= 256, "a pool slot is {size} bytes");
     }
 }
