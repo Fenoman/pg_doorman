@@ -163,6 +163,11 @@ pub struct ServerParameters {
     // demand from the iterator.
     pub(crate) parameters: AHashMap<String, String>,
 
+    /// `application_name` of `parameters`, empty when it has none. Stats
+    /// read it several times per transaction, and the copy spares them the
+    /// map lookup.
+    application_name: String,
+
     /// Lazy hash of planner-relevant parameters. Atomic keeps the
     /// containing async types `Send + Sync` while allowing cache updates.
     planner_hash_cache: std::sync::atomic::AtomicU64,
@@ -174,6 +179,7 @@ impl Clone for ServerParameters {
         // atomic value.
         ServerParameters {
             parameters: self.parameters.clone(),
+            application_name: self.application_name.clone(),
             planner_hash_cache: std::sync::atomic::AtomicU64::new(PLANNER_HASH_UNSET),
         }
     }
@@ -192,6 +198,7 @@ impl ServerParameters {
     pub fn new() -> Self {
         ServerParameters {
             parameters: AHashMap::new(),
+            application_name: String::new(),
             planner_hash_cache: std::sync::atomic::AtomicU64::new(PLANNER_HASH_UNSET),
         }
     }
@@ -203,6 +210,7 @@ impl ServerParameters {
     pub fn admin() -> Self {
         let mut server_parameters = ServerParameters {
             parameters: AHashMap::new(),
+            application_name: String::new(),
             planner_hash_cache: std::sync::atomic::AtomicU64::new(PLANNER_HASH_UNSET),
         };
 
@@ -259,6 +267,9 @@ impl ServerParameters {
                 Some(existing) => existing != &value,
                 None => true,
             };
+            if key == "application_name" {
+                self.application_name.clone_from(&value);
+            }
             self.parameters.insert(key, value);
             if planner_relevant && changed {
                 self.planner_hash_cache
@@ -295,6 +306,9 @@ impl ServerParameters {
         // entered the map per set_param's shape check.
         if !crate::config::startup_parameters::is_valid_guc_name(&canonical) {
             return;
+        }
+        if canonical == "application_name" {
+            self.application_name.clear();
         }
         if self.parameters.remove(&canonical).is_some() && is_planner_key(&canonical) {
             self.planner_hash_cache
@@ -355,16 +369,11 @@ impl ServerParameters {
         diff
     }
 
+    /// The application name, empty when the parameters have none:
+    /// `ServerParameters::new()` does not set it and a client RESET can
+    /// remove it.
     pub fn get_application_name(&self) -> &str {
-        // `ServerParameters::new()` does not set application_name
-        // (only `::admin()` does) and a client RESET can remove it, so a
-        // bare `.unwrap()` here was reachable unsoundness. Fall back to an
-        // empty name instead of panicking; the contract stays `&str` so
-        // the (stats-recording) callers are unchanged.
-        self.parameters
-            .get("application_name")
-            .map(String::as_str)
-            .unwrap_or("")
+        &self.application_name
     }
 
     pub fn as_hashmap(&self) -> HashMap<String, String> {
@@ -857,6 +866,30 @@ mod tests {
     fn get_application_name_returns_value_when_set() {
         let sp = ServerParameters::admin();
         assert_eq!(sp.get_application_name(), "pg_doorman");
+    }
+
+    /// The application name follows every change of the parameters: set in
+    /// any letter case, cloned, kept by a session reset, removed.
+    #[test]
+    fn get_application_name_follows_every_change_of_the_parameters() {
+        let mut sp = ServerParameters::new();
+        sp.set_param("application_name", "svc-a", false);
+        assert_eq!(sp.get_application_name(), "svc-a");
+        sp.set_param("Application_Name", "svc-b", false);
+        assert_eq!(sp.get_application_name(), "svc-b");
+        sp.set_from_hashmap(
+            &HashMap::from([("application_name".to_string(), "svc-c".to_string())]),
+            true,
+        );
+        assert_eq!(sp.get_application_name(), "svc-c");
+        assert_eq!(sp.clone().get_application_name(), "svc-c");
+
+        sp.remove_startup_only_params_after_session_reset();
+        assert_eq!(sp.get_application_name(), "svc-c");
+        sp.remove_param("APPLICATION_NAME");
+        assert_eq!(sp.get_application_name(), "");
+        sp.set_param("application_name", "svc-d", true);
+        assert_eq!(sp.get_application_name(), "svc-d");
     }
 
     #[test]
