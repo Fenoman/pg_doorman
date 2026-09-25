@@ -1060,8 +1060,87 @@ pub(crate) fn record_release_reply_metric(server: &mut Server, result: &Result<(
     }
 }
 
+/// What [`settle_buffered_release_reply`] found in the read buffer.
+#[derive(Debug, PartialEq)]
+enum BufferedReleaseReply {
+    /// The whole reply, now settled.
+    Settled,
+    /// Nothing yet.
+    Empty,
+    /// Part of the reply, or a message this pass does not settle (an error,
+    /// a parameter change), left untouched.
+    Other,
+}
+
+/// Settles a release reply that already sits whole in the read buffer, in
+/// one pass over the buffered bytes instead of a read per message: the
+/// reply usually arrives in one packet, often with the reply of the client's
+/// messages behind it.
+fn settle_buffered_release_reply(server: &mut Server) -> BufferedReleaseReply {
+    use futures::FutureExt;
+    use tokio::io::AsyncBufReadExt;
+
+    let mut commands = server.release_reply_commands;
+    let until_ready = commands == 0;
+    let buffered = match server.stream.fill_buf().now_or_never() {
+        Some(Ok(buffered)) if !buffered.is_empty() => buffered,
+        None => return BufferedReleaseReply::Empty,
+        Some(_) => return BufferedReleaseReply::Other,
+    };
+    let mut end = 0;
+    loop {
+        let Some(header) = buffered.get(end..end + 5) else {
+            return BufferedReleaseReply::Other;
+        };
+        let code = header[0];
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        if len < 4 {
+            return BufferedReleaseReply::Other;
+        }
+        let next = end + 1 + len as usize;
+        if buffered.len() < next {
+            return BufferedReleaseReply::Other;
+        }
+        match code {
+            b'1' | b'2' | b'D' | b'I' | b'N' | b'A' => {}
+            b'C' if !until_ready => {
+                commands -= 1;
+                if commands == 0 {
+                    end = next;
+                    break;
+                }
+            }
+            b'C' => {}
+            b'Z' if until_ready && len == 5 && buffered[end + 5] == b'I' => {
+                end = next;
+                break;
+            }
+            _ => return BufferedReleaseReply::Other,
+        }
+        end = next;
+    }
+    server.stream.consume(end);
+    server.stats.data_received(end);
+    server.release_reply_commands = 0;
+    server.release_reply_pending = false;
+    BufferedReleaseReply::Settled
+}
+
 async fn read_release_reply(server: &mut Server) -> Result<(), Error> {
+    use tokio::io::AsyncBufReadExt;
+
     while server.release_reply_pending {
+        match settle_buffered_release_reply(server) {
+            BufferedReleaseReply::Settled => break,
+            // Wait for the first bytes, then settle the reply in one pass;
+            // a failed read is left to the reader below.
+            BufferedReleaseReply::Empty => {
+                if server.stream.fill_buf().await.is_ok() {
+                    continue;
+                }
+            }
+            BufferedReleaseReply::Other => {}
+        }
         let read = async {
             let (code, len) = read_message_header(&mut *server.stream).await?;
             if len >= MAX_MESSAGE_SIZE {
@@ -1884,6 +1963,120 @@ mod tests {
         reply.put_slice(&[b'I', 0, 0, 0, 4]);
         reply.put(crate::messages::ready_for_query(false));
         reply
+    }
+
+    /// The reply to a release that went ahead of a client's first write:
+    /// the release block without the empty Query, so it ends at COMMIT.
+    fn coalesced_release_ok_reply() -> BytesMut {
+        let mut reply = release_ok_reply();
+        reply.truncate(reply.len() - 5 - 6);
+        reply
+    }
+
+    /// A whole release reply in the read buffer is settled in one pass: its
+    /// bytes are consumed and counted, the client's reply behind it stays.
+    #[tokio::test]
+    async fn a_buffered_release_reply_is_settled_in_one_pass() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        server.release_reply_commands = crate::server::server_backend::COALESCED_RELEASE_COMMANDS;
+        let release = coalesced_release_ok_reply();
+        let mut own = crate::messages::command_complete("SELECT 1");
+        own.put(crate::messages::ready_for_query(false));
+        let mut bytes = release.clone();
+        bytes.put_slice(&own);
+        peer.write_all(&bytes).await.unwrap();
+        server.stream.fill_buf().await.unwrap();
+        let received = server
+            .stats
+            .bytes_received
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            super::settle_buffered_release_reply(&mut server),
+            super::BufferedReleaseReply::Settled
+        );
+
+        assert!(!server.release_reply_pending);
+        assert_eq!(server.release_reply_commands, 0);
+        assert_eq!(server.stream.fill_buf().await.unwrap(), &own[..]);
+        assert_eq!(
+            server
+                .stats
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            received + release.len() as u64
+        );
+    }
+
+    /// Anything but a plain successful reply is left to the reader that goes
+    /// message by message: an error, a parameter change, a reply not yet
+    /// read whole.
+    #[tokio::test]
+    async fn a_buffered_release_reply_it_cannot_settle_is_left_alone() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut error = BytesMut::new();
+        error.put_slice(b"SERROR\0VERROR\0C57014\0Mcanceling statement due to user request\0\0");
+        let mut failed = BytesMut::from(&crate::messages::parse_complete()[..]);
+        failed.put_u8(b'E');
+        failed.put_i32(error.len() as i32 + 4);
+        failed.put(error);
+        // Whole otherwise: only the error keeps this pass off it.
+        failed.put_slice(&coalesced_release_ok_reply());
+        let mut parameter = BytesMut::from(&crate::messages::parse_complete()[..]);
+        parameter.put_u8(b'S');
+        parameter.put_i32(4 + b"TimeZone\0UTC\0".len() as i32);
+        parameter.put_slice(b"TimeZone\0UTC\0");
+        parameter.put_slice(&coalesced_release_ok_reply());
+        let mut partial = coalesced_release_ok_reply();
+        partial.truncate(partial.len() - 3);
+
+        for bytes in [failed, parameter, partial] {
+            let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+            server.release_reply_pending = true;
+            server.release_reply_commands =
+                crate::server::server_backend::COALESCED_RELEASE_COMMANDS;
+            peer.write_all(&bytes).await.unwrap();
+            server.stream.fill_buf().await.unwrap();
+
+            assert_eq!(
+                super::settle_buffered_release_reply(&mut server),
+                super::BufferedReleaseReply::Other
+            );
+
+            assert!(server.release_reply_pending);
+            assert_eq!(server.stream.fill_buf().await.unwrap(), &bytes[..]);
+        }
+    }
+
+    /// Before anything arrives there is nothing to settle; the reader waits
+    /// for the first bytes and settles the reply then.
+    #[tokio::test]
+    async fn a_release_reply_not_yet_arrived_is_waited_for_and_settled() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        server.release_reply_pending = true;
+        server.release_reply_commands = crate::server::server_backend::COALESCED_RELEASE_COMMANDS;
+        assert_eq!(
+            super::settle_buffered_release_reply(&mut server),
+            super::BufferedReleaseReply::Empty
+        );
+        let release = coalesced_release_ok_reply();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            peer.write_all(&release).await.unwrap();
+            peer
+        });
+
+        super::read_release_reply(&mut server).await.unwrap();
+
+        assert!(!server.release_reply_pending);
+        assert!(!server.is_bad());
+        drop(writer.await.unwrap());
     }
 
     /// The release reply precedes the reply to the exchange sent after it
