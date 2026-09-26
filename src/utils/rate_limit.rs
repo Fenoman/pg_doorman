@@ -1,4 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::time::{sleep_until, Duration, Instant};
@@ -11,14 +13,34 @@ struct Message {
 #[derive(Clone, Debug)]
 pub struct RateLimiter {
     sender: Sender<Message>,
+    /// The receiver until its task starts: at once when `new` runs inside a
+    /// tokio runtime, otherwise on the first `wait()`. The server builds the
+    /// limiter before it starts the runtime.
+    idle_receiver: Arc<Mutex<Option<Receiver<Message>>>>,
+    count: usize,
+    duration: Duration,
 }
 
 impl RateLimiter {
     pub fn new(count: usize, duration_in_ms: u64) -> Self {
         let duration = Duration::from_millis(duration_in_ms);
         let (sender, receiver) = channel(count);
-        RateLimiter::spawn_receiver(receiver, count, duration);
-        Self { sender }
+        let limiter = Self {
+            sender,
+            idle_receiver: Arc::new(Mutex::new(Some(receiver))),
+            count,
+            duration,
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            limiter.start();
+        }
+        limiter
+    }
+
+    fn start(&self) {
+        if let Some(receiver) = self.idle_receiver.lock().take() {
+            RateLimiter::spawn_receiver(receiver, self.count, self.duration);
+        }
     }
 
     /// two `.expect()` calls - if the spawned receiver
@@ -29,6 +51,7 @@ impl RateLimiter {
     /// `wait()` returns `Result`; callers decide whether to fail the
     /// handshake gracefully or panic.
     pub async fn wait(&self) -> Result<(), &'static str> {
+        self.start();
         let (s, r) = oneshot::channel::<()>();
         self.sender
             .send(Message { sender: s })
@@ -115,5 +138,24 @@ mod test {
         }
         let elapsed = start.elapsed();
         assert!(elapsed > Duration::from_secs(CHUNKS as u64 - 1));
+    }
+
+    /// The server builds its TLS state, the limiter included, before it
+    /// starts the tokio runtime. The limiter then works in that runtime.
+    #[test]
+    fn a_limiter_built_before_the_runtime_works_in_it() {
+        let limiter = RateLimiter::new(2, 60000);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(5), limiter.wait())
+                    .await
+                    .expect("the limiter admits within its rate")
+                    .expect("rate limiter healthy in test");
+            }
+        });
     }
 }
