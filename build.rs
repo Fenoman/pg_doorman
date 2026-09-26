@@ -1,9 +1,8 @@
 // Tell cargo to invalidate the build whenever the embedded SPA bundle
 // changes. Without this hint, cargo only watches the regular source
 // tree; a frontend rebuild that produces a new `frontend/dist/...js`
-// would be silently ignored and the resulting binary would still embed
-// the previous bundle. Docker builds share `target/`, so the COPY layer
-// alone is too late to invalidate cargo.
+// would be silently ignored by an incremental build and the resulting
+// binary would still embed the previous bundle.
 
 use std::fs;
 use std::path::Path;
