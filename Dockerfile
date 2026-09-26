@@ -26,16 +26,27 @@ COPY . /app
 WORKDIR /app
 # scripts/pgo-rustflags.sh adds the committed PGO profile to RUSTFLAGS when
 # pgo/pg_doorman.profdata.gz is present. `--build-arg PGO=0` builds without it.
-# cargo auditable runs rustc through RUSTC_WORKSPACE_WRAPPER, and cargo mixes
-# the wrapper path into the symbol names of the pg_doorman crates, so only the
-# dependencies find their records in a profile recorded by plain cargo.
+#
+# cargo-auditable runs as RUSTC_WRAPPER instead of through `cargo auditable
+# build`, which sets RUSTC_WORKSPACE_WRAPPER: cargo mixes the path of the
+# workspace wrapper into the symbol names of the pg_doorman crates, and the
+# profile, recorded by plain cargo, would then match only the dependencies.
+# RUSTC_WRAPPER leaves symbol names alone. CARGO_AUDITABLE_ORIG_ARGS is what
+# `cargo auditable build --locked` hands to its wrapper (cargo-auditable 0.7.5).
+# The build fails when a binary comes out without the dependency inventory.
 ARG PGO=1
 RUN pgo_flags="$(PGO="$PGO" bash scripts/pgo-rustflags.sh)" && \
     if [ -n "$pgo_flags" ]; then \
         export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$pgo_flags"; \
     fi && \
     echo "RUSTFLAGS=${RUSTFLAGS:-}" && \
-    cargo auditable build --locked --release --bin pg_doorman --bin patroni_proxy
+    CARGO_AUDITABLE_ORIG_ARGS='{"offline":false,"locked":true,"frozen":false,"config":[]}' \
+    RUSTC_WRAPPER=cargo-auditable \
+    cargo build --locked --release --bin pg_doorman --bin patroni_proxy && \
+    for bin in pg_doorman patroni_proxy; do \
+        readelf -SW "target/release/$bin" | grep -q '\.dep-v0' || \
+            { echo "target/release/$bin has no dependency inventory" >&2; exit 1; }; \
+    done
 
 # The runtime stage is distroless and has no shell, so everything that used to
 # be an in-image `RUN` has to be materialised here and copied in as files.

@@ -61,7 +61,7 @@ For deb/rpm packaging see `debian/` and `pkg/` in the repository.
 
 Release builds use profile-guided optimization (PGO): the compiler inlines and lays out code by a profile recorded while pgbench ran through pg_doorman. The hot path of pg_doorman is bound by instruction-cache misses, and PGO packs hot code densely. On a 16-core x86_64 host (pgbench select-only at 8 to 128 clients, pool of 8, 4 worker threads) a PGO build gives 2-3% more TPS and 3-5% less CPU per transaction.
 
-The profile is committed as `pgo/pg_doorman.profdata.gz`. `make build`, the Ubuntu PPA packages and the deb and rpm packages of GitHub releases use it when the file exists. The Docker build passes it too, but `cargo auditable` there changes the symbol names of pg_doorman's own code, so in the image only the dependencies get PGO. `make build PGO=0` and plain `cargo build --release` build without it.
+The profile is committed as `pgo/pg_doorman.profdata.gz`. `make build`, the Ubuntu PPA packages, the deb and rpm packages of GitHub releases and the amd64 Docker image use it when the file exists. The arm64 image and other platforms build without a matching profile. `make build PGO=0` and plain `cargo build --release` build without it.
 
 To record a new profile, run on x86_64 Linux with PostgreSQL and pgbench installed:
 
