@@ -44,7 +44,7 @@ RUN pgo_flags="$(PGO="$PGO" bash scripts/pgo-rustflags.sh)" && \
     RUSTC_WRAPPER=cargo-auditable \
     cargo build --locked --release --bin pg_doorman --bin patroni_proxy && \
     for bin in pg_doorman patroni_proxy; do \
-        readelf -SW "target/release/$bin" | grep -q '\.dep-v0' || \
+        readelf -SW "target/release/$bin" | grep -qE '[[:space:]]\.dep-v0[[:space:]]' || \
             { echo "target/release/$bin has no dependency inventory" >&2; exit 1; }; \
     done
 
