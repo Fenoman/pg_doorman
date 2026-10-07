@@ -402,9 +402,11 @@ where
         return Err(err);
     }
     server.bad = prev_bad;
+    // The buffer ends with the frame header, whose length field is also
+    // part of `message_len`.
     server
         .stats
-        .data_received(server.buffer.len() + message_len as usize);
+        .data_received(server.buffer.len() + message_len as usize - mem::size_of::<i32>());
     server.touch_activity();
     server.stats.wait_idle();
     server.buffer.clear();
@@ -3330,6 +3332,43 @@ mod tests {
         assert!(matches!(result, Ok(None)), "{result:?}");
         assert_eq!(client.taken, 1 + message_len as usize);
         assert!(!server.is_bad());
+        let _peer = writer.await.unwrap();
+    }
+
+    /// A streamed frame adds to the bytes received from the backend exactly
+    /// what crossed the socket: its code, its length and its body.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_streamed_frame_counts_the_bytes_it_received() {
+        use super::{stream_large_frame, StreamLimits};
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        let (message_len, body) = data_row_body(200 * 1024);
+        let writer = tokio::spawn(async move {
+            peer.write_all(&body).await.unwrap();
+            peer
+        });
+        let limits = StreamLimits {
+            client: std::time::Duration::from_secs(5),
+            backend: std::time::Duration::from_secs(5),
+        };
+        let before = server.stats.bytes_received.load(Ordering::Relaxed);
+
+        let result = stream_large_frame(
+            &mut server,
+            &mut tokio::io::sink(),
+            b'D',
+            message_len,
+            limits,
+            "data_row",
+        )
+        .await;
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
+        let counted = server.stats.bytes_received.load(Ordering::Relaxed) - before;
+        assert_eq!(counted, 1 + message_len as u64);
         let _peer = writer.await.unwrap();
     }
 
