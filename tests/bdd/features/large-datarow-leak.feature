@@ -141,14 +141,14 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
     # 2s client write timeout + cleanup margin.
     And we sleep 4000ms
 
-    When we close session "slow_a"
-    And we sleep 1000ms
-
-    # Pool releases the server: counters back to zero.
+    # Client A still holds its socket open: only the timeout can have
+    # disconnected it and released its server.
     When we create admin session "admin-mid" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW POOLS" on admin session "admin-mid" and store response
     Then admin session "admin-mid" column "cl_active" for row with "user" = "example_user_1" should be between 0 and 0
     And admin session "admin-mid" column "sv_active" for row with "user" = "example_user_1" should be between 0 and 0
+
+    When we close session "slow_a"
 
     # Client B gets a backend from the pool. It must see exactly its own result,
     # not leftover bytes from the abandoned 50 MB DataRow.
@@ -169,13 +169,14 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
     # 2s client write timeout + cleanup margin.
     And we sleep 4000ms
 
-    When we close session "copy_a"
-    And we sleep 1000ms
-
+    # Client A still holds its socket open: only the timeout can have
+    # disconnected it and released its server.
     When we create admin session "admin-copy" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW POOLS" on admin session "admin-copy" and store response
     Then admin session "admin-copy" column "cl_active" for row with "user" = "example_user_1" should be between 0 and 0
     And admin session "admin-copy" column "sv_active" for row with "user" = "example_user_1" should be between 0 and 0
+
+    When we close session "copy_a"
 
     When we create session "copy_b" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 'COPY_CLEAN'::text" to session "copy_b" and store response
