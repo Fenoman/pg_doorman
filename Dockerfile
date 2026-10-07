@@ -1,22 +1,9 @@
-FROM gcr.io/distroless/cc-debian13@sha256:9b615fff20e1a4fad29c2b30562580b212c7dd5e2225236735cca0070ed11c78 AS runtime-base
+FROM gcr.io/distroless/cc-debian13@sha256:159783207c2cd44c2aa5715961d13c8612368ac9bd450f887e3f08fc8ea461e3 AS runtime-base
 
 FROM rust:1.88.0-slim-trixie AS builder
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev perl
-
-# Keep the complete Debian libc6 payload and its package inventory together.
-# The pinned distroless release still contains u3; u4 fixes CVE-2026-5450 and
-# CVE-2026-5928. Remove this overlay when updating to a base that includes u4.
-ARG LIBC6_VERSION=2.41-12+deb13u4
-RUN apt-get update && \
-    mkdir -p /tmp/runtime-debs /runtime-root/var/lib/dpkg/status.d && \
-    cd /tmp/runtime-debs && \
-    apt-get download "libc6=${LIBC6_VERSION}" && \
-    dpkg-deb --extract libc6_*.deb /runtime-root && \
-    dpkg-deb --control libc6_*.deb /tmp/libc6-control && \
-    cp /tmp/libc6-control/control /runtime-root/var/lib/dpkg/status.d/libc6 && \
-    cp /tmp/libc6-control/md5sums /runtime-root/var/lib/dpkg/status.d/libc6.md5sums
 
 # Embed the resolved Rust dependency inventory so image scanners cover both
 # application binaries as well as the operating-system packages.
@@ -66,7 +53,6 @@ RUN cp /distroless/passwd /rootfs-passwd && \
 
 FROM runtime-base
 
-COPY --from=builder /runtime-root/ /
 COPY --from=builder /rootfs-passwd /etc/passwd
 COPY --from=builder /rootfs-group /etc/group
 COPY --from=builder --chown=999:999 /rootfs-etc-pg_doorman /etc/pg_doorman
