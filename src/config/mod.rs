@@ -1125,8 +1125,9 @@ pub fn proxy_copy_data_timeout() -> std::time::Duration {
 }
 
 /// `general.client_write_timeout`, which bounds every write to a pool client
-/// (the admin console keeps its own limit) and is read several times per
-/// transaction, like `proxy_copy_data_timeout()`.
+/// after startup and is read several times per transaction, like
+/// `proxy_copy_data_timeout()`. Startup and authentication are bounded by
+/// `PRE_AUTH_CLIENT_TIMEOUT` as a whole, the admin console by its own limit.
 pub fn client_write_timeout() -> std::time::Duration {
     client_write_limit(CONFIG.load().general.client_write_timeout)
 }
