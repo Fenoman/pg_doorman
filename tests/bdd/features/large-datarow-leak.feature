@@ -30,9 +30,11 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
       worker_threads = 1
       log_client_connections = true
       log_client_disconnections = true
-      # Cap proxy timeout so cleanup after RST/cancel completes within
-      # the test's wait windows (default 15s would exceed our 5s sleeps).
+      # Cap the proxy and client write timeouts so cleanup after RST/cancel
+      # completes within the test's wait windows (the defaults would exceed
+      # our 5s sleeps).
       proxy_copy_data_timeout = 2000
+      client_write_timeout = 2000
 
       [pools.example_db]
       server_host = "127.0.0.1"
@@ -126,16 +128,16 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
     And admin session "admin" column "sv_active" for row with "user" = "example_user_1" should be between 0 and 0
 
   @large-datarow-leak-timeout-clean-handoff
-  Scenario: proxy_copy_data timeout fires, next client on the same pool sees clean state
+  Scenario: client write timeout fires, next client on the same pool sees clean state
     # Client A sends a large SELECT and never reads. The send buffer fills,
-    # proxy_copy_data blocks on writes to client A, then fires the configured
-    # timeout (proxy_copy_data_timeout = 2000 in this feature's Background).
+    # the stream blocks on writes to client A, then fires the configured
+    # timeout (client_write_timeout = 2000 in this feature's Background).
     # handle_large_data_row marks the server bad and returns Err. Object::drop
     # must evict the connection so the leftover body bytes never reach client B.
     When we create session "slow_a" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT repeat('X', 50000000)::text" to session "slow_a" without waiting
 
-    # 2s proxy timeout + cleanup margin.
+    # 2s client write timeout + cleanup margin.
     And we sleep 4000ms
 
     When we close session "slow_a"
@@ -158,12 +160,12 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
     # Mirrors @large-datarow-leak-timeout-clean-handoff via the CopyData ('d')
     # path through handle_large_copy_data, instead of the DataRow ('D') path.
     # Client A starts COPY ... TO STDOUT producing a 4 MB CopyData frame, never
-    # reads, hits proxy_copy_data_timeout, and disconnects. Client B's next
+    # reads, hits client_write_timeout, and disconnects. Client B's next
     # query must return its own row, not leftover bytes.
     When we create session "copy_a" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "COPY (SELECT repeat('X', 4000000)::text) TO STDOUT" to session "copy_a" without waiting
 
-    # 2s proxy timeout + cleanup margin.
+    # 2s client write timeout + cleanup margin.
     And we sleep 4000ms
 
     When we close session "copy_a"
@@ -354,6 +356,7 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
       worker_threads = 1
       query_wait_timeout = 5000
       proxy_copy_data_timeout = 2000
+      client_write_timeout = 2000
 
       [pools.example_db]
       server_host = "${PG_TEMP_DIR}"
@@ -408,12 +411,10 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
   Scenario: TCP-zombie — client sends huge SELECT, never reads, never closes
     # Models the prod culprit: client's TCP socket is alive (kernel ACKs everything,
     # keepalive happy), but application stopped reading. doorman writes the response
-    # to the client, kernel buffer fills, write_all_flush in handle_large_data_row
-    # blocks indefinitely (no timeout in code, no signal from client side).
+    # to the client, kernel buffer fills, and the write in handle_large_data_row
+    # blocks until client_write_timeout (no signal from client side).
     #
-    # Expected (current code): sv_active stays at 1 for the entire scenario duration,
-    # because the only thing that would unblock the write is tcp_user_timeout (60s default)
-    # which we won't wait for.
+    # Expected: sv_active stays at 1 while the write is blocked.
     When we create session "zomb" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT repeat('X', 50000000)::text" to session "zomb" without waiting
 
@@ -598,9 +599,11 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
       worker_threads = 1
       log_client_connections = true
       log_client_disconnections = true
-      # Cap proxy timeout so cleanup after RST/cancel completes within
-      # the test's wait windows (default 15s would exceed our 5s sleeps).
+      # Cap the proxy and client write timeouts so cleanup after RST/cancel
+      # completes within the test's wait windows (the defaults would exceed
+      # our 5s sleeps).
       proxy_copy_data_timeout = 2000
+      client_write_timeout = 2000
       query_wait_timeout = 5000
 
       [pools.example_db]
@@ -762,6 +765,7 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
       worker_threads = 3
       query_wait_timeout = 5000
       proxy_copy_data_timeout = 2000
+      client_write_timeout = 2000
 
       [pools.example_db]
       server_host = "${PG_TEMP_DIR}"
@@ -818,6 +822,7 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
       worker_threads = 3
       query_wait_timeout = 5000
       proxy_copy_data_timeout = 2000
+      client_write_timeout = 2000
 
       [pools.example_db]
       server_host = "${PG_TEMP_DIR}"

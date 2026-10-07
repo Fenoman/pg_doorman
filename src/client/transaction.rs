@@ -153,7 +153,7 @@ async fn check_in_beside_response<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let write_timeout = crate::config::proxy_copy_data_timeout();
+    let write_timeout = crate::config::client_write_timeout();
     let flush_response = async {
         if buffered_response.is_empty() {
             Ok(())
@@ -1162,7 +1162,7 @@ where
                         0, // CommandComplete("BEGIN")
                         b'Z', 0, 0, 0, 5, b'T', // ReadyForQuery('T')
                     ];
-                    let write_timeout = crate::config::proxy_copy_data_timeout();
+                    let write_timeout = crate::config::client_write_timeout();
                     write_all_flush_timeout(
                         &mut self.write,
                         SYNTHETIC_EXTENDED_BEGIN_RESPONSE,
@@ -1288,7 +1288,7 @@ where
                                 self.username, self.pool_name, self.connection_id, count
                             );
                             self.stats.active_idle();
-                            let write_timeout = crate::config::proxy_copy_data_timeout();
+                            let write_timeout = crate::config::client_write_timeout();
                             write_all_flush_timeout(
                                 &mut self.write,
                                 &SIMPLE_DEALLOCATE_ALL_ACK,
@@ -1330,7 +1330,7 @@ where
                                     self.username, self.pool_name, self.connection_id, name
                                 );
                                 self.stats.active_idle();
-                                let write_timeout = crate::config::proxy_copy_data_timeout();
+                                let write_timeout = crate::config::client_write_timeout();
                                 write_all_flush_timeout(
                                     &mut self.write,
                                     &SIMPLE_DEALLOCATE_NAMED_ACK,
@@ -1440,7 +1440,7 @@ where
     ) -> Result<(), Error> {
         if let Some(cached) = pool.check_query_cache.get(&snapshot.query) {
             POOLER_CHECK_QUERY_CACHE_TOTAL.inc();
-            let write_timeout = crate::config::proxy_copy_data_timeout();
+            let write_timeout = crate::config::client_write_timeout();
             write_all_flush_timeout(&mut self.write, cached.as_ref(), write_timeout).await?;
             return Ok(());
         }
@@ -1551,7 +1551,7 @@ where
         conn.finalize_checkin().await?;
         drop(conn);
 
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
         write_all_flush_timeout(&mut self.write, &response, write_timeout).await?;
 
         if !has_error_response(&response) && ends_with_idle_ready_for_query(&response) {
@@ -1705,7 +1705,7 @@ where
             if skipped {
                 let reply = server.skipped_exchange_reply();
                 self.stats.active_write();
-                let write_timeout = crate::config::proxy_copy_data_timeout();
+                let write_timeout = crate::config::client_write_timeout();
                 write_all_flush_timeout(&mut self.write, &reply, write_timeout).await?;
             } else {
                 // Relay the CLIENT query's own response (we already sent the
@@ -1839,7 +1839,7 @@ where
         } else {
             DISCARD_ALL_RESPONSE_IDLE
         };
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
         write_all_flush_timeout(&mut self.write, response, write_timeout).await?;
         Ok(())
     }
@@ -2013,7 +2013,7 @@ where
             synthetic_response.extend_from_slice(&PARSE_COMPLETE_MSG);
         }
         self.reconcile_prepared_namespace(&synthetic_response, server);
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
         write_all_flush_timeout(&mut self.write, &synthetic_response, write_timeout).await?;
         self.prepared.skipped_parses.clear();
         self.prepared.batch_operations.clear();
@@ -2112,7 +2112,7 @@ where
 
         server.set_async_mode(extended);
         server.set_expected_responses(u32::from(extended));
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
         loop {
             let response = self.recv_copy_completion(server).await?;
             if extended && has_error_response(&response) {
@@ -2153,7 +2153,7 @@ where
     }
 
     async fn write_shutdown_error_and_disconnect(&mut self) -> Result<(), Error> {
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
         if let Err(err) = error_response_timeout(
             &mut self.write,
             "pooler is shut down now",
@@ -2172,7 +2172,7 @@ where
     }
 
     async fn write_checkout_error(&mut self, message: &str, sqlstate: &str) -> Result<(), Error> {
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
         error_response_timeout(&mut self.write, message, sqlstate, write_timeout).await
     }
 
@@ -2184,7 +2184,7 @@ where
     async fn end_after_checkout_exchange_error<C>(&mut self, conn: C, err: &Error) {
         drop(conn);
         if matches!(err, Error::ReleaseQueryFailed(_)) {
-            let write_timeout = crate::config::proxy_copy_data_timeout();
+            let write_timeout = crate::config::client_write_timeout();
             let _ = error_response_timeout(
                 &mut self.write,
                 crate::server::SKIPPED_EXCHANGE_MESSAGE,
@@ -2494,7 +2494,7 @@ where
                     b'C', 0, 0, 0, 10, b'B', b'E', b'G', b'I', b'N', 0, // CommandComplete
                     b'Z', 0, 0, 0, 5, b'T', // ReadyForQuery('T')
                 ];
-                let write_timeout = crate::config::proxy_copy_data_timeout();
+                let write_timeout = crate::config::client_write_timeout();
                 write_all_flush_timeout(&mut self.write, SYNTHETIC_BEGIN_RESPONSE, write_timeout)
                     .await?;
 
@@ -2841,7 +2841,7 @@ where
                             self.release_after_inner_handler_error();
                             let _ = server;
                             drop(conn);
-                            let write_timeout = crate::config::proxy_copy_data_timeout();
+                            let write_timeout = crate::config::client_write_timeout();
                             let _ = error_response_timeout(
                                 &mut self.write,
                                 "pooler is shut down now (deferred BEGIN timeout: server did not finish within the timeout period)",
@@ -2880,7 +2880,7 @@ where
                                 self.release_after_inner_handler_error();
                                 let _ = server;
                                 drop(conn);
-                                let write_timeout = crate::config::proxy_copy_data_timeout();
+                                let write_timeout = crate::config::client_write_timeout();
                                 let _ = error_response_timeout(
                                     &mut self.write,
                                     "pooler is shut down now (deferred BEGIN timeout: server did not finish within the timeout period)",
@@ -2943,7 +2943,7 @@ where
                                         &response,
                                     );
                                     self.stats.active_write();
-                                    let write_timeout = crate::config::proxy_copy_data_timeout();
+                                    let write_timeout = crate::config::client_write_timeout();
                                     if let Err(err) = write_all_flush_timeout(
                                         &mut self.write,
                                         &response,
@@ -2980,7 +2980,7 @@ where
                                     self.connected_to_server = false;
                                     self.release();
                                     drop(conn);
-                                    let write_timeout = crate::config::proxy_copy_data_timeout();
+                                    let write_timeout = crate::config::client_write_timeout();
                                     let _ = error_response_timeout(
                                         &mut self.write,
                                         "server closed the connection unexpectedly while client was idle in transaction",
@@ -3337,7 +3337,7 @@ where
                             if let Some((message, code)) = client_timeout_error {
                                 let _ = server;
                                 drop(conn);
-                                let write_timeout = crate::config::proxy_copy_data_timeout();
+                                let write_timeout = crate::config::client_write_timeout();
                                 let _ = error_response_timeout(
                                     &mut self.write,
                                     message,
@@ -3370,7 +3370,7 @@ where
             // send error to client and exit. When migration is active,
             // let the client return to idle loop where it will migrate.
             if shutdown_in_progress && !migration_in_progress() {
-                let write_timeout = crate::config::proxy_copy_data_timeout();
+                let write_timeout = crate::config::client_write_timeout();
                 error_response_timeout(
                     &mut self.write,
                     "pooler is shut down now",
@@ -3498,7 +3498,7 @@ where
     /// loop: same recv, same ParseComplete reorder, same pending CloseComplete
     /// insertion, same fast-release condition, same error handling.
     pub(crate) async fn relay_response(&mut self, server: &mut Server) -> Result<(), Error> {
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
 
         // Single initial state update
         self.stats.active_idle();
@@ -4100,8 +4100,8 @@ mod checkout_error_tests {
         let helper_body = &helper_body[..helper_end];
 
         assert!(
-            helper_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "checkout failure helper must use proxy_copy_data_timeout"
+            helper_body.contains("crate::config::client_write_timeout()"),
+            "checkout failure helper must use client_write_timeout"
         );
         assert!(
             helper_body.contains("error_response_timeout("),
@@ -4370,8 +4370,8 @@ mod internal_round_trip_timeout_tests {
             "pooler_check_query cache miss must finish and release the backend before bounded client response write and cache insertion"
         );
         assert!(
-            body.contains("crate::config::proxy_copy_data_timeout()"),
-            "pooler_check_query client response writes must use proxy_copy_data_timeout"
+            body.contains("crate::config::client_write_timeout()"),
+            "pooler_check_query client response writes must use client_write_timeout"
         );
         assert!(
             !body.contains("write_all_flush(&mut self.write, &response"),
@@ -4402,8 +4402,8 @@ mod internal_round_trip_timeout_tests {
         let hit_body = &hit_body[..hit_end];
 
         assert!(
-            hit_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "pooler_check_query cache-hit writes must use proxy_copy_data_timeout"
+            hit_body.contains("crate::config::client_write_timeout()"),
+            "pooler_check_query cache-hit writes must use client_write_timeout"
         );
         assert!(
             hit_body.contains(
@@ -4446,8 +4446,8 @@ mod internal_round_trip_timeout_tests {
             .find("self.client_pending_begin = Some(simple_begin_message())")
             .expect("deferred extended BEGIN must still set client_pending_begin");
         assert!(
-            extended_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "deferred extended BEGIN writes must use proxy_copy_data_timeout"
+            extended_body.contains("crate::config::client_write_timeout()"),
+            "deferred extended BEGIN writes must use client_write_timeout"
         );
         assert!(
             extended_write_idx < extended_pending_idx,
@@ -4468,8 +4468,8 @@ mod internal_round_trip_timeout_tests {
             .expect("pooler check handler should follow fast path");
         let fast_path_body = &fast_path_body[..fast_path_end];
         assert!(
-            fast_path_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "synthetic DEALLOCATE writes must use proxy_copy_data_timeout"
+            fast_path_body.contains("crate::config::client_write_timeout()"),
+            "synthetic DEALLOCATE writes must use client_write_timeout"
         );
         for ack in ["&SIMPLE_DEALLOCATE_NAMED_ACK", "&SIMPLE_DEALLOCATE_ALL_ACK"] {
             let ack_idx = fast_path_body.find(ack).expect(ack);
@@ -4515,8 +4515,8 @@ mod internal_round_trip_timeout_tests {
             .find("self.client_pending_begin = Some(message)")
             .expect("simple deferred BEGIN must still store the pending BEGIN");
         assert!(
-            simple_begin_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "simple deferred BEGIN writes must use proxy_copy_data_timeout"
+            simple_begin_body.contains("crate::config::client_write_timeout()"),
+            "simple deferred BEGIN writes must use client_write_timeout"
         );
         assert!(
             simple_write_idx < simple_pending_idx,
@@ -4596,8 +4596,8 @@ mod internal_round_trip_timeout_tests {
             "ServerDead must evict/release the bad backend before writing the client error"
         );
         assert!(
-            body.contains("crate::config::proxy_copy_data_timeout()"),
-            "ServerDead client error write must use proxy_copy_data_timeout"
+            body.contains("crate::config::client_write_timeout()"),
+            "ServerDead client error write must use client_write_timeout"
         );
         assert!(
             !body.contains("error_response(\n"),
@@ -4692,8 +4692,8 @@ mod internal_round_trip_timeout_tests {
             .expect("client handler should follow shutdown helper");
         let helper_body = &helper_body[..helper_end];
         assert!(
-            helper_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "shutdown client error writes must use proxy_copy_data_timeout"
+            helper_body.contains("crate::config::client_write_timeout()"),
+            "shutdown client error writes must use client_write_timeout"
         );
         assert!(
             helper_body.contains("error_response_timeout("),
@@ -4740,8 +4740,8 @@ mod internal_round_trip_timeout_tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("crate::config::proxy_copy_data_timeout()"),
-            "COPY completion client write must use proxy_copy_data_timeout"
+            body.contains("crate::config::client_write_timeout()"),
+            "COPY completion client write must use client_write_timeout"
         );
         assert!(
             body.contains("write_all_flush_timeout(&mut self.write, &response"),
@@ -4856,8 +4856,8 @@ mod internal_round_trip_timeout_tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("crate::config::proxy_copy_data_timeout()"),
-            "synthetic ParseComplete writes must use proxy_copy_data_timeout"
+            body.contains("crate::config::client_write_timeout()"),
+            "synthetic ParseComplete writes must use client_write_timeout"
         );
         assert!(
             body.contains("write_all_flush_timeout(&mut self.write, &synthetic_response"),
@@ -4994,8 +4994,8 @@ mod client_response_write_timeout_tests {
         let relay_body = &impl_src[relay_start..];
 
         assert!(
-            relay_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "client response relay writes must use the configured proxy copy timeout"
+            relay_body.contains("crate::config::client_write_timeout()"),
+            "client response relay writes must use client_write_timeout"
         );
         assert!(
             relay_body.contains("write_all_flush_timeout(&mut self.write, &response"),
@@ -5038,8 +5038,8 @@ mod client_response_write_timeout_tests {
         let flush_body = &flush_body[..flush_end];
 
         assert!(
-            flush_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "post-release fast-response flush must use proxy_copy_data_timeout"
+            flush_body.contains("crate::config::client_write_timeout()"),
+            "post-release fast-response flush must use client_write_timeout"
         );
         assert!(
             flush_body.contains(
@@ -5547,8 +5547,8 @@ mod discard_response_tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("crate::config::proxy_copy_data_timeout()"),
-            "intercepted DISCARD ALL client write must use proxy_copy_data_timeout"
+            body.contains("crate::config::client_write_timeout()"),
+            "intercepted DISCARD ALL client write must use client_write_timeout"
         );
         assert!(
             body.contains("write_all_flush_timeout(&mut self.write, response"),

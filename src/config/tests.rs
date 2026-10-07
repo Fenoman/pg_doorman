@@ -661,6 +661,46 @@ async fn test_validate_message_size_to_be_stream_below_protocol_max() {
 }
 
 #[test]
+fn test_client_write_timeout_defaults_to_ten_minutes() {
+    // A client that processes each row before reading the next one (a report
+    // service rendering a document per row) pauses for minutes in the middle
+    // of a result. PostgreSQL waits for it without a limit.
+    let general = General::default();
+    assert_eq!(general.client_write_timeout.as_millis(), 600_000);
+}
+
+#[test]
+fn test_tcp_user_timeout_defaults_to_disabled() {
+    // Linux aborts a client that keeps its receive window closed longer than
+    // TCP_USER_TIMEOUT, which would cap client_write_timeout at this value.
+    let general = General::default();
+    assert_eq!(general.tcp_user_timeout, 0);
+}
+
+#[test]
+fn test_client_write_timeout_zero_means_no_limit() {
+    assert_eq!(
+        client_write_limit(Duration::from_millis(0)),
+        std::time::Duration::MAX
+    );
+    assert_eq!(
+        client_write_limit(Duration::from_secs(30)),
+        std::time::Duration::from_secs(30)
+    );
+}
+
+#[test]
+fn test_client_write_timeout_parses_from_toml() {
+    let admin = "admin_username = \"a\"\nadmin_password = \"p\"\n";
+    let general: General =
+        toml::from_str(&format!("{admin}client_write_timeout = \"2m\"")).unwrap();
+    assert_eq!(general.client_write_timeout.as_millis(), 120_000);
+    let general: General = toml::from_str(admin).unwrap();
+    assert_eq!(general.client_write_timeout.as_millis(), 600_000);
+    assert_eq!(general.tcp_user_timeout, 0);
+}
+
+#[test]
 fn test_response_flush_threshold_defaults_to_64_kib() {
     // The default is a production-visible tuning decision: 64 KiB batches a
     // bulk response into ~8x fewer client writes than the historical 8 KiB

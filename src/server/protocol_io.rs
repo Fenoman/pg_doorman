@@ -253,13 +253,12 @@ async fn handle_large_data_row<C>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    let copy_timeout = crate::config::proxy_copy_data_timeout();
     let client_error = stream_large_frame(
         server,
         client_stream,
         code_u8,
         message_len,
-        copy_timeout,
+        StreamLimits::from_config(),
         "data_row",
     )
     .await?;
@@ -276,19 +275,38 @@ fn streamed_frame_result(client_error: Option<Error>) -> Result<BytesMut, Error>
     }
 }
 
+/// How long a streamed frame waits for each side without progress.
+#[derive(Clone, Copy, Debug)]
+struct StreamLimits {
+    /// A client that takes no bytes for this long gets no more.
+    client: Duration,
+    /// A backend that sends no bytes for this long fails the stream.
+    backend: Duration,
+}
+
+impl StreamLimits {
+    fn from_config() -> Self {
+        Self {
+            client: crate::config::client_write_timeout(),
+            backend: crate::config::proxy_copy_data_timeout(),
+        }
+    }
+}
+
 /// Streams a frame larger than `max_message_size` from the backend to the
 /// client: the response gathered so far with the frame header, then the
 /// body in chunks. A client that stops taking bytes (an error, or no
-/// progress for `timeout`) gets no more, but the rest of the frame is still
-/// read, so the backend stays in step with the protocol and its query can
-/// be drained or canceled while the pool slot is still held. Returns the
-/// client's error in that case; fails only when the backend does.
+/// progress for `limits.client`) gets no more, but the rest of the frame is
+/// still read, so the backend stays in step with the protocol and its query
+/// can be drained or canceled while the pool slot is still held. Returns the
+/// client's error in that case. Fails only when the backend does, including
+/// when it sends nothing for `limits.backend`.
 async fn stream_large_frame<C>(
     server: &mut Server,
     client_stream: &mut C,
     code_u8: u8,
     message_len: i32,
-    timeout: Duration,
+    limits: StreamLimits,
     kind: &'static str,
 ) -> Result<Option<Error>, Error>
 where
@@ -306,7 +324,7 @@ where
     let mut client_error = crate::messages::socket::write_all_flush_timeout_counted(
         client_stream,
         &server.buffer,
-        timeout,
+        limits.client,
         &mut written,
     )
     .await
@@ -328,8 +346,10 @@ where
     let mut backend_error = None;
     while remaining > 0 {
         let want = remaining.min(chunk.len());
-        let wait = drain_deadline.map_or(timeout, |deadline| {
-            timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        let wait = drain_deadline.map_or(limits.backend, |deadline| {
+            limits
+                .backend
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
         });
         let read = match crate::utils::timeout::timeout_unless_ready(
             wait,
@@ -358,7 +378,7 @@ where
             match crate::messages::socket::write_all_flush_timeout_counted(
                 client_stream,
                 &chunk[..read],
-                timeout,
+                limits.client,
                 &mut delivered,
             )
             .await
@@ -402,13 +422,12 @@ async fn handle_large_function_call_response<C>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    let copy_timeout = crate::config::proxy_copy_data_timeout();
     let client_error = stream_large_frame(
         server,
         client_stream,
         code_u8,
         message_len,
-        copy_timeout,
+        StreamLimits::from_config(),
         "function_call_response",
     )
     .await?;
@@ -427,19 +446,25 @@ async fn handle_large_copy_data<C>(
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
 {
-    let copy_timeout = crate::config::proxy_copy_data_timeout();
-    handle_large_copy_data_inner(server, client_stream, code_u8, message_len, copy_timeout).await
+    handle_large_copy_data_inner(
+        server,
+        client_stream,
+        code_u8,
+        message_len,
+        StreamLimits::from_config(),
+    )
+    .await
 }
 
-/// Inner body of [`handle_large_copy_data`] with the COPY-data stream
-/// deadline injected, so unit tests can drive it with a short timeout
-/// instead of the configured production value.
+/// Inner body of [`handle_large_copy_data`] with the stream limits
+/// injected, so unit tests can drive it with short timeouts instead of the
+/// configured production values.
 async fn handle_large_copy_data_inner<C>(
     server: &mut Server,
     client_stream: &mut C,
     code_u8: u8,
     message_len: i32,
-    copy_timeout: Duration,
+    limits: StreamLimits,
 ) -> Result<BytesMut, Error>
 where
     C: tokio::io::AsyncWrite + std::marker::Unpin,
@@ -452,7 +477,7 @@ where
         client_stream,
         code_u8,
         message_len,
-        copy_timeout,
+        limits,
         "copy_data",
     )
     .await?;
@@ -3153,7 +3178,7 @@ mod tests {
             impl_src.contains(
                 "write_all_flush_timeout_counted(\n        client_stream,\n        &server.buffer,"
             ),
-            "large-message header flushes to the client must be bounded by proxy_copy_data_timeout"
+            "large-message header flushes to the client must be bounded by client_write_timeout"
         );
         assert!(
             !impl_src.contains("write_all_flush(client_stream, &server.buffer)"),
@@ -3195,6 +3220,157 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
         }
+    }
+
+    /// Client write half that takes `before` bytes, accepts nothing for
+    /// `pause`, then takes everything: an application that processes a row
+    /// before it reads the next one.
+    struct PausingWriter {
+        before: usize,
+        taken: usize,
+        pause: std::time::Duration,
+        sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        resumed: bool,
+    }
+
+    impl PausingWriter {
+        fn new(before: usize, pause: std::time::Duration) -> Self {
+            Self {
+                before,
+                taken: 0,
+                pause,
+                sleep: None,
+                resumed: false,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PausingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            use std::future::Future;
+
+            if !self.resumed && self.taken >= self.before {
+                let pause = self.pause;
+                let sleep = self
+                    .sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(pause)));
+                if sleep.as_mut().poll(cx).is_pending() {
+                    return std::task::Poll::Pending;
+                }
+                self.resumed = true;
+            }
+            let n = if self.resumed {
+                buf.len()
+            } else {
+                buf.len().min(self.before - self.taken)
+            };
+            self.taken += n;
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Body of a DataRow with one `len`-byte column, without its header.
+    fn data_row_body(len: usize) -> (i32, Vec<u8>) {
+        let mut body = Vec::with_capacity(2 + 4 + len);
+        body.put_i16(1);
+        body.put_i32(len as i32);
+        body.resize(2 + 4 + len, b'x');
+        (4 + body.len() as i32, body)
+    }
+
+    /// A client that stops reading for longer than the backend limit, but
+    /// within its own, gets the whole frame: the client side of a stream is
+    /// bounded by `client_write_timeout`, not by `proxy_copy_data_timeout`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_pausing_past_the_backend_limit_gets_the_whole_frame() {
+        use super::{stream_large_frame, StreamLimits};
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        let (message_len, body) = data_row_body(200 * 1024);
+        let writer = tokio::spawn(async move {
+            peer.write_all(&body).await.unwrap();
+            peer
+        });
+        let mut client = PausingWriter::new(10_000, std::time::Duration::from_millis(300));
+        let limits = StreamLimits {
+            client: std::time::Duration::from_secs(5),
+            backend: std::time::Duration::from_millis(100),
+        };
+
+        let result = stream_large_frame(
+            &mut server,
+            &mut client,
+            b'D',
+            message_len,
+            limits,
+            "data_row",
+        )
+        .await;
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
+        assert_eq!(client.taken, 1 + message_len as usize);
+        assert!(!server.is_bad());
+        let _peer = writer.await.unwrap();
+    }
+
+    /// A client that stops reading for longer than its limit is given up,
+    /// and the rest of the frame is still read so the backend stays in step.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_pausing_past_its_limit_is_given_up_with_the_backend_in_step() {
+        use super::{stream_large_frame, StreamLimits};
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut peer) = crate::server::Server::test_silent_socket();
+        let (message_len, body) = data_row_body(200 * 1024);
+        let writer = tokio::spawn(async move {
+            peer.write_all(&body).await.unwrap();
+            peer
+        });
+        let mut client = PausingWriter::new(10_000, std::time::Duration::from_secs(30));
+        let limits = StreamLimits {
+            client: std::time::Duration::from_millis(100),
+            backend: std::time::Duration::from_secs(5),
+        };
+
+        let started = tokio::time::Instant::now();
+        let result = stream_large_frame(
+            &mut server,
+            &mut client,
+            b'D',
+            message_len,
+            limits,
+            "data_row",
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(Some(Error::ProxyTimeout))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!server.is_bad(), "the rest of the frame was read");
+        let _peer = writer.await.unwrap();
     }
 
     /// A client gone in the middle of a streamed frame leaves the backend in
@@ -3403,7 +3579,7 @@ mod tests {
         // copy timeout; the handler must return Err and mark the backend bad.
         // The outer 5 s guard turns a regression (missing internal timeout)
         // into a test failure instead of a hung suite.
-        use super::{handle_large_copy_data_inner, Server};
+        use super::{handle_large_copy_data_inner, Server, StreamLimits};
         use std::time::Duration;
 
         // Peer stays alive but silent, so reads on the backend stream block
@@ -3419,7 +3595,10 @@ mod tests {
                 &mut client,
                 b'd',
                 declared_len,
-                Duration::from_millis(80),
+                StreamLimits {
+                    client: Duration::from_secs(600),
+                    backend: Duration::from_millis(80),
+                },
             ),
         )
         .await;

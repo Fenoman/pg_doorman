@@ -44,7 +44,9 @@ pub struct General {
 
     /// TCP_USER_TIMEOUT for client connections (in seconds).
     /// Helps detect dead connections faster than keepalive by setting a timeout
-    /// on unacknowledged data. Only supported on Linux.
+    /// on unacknowledged data. Linux also aborts a live client that keeps its
+    /// receive window closed longer than this, so a non-zero value caps
+    /// `client_write_timeout`. Only supported on Linux.
     /// 0 means disabled (uses OS default).
     /// Default: 0 (disabled)
     #[serde(default = "General::default_tcp_user_timeout")]
@@ -211,6 +213,11 @@ pub struct General {
 
     #[serde(default = "General::default_proxy_copy_data_timeout")] // 15_000
     pub proxy_copy_data_timeout: Duration,
+
+    /// Longest pause without a byte taken by a client while a response is
+    /// written to it. 0 means no limit.
+    #[serde(default = "General::default_client_write_timeout")] // 600_000
+    pub client_write_timeout: Duration,
 
     // worker_cpu_affinity_pinning: пытаемся пинить каждый worker на CPU, начиная со второго CPU.
     #[serde(default = "General::default_worker_cpu_affinity_pinning")]
@@ -513,9 +520,9 @@ impl General {
         5 // 5 seconds
     }
 
-    /// Default: 60 seconds
+    /// Default: 0 (disabled)
     pub fn default_tcp_user_timeout() -> u64 {
-        60 // 60 seconds
+        0
     }
 
     pub fn default_idle_timeout() -> Duration {
@@ -528,6 +535,10 @@ impl General {
 
     pub fn default_proxy_copy_data_timeout() -> Duration {
         Duration::from_secs(15) // 15 seconds
+    }
+
+    pub fn default_client_write_timeout() -> Duration {
+        Duration::from_mins(10) // 10 minutes
     }
 
     pub fn default_message_size_to_be_stream() -> ByteSize {
@@ -628,6 +639,7 @@ impl Default for General {
             idle_timeout: General::default_idle_timeout(),
             shutdown_timeout: Self::default_shutdown_timeout(),
             proxy_copy_data_timeout: Self::default_proxy_copy_data_timeout(),
+            client_write_timeout: Self::default_client_write_timeout(),
             message_size_to_be_stream: Self::default_message_size_to_be_stream(),
             response_flush_threshold: Self::default_response_flush_threshold(),
             max_memory_usage: Self::default_max_memory_usage(),

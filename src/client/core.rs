@@ -1500,7 +1500,7 @@ where
             self.username,
             self.server_parameters.get_application_name(),
         ));
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
         if let Err(write_err) =
             error_response_timeout(&mut self.write, &client_msg, "3D000", write_timeout).await
         {
@@ -1549,8 +1549,8 @@ mod no_pool_error_tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("crate::config::proxy_copy_data_timeout()"),
-            "missing-pool ErrorResponse must use proxy_copy_data_timeout"
+            body.contains("crate::config::client_write_timeout()"),
+            "missing-pool ErrorResponse must use client_write_timeout"
         );
         assert!(
             body.contains("error_response_timeout(") && body.contains("&mut self.write"),

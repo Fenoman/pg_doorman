@@ -609,6 +609,16 @@ fn write_general_section(w: &mut ConfigWriter, config: &Config) {
         "15000 ms",
     );
 
+    write_field_desc(w, fi, "general", "client_write_timeout");
+    write_duration_value(
+        w,
+        fi,
+        "client_write_timeout",
+        g.client_write_timeout.as_millis(),
+        "10m",
+        "600000 ms",
+    );
+
     // --- TCP Settings ---
     w.separator(fi, f.section_title("tcp").get(w.russian));
     w.blank();

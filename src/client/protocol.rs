@@ -704,7 +704,7 @@ where
         message: &str,
         code: &str,
     ) -> Result<(), Error> {
-        let write_timeout = crate::config::proxy_copy_data_timeout();
+        let write_timeout = crate::config::client_write_timeout();
         error_response_timeout(&mut self.write, message, code, write_timeout).await
     }
 
@@ -1467,8 +1467,8 @@ mod discard_all_transaction_guard_tests {
             .expect("prepared lookup should follow error helper");
         let helper_body = &helper_body[..helper_end];
         assert!(
-            helper_body.contains("crate::config::proxy_copy_data_timeout()"),
-            "prepared synthetic errors must use proxy_copy_data_timeout"
+            helper_body.contains("crate::config::client_write_timeout()"),
+            "prepared synthetic errors must use client_write_timeout"
         );
         assert!(
             helper_body.contains("error_response_timeout(&mut self.write"),

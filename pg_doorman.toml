@@ -100,9 +100,14 @@ dead_backend_check_max_per_cycle = 8
 # Default: 10000 (10000 ms)
 shutdown_timeout = 10000
 
-# Maximum pause without read/write progress while proxying data.
+# Maximum pause without backend read/write progress while proxying data.
 # Default: 15000 (15000 ms)
 proxy_copy_data_timeout = 15000
+
+# Maximum pause without a byte taken by the client while a response is written to it.
+# 0 means no limit.
+# Default: 600000 (600000 ms)
+client_write_timeout = 600000
 
 # --------------------------------------------------------------------------
 # TCP Settings
@@ -128,9 +133,10 @@ tcp_no_delay = true
 
 # TCP_USER_TIMEOUT for client connections (in seconds).
 # Helps detect dead connections faster when data remains unacknowledged.
+# Linux also aborts a client that does not read for this long, which caps client_write_timeout.
 # Only supported on Linux. Set to 0 to disable.
-# Default: 60
-tcp_user_timeout = 60
+# Default: 0
+tcp_user_timeout = 0
 
 # Kernel SO_RCVBUF/SO_SNDBUF limits for accepted client TCP sockets, accepted web TCP sockets, and outbound backend TCP sockets.
 # `0` (default) keeps Linux TCP autotuning active.

@@ -20,9 +20,10 @@ Feature: Client restart under full pool pressure should release active counters
       prepared_statements_cache_size = 300
       worker_threads = 3
       query_wait_timeout = 5000
-      # Cap proxy timeout so cleanup after client close completes within
-      # the test's wait window instead of relying on the 15s default.
+      # Cap the proxy and client write timeouts so cleanup after client close
+      # completes within the test's wait window instead of relying on the defaults.
       proxy_copy_data_timeout = 2000
+      client_write_timeout = 2000
 
       [pools.example_db]
       server_host = "${PG_TEMP_DIR}"

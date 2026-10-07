@@ -256,6 +256,7 @@ fn write_general_fields(out: &mut String, f: &FieldsData) {
         "max_memory_usage",
         "shutdown_timeout",
         "proxy_copy_data_timeout",
+        "client_write_timeout",
         "server_tls_mode",
         "server_tls_ca_cert",
         "server_tls_certificate",

@@ -355,6 +355,13 @@ impl Config {
             format_duration_ms(self.general.shutdown_timeout.as_millis())
         );
         info!(
+            "Client write timeout: {}",
+            match self.general.client_write_timeout.as_millis() {
+                0 => "no limit".to_string(),
+                ms => format_duration_ms(ms),
+            }
+        );
+        info!(
             "Message size to stream: {}",
             self.general.message_size_to_be_stream
         );
@@ -1109,11 +1116,27 @@ pub fn config_arc() -> Arc<Config> {
     CONFIG.load_full()
 }
 
-/// `general.proxy_copy_data_timeout`, which bounds every write to a client
-/// and is read several times per transaction. `CONFIG.load()` touches no
-/// reference count shared by all worker threads, unlike `config_arc()`.
+/// `general.proxy_copy_data_timeout`, which bounds a wait for the backend
+/// while data is proxied: a streamed frame it sends and COPY data it takes.
+/// `CONFIG.load()` touches no reference count shared by all worker threads,
+/// unlike `config_arc()`.
 pub fn proxy_copy_data_timeout() -> std::time::Duration {
     CONFIG.load().general.proxy_copy_data_timeout.as_std()
+}
+
+/// `general.client_write_timeout`, which bounds every write to a client and
+/// is read several times per transaction, like `proxy_copy_data_timeout()`.
+pub fn client_write_timeout() -> std::time::Duration {
+    client_write_limit(CONFIG.load().general.client_write_timeout)
+}
+
+/// The limit a configured `client_write_timeout` sets: 0 sets none.
+pub(crate) fn client_write_limit(timeout: Duration) -> std::time::Duration {
+    if timeout.as_millis() == 0 {
+        std::time::Duration::MAX
+    } else {
+        timeout.as_std()
+    }
 }
 
 async fn load_file(path: &str) -> Result<String, Error> {
