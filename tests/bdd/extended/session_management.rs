@@ -908,6 +908,41 @@ pub async fn session_should_receive_any_datarow(world: &mut DoormanWorld, sessio
     expect_message_tag(world, &session_name, 'D', "DataRow", None);
 }
 
+/// Every DataRow holds one column of a repeated byte, and the columns
+/// together hold `expected_bytes` bytes: nothing of the result is lost or
+/// changed on the way.
+#[then(regex = r#"^session "([^"]+)" DataRows should hold (\d+) bytes of "(.)"$"#)]
+pub async fn session_datarows_should_hold_bytes_of(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected_bytes: usize,
+    byte: String,
+) {
+    let messages = world
+        .session_messages
+        .get(&session_name)
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
+    let expected_byte = byte.as_bytes()[0];
+    let mut total = 0;
+    for (row, (_, data)) in messages.iter().filter(|(tag, _)| *tag == 'D').enumerate() {
+        let len = i32::from_be_bytes(data[2..6].try_into().unwrap());
+        assert!(
+            len >= 0,
+            "DataRow {row} from session '{session_name}' is NULL"
+        );
+        let value = &data[6..6 + len as usize];
+        assert!(
+            value.iter().all(|b| *b == expected_byte),
+            "DataRow {row} from session '{session_name}' holds bytes other than {byte:?}"
+        );
+        total += value.len();
+    }
+    assert_eq!(
+        total, expected_bytes,
+        "DataRows from session '{session_name}' hold {total} bytes, expected {expected_bytes}"
+    );
+}
+
 #[then(regex = r#"^session "([^"]+)" should receive (\d+) DataRows$"#)]
 pub async fn session_should_receive_datarow_count(
     world: &mut DoormanWorld,

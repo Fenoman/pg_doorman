@@ -1124,8 +1124,9 @@ pub fn proxy_copy_data_timeout() -> std::time::Duration {
     CONFIG.load().general.proxy_copy_data_timeout.as_std()
 }
 
-/// `general.client_write_timeout`, which bounds every write to a client and
-/// is read several times per transaction, like `proxy_copy_data_timeout()`.
+/// `general.client_write_timeout`, which bounds every write to a pool client
+/// (the admin console keeps its own limit) and is read several times per
+/// transaction, like `proxy_copy_data_timeout()`.
 pub fn client_write_timeout() -> std::time::Duration {
     client_write_limit(CONFIG.load().general.client_write_timeout)
 }

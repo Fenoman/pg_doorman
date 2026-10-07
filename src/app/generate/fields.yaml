@@ -508,8 +508,8 @@ fields:
         does not read, it keeps its backend, the same as with a direct PostgreSQL connection, which waits
         for the client without a limit.
 
-        Set to `0` to remove the limit. The admin console is not affected: it writes each response with
-        its own limit of 5 seconds.
+        Set to `0` to remove the limit. The admin console is not affected: it has its own fixed limit of
+        5 seconds for a write and for a flush.
 
         **Note:** on Linux a non-zero `tcp_user_timeout` also aborts a client that keeps its receive
         window closed longer than that value, so the shorter of the two applies.

@@ -43,6 +43,7 @@ Feature: A client that pauses reading keeps its response
     And we sleep 3000ms
     Then we read SimpleQuery response from session "reader" within 15000ms
     And session "reader" should receive 20000 DataRows
+    And session "reader" DataRows should hold 20000000 bytes of "x"
     And session "reader" should receive CommandComplete "SELECT 20000"
     When we create admin session "admin" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW POOLS" on admin session "admin" and store response
@@ -57,6 +58,7 @@ Feature: A client that pauses reading keeps its response
     And we sleep 3000ms
     Then we read SimpleQuery response from session "reader" within 15000ms
     And session "reader" should receive 1000 DataRows
+    And session "reader" DataRows should hold 16999000 bytes of "x"
     And session "reader" should receive CommandComplete "SELECT 1000"
     When we create admin session "admin" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW POOLS" on admin session "admin" and store response

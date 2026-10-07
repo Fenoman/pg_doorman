@@ -132,8 +132,9 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
     # Client A sends a large SELECT and never reads. The send buffer fills,
     # the stream blocks on writes to client A, then fires the configured
     # timeout (client_write_timeout = 2000 in this feature's Background).
-    # handle_large_data_row marks the server bad and returns Err. Object::drop
-    # must evict the connection so the leftover body bytes never reach client B.
+    # The rest of the frame is still read, so the backend either stays in step
+    # with the protocol and returns to the pool, or is closed if its query has
+    # to be canceled. Either way the leftover body bytes never reach client B.
     When we create session "slow_a" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT repeat('X', 50000000)::text" to session "slow_a" without waiting
 
@@ -143,13 +144,13 @@ Feature: Large DataRow + RST mid-stream — server-side leak detection (mirrors 
     When we close session "slow_a"
     And we sleep 1000ms
 
-    # Pool releases the bad server: counters back to zero.
+    # Pool releases the server: counters back to zero.
     When we create admin session "admin-mid" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW POOLS" on admin session "admin-mid" and store response
     Then admin session "admin-mid" column "cl_active" for row with "user" = "example_user_1" should be between 0 and 0
     And admin session "admin-mid" column "sv_active" for row with "user" = "example_user_1" should be between 0 and 0
 
-    # Client B picks up a fresh connection. It must see exactly its own result,
+    # Client B gets a backend from the pool. It must see exactly its own result,
     # not leftover bytes from the abandoned 50 MB DataRow.
     When we create session "client_b" to pg_doorman as "example_user_1" with password "" and database "example_db"
     And we send SimpleQuery "SELECT 'CLEAN_HANDOFF'::text" to session "client_b" and store response

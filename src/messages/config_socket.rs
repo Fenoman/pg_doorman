@@ -42,22 +42,26 @@ pub fn configure_tcp_socket_for_cancel(stream: &TcpStream) {
 /// Configure a client TCP socket received from the previous process during
 /// client migration. The options that process set stay on the socket, so
 /// TCP_USER_TIMEOUT is applied even when it is 0: the client must not keep
-/// the limit of the old configuration.
+/// the limit of the old configuration. One configuration snapshot decides
+/// both, so a RELOAD in between cannot leave the old limit in place.
 pub fn configure_migrated_tcp_socket(stream: &TcpStream) {
-    configure_tcp_socket(stream);
+    let sock_ref = SockRef::from(stream);
+    let conf = config_arc();
+    configure_tcp_socket_with(&sock_ref, &conf);
     #[cfg(target_os = "linux")]
-    if config_arc().general.tcp_user_timeout == 0 {
-        set_tcp_user_timeout(&SockRef::from(stream), 0, "migrated TCP socket");
+    if conf.general.tcp_user_timeout == 0 {
+        set_tcp_user_timeout(&sock_ref, 0, "migrated TCP socket");
     }
 }
 
 /// Configure TCP socket parameters.
 pub fn configure_tcp_socket(stream: &TcpStream) {
-    let sock_ref = SockRef::from(stream);
     // Per-connection: borrow the live Arc<Config> instead of deep-cloning
     // the whole Config just to read a few scalar `general` fields.
-    let conf = config_arc();
+    configure_tcp_socket_with(&SockRef::from(stream), &config_arc());
+}
 
+fn configure_tcp_socket_with(sock_ref: &SockRef<'_>, conf: &Config) {
     match sock_ref.set_linger(Some(Duration::from_secs(conf.general.tcp_so_linger))) {
         Ok(_) => {}
         Err(err) => error!("failed to set SO_LINGER on TCP socket: {err}"),
@@ -68,7 +72,7 @@ pub fn configure_tcp_socket(stream: &TcpStream) {
         Err(err) => error!("failed to set TCP_NODELAY on TCP socket: {err}"),
     }
 
-    configure_tcp_socket_without_linger(&sock_ref, &conf, "TCP socket");
+    configure_tcp_socket_without_linger(sock_ref, conf, "TCP socket");
 }
 
 /// Configure accepted web TCP socket parameters.
@@ -181,6 +185,39 @@ mod tests {
         set_tcp_user_timeout(&sock_ref, 0, "test socket");
 
         assert_eq!(sock_ref.tcp_user_timeout().unwrap(), None);
+    }
+
+    /// The old process left 60 seconds on the socket. The configuration
+    /// here keeps the default of 0, which the migrated socket must get.
+    #[tokio::test]
+    async fn a_migrated_socket_drops_the_tcp_user_timeout_of_the_old_process() {
+        assert_eq!(config_arc().general.tcp_user_timeout, 0);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        SockRef::from(&client)
+            .set_tcp_user_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+
+        configure_migrated_tcp_socket(&client);
+
+        assert_eq!(SockRef::from(&client).tcp_user_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn both_migration_imports_use_the_migrated_socket_configuration() {
+        let src = include_str!("../client/migration.rs");
+        let impl_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert_eq!(
+            impl_src.matches("configure_migrated_tcp_socket(&").count(),
+            2,
+            "the plain and the TLS import must both reset socket options"
+        );
+        assert!(
+            !impl_src.contains("configure_tcp_socket(&"),
+            "a migrated socket must not be configured like a fresh one"
+        );
     }
 
     #[tokio::test]
