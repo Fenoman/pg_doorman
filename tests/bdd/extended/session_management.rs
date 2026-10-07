@@ -908,6 +908,23 @@ pub async fn session_should_receive_any_datarow(world: &mut DoormanWorld, sessio
     expect_message_tag(world, &session_name, 'D', "DataRow", None);
 }
 
+#[then(regex = r#"^session "([^"]+)" should receive (\d+) DataRows$"#)]
+pub async fn session_should_receive_datarow_count(
+    world: &mut DoormanWorld,
+    session_name: String,
+    expected: usize,
+) {
+    let messages = world
+        .session_messages
+        .get(&session_name)
+        .unwrap_or_else(|| panic!("No messages stored for session '{session_name}'"));
+    let rows = messages.iter().filter(|(tag, _)| *tag == 'D').count();
+    assert_eq!(
+        rows, expected,
+        "session '{session_name}' received {rows} DataRows, expected {expected}"
+    );
+}
+
 #[then(regex = r#"^session "([^"]+)" should receive ParseComplete$"#)]
 pub async fn session_should_receive_parse_complete(world: &mut DoormanWorld, session_name: String) {
     expect_message_tag(world, &session_name, '1', "ParseComplete", None);

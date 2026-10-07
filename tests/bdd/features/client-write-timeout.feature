@@ -42,6 +42,7 @@ Feature: A client that pauses reading keeps its response
     And we send SimpleQuery "SELECT repeat('x', 1000) FROM generate_series(1, 20000)" to session "reader" without waiting
     And we sleep 3000ms
     Then we read SimpleQuery response from session "reader" within 15000ms
+    And session "reader" should receive 20000 DataRows
     And session "reader" should receive CommandComplete "SELECT 20000"
     When we create admin session "admin" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW POOLS" on admin session "admin" and store response
@@ -55,6 +56,7 @@ Feature: A client that pauses reading keeps its response
     And we send SimpleQuery "SELECT repeat('x', CASE WHEN g = 1 THEN 16000000 ELSE 1000 END) FROM generate_series(1, 1000) g" to session "reader" without waiting
     And we sleep 3000ms
     Then we read SimpleQuery response from session "reader" within 15000ms
+    And session "reader" should receive 1000 DataRows
     And session "reader" should receive CommandComplete "SELECT 1000"
     When we create admin session "admin" to pg_doorman as "admin" with password "admin"
     And we execute "SHOW POOLS" on admin session "admin" and store response

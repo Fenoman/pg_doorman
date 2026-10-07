@@ -16,7 +16,7 @@ use crate::client::util::{
 };
 use crate::config::{get_config, BackendAuthMethod};
 use crate::errors::Error;
-use crate::messages::config_socket::configure_tcp_socket;
+use crate::messages::config_socket::configure_migrated_tcp_socket;
 use crate::messages::Parse;
 use crate::pool::{
     get_pool_by_id, resolve_client_anon_cache_size, ClientServerMap, ConnectionPool, PoolIdentifier,
@@ -930,7 +930,7 @@ pub async fn reconstruct_client(
         .map_err(|e| Error::SocketError(format!("set_nonblocking: {e}")))?;
     let stream = TcpStream::from_std(std_stream)
         .map_err(|e| Error::SocketError(format!("from_std: {e}")))?;
-    configure_tcp_socket(&stream);
+    configure_migrated_tcp_socket(&stream);
 
     let raw_fd = Some(stream.as_raw_fd());
     let (read, write) = split(stream);
@@ -1058,7 +1058,7 @@ pub async fn reconstruct_tls_client(
         .map_err(|e| Error::SocketError(format!("set_nonblocking: {e}")))?;
     let tcp_stream = TcpStream::from_std(std_stream)
         .map_err(|e| Error::SocketError(format!("from_std: {e}")))?;
-    configure_tcp_socket(&tcp_stream);
+    configure_migrated_tcp_socket(&tcp_stream);
 
     let tls_fd = tcp_stream.as_raw_fd();
     let raw_fd = Some(tls_fd);

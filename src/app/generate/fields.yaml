@@ -499,8 +499,8 @@ fields:
       doc: |
         Maximum interval without a single byte taken by the client while pg_doorman writes a response
         to it, in milliseconds. Each successful write restarts the interval. When the interval passes,
-        the client is disconnected, the rest of its response is drained or its query is canceled, and
-        the backend returns to the pool.
+        the client is disconnected. Its backend returns to the pool once the rest of the response is
+        read, or is closed if the query has to be canceled.
 
         A client stops taking bytes when the application does not read its socket, for example while it
         processes one row of a result before it reads the next one. A response that fits into the socket
@@ -508,7 +508,8 @@ fields:
         does not read, it keeps its backend, the same as with a direct PostgreSQL connection, which waits
         for the client without a limit.
 
-        Set to `0` to remove the limit.
+        Set to `0` to remove the limit. The admin console is not affected: it writes each response with
+        its own limit of 5 seconds.
 
         **Note:** on Linux a non-zero `tcp_user_timeout` also aborts a client that keeps its receive
         window closed longer than that value, so the shorter of the two applies.
